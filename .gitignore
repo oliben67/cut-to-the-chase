@@ -7,3 +7,4 @@ app/demo/data/
 stay-the-course/
 .prompts/
 *.cttc
+.coverage

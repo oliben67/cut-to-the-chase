@@ -30,7 +30,8 @@ import threading
 import time
 import zipfile
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer as _ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -161,6 +162,8 @@ class TransformRegistry:
         fns = []
         for name in names:
             path = self.directory / f"{name}.py"
+            if not path.is_file():
+                raise ValueError(f"transform not found: {name}")
             spec = importlib.util.spec_from_file_location(f"cttc_transform_{name}", path)
             if spec is None or spec.loader is None:
                 raise ValueError(f"transform not found: {name}")
@@ -330,6 +333,26 @@ class LogSource:
             if not self.rows:
                 return None
             return (self.rows[0][0], self.rows[-1][0])
+
+    def find(self, query: str, start: int, forward: bool = True) -> int | None:
+        """Case-insensitive substring search, wrapping around the whole log."""
+        q = query.strip().lower()
+        if not q:
+            return None
+        with self.lock:
+            n = len(self.rows)
+            if n == 0:
+                return None
+            start = max(0, min(start, n - 1))
+            order = (
+                list(range(start, n)) + list(range(0, start))
+                if forward
+                else list(range(start, -1, -1)) + list(range(n - 1, start, -1))
+            )
+            for i in order:
+                if q in self.rows[i][3].lower():
+                    return i
+        return None
 
 
 class StatsSource:
@@ -992,9 +1015,12 @@ class State:
             opened.append(sid)
         return opened
 
-    def export_sample(self, path: str, t0: float, t1: float, public_key: str | None = None) -> dict:
+    def export_sample(
+        self, path: str, t0: float, t1: float, public_key: str | None = None, include_host: bool = True
+    ) -> dict:
         """Write a .cttc sample: a zip of per-source log/metric slices in
-        [t0, t1] plus a manifest, for every currently open source. When
+        [t0, t1] plus a manifest, for every currently open source (unless
+        include_host is False, which excludes host-telemetry sources). When
         public_key is given (a stored key name or a raw PEM string), the zip
         is AES-256-GCM encrypted under a one-time key that is itself wrapped
         with that RSA public key — only the matching private key can open it."""
@@ -1005,6 +1031,8 @@ class State:
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
             for i, s in enumerate(items):
+                if not include_host and getattr(s, "is_host", False):
+                    continue
                 if s.kind == "log":
                     with s.lock:
                         lo = bisect.bisect_left(s.rows, (t0,))
@@ -1158,6 +1186,21 @@ def tail_loop(state: State, interval: float = 1.0):
 # ── HTTP API ─────────────────────────────────────────────────────────────────
 
 
+class ThreadingHTTPServer(_ThreadingHTTPServer):
+    """Keep-alive (HTTP/1.1) connections get closed by the client all the
+    time (window reload/close, Electron tearing down a popped-out window,
+    the browser recycling an idle socket, ...): the next read on that socket
+    then raises ECONNRESET/EPIPE while we're simply waiting for another
+    request. That's expected and not a bug, so keep the default traceback
+    dump (BaseServer.handle_error) for anything else but swallow these."""
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
+            return
+        super().handle_error(request, client_address)
+
+
 class Handler(BaseHTTPRequestHandler):
     state: State = None  # set at startup
     protocol_version = "HTTP/1.1"
@@ -1231,6 +1274,12 @@ class Handler(BaseHTTPRequestHandler):
                 src = self._log_source(q["source"])
                 t0, t1, px = float(q["from"]), float(q["to"]), int(q.get("px", 800))
                 self._send({"counts": src.ticks(t0, t1, px)})
+            elif u.path == "/logs/find":
+                src = self._log_source(q["source"])
+                start = int(q.get("start", 0))
+                forward = q.get("dir", "fwd") != "back"
+                idx = src.find(q.get("q", ""), start, forward)
+                self._send({"index": idx})
             elif u.path == "/events":
                 self._sse()
             else:
@@ -1273,7 +1322,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send({"ok": True})
             elif u.path == "/sample/export":
                 self._send(st.export_sample(
-                    body["path"], float(body["from"]), float(body["to"]), body.get("public_key") or None
+                    body["path"], float(body["from"]), float(body["to"]),
+                    body.get("public_key") or None, bool(body.get("include_host", True)),
                 ))
             elif u.path == "/cttc/keys/generate":
                 self._send(generate_keypair(body["name"]))

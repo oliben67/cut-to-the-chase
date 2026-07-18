@@ -61,6 +61,22 @@ tasks:
       - task: demo
       - "{{.ELECTRON}} . demo/data/stats.jsonl demo/data/c3_api.log demo/data/c3_worker.log"
 
+  # ── Tests ─────────────────────────────────────────────────────────────────
+  test:
+    desc: Run everything — server unit tests (with coverage) then renderer E2E
+    cmds:
+      - task: test:server
+      - task: test:e2e
+
+  test:server:
+    desc: Server test suite with line coverage (uv run pytest)
+    dir: '{{.SERVER}}'
+    cmd: "{{.UV}} run --group dev pytest tests/ -q --cov=server --cov-report=term-missing"
+
+  test:e2e:
+    desc: Renderer E2E — runs test/renderer-spec.js inside the real app against demo data
+    cmd: ./test/run-e2e.sh
+
   # ── Quality gates ─────────────────────────────────────────────────────────
   check:
     desc: Run all quality gates — JS syntax checks and server import (orjson present)

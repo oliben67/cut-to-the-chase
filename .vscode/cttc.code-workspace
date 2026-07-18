@@ -3,6 +3,10 @@
 		{
 			"name": "CutToTheChase",
 			"path": ".."
+		},
+		{
+			"name": "Songbooks",
+			"uri": "cantica-songbooks:/"
 		}
 	],
 	"settings": {}

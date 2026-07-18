@@ -29,10 +29,10 @@ the cursor to that line's time instead.
   level-colored (ERROR/WARN) and virtually scrolled, so multi-million-line
   files stay smooth.
 - **Line plot or histogram** rendering for every metric strip (toolbar toggle).
-- **Timeline navigation**: drag to zoom, `◀ / now / ▶` to pan half a window or
-  re-center on the present, double-click / *reset zoom* to fit the data,
-  *follow live* to pin the view to incoming data. The view starts centered on
-  now (± 5 min).
+- **Timeline navigation**: drag to zoom, double-click any point on the charts
+  or log density lanes to re-center every panel on that time, *reset zoom* to
+  fit the full data range, *follow live* to pin the view to incoming data.
+  The view starts centered on now (± 5 min).
 - **Resizable layout**: drag the divider between charts and log panels to trade
   chart height for log space.
 - **Docker collection** from the local daemon or a remote one over
@@ -55,7 +55,7 @@ the cursor to that line's time instead.
 - **Samples**: **shift+drag** on the timeline (or arm the `✂ sample` button and
   drag) to export the selected time range — logs and metrics of every open
   source, host included — as a zipped **`.cttc`** file. Load a `.cttc` back via
-  ＋ Add sources → Files to analyze it later.
+  the toolbar's **📂 Load sample** button to analyze it later.
 - **Duplicate guards**: a container, stats collector, host-telemetry collector,
   or file that is already being collected shows as *already added* and can't be
   added twice.
@@ -78,10 +78,6 @@ the cursor to that line's time instead.
   - [app/server/transforms/](app/server/transforms/) — drop-in transform
     modules.
   - [app/demo/](app/demo/) — correlated demo-data generator.
-- [scripts/](scripts/) — standalone shell/Python collectors that predate the
-  app (`container-logs` writes `docker stats` JSONL, `jsonify-stats` converts
-  to a JSON array, `analyze-logs` renders a terminal report, `remote.sh` runs a
-  collector on a remote host). Their output files load straight into the app.
 
 ## Run
 
@@ -100,18 +96,21 @@ the `docker` CLI if you use the Docker collector.
 
 ## Getting data in
 
-**＋ Add sources → Files** — open any mix of:
-- `docker stats` JSONL (one JSON object per line with a `timestamp` field, as
-  produced by `scripts/container-logs`) or a whole JSON array of those entries
-  (as produced by `scripts/jsonify-stats`),
+**Command-line arguments** — `npm start -- path/to/stats.jsonl path/to/service.log`
+opens any mix of:
+- `docker stats` JSONL (one JSON object per line with a `timestamp` field) or
+  a whole JSON array of those entries,
 - service logs from `docker logs -t` / `docker service logs -t` (RFC3339
   timestamp prefix),
-- JSONL logs (timestamp taken from `timestamp`/`ts`/`time`/`@timestamp`/…),
-- **`.cttc` sample files** exported from the app (loaded as static sources).
+- JSONL logs (timestamp taken from `timestamp`/`ts`/`time`/`@timestamp`/…).
 
 Lines without their own timestamp (stack traces, wrapped output) are appended
-to the previous entry. With *live* checked, files are tailed for new lines;
-log rotation/truncation is handled.
+to the previous entry. Files opened this way are tailed for new lines by
+default (`--static` disables that); log rotation/truncation is handled.
+
+**📂 Load sample** (toolbar) — pick one or more **`.cttc`** sample files
+exported from the app; they open as static (non-tailed) sources alongside
+whatever else is already open.
 
 **＋ Add sources → Docker** — attach to a daemon directly. Leave the host empty
 for the local daemon, or use `ssh://user@host` — an SSH-key selector appears
@@ -133,9 +132,11 @@ your local timezone; the cursor readout in the toolbar shows UTC.
 | click log row | move cursor to that row's time |
 | drag on chart / lane | zoom to selection (blue band) |
 | **shift+drag** (or `✂ sample` then drag) | export the selected range as a `.cttc` sample (orange band) |
-| double-click / reset zoom | fit the full data range |
-| ◀ / ▶ | pan half a window back / forward |
-| now | center the view on the present, keeping the span |
+| double-click chart / lane | re-center every panel on that point in time |
+| right-click chart / lane | menu: zoom in / zoom out / reset zoom / take snapshot |
+| drag timeline-nav thumb | pan the view |
+| click timeline-nav track | jump/re-center the view there |
+| click "now" on the timeline-nav | center the view on the present, keeping the span |
 | 〜 lines / ▤ histogram | switch chart rendering style |
 | drag divider above log panels | resize charts vs. logs |
 | window ± | size of the highlight window around t |
@@ -191,16 +192,37 @@ visible.
 
 ```
 GET  /sources · /range · /series?from&to&px · /logs?source&start&count
-     /index_at?source&t · /ticks?source&from&to&px · /transforms
-     /ssh/keys · /events (SSE)
-POST /open · /close · /docker/ps · /docker/collect · /sample/export · /shutdown
+     /index_at?source&t · /ticks?source&from&to&px · /logs/find?source&q&start&dir
+     /point?t · /transforms · /ssh/keys · /cttc/keys · /events (SSE)
+POST /open · /close · /docker/ps · /docker/collect · /sample/export
+     /cttc/keys/generate · /cttc/keys/import · /shutdown
 ```
 
 `/series` entries carry `host` (host-telemetry flag), `sid` (source id) and
 `ttype` (`container` | `service`). `/docker/collect` accepts `host`, `stats`,
 `host_stats`, `logs: [{name, type}]`, `transforms`, `interval`, `ssh_key`.
-`/sample/export` takes `{path, from, to}`. All timestamps are epoch
-milliseconds. The server binds `127.0.0.1` only.
+`/sample/export` takes `{path, from, to, include_host, public_key}` — with a
+`public_key` (a stored key name or raw PEM) the sample is encrypted
+(RSA-OAEP-wrapped AES-256-GCM); `/open` then needs `private_key` for that
+file, and reports `encrypted: true` in its error entry when it's missing.
+Keys live in `~/.cttc/keys/`. All timestamps are epoch milliseconds. The
+server binds `127.0.0.1` only.
+
+## Tests
+
+- **Server** — `task test:server` (or `cd app/server && uv run --group dev
+  pytest --cov=server`): ~150 tests covering parsers, ingestion, transforms,
+  the docker/ssh collectors (subprocesses fully mocked), sample
+  export/load/encryption, every HTTP endpoint incl. SSE, and `main()` —
+  at 100% line coverage of `server.py`.
+- **Renderer** — `task test:e2e` (or `npm run test:e2e`): launches the real
+  app on fresh demo data and runs `app/test/renderer-spec.js` inside the
+  window — view math, toolbar controls, legend track states, drag
+  zoom/sample/recenter gestures on the actual canvases, tooltips, log panels,
+  snapshots, the add-sources dialog logic, and a sample export/reload round
+  trip. Prints a result line plus V8 byte-coverage of `app.js`; exit code 0
+  means every assertion passed.
+- `task test` runs both.
 
 ## Development / verification hooks
 
@@ -211,6 +233,9 @@ Environment variables understood by the Electron main process:
 - `CTTC_EVAL='<js>'` — run arbitrary JS in the renderer before the capture.
 - `CTTC_CURSOR_OFFSET=<ms>` — set the cursor at `range.min + offset` before the
   capture.
+- `CTTC_TEST=<spec.js>` — run a test spec inside the window (used by
+  `task test:e2e`), print `CTTC_TEST_RESULTS {...}` with pass/fail counts and
+  app.js coverage, and exit non-zero on failures.
 
 Note for VS Code terminals: the extension host exports `ELECTRON_RUN_AS_NODE`,
 which turns the Electron binary into plain Node — unset it (the Taskfile's

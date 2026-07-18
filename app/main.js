@@ -1,12 +1,14 @@
 "use strict";
 
-const { app, BrowserWindow, dialog, ipcMain } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain, Menu } = require("electron");
 const { spawn } = require("child_process");
 const path = require("path");
 const readline = require("readline");
 
 const SERVER_DIR = path.join(__dirname, "server");
 const APP_ICON = path.join(__dirname, "assets", "icon.png");
+// one-liner as published on GitHub (kept in sync with package.json's "description")
+const APP_TAGLINE = "Correlate container telemetry with service logs on a shared clickable timeline";
 let serverProc = null;
 let serverPort = null;
 
@@ -43,6 +45,61 @@ function startServer(extraArgs) {
   });
 }
 
+function showAboutDialog() {
+  const stack = [
+    `Electron ${process.versions.electron}`,
+    `Chromium ${process.versions.chrome}`,
+    `Node.js ${process.versions.node}`,
+    "Python >=3.11 (via uv)",
+    "cryptography >=49.0.0",
+    "orjson >=3.10",
+    "psutil >=5.9",
+  ];
+  dialog.showMessageBox({
+    type: "info",
+    icon: APP_ICON,
+    title: `About ${app.name}`,
+    message: "Cut to the Chase (CTTC)",
+    detail:
+      `${APP_TAGLINE}\n\n` +
+      `Version ${app.getVersion()}\n` +
+      `\u00A9 ${new Date().getFullYear()} Olivier Steck\n\n` +
+      `Built with:\n${stack.map((s) => `  \u2022 ${s}`).join("\n")}`,
+    buttons: ["OK"],
+    noLink: true,
+  });
+}
+
+function installMenu() {
+  const isMac = process.platform === "darwin";
+  const template = [
+    ...(isMac
+      ? [{
+          label: app.name,
+          submenu: [
+            { label: `About ${app.name}`, click: showAboutDialog },
+            { type: "separator" },
+            { role: "services" },
+            { type: "separator" },
+            { role: "hide" },
+            { role: "hideOthers" },
+            { role: "unhide" },
+            { type: "separator" },
+            { role: "quit" },
+          ],
+        }]
+      : []),
+    { role: "editMenu" },
+    { role: "viewMenu" },
+    { role: "windowMenu" },
+    {
+      role: "help",
+      submenu: [{ label: `About ${app.name}`, click: showAboutDialog }],
+    },
+  ];
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
+
 async function createWindow() {
   const win = new BrowserWindow({
     width: 1440,
@@ -60,6 +117,50 @@ async function createWindow() {
   await win.loadFile(path.join(__dirname, "renderer", "index.html"), {
     search: `port=${serverPort}`,
   });
+  // e2e mode: CTTC_TEST=<spec.js> runs the spec in the page, reports results
+  // + V8 byte coverage of app.js (as exercised by the spec) on stdout, then
+  // exits (0 = all passed). The debugger can only attach to a live page, so
+  // coverage starts after load — boot-only top-level lines read as uncovered.
+  const testFile = process.env.CTTC_TEST;
+  if (testFile) {
+    setTimeout(() => {
+      console.error("[test] global timeout — spec never resolved");
+      app.exit(3);
+    }, 120000);
+    setTimeout(async () => {
+      let code = 2;
+      try {
+        const fs = require("fs");
+        const dbg = win.webContents.debugger;
+        dbg.attach("1.3");
+        await dbg.sendCommand("Profiler.enable");
+        await dbg.sendCommand("Profiler.startPreciseCoverage", { callCount: false, detailed: true });
+        const spec = fs.readFileSync(path.resolve(testFile), "utf8");
+        const result = await win.webContents.executeJavaScript(spec);
+        let coverage = null;
+        try {
+          const cov = await win.webContents.debugger.sendCommand("Profiler.takePreciseCoverage");
+          const entry = cov.result.find((s) => s.url.endsWith("renderer/app.js"));
+          if (entry) {
+            const src = fs.readFileSync(path.join(__dirname, "renderer", "app.js"), "utf8");
+            const flat = new Uint8Array(src.length);
+            for (const fn of entry.functions)
+              for (const r of fn.ranges)
+                flat.fill(r.count > 0 ? 1 : 0, r.startOffset, Math.min(r.endOffset, src.length));
+            let covered = 0;
+            for (const b of flat) covered += b;
+            coverage = Math.round((covered / src.length) * 1000) / 10;
+          }
+        } catch { /* coverage is informational only */ }
+        console.log("CTTC_TEST_RESULTS " + JSON.stringify({ ...result, appJsByteCoveragePct: coverage }));
+        code = result && result.failed === 0 ? 0 : 1;
+      } catch (err) {
+        console.error(`[test] ${err.stack || err}`);
+      }
+      app.exit(code);
+    }, 1500);
+    return;
+  }
   // headless-ish verification: CTTC_SCREENSHOT=/path.png captures the window and quits
   const shot = process.env.CTTC_SCREENSHOT;
   if (shot) {
@@ -99,7 +200,70 @@ ipcMain.handle("save-file", async (_e, defaultName) => {
   return r.canceled ? null : r.filePath;
 });
 
+ipcMain.handle("save-json", async (_e, defaultName, jsonText) => {
+  const r = await dialog.showSaveDialog({
+    title: "Save snapshot",
+    defaultPath: defaultName,
+    filters: [{ name: "JSON", extensions: ["json"] }],
+  });
+  if (r.canceled || !r.filePath) return null;
+  await require("fs").promises.writeFile(r.filePath, jsonText, "utf-8");
+  return r.filePath;
+});
+
+ipcMain.handle("save-text", async (_e, defaultName, text) => {
+  const r = await dialog.showSaveDialog({
+    title: "Save snapshot",
+    defaultPath: defaultName,
+    filters: [{ name: "Text", extensions: ["txt"] }],
+  });
+  if (r.canceled || !r.filePath) return null;
+  await require("fs").promises.writeFile(r.filePath, text, "utf-8");
+  return r.filePath;
+});
+
+// panels ("telemetry", or a log source by id) popped out into their own
+// window; still talk to the same server and stay in sync with the main
+// window (and each other) via the "sync-broadcast" relay below.
+const popoutWindows = new Map(); // "kind:id" -> BrowserWindow
+
+ipcMain.handle("popout", async (e, kind, id) => {
+  const key = `${kind}:${id || ""}`;
+  const existing = popoutWindows.get(key);
+  if (existing && !existing.isDestroyed()) {
+    existing.focus();
+    return;
+  }
+  const opener = BrowserWindow.fromWebContents(e.sender);
+  const big = kind === "telemetry" || kind === "host";
+  const win = new BrowserWindow({
+    width: big ? 1000 : 640,
+    height: big ? 620 : 520,
+    icon: APP_ICON,
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+  popoutWindows.set(key, win);
+  const params = new URLSearchParams({ port: String(serverPort), popout: kind });
+  if (id) params.set("id", id);
+  await win.loadFile(path.join(__dirname, "renderer", "index.html"), { search: params.toString() });
+  win.on("closed", () => {
+    popoutWindows.delete(key);
+    if (opener && !opener.isDestroyed()) opener.webContents.send("popout-closed", { kind, id });
+  });
+});
+
+ipcMain.on("sync-broadcast", (e, msg) => {
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (win.webContents.id !== e.sender.id) win.webContents.send("sync-broadcast", msg);
+  }
+});
+
 app.whenReady().then(async () => {
+  installMenu();
   // the window `icon` option is ignored on macOS; the running app's Dock icon
   // must be set explicitly (only affects unpackaged runs — packaged apps use .icns)
   if (process.platform === "darwin") app.dock.setIcon(APP_ICON);

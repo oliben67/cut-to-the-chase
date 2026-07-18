@@ -5,6 +5,12 @@
 const PORT = new URLSearchParams(location.search).get("port") || "8765";
 const API = `http://127.0.0.1:${PORT}`;
 
+// a window can either be the main window (POPOUT_KIND == null) or a panel
+// popped out into its own window: "telemetry" (the chart area) or "log"
+// (a single log panel, identified by POPOUT_ID = source id).
+const POPOUT_KIND = new URLSearchParams(location.search).get("popout") || null;
+const POPOUT_ID = new URLSearchParams(location.search).get("id") || null;
+
 async function get(path) {
   const r = await fetch(API + path);
   if (!r.ok) throw new Error(`${path}: ${r.status}`);
@@ -43,11 +49,13 @@ const state = {
   series: null,           // /series payload for current view
   ticks: new Map(),       // log source id -> counts[]
   visible: new Map(),     // series name -> bool
+  hiddenSamples: new Set(), // loaded .cttc file path -> hidden (whole-file toggle)
   hoverGroup: "svc",      // strip group under the pointer: "svc" | "host"
   chartStyle: prefs.get("chartStyle", "lines"), // "lines" | "bars"
   showHost: prefs.get("showHost", true),
   track: prefs.get("track", {}),           // series name -> "sel" | "mut" | "hid"
   showOthers: prefs.get("showOthers", true), // list not-selected containers in legend
+  poppedOut: new Set(),   // "telemetry" and/or log source ids moved to their own window
 };
 
 /* Tracking states: "sel" plots + normal legend entry; "mut" (not selected)
@@ -103,17 +111,125 @@ function themeVar(name) {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 }
 
+/* ── sample vs. live styling ───────────────────────────────────────────────
+   Per stay-the-course/sampled-vs-live-data.md: live data stays a solid,
+   full-saturation line/fill; data coming from a loaded .cttc sample is
+   grayed + dashed/hatched instead. Each *sample file* (source id) gets its
+   own gray level + dash rhythm, so several loaded samples stay visually
+   distinguishable from each other and from live data. */
+
+const sampleSlotBySid = new Map();
+function sampleSlot(sid) {
+  if (!sampleSlotBySid.has(sid)) sampleSlotBySid.set(sid, sampleSlotBySid.size);
+  return sampleSlotBySid.get(sid);
+}
+const SAMPLE_DASH_PATTERNS = [[6, 4], [2, 3], [9, 3, 2, 3], [1, 2.5], [10, 3, 3, 3]];
+const SAMPLE_GRAY_LEVELS = [0.3, 0.45, 0.6, 0.75];
+
+function isLiveSid(sid) {
+  const src = state.sources.find((s) => s.id === sid);
+  return !src || src.live !== false; // source unknown yet -> assume live
+}
+function basename(p) {
+  return String(p || "").split("/").pop();
+}
+// text to append after a container/source name when it comes from a loaded
+// .cttc sample, e.g. "api — sample-2026-07-18.cttc"
+function sampleFileLabel(sid) {
+  const src = state.sources.find((s) => s.id === sid);
+  if (!src || src.live !== false) return "";
+  const base = basename(src.path);
+  return base ? ` — ${base}` : "";
+}
+// group every non-live source by its originating .cttc file, so the whole
+// file's data can be shown/hidden with one click
+function sampleFileGroups() {
+  const byPath = new Map();
+  for (const s of state.sources) {
+    if (s.live !== false) continue;
+    if (!byPath.has(s.path)) byPath.set(s.path, { path: s.path, ids: new Set() });
+    byPath.get(s.path).ids.add(s.id);
+  }
+  return [...byPath.values()];
+}
+function isSampleHidden(sid) {
+  const src = state.sources.find((s) => s.id === sid);
+  return !!(src && src.live === false && state.hiddenSamples.has(src.path));
+}
+function dashFor(sid) {
+  return SAMPLE_DASH_PATTERNS[sampleSlot(sid) % SAMPLE_DASH_PATTERNS.length];
+}
+function hexToRgb(hex) {
+  const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec((hex || "").trim());
+  return m ? [parseInt(m[1], 16), parseInt(m[2], 16), parseInt(m[3], 16)] : null;
+}
+// blend a series color toward neutral gray by this sample's own gray level
+function grayedColor(hex, sid) {
+  const rgb = hexToRgb(hex);
+  if (!rgb) return hex;
+  const frac = SAMPLE_GRAY_LEVELS[sampleSlot(sid) % SAMPLE_GRAY_LEVELS.length];
+  const [r, g, b] = rgb.map((c) => Math.round(c + (136 - c) * frac));
+  return `rgb(${r}, ${g}, ${b})`;
+}
+// diagonal hatch fill pattern, one per (color, sample) pair — used for
+// histogram bars and density lanes belonging to a loaded sample
+const hatchPatternCache = new Map();
+function hatchPattern(ctx, color, sid) {
+  const key = color + "|" + sid;
+  let pattern = hatchPatternCache.get(key);
+  if (pattern) return pattern;
+  const size = 6;
+  const pc = document.createElement("canvas");
+  pc.width = pc.height = size;
+  const pctx = pc.getContext("2d");
+  pctx.strokeStyle = color;
+  pctx.lineWidth = 1;
+  pctx.beginPath();
+  pctx.moveTo(0, size);
+  pctx.lineTo(size, 0);
+  pctx.stroke();
+  pattern = ctx.createPattern(pc, "repeat");
+  hatchPatternCache.set(key, pattern);
+  return pattern;
+}
+
 /* ── layout references ──────────────────────────────────────────────────── */
 
 const $ = (id) => document.getElementById(id);
 const chartsEl = $("charts"), lanesEl = $("lanes"), legendEl = $("legend");
 const panelsEl = $("panels"), tooltipEl = $("tooltip");
 const hostChartsEl = $("host-charts"), hostBlockEl = $("host-block");
+const chartNav = attachTimelineNav($("chart-nav"));
+const hostNav = attachTimelineNav($("host-nav"));
+
+// this window is itself a popped-out panel: show only that panel, full-size.
+if (POPOUT_KIND === "telemetry") document.body.classList.add("popout-telemetry");
+if (POPOUT_KIND === "log") document.body.classList.add("popout-log");
+if (POPOUT_KIND === "host") document.body.classList.add("popout-host");
+
+// in the main window, hide whichever panels have been popped out elsewhere.
+function applyPopoutLayout() {
+  if (POPOUT_KIND) return; // popout windows have a fixed single-panel layout
+  $("chart-block").hidden = state.poppedOut.has("telemetry");
+}
+$("btn-popout-telemetry").hidden = !window.cttc?.popout || POPOUT_KIND != null;
+$("btn-popout-host").hidden = !window.cttc?.popout || POPOUT_KIND != null;
+
+// inside a popped-out panel window, replace the pop-out button with a
+// "pop back" button that just closes this window (the opener reintegrates
+// the panel once it sees the window close, via onPopoutClosed below).
+$("btn-popback-telemetry").hidden = POPOUT_KIND !== "telemetry";
+$("btn-popback-host").hidden = POPOUT_KIND !== "host";
+$("btn-popback-telemetry").onclick = () => window.close();
+$("btn-popback-host").onclick = () => window.close();
 
 /* ── time/pixel mapping ─────────────────────────────────────────────────── */
 
 function plotWidth() {
-  return Math.max(50, chartsEl.clientWidth - MARGIN_L - MARGIN_R);
+  // svc and host strips share the same geometry; fall back to whichever
+  // container is actually visible (a host-only popout hides #charts).
+  const el = chartsEl.clientWidth > 0 ? chartsEl : hostChartsEl;
+  return Math.max(50, el.clientWidth - MARGIN_L - MARGIN_R);
 }
 function xToT(x) {
   const { t0, t1 } = state.view;
@@ -162,6 +278,7 @@ function seriesOf(group, respectVisibility = true) {
   return (state.series?.services || []).filter((s) => {
     if (!!s.host !== (group === "host")) return false;
     if (group === "svc" && trackStateOf(s) !== "sel") return false;
+    if (isSampleHidden(s.sid)) return false;
     return !respectVisibility || state.visible.get(s.name) !== false;
   });
 }
@@ -173,13 +290,19 @@ function allSvcSeries() {
 function drawAll() {
   if (!state.view) return;
   const hasHost = seriesOf("host", false).length > 0;
-  hostBlockEl.hidden = !hasHost;
+  const hostPoppedOut = !POPOUT_KIND && state.poppedOut.has("host");
+  // a "telemetry"/"log" popout only ever shows containers, never the host.
+  hostBlockEl.hidden = POPOUT_KIND === "host" ? false : (POPOUT_KIND != null || !hasHost || hostPoppedOut);
   hostChartsEl.hidden = !state.showHost;
-  $("btn-host-toggle").textContent = state.showHost ? "hide" : "show";
+  $("host-nav").hidden = !state.showHost;
+  $("btn-host-toggle").textContent = state.showHost ? "\u25be" : "\u25b8";
+  $("btn-host-toggle").title = state.showHost ? "Hide host telemetry" : "Show host telemetry";
   STRIPS.forEach((spec, i) => drawStrip(stripCanvases[i], spec, "svc", i === STRIPS.length - 1));
-  if (hasHost && state.showHost)
+  if (hasHost && state.showHost && !hostBlockEl.hidden)
     STRIPS.forEach((spec, i) => drawStrip(hostCanvases[i], spec, "host", i === STRIPS.length - 1));
   drawLanes();
+  updateTimelineNav(chartNav);
+  updateTimelineNav(hostNav);
 }
 
 function drawStrip(c, spec, group, isLast) {
@@ -227,11 +350,18 @@ function drawStrip(c, spec, group, isLast) {
   const px = state.series?.px || pw;
   if (state.chartStyle === "bars") {
     // histogram: one bar per non-empty bucket, translucent so overlapping
-    // series stay readable
+    // series stay readable. Sample-sourced series get a grayed hatch fill
+    // instead of a solid one (see sample-vs-live styling above).
     const bw = Math.max(1, pw / px - 0.5);
-    ctx.globalAlpha = services.length > 1 ? 0.55 : 0.85;
     for (const s of services) {
-      ctx.fillStyle = colorFor(s.name);
+      const live = isLiveSid(s.sid);
+      if (live) {
+        ctx.globalAlpha = services.length > 1 ? 0.55 : 0.85;
+        ctx.fillStyle = colorFor(s.name);
+      } else {
+        ctx.globalAlpha = 0.9;
+        ctx.fillStyle = hatchPattern(ctx, grayedColor(colorFor(s.name), s.sid), s.sid);
+      }
       const arr = s[spec.key];
       for (let b = 0; b < arr.length; b++) {
         if (arr[b] == null) continue;
@@ -241,9 +371,11 @@ function drawStrip(c, spec, group, isLast) {
     }
     ctx.globalAlpha = 1;
   } else {
-    // series lines (2px). Buckets are sparse when zoomed out (one sample every
+    // series lines. Buckets are sparse when zoomed out (one sample every
     // N pixels), so connect across gaps up to ~4x the typical sample spacing
-    // and render truly isolated samples as dots.
+    // and render truly isolated samples as dots. Live series are solid and
+    // full-saturation; sample-sourced series are grayed + dashed, with the
+    // dash rhythm/gray level unique per sample file.
     for (const s of services) {
       const arr = s[spec.key];
       const pts = [];
@@ -252,10 +384,12 @@ function drawStrip(c, spec, group, isLast) {
       if (!pts.length) continue;
       const spacing = Math.max(1, px / pts.length);
       const gapLimit = spacing * 4;
-      const color = colorFor(s.name);
+      const live = isLiveSid(s.sid);
+      const color = live ? colorFor(s.name) : grayedColor(colorFor(s.name), s.sid);
       ctx.strokeStyle = color;
       ctx.fillStyle = color;
-      ctx.lineWidth = 2;
+      ctx.lineWidth = live ? 2 : 1.25;
+      ctx.setLineDash(live ? [] : dashFor(s.sid));
       ctx.lineJoin = "round";
       ctx.beginPath();
       let runLen = 0;
@@ -275,6 +409,7 @@ function drawStrip(c, spec, group, isLast) {
       }
       if (runLen === 1) dot(ctx, prevX, prevY);
       ctx.stroke();
+      ctx.setLineDash([]);
     }
   }
 
@@ -340,7 +475,7 @@ function drawVerticals(ctx, h) {
 /* ── density lanes (one per log source) ─────────────────────────────────── */
 
 function drawLanes() {
-  const logs = state.sources.filter((s) => s.kind === "log");
+  const logs = state.sources.filter((s) => s.kind === "log" && !isSampleHidden(s.id));
   // rebuild DOM if the set changed
   const want = logs.map((s) => s.id).join(",");
   if (lanesEl.dataset.ids !== want) {
@@ -350,7 +485,7 @@ function drawLanes() {
       const canvas = document.createElement("canvas");
       canvas.className = "lane-canvas";
       canvas.dataset.sid = s.id;
-      canvas.title = s.path;
+      canvas.title = s.name + sampleFileLabel(s.id);
       attachLaneEvents(canvas);
       lanesEl.appendChild(canvas);
     }
@@ -368,30 +503,32 @@ function drawLane(c) {
   const pw = plotWidth(); // identical geometry to the strips above
   ctx.clearRect(0, 0, w, LANE_H);
   const counts = state.ticks.get(sid);
+  const live = !src || src.live !== false;
   const color = colorFor(src?.name || sid);
   if (counts) {
     const maxC = Math.max(1, ...counts);
     const n = counts.length;
-    ctx.fillStyle = color;
+    ctx.fillStyle = live ? color : hatchPattern(ctx, grayedColor(color, sid), sid);
     for (let b = 0; b < n; b++) {
       if (!counts[b]) continue;
-      ctx.globalAlpha = 0.35 + 0.65 * (counts[b] / maxC);
+      ctx.globalAlpha = live ? 0.35 + 0.65 * (counts[b] / maxC) : 0.85;
       const x = MARGIN_L + (b / n) * pw;
       ctx.fillRect(x, 3, Math.max(1, pw / n - 0.5), LANE_H - 6);
     }
     ctx.globalAlpha = 1;
   }
-  // source name inside the plot, like a strip title (identity also carried by hue)
-  ctx.font = "600 10px system-ui, sans-serif";
-  ctx.textAlign = "left";
-  ctx.fillStyle = themeVar("--text-secondary");
-  ctx.fillText(src?.name || sid, MARGIN_L + 4, LANE_H - 6);
   drawVerticals(ctx, LANE_H);
 }
 
 function attachLaneEvents(c) {
   c.addEventListener("mousedown", (e) => timelineDown(c, e));
   c.addEventListener("mouseup", (e) => timelineUp(c, e));
+  c.addEventListener("dblclick", (e) => {
+    const rect = c.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    if (x < MARGIN_L || !state.view) return;
+    recenterOn(xToT(x));
+  });
   c.addEventListener("mousemove", (e) => {
     const rect = c.getBoundingClientRect();
     const x = e.clientX - rect.left;
@@ -463,13 +600,13 @@ async function startTracking(s) {
 
 /* ── legend ─────────────────────────────────────────────────────────────── */
 
-function legendItem(name, cls) {
+function legendItem(name, cls, label = name) {
   const item = document.createElement("span");
   item.className = "legend-item" + (cls ? " " + cls : "");
   const sw = document.createElement("span");
   sw.className = "legend-swatch";
   sw.style.background = cls === "disabled" ? "var(--muted)" : colorFor(name);
-  item.append(sw, document.createTextNode(name));
+  item.append(sw, document.createTextNode(label));
   return item;
 }
 
@@ -480,6 +617,42 @@ function legendChip(text) {
   return chip;
 }
 
+// one row per loaded .cttc file, with a slide switch to show/hide everything
+// from that file (charts, lanes, panels) in a single click
+function renderSampleFiles() {
+  const groups = sampleFileGroups();
+  if (!groups.length) return;
+  const box = document.createElement("div");
+  box.id = "sample-files";
+  for (const g of groups) {
+    const hidden = state.hiddenSamples.has(g.path);
+    const row = document.createElement("label");
+    row.className = "ctl switch-row sample-file-row";
+    row.title = g.path;
+    const sw = document.createElement("span");
+    sw.className = "switch";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = !hidden;
+    cb.onchange = () => {
+      if (cb.checked) state.hiddenSamples.delete(g.path);
+      else state.hiddenSamples.add(g.path);
+      relist();
+    };
+    const track = document.createElement("span");
+    track.className = "switch-track";
+    const thumb = document.createElement("span");
+    thumb.className = "switch-thumb";
+    track.appendChild(thumb);
+    sw.append(cb, track);
+    const label = document.createElement("span");
+    label.textContent = `${basename(g.path)} ${hidden ? "(hidden)" : "(shown)"}`;
+    row.append(sw, label);
+    box.appendChild(row);
+  }
+  legendEl.appendChild(box);
+}
+
 function relist() {
   renderLegend();
   drawAll();
@@ -487,13 +660,17 @@ function relist() {
 
 function renderLegend() {
   legendEl.innerHTML = "";
+  renderSampleFiles();
   const all = allSvcSeries();
   const sel = all.filter((s) => trackStateOf(s) === "sel");
   const mut = all.filter((s) => trackStateOf(s) === "mut");
   const hid = all.filter((s) => trackStateOf(s) === "hid");
 
   for (const s of sel) {
-    const item = legendItem(s.name, state.visible.get(s.name) === false ? "off" : "");
+    const sample = !isLiveSid(s.sid);
+    const cls = (state.visible.get(s.name) === false ? "off " : "") + (sample ? "sample" : "");
+    const item = legendItem(s.name, cls.trim(), s.name + sampleFileLabel(s.sid));
+    if (sample) item.title = "from loaded .cttc metrics";
     item.onclick = () => {
       state.visible.set(s.name, state.visible.get(s.name) === false);
       relist();
@@ -576,20 +753,301 @@ function timelineUp(c, e) {
   drawAll();
 }
 
+function hasHostSeries() {
+  return (state.series?.services || []).some((s) => s.host);
+}
+
+// any currently open docker:// source tells us which host (and ssh key) to
+// use if we need to start host-telemetry collection from the export dialog
+function currentDockerHost() {
+  for (const s of state.sources) {
+    const m = /^docker:\/\/([^/]+)\//.exec(s.path || "");
+    if (m) return m[1] === "local" ? null : m[1];
+  }
+  return null;
+}
+
+const dlgExport = $("dlg-export");
+
+function askExportOptions() {
+  return new Promise((resolve) => {
+    const hasHost = hasHostSeries();
+    const cb = $("export-host");
+    cb.checked = hasHost;
+    $("export-host-note").textContent = hasHost
+      ? "Currently being collected — included automatically unless you uncheck this."
+      : "Not currently collected — checking this starts collecting it now (this past range won't have host data yet, but later saved metrics will).";
+    const done = (ok) => {
+      dlgExport.close();
+      $("dlg-export-ok").onclick = null;
+      $("dlg-export-cancel").onclick = null;
+      resolve(ok ? { includeHost: cb.checked, hadHost: hasHost } : null);
+    };
+    $("dlg-export-ok").onclick = () => done(true);
+    $("dlg-export-cancel").onclick = () => done(false);
+    dlgExport.showModal();
+  });
+}
+
 async function exportSample(t0, t1) {
-  const name = `sample-${new Date(t0).toISOString().slice(0, 19).replace(/[T:]/g, "-")}.cttc`;
+  const opts = await askExportOptions();
+  if (!opts) return;
+  if (opts.includeHost && !opts.hadHost) {
+    try {
+      const host = currentDockerHost();
+      await post("/docker/collect", {
+        host, stats: false, host_stats: true, logs: [], transforms: [],
+        ssh_key: prefs.get("sshKeys", {})[host] || null,
+        interval: 5,
+      });
+    } catch (err) {
+      setStatus("could not start host telemetry: " + (err.message || err));
+    }
+  }
+  const name = `metrics-${new Date(t0).toISOString().slice(0, 19).replace(/[T:]/g, "-")}.cttc`;
   let path = window.cttc?.saveFile ? await window.cttc.saveFile(name)
-                                   : prompt("Save sample as (.cttc):", name);
+                                   : prompt("Save metrics as (.cttc):", name);
   if (!path) return;
   if (!path.endsWith(".cttc")) path += ".cttc";
   try {
-    const r = await post("/sample/export", { path, from: t0, to: t1 });
-    setStatus(r.sources ? `sample saved: ${r.path} (${r.sources} sources)`
-                        : "sample saved, but no data in the selected range");
+    const r = await post("/sample/export", { path, from: t0, to: t1, include_host: opts.includeHost });
+    setStatus(r.sources ? `metrics saved: ${r.path} (${r.sources} sources)`
+                        : "metrics saved, but no data in the selected range");
   } catch (err) {
-    setStatus("sample export failed: " + (err.message || err));
+    setStatus("metrics export failed: " + (err.message || err));
   }
 }
+
+/* ── snapshots: telemetry + nearby log entries at one point in time ──────
+   Right-click a chart -> "Take snapshot at this time". /point already
+   aggregates every currently open stats source (all containers *and* all
+   docker hosts), so "all the other servers at the same time" comes for
+   free; the dialog's checkbox only narrows it back down to the currently
+   selected series if unchecked. */
+
+const dlgSnapshot = $("dlg-snapshot");
+let currentSnapshot = null;
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function fmtIso(t) {
+  return new Date(t).toISOString().replace("T", " ").replace("Z", " UTC");
+}
+
+async function takeSnapshot(t) {
+  currentSnapshot = null;
+  $("snapshot-meta").textContent = "loading…";
+  $("snapshot-props").innerHTML = "";
+  $("snapshot-json").textContent = "";
+  dlgSnapshot.showModal();
+  await refreshSnapshot(t);
+}
+
+// a single point-in-time slice: telemetry (via /point) + nearby log entries
+// (via /index_at + /logs). Reused for the center time and, when a panorama
+// is requested, for the "before"/"after" times too.
+async function computeSlice(t, { includeAll, includeLogs, ctxLines }) {
+  const r = await get(`/point?t=${t}`);
+  let services = Object.entries(r.services || {}).map(([name, v]) => ({ name, ...v }));
+  if (!includeAll) {
+    const selected = new Set(allSvcSeries().filter((s) => trackStateOf(s) === "sel").map((s) => s.name));
+    services = services.filter((s) => s.host || selected.has(s.name));
+  }
+  services.sort((a, b) => (b.host - a.host) || a.name.localeCompare(b.name));
+
+  let logs = [];
+  if (includeLogs) {
+    const logSources = state.sources.filter((s) => s.kind === "log" && !isSampleHidden(s.id));
+    logs = await Promise.all(logSources.map(async (s) => {
+      try {
+        const idx = await get(`/index_at?source=${s.id}&t=${t}`);
+        const start = Math.max(0, idx.index - ctxLines);
+        const page = await get(`/logs?source=${s.id}&start=${start}&count=${ctxLines * 2 + 1}`);
+        return { source: s.name, path: s.path, rows: page.rows };
+      } catch {
+        return { source: s.name, path: s.path, rows: [] };
+      }
+    }));
+    logs = logs.filter((l) => l.rows.length);
+  }
+  return { t, services, logs };
+}
+
+async function refreshSnapshot(t) {
+  const includeAll = $("snap-all-sources").checked;
+  const includeLogs = $("snap-logs").checked;
+  const panOn = $("snap-panorama-on").checked;
+  const panUnit = $("snap-panorama-unit").value; // "entries" | "seconds"
+  const panValue = panOn ? Math.max(0, Number($("snap-panorama-value").value) || 0) : 0;
+  const ctxLines = panUnit === "entries" ? panValue : 0;
+  const panSec = panUnit === "seconds" ? panValue : 0;
+  const opts = { includeAll, includeLogs, ctxLines };
+
+  // a "panorama" enlarges the snapshot around the selected time: either by
+  // widening the per-slice log context (n nearby entries), or by adding two
+  // extra full slices (n seconds before / after) so records on both sides of
+  // the selected time can be compared to the center one.
+  const wanted = panSec > 0
+    ? [{ label: `${panSec}s before`, at: t - panSec * 1000 },
+       { label: "at", at: t },
+       { label: `${panSec}s after`, at: t + panSec * 1000 }]
+    : [{ label: "at", at: t }];
+
+  let slices;
+  try {
+    slices = await Promise.all(wanted.map(async (w) => ({ label: w.label, ...(await computeSlice(w.at, opts)) })));
+  } catch (err) {
+    $("snapshot-meta").textContent = "snapshot failed: " + (err.message || err);
+    return;
+  }
+
+  currentSnapshot = { t, panoramaOn: panOn, panoramaUnit: panUnit, panoramaValue: panValue, generated_at: new Date().toISOString(), slices };
+  renderSnapshot();
+}
+
+function renderSnapshot() {
+  const snap = currentSnapshot;
+  if (!snap) return;
+  const nServices = snap.slices[0]?.services.length || 0;
+  const nLogRows = snap.slices.reduce((n, sl) => n + sl.logs.reduce((m, l) => m + l.rows.length, 0), 0);
+  const panoramaDesc = !(snap.panoramaOn && snap.panoramaValue) ? "" :
+    snap.panoramaUnit === "seconds" ? `panorama ±${snap.panoramaValue}s` : `panorama ${snap.panoramaValue} entries`;
+  $("snapshot-meta").textContent =
+    `t = ${fmtIso(snap.t)}` +
+    (panoramaDesc ? ` · ${panoramaDesc}` : "") +
+    ` · ${nServices} series · ${nLogRows} log entries`;
+
+  const box = $("snapshot-props");
+  box.innerHTML = "";
+  for (const slice of snap.slices) {
+    if (snap.slices.length > 1) {
+      const h = document.createElement("div");
+      h.className = "snapshot-slice-head";
+      h.textContent = `${slice.label} — ${fmtIso(slice.t)}`;
+      box.appendChild(h);
+    }
+    const table = document.createElement("table");
+    table.className = "snapshot-table";
+    const head = document.createElement("tr");
+    head.innerHTML = "<th>source</th><th>cpu</th><th>mem</th><th>net</th><th>at</th>";
+    table.appendChild(head);
+    for (const s of slice.services) {
+      const tr = document.createElement("tr");
+      tr.innerHTML =
+        `<td>${s.host ? "\u{1F5A5} " : ""}${escapeHtml(s.name)}</td>` +
+        `<td>${s.cpu != null ? s.cpu.toFixed(1) + "%" : "\u2013"}</td>` +
+        `<td>${s.mem != null ? s.mem.toFixed(1) + "%" : "\u2013"}</td>` +
+        `<td>${s.net != null ? fmtBytes(s.net) : "\u2013"}</td>` +
+        `<td>${s.ts != null ? fmtClock(s.ts, true) : "\u2013"}</td>`;
+      table.appendChild(tr);
+    }
+    box.appendChild(table);
+
+    for (const l of slice.logs) {
+      const lh = document.createElement("div");
+      lh.className = "snapshot-log-head";
+      lh.textContent = l.source;
+      box.appendChild(lh);
+      for (const row of l.rows) {
+        const div = document.createElement("div");
+        div.className = "snapshot-log-row";
+        div.textContent = `${fmtClock(row.ts, true)}  ${row.text.split("\n")[0]}`;
+        box.appendChild(div);
+      }
+    }
+  }
+
+  $("snapshot-json").textContent = JSON.stringify(snap, null, 2);
+}
+
+// plain-text rendering of the Raw view, for the "Save as TXT" export.
+function snapshotToText(snap) {
+  const lines = [];
+  lines.push(`Snapshot @ ${fmtIso(snap.t)}`);
+  if (snap.panoramaOn && snap.panoramaValue) {
+    lines.push(snap.panoramaUnit === "seconds"
+      ? `Panorama: +/- ${snap.panoramaValue}s`
+      : `Panorama: ${snap.panoramaValue} entries`);
+  }
+  lines.push(`Generated: ${snap.generated_at}`);
+  for (const slice of snap.slices) {
+    lines.push("");
+    if (snap.slices.length > 1) lines.push(`== ${slice.label} — ${fmtIso(slice.t)} ==`);
+    if (slice.services.length) {
+      const header = ["source", "cpu", "mem", "net", "at"];
+      const rows = slice.services.map((s) => [
+        (s.host ? "* " : "") + s.name,
+        s.cpu != null ? s.cpu.toFixed(1) + "%" : "-",
+        s.mem != null ? s.mem.toFixed(1) + "%" : "-",
+        s.net != null ? fmtBytes(s.net) : "-",
+        s.ts != null ? fmtClock(s.ts, true) : "-",
+      ]);
+      const widths = header.map((h, i) => Math.max(h.length, ...rows.map((r) => r[i].length)));
+      const fmtRow = (r) => r.map((c, i) => c.padEnd(widths[i])).join("  ");
+      lines.push(fmtRow(header));
+      for (const r of rows) lines.push(fmtRow(r));
+    } else {
+      lines.push("(no telemetry)");
+    }
+    for (const l of slice.logs) {
+      lines.push("");
+      lines.push(`[${l.source}]`);
+      for (const row of l.rows) lines.push(`  ${fmtClock(row.ts, true)}  ${row.text.split("\n")[0]}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+$("snap-view-raw").onclick = () => {
+  $("snap-view-raw").classList.add("primary");
+  $("snap-view-json").classList.remove("primary");
+  $("snapshot-props").hidden = false;
+  $("snapshot-json").hidden = true;
+  $("dlg-snapshot-save-txt").hidden = false;
+  $("dlg-snapshot-save").hidden = true;
+};
+$("snap-view-json").onclick = () => {
+  $("snap-view-json").classList.add("primary");
+  $("snap-view-raw").classList.remove("primary");
+  $("snapshot-props").hidden = true;
+  $("snapshot-json").hidden = false;
+  $("dlg-snapshot-save-txt").hidden = true;
+  $("dlg-snapshot-save").hidden = false;
+};
+$("snap-all-sources").onchange = () => currentSnapshot && refreshSnapshot(currentSnapshot.t);
+$("snap-logs").onchange = () => currentSnapshot && refreshSnapshot(currentSnapshot.t);
+$("snap-panorama-on").onchange = () => {
+  $("snap-panorama-value").disabled = !$("snap-panorama-on").checked;
+  $("snap-panorama-unit").disabled = !$("snap-panorama-on").checked;
+  currentSnapshot && refreshSnapshot(currentSnapshot.t);
+};
+$("snap-panorama-value").onchange = () => currentSnapshot && refreshSnapshot(currentSnapshot.t);
+$("snap-panorama-unit").onchange = () => currentSnapshot && refreshSnapshot(currentSnapshot.t);
+$("dlg-snapshot-close").onclick = () => dlgSnapshot.close();
+$("dlg-snapshot-save").onclick = async () => {
+  if (!currentSnapshot) return;
+  const name = `snapshot-${new Date(currentSnapshot.t).toISOString().slice(0, 19).replace(/[T:]/g, "-")}.json`;
+  const json = JSON.stringify(currentSnapshot, null, 2);
+  try {
+    const path = window.cttc?.saveJson ? await window.cttc.saveJson(name, json) : null;
+    if (path) setStatus("snapshot saved: " + path);
+  } catch (err) {
+    setStatus("snapshot save failed: " + (err.message || err));
+  }
+};
+$("dlg-snapshot-save-txt").onclick = async () => {
+  if (!currentSnapshot) return;
+  const name = `snapshot-${new Date(currentSnapshot.t).toISOString().slice(0, 19).replace(/[T:]/g, "-")}.txt`;
+  const text = snapshotToText(currentSnapshot);
+  try {
+    const path = window.cttc?.saveText ? await window.cttc.saveText(name, text) : null;
+    if (path) setStatus("snapshot saved: " + path);
+  } catch (err) {
+    setStatus("snapshot save failed: " + (err.message || err));
+  }
+};
 
 function attachChartEvents() {
   for (const c of [...stripCanvases, ...hostCanvases]) {
@@ -610,7 +1068,24 @@ function attachChartEvents() {
     });
     c.addEventListener("mousedown", (e) => timelineDown(c, e));
     c.addEventListener("mouseup", (e) => timelineUp(c, e));
-    c.addEventListener("dblclick", resetZoom);
+    c.addEventListener("dblclick", (e) => {
+      const rect = c.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      if (x < MARGIN_L || !state.view) return;
+      recenterOn(xToT(x));
+    });
+    c.addEventListener("contextmenu", (e) => {
+      const rect = c.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      if (x < MARGIN_L || !state.view) return;
+      const t = xToT(x);
+      ctxMenu(e, [
+        ["📸 Take snapshot at this time", () => takeSnapshot(t)],
+        ["🔍+ Zoom in here", () => zoomAt(t, 0.5)],
+        ["🔍− Zoom out here", () => zoomAt(t, 2)],
+        ["↺ Reset zoom", resetZoom],
+      ]);
+    });
   }
 }
 
@@ -662,17 +1137,38 @@ function updateTooltip(e, x) {
 
 let seriesTimer = null;
 
-function setView(t0, t1) {
+function setView(t0, t1, opts = {}) {
   if (t1 - t0 < 200) return; // 200ms minimum zoom
   state.view = { t0, t1 };
   scheduleSeriesFetch();
   drawAll();
+  if (opts.broadcast !== false) window.cttc?.broadcastSync?.({ type: "view", t0, t1 });
 }
 
 function resetZoom() {
   if (!state.range || state.range.min_ts == null) return;
   const pad = Math.max(1000, (state.range.max_ts - state.range.min_ts) * 0.01);
   setView(state.range.min_ts - pad, state.range.max_ts + pad);
+  // center the cursor (and with it every log panel) on the middle of the
+  // data, matching what a double-click on the timeline does
+  setCursor((state.range.min_ts + state.range.max_ts) / 2);
+}
+
+// double-clicking anywhere on the timeline (charts or log density lanes)
+// re-centers every panel on that exact point in time, keeping the current
+// zoom span.
+function recenterOn(t) {
+  if (!state.view) return;
+  const span = state.view.t1 - state.view.t0;
+  setView(t - span / 2, t + span / 2);
+}
+
+// zoom in/out around a given point in time (from the chart's right-click
+// menu): factor < 1 narrows the span (zoom in), factor > 1 widens it.
+function zoomAt(t, factor) {
+  if (!state.view) return;
+  const span = (state.view.t1 - state.view.t0) * factor;
+  setView(t - span / 2, t + span / 2);
 }
 
 const DEFAULT_SPAN = 10 * 60 * 1000; // initial window: now ± 5 min
@@ -688,6 +1184,77 @@ function centerOnNow() {
   const now = Date.now();
   setView(now - span / 2, now + span / 2);
 }
+
+/* ── timeline navigator: a scrollbar-style control (not buttons) spanning
+   the entire width of its graph panel. The thumb shows the current view as
+   a fraction of the whole available time range; drag it (or click the
+   track) to pan/jump. "now" is a fixed label in the middle, click it to
+   re-center on the present. ────────────────────────────────────────────── */
+
+function totalSpanBounds() {
+  const now = Date.now();
+  let lo = state.range?.min_ts, hi = state.range?.max_ts;
+  if (lo == null || hi == null) {
+    lo = state.view ? state.view.t0 : now - DEFAULT_SPAN / 2;
+    hi = state.view ? state.view.t1 : now + DEFAULT_SPAN / 2;
+  }
+  if (state.view) { lo = Math.min(lo, state.view.t0); hi = Math.max(hi, state.view.t1); }
+  lo = Math.min(lo, now);
+  hi = Math.max(hi, now);
+  return { lo, hi: Math.max(hi, lo + 1) };
+}
+
+function updateTimelineNav(nav) {
+  if (!state.view) return;
+  const { lo, hi } = totalSpanBounds();
+  const span = hi - lo;
+  const w = nav.track.clientWidth;
+  const x0 = ((state.view.t0 - lo) / span) * w;
+  const x1 = ((state.view.t1 - lo) / span) * w;
+  nav.thumb.style.left = `${Math.max(0, x0)}px`;
+  nav.thumb.style.width = `${Math.max(8, x1 - x0)}px`;
+}
+
+function attachTimelineNav(navEl) {
+  const track = navEl.querySelector(".tl-track");
+  const thumb = navEl.querySelector(".tl-thumb");
+  const nowLabel = navEl.querySelector(".tl-now-label");
+
+  nowLabel.addEventListener("click", (e) => {
+    e.stopPropagation();
+    centerOnNow();
+  });
+
+  thumb.addEventListener("mousedown", (e) => {
+    e.stopPropagation();
+    if (!state.view) return;
+    const startX = e.clientX, startT0 = state.view.t0, startT1 = state.view.t1;
+    const move = (ev) => {
+      const { lo, hi } = totalSpanBounds();
+      const dt = ((ev.clientX - startX) / track.clientWidth) * (hi - lo);
+      setView(startT0 + dt, startT1 + dt);
+    };
+    const up = () => {
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", up);
+    };
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
+  });
+
+  track.addEventListener("click", (e) => {
+    if (e.target === thumb || e.target === nowLabel || !state.view) return;
+    const rect = track.getBoundingClientRect();
+    const frac = (e.clientX - rect.left) / rect.width;
+    const { lo, hi } = totalSpanBounds();
+    const t = lo + frac * (hi - lo);
+    const span = state.view.t1 - state.view.t0;
+    setView(t - span / 2, t + span / 2);
+  });
+
+  return { track, thumb, nowLabel };
+}
+
 
 function scheduleSeriesFetch() {
   clearTimeout(seriesTimer);
@@ -731,11 +1298,12 @@ function assignColorSlots() {
 
 /* ── cursor → log panel sync ────────────────────────────────────────────── */
 
-async function setCursor(t) {
+async function setCursor(t, opts = {}) {
   state.cursorT = t;
   $("cursor-label").textContent = "t = " + new Date(t).toISOString().replace("T", " ").replace("Z", " UTC");
   drawAll();
   for (const p of panels.values()) p.jumpTo(t);
+  if (opts.broadcast !== false) window.cttc?.broadcastSync?.({ type: "cursor", t });
 }
 
 /* ── log panels (virtual scroll) ────────────────────────────────────────── */
@@ -757,16 +1325,75 @@ class Panel {
     name.className = "name";
     name.textContent = src.name;
     name.title = src.path;
+    this.sampleBadge = document.createElement("span");
+    this.sampleBadge.className = "sample-badge";
+    this.sampleBadge.title = "static data from loaded .cttc metrics";
+    this.sampleBadge.hidden = true;
     this.countEl = document.createElement("span");
     this.countEl.className = "muted";
     this.errEl = document.createElement("span");
     this.errEl.className = "error";
+    const searchToggle = document.createElement("button");
+    searchToggle.className = "icon-btn";
+    searchToggle.textContent = "🔍";
+    searchToggle.title = "Search this log";
+    searchToggle.onclick = () => {
+      this.searchBar.hidden = !this.searchBar.hidden;
+      if (!this.searchBar.hidden) this.searchInput.focus();
+    };
+    const popout = document.createElement("button");
+    popout.className = "icon-btn";
+    popout.textContent = "⧉";
+    popout.hidden = !window.cttc?.popout || POPOUT_KIND != null;
+    popout.title = "Open this log in its own window";
+    popout.onclick = () => {
+      state.poppedOut.add(src.id);
+      syncPanels();
+      window.cttc.popout("log", src.id);
+    };
     const close = document.createElement("button");
     close.className = "close";
     close.textContent = "✕";
     close.title = "Close source";
     close.onclick = async () => { await post("/close", { id: src.id }); refreshAll(); };
-    head.append(name, this.countEl, this.errEl, close);
+    const right = document.createElement("div");
+    right.className = "panel-head-right";
+    right.append(popout, close);
+    if (POPOUT_KIND === "log") {
+      const popback = document.createElement("button");
+      popback.textContent = "⤴ Pop back";
+      popback.title = "Pop back into the main window";
+      popback.onclick = () => window.close();
+      right.append(popback);
+    }
+    head.append(name, this.sampleBadge, this.countEl, this.errEl, searchToggle, right);
+
+    this.searchBar = document.createElement("div");
+    this.searchBar.className = "panel-search";
+    this.searchBar.hidden = true;
+    this.searchQuery = "";
+    this.searchInput = document.createElement("input");
+    this.searchInput.type = "text";
+    this.searchInput.placeholder = "search…";
+    this.searchInput.onkeydown = (e) => {
+      if (e.key === "Enter") { e.preventDefault(); this.find(!e.shiftKey); }
+      else if (e.key === "Escape") { this.searchBar.hidden = true; }
+    };
+    const prevBtn = document.createElement("button");
+    prevBtn.textContent = "▲";
+    prevBtn.title = "Previous match";
+    prevBtn.onclick = () => this.find(false);
+    const nextBtn = document.createElement("button");
+    nextBtn.textContent = "▼";
+    nextBtn.title = "Next match";
+    nextBtn.onclick = () => this.find(true);
+    this.searchStatus = document.createElement("span");
+    this.searchStatus.className = "muted search-status";
+    const searchClose = document.createElement("button");
+    searchClose.textContent = "✕";
+    searchClose.title = "Close search";
+    searchClose.onclick = () => { this.searchBar.hidden = true; };
+    this.searchBar.append(this.searchInput, prevBtn, nextBtn, this.searchStatus, searchClose);
 
     this.body = document.createElement("div");
     this.body.className = "panel-body";
@@ -775,12 +1402,14 @@ class Panel {
     this.body.appendChild(this.spacer);
     this.body.addEventListener("scroll", () => this.render());
 
-    this.el.append(head, this.body);
+    this.el.append(head, this.searchBar, this.body);
     this.update(src);
   }
 
   update(src) {
     this.src = src;
+    this.sampleBadge.hidden = src.live !== false;
+    if (src.live === false) this.sampleBadge.textContent = basename(src.path);
     if (src.total !== this.total) {
       // drop the last (possibly partial) cached page so new rows appear
       const lastPage = Math.floor(this.total / PAGE);
@@ -826,6 +1455,7 @@ class Panel {
       if (i === this.cursorIdx) div.classList.add("cursor-row");
       if (/\b(ERROR|FATAL|CRIT)/i.test(row.text)) div.classList.add("lvl-error");
       else if (/\bWARN/i.test(row.text)) div.classList.add("lvl-warn");
+      if (this.searchQuery && row.text.toLowerCase().includes(this.searchQuery)) div.classList.add("search-hit");
       const ts = document.createElement("span");
       ts.className = "ts";
       ts.textContent = fmtClock(row.ts, true);
@@ -847,13 +1477,40 @@ class Panel {
     } catch { /* source may have vanished */ }
   }
 
+  async jumpToIndex(idx) {
+    this.cursorIdx = idx;
+    this.body.scrollTop = Math.max(0, idx * ROWH - this.body.clientHeight / 2 + ROWH / 2);
+    await this.render();
+    const row = (await this.page(Math.floor(idx / PAGE)))?.[idx % PAGE];
+    if (row) setCursor(row.ts); // keep the chart crosshair (and other panels) in sync
+  }
+
+  async find(forward) {
+    const q = this.searchInput.value;
+    this.searchQuery = q.toLowerCase();
+    if (!q) { this.searchStatus.textContent = ""; this.render(); return; }
+    const start = this.cursorIdx != null ? this.cursorIdx + (forward ? 1 : -1) : 0;
+    try {
+      const r = await get(
+        `/logs/find?source=${this.src.id}&q=${encodeURIComponent(q)}&start=${Math.max(0, start)}&dir=${forward ? "fwd" : "back"}`
+      );
+      if (r.index == null) { this.searchStatus.textContent = "no matches"; return; }
+      this.searchStatus.textContent = "";
+      await this.jumpToIndex(r.index);
+    } catch (err) {
+      this.searchStatus.textContent = String(err.message || err);
+    }
+  }
+
   scrollToEnd() {
     this.body.scrollTop = this.spacer.offsetHeight;
   }
 }
 
 function syncPanels() {
-  const logs = state.sources.filter((s) => s.kind === "log");
+  let logs = state.sources.filter((s) => s.kind === "log");
+  if (POPOUT_KIND === "log") logs = logs.filter((s) => s.id === POPOUT_ID);
+  else if (!POPOUT_KIND) logs = logs.filter((s) => !state.poppedOut.has(s.id));
   for (const [sid, p] of panels) {
     if (!logs.find((s) => s.id === sid)) {
       p.el.remove();
@@ -869,6 +1526,7 @@ function syncPanels() {
     } else {
       p.update(s);
     }
+    p.el.hidden = isSampleHidden(s.id);
   }
 }
 
@@ -916,11 +1574,9 @@ function connectSSE() {
   es.onopen = () => setStatus("");
 }
 
-/* ── add-sources dialog ─────────────────────────────────────────────────── */
+/* ── add-sources dialog (Docker) ────────────────────────────────────────── */
 
 const dlg = $("dlg-add");
-let pickedFiles = [];
-let activeTab = "files";
 
 function chosenTransforms() {
   return [...dlg.querySelectorAll("#transforms-list input:checked")].map((i) => i.value);
@@ -947,8 +1603,6 @@ function updateDockerDupes() {
 }
 
 $("btn-add").onclick = async () => {
-  pickedFiles = [];
-  $("picked-files").innerHTML = "";
   $("docker-targets").innerHTML = "";
   $("docker-error").textContent = "";
   setContainersListed(false);
@@ -970,38 +1624,29 @@ $("btn-add").onclick = async () => {
       label.appendChild(doc);
       box.appendChild(label);
     }
-  } catch { /* server down; dialog still usable for files once it's back */ }
+  } catch { /* server down; dialog still usable once it's back */ }
   dlg.showModal();
 };
 
-for (const tab of dlg.querySelectorAll(".tab")) {
-  tab.onclick = () => {
-    activeTab = tab.dataset.tab;
-    for (const t of dlg.querySelectorAll(".tab")) t.classList.toggle("active", t === tab);
-    $("page-files").hidden = activeTab !== "files";
-    $("page-docker").hidden = activeTab !== "docker";
-  };
-}
+/* ── load .cttc metrics (separate from the Docker "Add sources" flow) ──── */
 
-$("btn-pick").onclick = async () => {
+$("btn-load-sample").onclick = async () => {
   let paths = [];
   if (window.cttc?.pickFiles) paths = await window.cttc.pickFiles();
   else {
-    const p = prompt("Path(s) to open, comma-separated:");
-    if (p) paths = p.split(",").map((s) => s.trim()).filter(Boolean);
+    const p = prompt("Path to .cttc metrics file:");
+    if (p) paths = [p];
   }
-  pickedFiles.push(...paths.filter((p) => !pickedFiles.includes(p)));
-  const ul = $("picked-files");
-  ul.innerHTML = "";
   const open = openPaths();
-  for (const p of pickedFiles) {
-    const li = document.createElement("li");
-    li.textContent = p;
-    if (open.has(p)) {
-      li.classList.add("added");
-      li.textContent = p + " — already open";
-    }
-    ul.appendChild(li);
+  const files = paths.filter((p) => p.endsWith(".cttc") && !open.has(p));
+  if (!files.length) return;
+  try {
+    const r = await post("/open", { files: files.map((path) => ({ path, live: false })) });
+    if (r.errors?.length) alert(r.errors.map((e) => `${e.path}: ${e.error}`).join("\n"));
+    await refreshAll();
+    resetZoom(); // show the full timeline, including the newly loaded metrics
+  } catch (err) {
+    alert(String(err.message || err));
   }
 };
 
@@ -1071,7 +1716,8 @@ let containersListed = false;
 
 function setContainersListed(listed) {
   containersListed = listed;
-  $("btn-ps").textContent = listed ? "Hide containers" : "List containers";
+  $("btn-ps").checked = listed;
+  $("btn-ps-label").textContent = listed ? "Hide containers" : "Show containers";
   $("btn-ps-refresh").hidden = !listed;
 }
 
@@ -1121,8 +1767,8 @@ async function listContainers() {
   }
 }
 
-$("btn-ps").onclick = () => {
-  if (containersListed) {
+$("btn-ps").onchange = (e) => {
+  if (!e.target.checked) {
     $("docker-targets").innerHTML = "";
     $("docker-error").textContent = "";
     setContainersListed(false);
@@ -1142,34 +1788,22 @@ $("dlg-cancel").onclick = () => dlg.close();
 $("dlg-ok").onclick = async () => {
   const transforms = chosenTransforms();
   try {
-    if (activeTab === "files") {
-      const open = openPaths();
-      const files = pickedFiles.filter((p) => !open.has(p));
-      if (files.length) {
-        const live = $("files-live").checked;
-        const r = await post("/open", {
-          files: files.map((p) => ({ path: p, live, transforms })),
-        });
-        if (r.errors?.length) alert(r.errors.map((e) => `${e.path}: ${e.error}`).join("\n"));
-      }
-    } else {
-      const host = $("docker-host").value.trim() || null;
-      const logs = [...$("docker-targets").querySelectorAll("input:checked:not(:disabled)")].map((cb) => ({
-        name: cb.value,
-        type: cb.dataset.type,
-      }));
-      const stats = $("docker-stats").checked;
-      const hostStats = $("docker-host-stats").checked;
-      if (stats || hostStats || logs.length) {
-        await post("/docker/collect", {
-          host, stats, logs, transforms,
-          host_stats: hostStats,
-          ssh_key: currentSshKey(),
-          interval: Number($("docker-interval").value) || 5,
-        });
-        // containers picked here are the "selected" set shown in the legend
-        for (const l of logs) setTrack(l.name, "sel");
-      }
+    const host = $("docker-host").value.trim() || null;
+    const logs = [...$("docker-targets").querySelectorAll("input:checked:not(:disabled)")].map((cb) => ({
+      name: cb.value,
+      type: cb.dataset.type,
+    }));
+    const stats = $("docker-stats").checked;
+    const hostStats = $("docker-host-stats").checked;
+    if (stats || hostStats || logs.length) {
+      await post("/docker/collect", {
+        host, stats, logs, transforms,
+        host_stats: hostStats,
+        ssh_key: currentSshKey(),
+        interval: Number($("docker-interval").value) || 5,
+      });
+      // containers picked here are the "selected" set shown in the legend
+      for (const l of logs) setTrack(l.name, "sel");
     }
     dlg.close();
     refreshAll();
@@ -1188,11 +1822,17 @@ $("chk-follow").onchange = (e) => {
   state.follow = e.target.checked;
   if (state.follow) refreshAll();
 };
-$("btn-reset").onclick = resetZoom;
 $("btn-sample").onclick = () => setSampleArmed(!sampleArmed);
-$("btn-back").onclick = () => pan(-0.5);
-$("btn-fwd").onclick = () => pan(0.5);
-$("btn-now").onclick = centerOnNow;
+$("btn-popout-telemetry").onclick = () => {
+  state.poppedOut.add("telemetry");
+  applyPopoutLayout();
+  window.cttc.popout("telemetry");
+};
+$("btn-popout-host").onclick = () => {
+  state.poppedOut.add("host");
+  drawAll();
+  window.cttc.popout("host");
+};
 
 function syncStyleButton() {
   $("btn-style").textContent = state.chartStyle === "bars" ? "▤ histogram" : "〜 lines";
@@ -1234,12 +1874,35 @@ $("splitter").addEventListener("mousedown", (e) => {
 
 buildStrips();
 syncStyleButton();
-centerOnNow(); // default view: the present, ± DEFAULT_SPAN/2
-new ResizeObserver(() => {
+applyPopoutLayout();
+// main window: default view is the present, ± DEFAULT_SPAN/2. Popped-out
+// panel windows start with no view so the first refreshAll() fits the full
+// available range instead (they then track the opener via sync-broadcast).
+if (!POPOUT_KIND) centerOnNow();
+const chartsResizeObserver = new ResizeObserver(() => {
   scheduleSeriesFetch();
   drawAll();
-}).observe(chartsEl);
+});
+chartsResizeObserver.observe(chartsEl);
+chartsResizeObserver.observe(hostChartsEl);
 window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", drawAll);
+
+// stay in sync with other windows (popped-out telemetry/log panels): mirror
+// cursor moves and pan/zoom without re-broadcasting (avoids echo loops).
+window.cttc?.onSync?.((msg) => {
+  if (msg.type === "cursor") setCursor(msg.t, { broadcast: false });
+  else if (msg.type === "view") setView(msg.t0, msg.t1, { broadcast: false });
+});
+
+// a popped-out panel window was closed: bring its panel back into this window.
+window.cttc?.onPopoutClosed?.(({ kind, id }) => {
+  if (kind === "telemetry") state.poppedOut.delete("telemetry");
+  else if (kind === "host") state.poppedOut.delete("host");
+  else state.poppedOut.delete(id);
+  applyPopoutLayout();
+  drawAll();
+  syncPanels();
+});
 
 refreshAll();
 connectSSE();

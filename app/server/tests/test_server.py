@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import http.client
 import json
+import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -148,6 +150,22 @@ class TestTransformRegistry:
         (tdir / "bad.py").write_text("x = 1\n")
         with pytest.raises(ValueError, match="no transform"):
             server.TransformRegistry(tdir).load(["bad"])
+
+    def test_available_unreadable_file(self, tdir):
+        p = tdir / "locked.py"
+        p.write_text('"""Hidden."""\ndef transform(r): return r\n')
+        p.chmod(0o000)
+        try:
+            got = server.TransformRegistry(tdir).available()
+            assert got == [{"name": "locked", "doc": ""}]   # listed, doc unreadable
+        finally:
+            p.chmod(0o644)
+
+    def test_load_spec_failure(self, tdir, monkeypatch):
+        (tdir / "weird.py").write_text("def transform(r): return r\n")
+        monkeypatch.setattr(server.importlib.util, "spec_from_file_location", lambda *a, **k: None)
+        with pytest.raises(ValueError, match="not found"):
+            server.TransformRegistry(tdir).load(["weird"])
 
 
 class TestApplyTransforms:
@@ -306,6 +324,25 @@ class TestLogSource:
         src.ingest_chunk(b"2026-01-02T03:00:00Z a\n")
         assert src.slice(-5, 10)[0]["text"] == "a"
 
+    def test_find_forward_backward_wrap_and_case(self):
+        src = log_source()
+        src.ingest_chunk(
+            b"2026-01-02T03:00:00Z Alpha ERROR one\n"
+            b"2026-01-02T03:00:01Z beta ok\n"
+            b"2026-01-02T03:00:02Z gamma ERROR two\n"
+        )
+        assert src.find("error", 0) == 0                 # case-insensitive
+        assert src.find("error", 1) == 2                 # forward from middle
+        assert src.find("error", 1, forward=False) == 0  # backward from middle
+        assert src.find("ERROR one", 1) == 0             # wraps past the end
+        assert src.find("two", 0, forward=False) == 2    # wraps backward
+        assert src.find("nothing-here", 0) is None
+        assert src.find("   ", 0) is None                # blank query
+        assert src.find("x", 99) is None or src.find("x", 99) >= 0  # start clamped
+
+    def test_find_empty_log(self):
+        assert log_source().find("x", 0) is None
+
 
 # ── StatsSource ──────────────────────────────────────────────────────────────
 
@@ -361,6 +398,18 @@ class TestStatsSource:
         feed_stats(src, [stats_entry("api", "2026-01-02T03:00:00Z", netio="weird")])
         assert src.series["api"][0][4] is None
 
+    def test_unparsable_netio_sides_give_none(self):
+        src = stats_source()
+        feed_stats(src, [stats_entry("api", "2026-01-02T03:00:00Z", netio="abc / def")])
+        assert src.series["api"][0][4] is None
+
+    def test_blank_lines_in_jsonl_ignored(self):
+        src = stats_source()
+        n = src.ingest_chunk(
+            b"\n   \n" + json.dumps(stats_entry("api", "2026-01-02T03:00:00Z")).encode() + b"\n"
+        )
+        assert n == 1 and src.skipped == 0
+
     def test_swarm_grouping_and_detection(self):
         src = stats_source()
         feed_stats(src, [
@@ -415,7 +464,7 @@ class TestStatsSource:
         assert src.services() == ["a", "b"]
         lo, hi = src.range()
         assert lo == ms(2026, 1, 2, 3, 0, 0) and hi == ms(2026, 1, 2, 3, 0, 5)
-        out = src.bucketed(lo, lo + 10000, 10)
+        out = src.bucketed(lo, lo + 10000, 5)        # dt = 2 s: both b samples share bucket 0
         by_name = {o["name"]: o for o in out}
         assert by_name["b"]["cpu"][0] == 50.0        # max-merged in one bucket
         assert by_name["a"]["ttype"] == "service"
@@ -427,10 +476,29 @@ class TestStatsSource:
         src = stats_source()
         feed_stats(src, [stats_entry("api", "2026-01-02T03:00:00Z")])
         t0 = ms(2026, 1, 2, 4, 0, 0)
-        assert src.bucketed(t0, t0 + 1000, 5) == []
+        out = src.bucketed(t0, t0 + 1000, 5)
+        assert len(out) == 1                          # service listed, but no samples land
+        assert all(v is None for v in out[0]["cpu"] + out[0]["mem"] + out[0]["net"])
 
     def test_empty_range(self):
         assert stats_source().range() is None
+
+    def test_point_at_nearest(self):
+        src = stats_source()
+        feed_stats(src, [
+            stats_entry("api", "2026-01-02T03:00:00Z", cpu="10%"),
+            stats_entry("api", "2026-01-02T03:00:10Z", cpu="90%"),
+        ])
+        src.series["empty"] = []                     # skipped without crashing
+        t0 = ms(2026, 1, 2, 3, 0, 0)
+        assert src.point_at(t0 + 2000)["api"]["cpu"] == 10.0     # nearest is earlier
+        assert src.point_at(t0 + 8000)["api"]["cpu"] == 90.0     # nearest is later
+        after = src.point_at(t0 + 60000)["api"]                  # past the end
+        assert after["cpu"] == 90.0 and after["ts"] == t0 + 10000
+        before = src.point_at(t0 - 60000)["api"]                 # before the start
+        assert before["cpu"] == 10.0
+        assert src.point_at(t0)["api"]["host"] is False
+        assert "empty" not in src.point_at(t0)
 
 
 # ── sniff_kind / read_all / tail_loop ────────────────────────────────────────
@@ -478,6 +546,22 @@ class TestSniffAndTail:
         assert src.total() == 3
         assert gsrc.total() == 1  # unchanged, stat() failed quietly
 
+    def test_tail_loop_survives_read_failure(self, tmp_path, monkeypatch):
+        f = tmp_path / "r.log"
+        f.write_text("2026-01-02T03:00:00Z one\n")
+        st = server.State(tmp_path)
+        src = st.open_file(str(f), "log", None, live=True, transforms=[])
+
+        def broken_read(_src):
+            raise OSError("disk on fire")
+
+        monkeypatch.setattr(server, "read_all", broken_read)
+        threading.Thread(target=server.tail_loop, args=(st, 0.03), daemon=True).start()
+        with open(f, "a") as fh:
+            fh.write("2026-01-02T03:00:01Z two\n")
+        time.sleep(0.3)                               # loop hits OSError and keeps running
+        assert src.total() == 1
+
 
 # ── ssh helpers ──────────────────────────────────────────────────────────────
 
@@ -504,8 +588,14 @@ class TestSshHelpers:
         (d / "config").write_text("Host *\n")
         (d / "known_hosts").write_text("github.com ssh-rsa AAA")
         (d / "subdir").mkdir()
-        keys = server.list_ssh_keys()
-        assert keys == [str(d / "id_ed25519")]
+        locked = d / "locked_key"
+        locked.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\n...")
+        locked.chmod(0o000)
+        try:
+            keys = server.list_ssh_keys()
+            assert keys == [str(d / "id_ed25519")]   # unreadable key skipped quietly
+        finally:
+            locked.chmod(0o644)
 
 
 # ── docker CLI (fully mocked) ────────────────────────────────────────────────
@@ -629,8 +719,9 @@ class TestDockerStatsSource:
 
 
 class FakeProc:
-    def __init__(self, chunks):
+    def __init__(self, chunks, linger_polls=0):
         self.chunks = list(chunks)
+        self.linger_polls = linger_polls   # poll() returns None this many times after EOF
         self.terminated = False
         outer = self
 
@@ -641,7 +732,12 @@ class FakeProc:
         self.stdout = Out()
 
     def poll(self):
-        return 0 if not self.chunks else None
+        if self.chunks:
+            return None
+        if self.linger_polls > 0:
+            self.linger_polls -= 1
+            return None
+        return 0
 
     def terminate(self):
         self.terminated = True
@@ -649,7 +745,9 @@ class FakeProc:
 
 class TestDockerLogSource:
     def test_follows_and_reports_end(self, docker_cli, monkeypatch):
-        proc = FakeProc([b"2026-01-02T03:04:05Z hello\n2026-01-02T03:04:06Z world\n"])
+        # linger_polls > 0 exercises the "no data yet, stream still open" sleep
+        proc = FakeProc([b"2026-01-02T03:04:05Z hello\n2026-01-02T03:04:06Z world\n"],
+                        linger_polls=2)
         monkeypatch.setattr(server.subprocess, "Popen", lambda *a, **k: proc)
         st = FakeState()
         src = server.DockerLogSource("l1", "web", None, "container", "web", [], st)
@@ -748,8 +846,8 @@ class TestHostStatsSource:
             assert "-i" in calls[0] and "/tmp/key" in calls[0]
             assert calls[0][-4:] == ["cat", "/proc/stat", "/proc/meminfo", "/proc/net/dev"]
             ts, cpu, mem, mem_bytes, rate = src.series["host@h"][0]
-            # busy delta 200 of total delta 300
-            assert cpu == pytest.approx(200 / 300 * 100, rel=1e-3)
+            # busy: 200 -> 300 (delta 100) of total 1000 -> 1300 (delta 300)
+            assert cpu == pytest.approx(100 / 300 * 100, rel=1e-3)
             assert mem == pytest.approx(60.0)
             assert mem_bytes == pytest.approx(600000 * 1024)
             assert rate > 0                     # 6000 bytes over the poll gap; lo/veth/br/docker0 excluded
@@ -775,6 +873,13 @@ class TestHostStatsSource:
             assert "Permission denied" in src.error
         finally:
             src.stop()
+
+    def test_local_without_psutil_reports_error(self, monkeypatch):
+        src = server.HostStatsSource("h5", "host@x", "tcp://nope", 0.05, FakeState())
+        src.stop()                               # loop idles; call the sampler directly
+        monkeypatch.setitem(sys.modules, "psutil", None)
+        with pytest.raises(RuntimeError, match="psutil not installed"):
+            src._sample_local()
 
 
 # ── State ────────────────────────────────────────────────────────────────────
@@ -803,7 +908,7 @@ def log_file(tmp_path):
 @pytest.fixture
 def stats_file(tmp_path):
     f = tmp_path / "stats.jsonl"
-    f.write_text("\n".join(json.dumps(stats_entry("api", f"2026-01-02T03:00:0{i}Z")) for i in range(3)))
+    f.write_text("\n".join(json.dumps(stats_entry("api", f"2026-01-02T03:00:0{i}Z")) for i in range(3)) + "\n")
     return f
 
 
@@ -893,13 +998,139 @@ class TestSampleRoundTrip:
         assert stt._swarm == {"api"}
         assert stt.live is False and lg.live is False
 
-    def test_export_empty_range(self, state, log_file, tmp_path):
+    def test_export_empty_range(self, state, log_file, stats_file, tmp_path):
         state.open_file(str(log_file), "auto", None, live=False, transforms=[])
+        state.open_file(str(stats_file), "auto", None, live=False, transforms=[])
         out = tmp_path / "empty.cttc"
-        r = state.export_sample(str(out), 0.0, 1.0)
+        r = state.export_sample(str(out), 0.0, 1.0)   # both log and stats out of range
         assert r["sources"] == 0
         assert zipfile.ZipFile(out).namelist() == ["manifest.json"]
         assert server.State(tmp_path).load_sample(str(out)) == []
+
+    def test_load_sample_skips_blank_log_lines(self, state, tmp_path):
+        out = tmp_path / "crafted.cttc"
+        with zipfile.ZipFile(out, "w") as z:
+            z.writestr("logs/0.jsonl", '{"ts": 1000, "text": "a"}\n\n   \n{"ts": 2000}\n')
+            z.writestr("manifest.json", json.dumps({
+                "version": 1,
+                "sources": [{"type": "log", "name": "crafted", "file": "logs/0.jsonl"}],
+            }))
+        opened = state.load_sample(str(out))
+        src = state.sources[opened[0]]
+        assert src.total() == 2
+        assert src.slice(1, 1)[0]["text"] == ""       # missing text defaults to empty
+
+
+# ── sample encryption ────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def keyhome(tmp_path, monkeypatch):
+    """Redirect ~/.cttc/keys into a temp dir so tests never touch real keys."""
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    return tmp_path
+
+
+class TestKeyManagement:
+    def test_generate_list_and_files(self, keyhome):
+        r = server.generate_keypair("alice")
+        assert r == {"name": "alice", "has_public": True, "has_private": True,
+                     "public_pem": r["public_pem"]}
+        assert r["public_pem"].startswith("-----BEGIN PUBLIC KEY-----")
+        d = keyhome / ".cttc" / "keys"
+        assert (d / "alice.key.pem").stat().st_mode & 0o777 == 0o600
+        assert server.list_keypairs() == [
+            {"name": "alice", "has_public": True, "has_private": True}
+        ]
+
+    def test_generate_duplicate_rejected(self, keyhome):
+        server.generate_keypair("bob")
+        with pytest.raises(ValueError, match="already exists"):
+            server.generate_keypair("bob")
+
+    @pytest.mark.parametrize("bad", ["", "  ", "a/b", "x y", "é", "a\\b"])
+    def test_bad_key_names_rejected(self, keyhome, bad):
+        with pytest.raises(ValueError, match="key name"):
+            server.generate_keypair(bad)
+
+    def test_import_public_key(self, keyhome):
+        pem = server.generate_keypair("src")["public_pem"]
+        r = server.import_public_key("friend", pem)
+        assert r == {"name": "friend", "has_public": True, "has_private": False}
+        listed = {k["name"]: k for k in server.list_keypairs()}
+        assert listed["friend"]["has_private"] is False
+        with pytest.raises(ValueError, match="already exists"):
+            server.import_public_key("friend", pem)
+
+    def test_import_invalid_pem_rejected(self, keyhome):
+        with pytest.raises(Exception):
+            server.import_public_key("junk", "not a pem")
+
+    def test_resolvers(self, keyhome):
+        pem = server.generate_keypair("kr")["public_pem"]
+        assert server.resolve_public_key("kr") == pem.encode()
+        # raw PEM passthrough (resolver strips surrounding whitespace)
+        assert server.resolve_public_key(pem).strip() == pem.encode().strip()
+        priv = server.resolve_private_key("kr")
+        assert b"PRIVATE KEY" in priv
+        assert server.resolve_private_key(priv.decode()).strip() == priv.strip()
+        with pytest.raises(ValueError, match="unknown public key"):
+            server.resolve_public_key("ghost")
+        with pytest.raises(ValueError, match="unknown private key"):
+            server.resolve_private_key("ghost")
+
+
+class TestEncryptDecrypt:
+    def test_round_trip(self, keyhome):
+        server.generate_keypair("rt")
+        blob = server.encrypt_bytes(b"payload " * 1000, server.resolve_public_key("rt"))
+        assert server.is_encrypted_sample(blob)
+        assert blob.startswith(server.ENC_MAGIC)
+        out = server.decrypt_bytes(blob, server.resolve_private_key("rt"))
+        assert out == b"payload " * 1000
+
+    def test_wrong_key_fails(self, keyhome):
+        server.generate_keypair("k1")
+        server.generate_keypair("k2")
+        blob = server.encrypt_bytes(b"secret", server.resolve_public_key("k1"))
+        with pytest.raises(ValueError, match="decryption failed"):
+            server.decrypt_bytes(blob, server.resolve_private_key("k2"))
+
+    def test_not_encrypted_rejected(self):
+        with pytest.raises(ValueError, match="not an encrypted sample"):
+            server.decrypt_bytes(b"PK\x03\x04zipdata", b"irrelevant")
+
+    def test_is_encrypted_sample(self):
+        assert server.is_encrypted_sample(server.ENC_MAGIC + b"x") is True
+        assert server.is_encrypted_sample(b"PK\x03\x04") is False
+
+
+class TestEncryptedSampleRoundTrip:
+    def test_encrypted_export_and_load(self, state, log_file, keyhome, tmp_path):
+        state.open_file(str(log_file), "auto", None, live=False, transforms=[])
+        server.generate_keypair("me")
+        out = tmp_path / "enc.cttc"
+        t0 = ms(2026, 1, 2, 3, 0, 0)
+        r = state.export_sample(str(out), t0, t0 + 60000, public_key="me")
+        assert r["encrypted"] is True
+        raw = out.read_bytes()
+        assert server.is_encrypted_sample(raw)
+        assert b"alpha" not in raw                    # log text is not in the clear
+
+        st2 = server.State(tmp_path)
+        with pytest.raises(server.EncryptedSampleError, match="private key is required"):
+            st2.load_sample(str(out))
+        opened = st2.load_sample(str(out), private_key="me")
+        assert len(opened) == 1
+        assert st2.sources[opened[0]].slice(0, 1)[0]["text"] == "alpha"
+
+    def test_export_include_host_false(self, state, stats_file, tmp_path):
+        src = state.open_file(str(stats_file), "auto", None, live=False, transforms=[])
+        src.is_host = True
+        out = tmp_path / "nohost.cttc"
+        t0 = ms(2026, 1, 2, 3, 0, 0)
+        r = state.export_sample(str(out), t0, t0 + 60000, include_host=False)
+        assert r["sources"] == 0 and r["encrypted"] is False
 
 
 # ── HTTP API ─────────────────────────────────────────────────────────────────
@@ -920,8 +1151,11 @@ def api(state, log_file, stats_file):
 
 
 def get(base, path):
-    with urllib.request.urlopen(base + path, timeout=5) as r:
-        return r.status, json.loads(r.read())
+    try:
+        with urllib.request.urlopen(base + path, timeout=5) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
 
 
 def post(base, path, body=None):
@@ -1063,11 +1297,112 @@ class TestHttpApi:
         for sid in j["opened"]:
             st.close_source(sid)
 
+    def test_point_endpoint(self, api):
+        base, _ = api
+        t = ms(2026, 1, 2, 3, 0, 1)
+        _, j = get(base, f"/point?t={t}")
+        assert j["t"] == t
+        assert j["services"]["api"]["cpu"] == 10.0
+        assert abs(j["services"]["api"]["ts"] - t) < 1500
+        assert get(base, "/point")[0] == 400          # t is required
+
+    def test_logs_find_endpoint(self, api):
+        base, st = api
+        sid = next(s.id for s in st.sources.values() if s.kind == "log")
+        _, j = get(base, f"/logs/find?source={sid}&q=beta&start=0")
+        assert j["index"] == 1
+        _, j = get(base, f"/logs/find?source={sid}&q=alpha&start=1&dir=back")
+        assert j["index"] == 0
+        _, j = get(base, f"/logs/find?source={sid}&q=zzz")
+        assert j["index"] is None
+
+    def test_cttc_key_endpoints(self, api, keyhome):
+        base, _ = api
+        code, j = post(base, "/cttc/keys/generate", {"name": "webkey"})
+        assert code == 200 and j["has_private"] is True
+        pem = j["public_pem"]
+        code, j = post(base, "/cttc/keys/import", {"name": "peer", "public_pem": pem})
+        assert code == 200 and j["has_private"] is False
+        _, j = get(base, "/cttc/keys")
+        assert [k["name"] for k in j["keys"]] == ["peer", "webkey"]
+        code, j = post(base, "/cttc/keys/generate", {"name": "web key!"})
+        assert code == 400 and "key name" in j["error"]
+        code, j = post(base, "/cttc/keys/generate", {})
+        assert code == 400
+
+    def test_encrypted_sample_over_http(self, api, keyhome, tmp_path):
+        base, _ = api
+        _, j = post(base, "/cttc/keys/generate", {"name": "httpkey"})
+        out = tmp_path / "enc-http.cttc"
+        t0 = ms(2026, 1, 2, 3, 0, 0)
+        code, j = post(base, "/sample/export",
+                       {"path": str(out), "from": t0, "to": t0 + 60000, "public_key": "httpkey"})
+        assert code == 200 and j["encrypted"] is True
+
+        code, j = post(base, "/open", {"files": [{"path": str(out)}]})
+        assert code == 200 and j["opened"] == []
+        assert j["errors"][0]["encrypted"] is True    # renderer uses this to prompt for a key
+
+        code, j = post(base, "/open", {"files": [{"path": str(out), "private_key": "httpkey"}]})
+        assert code == 200 and len(j["opened"]) == 2 and j["errors"] == []
+
+    def test_export_include_host_flag_over_http(self, api, tmp_path):
+        base, st = api
+        for s in st.sources.values():
+            if s.kind == "stats":
+                s.is_host = True
+        out = tmp_path / "nohost-http.cttc"
+        t0 = ms(2026, 1, 2, 3, 0, 0)
+        _, j = post(base, "/sample/export",
+                    {"path": str(out), "from": t0, "to": t0 + 60000, "include_host": False})
+        assert j["sources"] == 1                      # only the log made it in
+
+    def test_handle_error_swallows_disconnects_but_not_bugs(self, capsys):
+        inst = server.ThreadingHTTPServer.__new__(server.ThreadingHTTPServer)
+        try:
+            raise ConnectionResetError("peer vanished")
+        except ConnectionResetError:
+            inst.handle_error(None, ("127.0.0.1", 1))   # swallowed
+        assert capsys.readouterr().err == ""
+        try:
+            raise RuntimeError("actual bug")
+        except RuntimeError:
+            inst.handle_error(None, ("127.0.0.1", 1))   # dumped like the default
+        assert "actual bug" in capsys.readouterr().err
+
+    def test_get_broken_pipe_swallowed(self, api, monkeypatch):
+        base, st = api
+        def explode():
+            raise BrokenPipeError()
+        monkeypatch.setattr(st, "describe", explode)
+        conn = http.client.HTTPConnection(base.split("//")[1], timeout=2)
+        conn.request("GET", "/sources")
+        with pytest.raises(Exception):                  # server sends nothing back
+            conn.getresponse()
+        conn.close()
+
+    def test_sse_keepalive_comment(self, api, monkeypatch):
+        base, st = api
+
+        class FastQueue(server.queue.Queue):
+            def get(self, timeout=None):                # shrink the 15 s keepalive wait
+                return super().get(timeout=0.05)
+
+        monkeypatch.setattr(server.queue, "Queue", FastQueue)
+        conn = http.client.HTTPConnection(base.split("//")[1], timeout=5)
+        conn.request("GET", "/events")
+        resp = conn.getresponse()
+        line = resp.fp.readline()
+        assert line.startswith(b": keepalive")
+        resp.close()
+        conn.close()
+
     def test_sse_event_delivery_and_cleanup(self, api):
         base, st = api
         host = base.split("//")[1]
         conn = http.client.HTTPConnection(host, timeout=5)
         conn.request("GET", "/events")
+        sock = conn.sock                        # getresponse() may detach conn.sock
         resp = conn.getresponse()
         deadline = time.time() + 3
         while not st.listeners and time.time() < deadline:
@@ -1075,9 +1410,13 @@ class TestHttpApi:
         st.broadcast({"type": "ping"})
         line = resp.fp.readline()
         assert line.startswith(b"data:") and b"ping" in line
+        # force an immediate RST so the handler's next write fails (a plain
+        # close is a half-close, which the server can keep writing into)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        resp.close()          # the streaming response owns the socket, not conn
+        sock.close()
         conn.close()
-        st.broadcast({"type": "after-close"})   # first write after close raises -> cleanup
-        deadline = time.time() + 3
+        deadline = time.time() + 5
         while st.listeners and time.time() < deadline:
             st.broadcast({"type": "flush"})
             time.sleep(0.05)
@@ -1133,6 +1472,24 @@ class TestMain:
         assert server.NAIVE_TZ is not None and server.NAIVE_TZ != timezone.utc or old_tz != timezone.utc
         server.NAIVE_TZ = timezone.utc          # restore module global for other tests
 
+    def test_main_keyboard_interrupt_exits_cleanly(self, tmp_path, monkeypatch):
+        class InterruptingServer(ThreadingHTTPServer):
+            def serve_forever(self, *a, **k):
+                raise KeyboardInterrupt
+
+        monkeypatch.setattr(server, "ThreadingHTTPServer", InterruptingServer)
+        monkeypatch.setattr(sys, "argv", ["server.py", "--port", "0",
+                                          "--transforms-dir", str(tmp_path)])
+        server.main()                           # KeyboardInterrupt swallowed
+
+    def test_dunder_main_via_runpy(self, tmp_path, monkeypatch, capsys):
+        import runpy
+        monkeypatch.setattr(sys, "argv", ["server.py", "--help"])
+        with pytest.raises(SystemExit) as exc:
+            runpy.run_path(str(Path(server.__file__)), run_name="__main__")
+        assert exc.value.code == 0
+        assert "--naive-tz" in capsys.readouterr().out
+
 
 # ── stdlib-json fallback (orjson blocked in a subprocess) ────────────────────
 
@@ -1150,3 +1507,25 @@ def test_stdlib_json_fallback():
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr
     assert "fallback-ok" in out.stdout
+
+
+def test_zz_stdlib_json_fallback_reload():
+    """Reload the module with orjson blocked so the fallback lines execute
+    inside this process (and count toward coverage), then restore. Runs last
+    (zz) so no other test observes the reloaded module identity."""
+    import importlib
+
+    saved = sys.modules.get("orjson")
+    sys.modules["orjson"] = None                # forces ImportError on import
+    try:
+        importlib.reload(server)
+        assert server.JSON_IMPL == "stdlib-json"
+        assert server.jloads(server.jdumps({"a": [1, "x"]})) == {"a": [1, "x"]}
+        assert isinstance(server.jdumps({}), bytes)
+    finally:
+        if saved is not None:
+            sys.modules["orjson"] = saved
+        else:
+            sys.modules.pop("orjson", None)
+        importlib.reload(server)
+        assert server.JSON_IMPL == "orjson"
