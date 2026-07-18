@@ -68,25 +68,29 @@ opens the relevant section of this manual.
 
 ## The main window
 
-```
-┌───────────────────────────────────────────────┐
-│ toolbar: ＋ Add sources · 🗑 Clear sources ·   │
-│ 📂 Load metrics · 🔑 Keys · frequency · style  │
-├───────────────────────────────────────────────┤
-│  Telemetry                              ⧉     │
-│  legend: containers · sample files            │
-│  CPU % ────────╱╲──────────│──────────────    │ ← metric strips
-│  MEM % ────────────────────│──────────────    │
-│  NET   ────────╱╲──────────│──────────────    │
-│  [═══════▓▓▓▓═══ now ═════════════]           │ ← timeline navigator
-│  api   ▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮│▮▮▮▮▮▮▮▮          │ ← density lanes
-│  Host telemetry                    ▾ ⧉        │
-│  CPU % ──────╱─╲───────────│──────────────    │ ← docker host vitals
-├───────────────────────────────────────────────┤ ← drag divider to resize
-│  api log        ····· [t] ·····          🔍 ⧉ │ ← one panel per log source
-│  worker log     ····· [t] ·····               │
-└───────────────────────────────────────────────┘
-```
+![The CTTC main window: the cursor sits on a c3_worker spike; both log panels
+have jumped to that moment, highlighting the ± frequency window, with ERROR
+and WARN rows edge-colored](docs/images/app-overview.png)
+
+From top to bottom:
+
+1. **Toolbar** — ＋ Add sources, 🗑 Clear sources, 📂 Load metrics, 🔑 Keys,
+   the *frequency* window, the 〜/▤ chart-style switch, and (right) the
+   cursor's UTC readout.
+2. **Telemetry** — the container legend, then the CPU % / MEM % / NET metric
+   strips. In the screenshot the vertical blue line is the **cursor**,
+   placed on one of `c3_worker`'s spikes. The ⧉ button pops the whole block
+   into its own window.
+3. **Timeline navigator** — the scrollbar-like track showing the current
+   view within the whole available range, with **now** as a click target.
+4. **Density lanes** — one row of tick marks per log source, darker where
+   entries are denser.
+5. **Host telemetry** (when collected — not shown above) — the docker host's
+   own CPU/MEM/NET in a collapsible strip group with its own navigator.
+6. **Log panels** — one per log source, below the divider. Both panels above
+   have jumped to the cursor's time: the blue-tinted rows are inside the ±
+   frequency window, and `c3_worker` shows why the spike happened —
+   edge-colored `WARN job … slow` and `ERROR … OutOfMemoryError` rows.
 
 Drag the divider between charts and log panels to trade chart height for log
 space; the position is remembered.
