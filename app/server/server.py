@@ -14,9 +14,11 @@ Prints one JSON line {"port": N} on stdout once listening.
 from __future__ import annotations
 
 import argparse
+import base64
 import bisect
 import hashlib
 import importlib.util
+import io
 import os
 import queue
 import re
@@ -31,6 +33,16 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.serialization import (
+    Encoding,
+    NoEncryption,
+    PrivateFormat,
+    PublicFormat,
+)
 
 try:
     import orjson
@@ -468,6 +480,27 @@ class StatsSource:
                 })
         return out
 
+    def point_at(self, t: float):
+        """Per service, the single sample nearest time t — used to compare an
+        arbitrary point (e.g. a loaded sample) against another point (e.g.
+        live 'now') regardless of the current chart zoom window."""
+        with self.lock:
+            out = {}
+            for svc, lst in self.series.items():
+                if not lst:
+                    continue
+                i = bisect.bisect_left(lst, (t,))
+                cands = [lst[i]] if i < len(lst) else []
+                if i > 0:
+                    cands.append(lst[i - 1])
+                best = min(cands, key=lambda r: abs(r[0] - t))
+                out[svc] = {
+                    "ts": best[0], "cpu": best[1], "mem": best[2],
+                    "mem_bytes": best[3], "net": best[4],
+                    "host": self.is_host,
+                }
+            return out
+
 
 # ── docker collectors (local daemon or ssh://user@host) ──────────────────────
 
@@ -544,6 +577,137 @@ def docker_ps(host: str | None, ssh_key: str | None = None) -> dict:
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+# ── sample encryption: RSA-OAEP(SHA256) key wrap + AES-256-GCM payload ───────
+#
+# A .cttc sample is a plain zip by default. When a public key is supplied at
+# export time, the zip bytes are AES-256-GCM encrypted under a random
+# one-time key, and that key is wrapped with the recipient's RSA public key
+# (hybrid encryption — RSA alone can't handle payloads of arbitrary size).
+# Only the holder of the matching private key can unwrap the AES key and
+# decrypt the sample. Keys are simple PEM files under ~/.cttc/keys/.
+
+ENC_MAGIC = b"CTTCENC1"
+_KEY_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+class EncryptedSampleError(ValueError):
+    """Raised by load_sample() for an encrypted .cttc when no (or the wrong)
+    private key was supplied — lets callers distinguish this from other
+    load failures and prompt for a key instead of just reporting an error."""
+
+
+def keys_dir() -> Path:
+    d = Path.home() / ".cttc" / "keys"
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return d
+
+
+def _check_key_name(name: str) -> str:
+    name = (name or "").strip()
+    if not name or not _KEY_NAME_RE.match(name):
+        raise ValueError("key name must be non-empty and use only letters, digits, '.', '_', '-'")
+    return name
+
+
+def generate_keypair(name: str) -> dict:
+    """Create a new RSA-3072 keypair under ~/.cttc/keys/. The private key is
+    stored unencrypted (mode 0600, owner-only) — protection relies on
+    filesystem permissions, same trust model as ~/.ssh."""
+    name = _check_key_name(name)
+    d = keys_dir()
+    priv_path, pub_path = d / f"{name}.key.pem", d / f"{name}.pub.pem"
+    if priv_path.exists() or pub_path.exists():
+        raise ValueError(f"a key named {name!r} already exists")
+    key = rsa.generate_private_key(public_exponent=65537, key_size=3072)
+    priv_pem = key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
+    pub_pem = key.public_key().public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
+    priv_path.write_bytes(priv_pem)
+    priv_path.chmod(0o600)
+    pub_path.write_bytes(pub_pem)
+    return {"name": name, "has_public": True, "has_private": True, "public_pem": pub_pem.decode()}
+
+
+def import_public_key(name: str, public_pem: str) -> dict:
+    """Store someone else's public key (e.g. pasted/shared) so samples can be
+    encrypted for them without holding their private key."""
+    name = _check_key_name(name)
+    serialization.load_pem_public_key(public_pem.encode())  # validate before saving
+    pub_path = keys_dir() / f"{name}.pub.pem"
+    if pub_path.exists():
+        raise ValueError(f"a key named {name!r} already exists")
+    pub_path.write_bytes(public_pem.encode())
+    return {"name": name, "has_public": True, "has_private": False}
+
+
+def list_keypairs() -> list[dict]:
+    d = keys_dir()
+    names = {p.name[: -len(".pub.pem")] for p in d.glob("*.pub.pem")}
+    names |= {p.name[: -len(".key.pem")] for p in d.glob("*.key.pem")}
+    return [
+        {
+            "name": n,
+            "has_public": (d / f"{n}.pub.pem").exists(),
+            "has_private": (d / f"{n}.key.pem").exists(),
+        }
+        for n in sorted(names)
+    ]
+
+
+def resolve_public_key(ref: str) -> bytes:
+    """ref is either a raw PEM string or the name of a stored key."""
+    s = (ref or "").strip()
+    if s.startswith("-----BEGIN"):
+        return s.encode()
+    p = keys_dir() / f"{s}.pub.pem"
+    if not p.is_file():
+        raise ValueError(f"unknown public key: {ref}")
+    return p.read_bytes()
+
+
+def resolve_private_key(ref: str) -> bytes:
+    s = (ref or "").strip()
+    if s.startswith("-----BEGIN"):
+        return s.encode()
+    p = keys_dir() / f"{s}.key.pem"
+    if not p.is_file():
+        raise ValueError(f"unknown private key: {ref}")
+    return p.read_bytes()
+
+
+_OAEP = padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
+
+
+def encrypt_bytes(data: bytes, public_pem: bytes) -> bytes:
+    pubkey = serialization.load_pem_public_key(public_pem)
+    aes_key = os.urandom(32)
+    nonce = os.urandom(12)
+    ciphertext = AESGCM(aes_key).encrypt(nonce, data, None)
+    wrapped_key = pubkey.encrypt(aes_key, _OAEP)
+    header = jdumps({
+        "alg": "rsa-oaep-sha256+aes-256-gcm",
+        "key": base64.b64encode(wrapped_key).decode(),
+        "nonce": base64.b64encode(nonce).decode(),
+    })
+    return ENC_MAGIC + header + b"\n" + ciphertext
+
+
+def decrypt_bytes(container: bytes, private_pem: bytes) -> bytes:
+    if not container.startswith(ENC_MAGIC):
+        raise ValueError("not an encrypted sample")
+    header_bytes, ciphertext = container[len(ENC_MAGIC):].split(b"\n", 1)
+    header = jloads(header_bytes)
+    privkey = serialization.load_pem_private_key(private_pem, password=None)
+    try:
+        aes_key = privkey.decrypt(base64.b64decode(header["key"]), _OAEP)
+        return AESGCM(aes_key).decrypt(base64.b64decode(header["nonce"]), ciphertext, None)
+    except Exception as e:
+        raise ValueError(f"decryption failed (wrong private key?): {e}") from e
+
+
+def is_encrypted_sample(data: bytes) -> bool:
+    return data.startswith(ENC_MAGIC)
 
 
 class DockerStatsSource(StatsSource):
@@ -828,14 +992,18 @@ class State:
             opened.append(sid)
         return opened
 
-    def export_sample(self, path: str, t0: float, t1: float) -> dict:
+    def export_sample(self, path: str, t0: float, t1: float, public_key: str | None = None) -> dict:
         """Write a .cttc sample: a zip of per-source log/metric slices in
-        [t0, t1] plus a manifest, for every currently open source."""
+        [t0, t1] plus a manifest, for every currently open source. When
+        public_key is given (a stored key name or a raw PEM string), the zip
+        is AES-256-GCM encrypted under a one-time key that is itself wrapped
+        with that RSA public key — only the matching private key can open it."""
         with self.lock:
             items = list(self.sources.values())
         p = Path(path).expanduser()
         meta = []
-        with zipfile.ZipFile(p, "w", zipfile.ZIP_DEFLATED) as z:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
             for i, s in enumerate(items):
                 if s.kind == "log":
                     with s.lock:
@@ -864,13 +1032,24 @@ class State:
             z.writestr("manifest.json", jdumps({
                 "version": 1, "from": t0, "to": t1, "created": now_iso(), "sources": meta,
             }))
-        return {"path": str(p), "sources": len(meta)}
+        data = buf.getvalue()
+        if public_key:
+            data = encrypt_bytes(data, resolve_public_key(public_key))
+        p.write_bytes(data)
+        return {"path": str(p), "sources": len(meta), "encrypted": bool(public_key)}
 
-    def load_sample(self, path: str) -> list[str]:
-        """Open a .cttc sample as a set of static sources."""
+    def load_sample(self, path: str, private_key: str | None = None) -> list[str]:
+        """Open a .cttc sample as a set of static sources. If the file is
+        encrypted, private_key (a stored key name or raw PEM) must unwrap it;
+        raises EncryptedSampleError when it's missing so callers can prompt."""
         p = Path(path).expanduser()
         opened = []
-        with zipfile.ZipFile(p) as z:
+        raw = p.read_bytes()
+        if is_encrypted_sample(raw):
+            if not private_key:
+                raise EncryptedSampleError(f"{p.name} is encrypted — a private key is required")
+            raw = decrypt_bytes(raw, resolve_private_key(private_key))
+        with zipfile.ZipFile(io.BytesIO(raw)) as z:
             man = jloads(z.read("manifest.json"))
             for meta in man.get("sources", []):
                 with self.lock:
@@ -1014,6 +1193,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send({"transforms": st.registry.available()})
             elif u.path == "/ssh/keys":
                 self._send({"keys": list_ssh_keys()})
+            elif u.path == "/cttc/keys":
+                self._send({"keys": list_keypairs()})
             elif u.path == "/range":
                 lo = hi = None
                 for s in st.describe():
@@ -1034,6 +1215,15 @@ class Handler(BaseHTTPRequestHandler):
                 src = self._log_source(q["source"])
                 start, count = int(q.get("start", 0)), min(int(q.get("count", 200)), 2000)
                 self._send({"total": src.total(), "rows": src.slice(start, count)})
+            elif u.path == "/point":
+                t = float(q["t"])
+                out = {}
+                with st.lock:
+                    items = list(st.sources.values())
+                for s in items:
+                    if s.kind == "stats":
+                        out.update(s.point_at(t))
+                self._send({"t": t, "services": out})
             elif u.path == "/index_at":
                 src = self._log_source(q["source"])
                 self._send({"index": src.index_at(float(q["t"]))})
@@ -1061,7 +1251,7 @@ class Handler(BaseHTTPRequestHandler):
                 for f in body.get("files", []):
                     try:
                         if str(f["path"]).endswith(".cttc"):
-                            opened.extend(st.load_sample(f["path"]))
+                            opened.extend(st.load_sample(f["path"], f.get("private_key") or None))
                             continue
                         src = st.open_file(
                             f["path"],
@@ -1071,6 +1261,8 @@ class Handler(BaseHTTPRequestHandler):
                             f.get("transforms", []),
                         )
                         opened.append(src.id)
+                    except EncryptedSampleError as e:
+                        errors.append({"path": f.get("path"), "error": str(e), "encrypted": True})
                     except Exception as e:
                         errors.append({"path": f.get("path"), "error": str(e)})
                 st.broadcast({"type": "sources"})
@@ -1080,7 +1272,13 @@ class Handler(BaseHTTPRequestHandler):
                 st.broadcast({"type": "sources"})
                 self._send({"ok": True})
             elif u.path == "/sample/export":
-                self._send(st.export_sample(body["path"], float(body["from"]), float(body["to"])))
+                self._send(st.export_sample(
+                    body["path"], float(body["from"]), float(body["to"]), body.get("public_key") or None
+                ))
+            elif u.path == "/cttc/keys/generate":
+                self._send(generate_keypair(body["name"]))
+            elif u.path == "/cttc/keys/import":
+                self._send(import_public_key(body["name"], body["public_pem"]))
             elif u.path == "/docker/ps":
                 self._send(docker_ps(body.get("host") or None, body.get("ssh_key") or None))
             elif u.path == "/docker/collect":

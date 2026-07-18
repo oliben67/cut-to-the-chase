@@ -4,4 +4,6 @@ __pycache__/
 *.pyc
 .venv/
 app/demo/data/
+stay-the-course/
+.prompts/
 *.cttc
