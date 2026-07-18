@@ -668,14 +668,33 @@ def list_keypairs() -> list[dict]:
     d = keys_dir()
     names = {p.name[: -len(".pub.pem")] for p in d.glob("*.pub.pem")}
     names |= {p.name[: -len(".key.pem")] for p in d.glob("*.key.pem")}
-    return [
-        {
+    out = []
+    for n in sorted(names):
+        pub = d / f"{n}.pub.pem"
+        entry = {
             "name": n,
-            "has_public": (d / f"{n}.pub.pem").exists(),
+            "has_public": pub.exists(),
             "has_private": (d / f"{n}.key.pem").exists(),
         }
-        for n in sorted(names)
-    ]
+        if entry["has_public"]:
+            # public keys are public: shipping the PEM lets the UI offer
+            # copy-to-share without a per-key round trip
+            entry["public_pem"] = pub.read_text()
+        out.append(entry)
+    return out
+
+
+def delete_keypair(name: str) -> dict:
+    name = _check_key_name(name)
+    d = keys_dir()
+    found = False
+    for p in (d / f"{name}.pub.pem", d / f"{name}.key.pem"):
+        if p.exists():
+            p.unlink()
+            found = True
+    if not found:
+        raise ValueError(f"unknown key: {name}")
+    return {"ok": True, "name": name}
 
 
 def resolve_public_key(ref: str) -> bytes:
@@ -1330,6 +1349,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(generate_keypair(body["name"]))
             elif u.path == "/cttc/keys/import":
                 self._send(import_public_key(body["name"], body["public_pem"]))
+            elif u.path == "/cttc/keys/delete":
+                self._send(delete_keypair(body["name"]))
             elif u.path == "/docker/ps":
                 self._send(docker_ps(body.get("host") or None, body.get("ssh_key") or None))
             elif u.path == "/docker/collect":

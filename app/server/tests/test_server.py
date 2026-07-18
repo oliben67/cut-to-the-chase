@@ -1042,7 +1042,8 @@ class TestKeyManagement:
         d = keyhome / ".cttc" / "keys"
         assert (d / "alice.key.pem").stat().st_mode & 0o777 == 0o600
         assert server.list_keypairs() == [
-            {"name": "alice", "has_public": True, "has_private": True}
+            {"name": "alice", "has_public": True, "has_private": True,
+             "public_pem": r["public_pem"]}
         ]
 
     def test_generate_duplicate_rejected(self, keyhome):
@@ -1067,6 +1068,23 @@ class TestKeyManagement:
     def test_import_invalid_pem_rejected(self, keyhome):
         with pytest.raises(Exception):
             server.import_public_key("junk", "not a pem")
+
+    def test_delete_keypair(self, keyhome):
+        server.generate_keypair("gone")
+        assert server.delete_keypair("gone") == {"ok": True, "name": "gone"}
+        assert server.list_keypairs() == []
+        with pytest.raises(ValueError, match="unknown key"):
+            server.delete_keypair("gone")
+
+    def test_delete_public_only_key(self, keyhome):
+        pem = server.generate_keypair("mine")["public_pem"]
+        server.import_public_key("theirs", pem)
+        server.delete_keypair("theirs")
+        assert [k["name"] for k in server.list_keypairs()] == ["mine"]
+
+    def test_delete_bad_name_rejected(self, keyhome):
+        with pytest.raises(ValueError, match="key name"):
+            server.delete_keypair("../escape")
 
     def test_resolvers(self, keyhome):
         pem = server.generate_keypair("kr")["public_pem"]
@@ -1327,10 +1345,17 @@ class TestHttpApi:
         assert code == 200 and j["has_private"] is False
         _, j = get(base, "/cttc/keys")
         assert [k["name"] for k in j["keys"]] == ["peer", "webkey"]
+        assert all("PUBLIC KEY" in k["public_pem"] for k in j["keys"])
         code, j = post(base, "/cttc/keys/generate", {"name": "web key!"})
         assert code == 400 and "key name" in j["error"]
         code, j = post(base, "/cttc/keys/generate", {})
         assert code == 400
+        code, j = post(base, "/cttc/keys/delete", {"name": "peer"})
+        assert code == 200 and j["ok"] is True
+        _, j = get(base, "/cttc/keys")
+        assert [k["name"] for k in j["keys"]] == ["webkey"]
+        code, j = post(base, "/cttc/keys/delete", {"name": "peer"})
+        assert code == 400 and "unknown key" in j["error"]
 
     def test_encrypted_sample_over_http(self, api, keyhome, tmp_path):
         base, _ = api

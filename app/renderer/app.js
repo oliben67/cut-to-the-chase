@@ -831,19 +831,43 @@ function currentDockerHost() {
 
 const dlgExport = $("dlg-export");
 
-function askExportOptions() {
+// fill a <select> with the stored public keys (value = key name); the first
+// option means "no encryption" / "pick one"
+async function fillKeySelect(sel, emptyLabel) {
+  sel.innerHTML = "";
+  const none = document.createElement("option");
+  none.value = "";
+  none.textContent = emptyLabel;
+  sel.appendChild(none);
+  try {
+    for (const k of (await get("/cttc/keys")).keys) {
+      if (!k.has_public) continue;
+      const o = document.createElement("option");
+      o.value = k.name;
+      o.textContent = k.name + (k.has_private ? " (yours)" : "");
+      sel.appendChild(o);
+    }
+  } catch { /* server down: only "no encryption" is offered */ }
+}
+
+async function askExportOptions() {
+  const hasHost = hasHostSeries();
+  const cb = $("export-host");
+  cb.checked = hasHost;
+  $("export-host-note").textContent = hasHost
+    ? "Currently being collected — included automatically unless you uncheck this."
+    : "Not currently collected — checking this starts collecting it now (this past range won't have host data yet, but later saved metrics will).";
+  await fillKeySelect($("export-key"), "no encryption");
   return new Promise((resolve) => {
-    const hasHost = hasHostSeries();
-    const cb = $("export-host");
-    cb.checked = hasHost;
-    $("export-host-note").textContent = hasHost
-      ? "Currently being collected — included automatically unless you uncheck this."
-      : "Not currently collected — checking this starts collecting it now (this past range won't have host data yet, but later saved metrics will).";
     const done = (ok) => {
       dlgExport.close();
       $("dlg-export-ok").onclick = null;
       $("dlg-export-cancel").onclick = null;
-      resolve(ok ? { includeHost: cb.checked, hadHost: hasHost } : null);
+      resolve(ok ? {
+        includeHost: cb.checked,
+        hadHost: hasHost,
+        publicKey: $("export-key").value || null,
+      } : null);
     };
     $("dlg-export-ok").onclick = () => done(true);
     $("dlg-export-cancel").onclick = () => done(false);
@@ -872,8 +896,13 @@ async function exportSample(t0, t1) {
   if (!path) return;
   if (!path.endsWith(".cttc")) path += ".cttc";
   try {
-    const r = await post("/sample/export", { path, from: t0, to: t1, include_host: opts.includeHost });
-    setStatus(r.sources ? `metrics saved: ${r.path} (${r.sources} sources)`
+    const r = await post("/sample/export", {
+      path, from: t0, to: t1,
+      include_host: opts.includeHost,
+      public_key: opts.publicKey,
+    });
+    const enc = r.encrypted ? `, encrypted for “${opts.publicKey}”` : "";
+    setStatus(r.sources ? `metrics saved: ${r.path} (${r.sources} sources${enc})`
                         : "metrics saved, but no data in the selected range");
   } catch (err) {
     setStatus("metrics export failed: " + (err.message || err));
@@ -1794,6 +1823,108 @@ $("btn-load-sample").onclick = async () => {
     resetZoom(); // show the full timeline, including the newly loaded metrics
   } catch (err) {
     alert(String(err.message || err));
+  }
+};
+
+/* ── encryption keys management (dlg-keys) ──────────────────────────────── */
+
+const dlgKeys = $("dlg-keys");
+
+async function renderKeysList() {
+  const box = $("keys-list");
+  $("keys-error").textContent = "";
+  let keys = [];
+  try {
+    keys = (await get("/cttc/keys")).keys;
+  } catch (err) {
+    $("keys-error").textContent = String(err.message || err);
+    return;
+  }
+  box.innerHTML = "";
+  if (!keys.length) {
+    box.innerHTML = '<div class="muted">no keys yet</div>';
+    return;
+  }
+  for (const k of keys) {
+    const row = document.createElement("div");
+    row.className = "key-row";
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = k.name;
+    row.appendChild(name);
+    const badge = document.createElement("span");
+    badge.className = "key-badge" + (k.has_private ? " private" : "");
+    badge.textContent = k.has_private ? "public + private" : "public only";
+    badge.title = k.has_private
+      ? "You hold the private key: you can open metrics encrypted for this key."
+      : "Imported public key: you can encrypt metrics for its owner, not open them.";
+    row.appendChild(badge);
+    const spacer = document.createElement("span");
+    spacer.className = "spacer";
+    row.appendChild(spacer);
+    if (k.has_public) {
+      const copy = document.createElement("button");
+      copy.className = "icon-btn";
+      copy.textContent = "📋";
+      copy.title = "Copy the public key (share it so others can encrypt metrics for you)";
+      copy.onclick = async () => {
+        await navigator.clipboard.writeText(k.public_pem);
+        setStatus(`public key “${k.name}” copied to clipboard`);
+      };
+      row.appendChild(copy);
+    }
+    const del = document.createElement("button");
+    del.className = "icon-btn";
+    del.textContent = "🗑";
+    del.title = k.has_private
+      ? "Delete this keypair — metrics encrypted for it become unreadable!"
+      : "Delete this imported public key";
+    del.onclick = async () => {
+      const warn = k.has_private
+        ? `Delete keypair “${k.name}”?\n\nThe private key is destroyed: any metrics encrypted for it can never be opened again.`
+        : `Delete imported public key “${k.name}”?`;
+      if (!confirm(warn)) return;
+      try {
+        await post("/cttc/keys/delete", { name: k.name });
+        renderKeysList();
+      } catch (err) {
+        $("keys-error").textContent = String(err.message || err);
+      }
+    };
+    row.appendChild(del);
+    box.appendChild(row);
+  }
+}
+
+$("btn-keys").onclick = () => {
+  renderKeysList();
+  dlgKeys.showModal();
+};
+$("dlg-keys-close").onclick = () => dlgKeys.close();
+
+$("key-gen-btn").onclick = async () => {
+  const name = $("key-gen-name").value.trim();
+  try {
+    const r = await post("/cttc/keys/generate", { name });
+    $("key-gen-name").value = "";
+    setStatus(`keypair “${r.name}” generated`);
+    renderKeysList();
+  } catch (err) {
+    $("keys-error").textContent = String(err.message || err);
+  }
+};
+
+$("key-import-btn").onclick = async () => {
+  const name = $("key-import-name").value.trim();
+  const pem = $("key-import-pem").value.trim();
+  try {
+    const r = await post("/cttc/keys/import", { name, public_pem: pem });
+    $("key-import-name").value = "";
+    $("key-import-pem").value = "";
+    setStatus(`public key “${r.name}” imported`);
+    renderKeysList();
+  } catch (err) {
+    $("keys-error").textContent = String(err.message || err);
   }
 };
 

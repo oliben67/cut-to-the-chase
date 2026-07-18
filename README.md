@@ -66,7 +66,12 @@ the cursor to that line's time instead.
   **✂ Capture metrics** and drag) to export the selected time range — logs and
   metrics of every open source, host included — as a zipped **`.cttc`** file.
   Load a `.cttc` back via the toolbar's **📂 Load sample** button to analyze it
-  later.
+  later. The save dialog can **encrypt the file for a stored key** (“Encrypt
+  for” menu); loading an encrypted file prompts for the private key.
+- **🔑 Keys** (toolbar): manage the encryption keys in `~/.cttc/keys/` —
+  generate an RSA keypair for yourself, import public keys others share with
+  you, copy your public key to share, delete keys (with a loud warning when a
+  private key is involved).
 - **Duplicate guards**: a container, stats collector, host-telemetry collector,
   or file that is already being collected shows as *already added* and can't be
   added twice.
@@ -214,14 +219,15 @@ GET  /sources · /range · /series?from&to&px · /logs?source&start&count
      /index_at?source&t · /ticks?source&from&to&px · /logs/find?source&q&start&dir
      /point?t · /transforms · /ssh/keys · /cttc/keys · /events (SSE)
 POST /open · /close · /docker/ps · /docker/collect · /sample/export
-     /cttc/keys/generate · /cttc/keys/import · /shutdown
+     /cttc/keys/generate · /cttc/keys/import · /cttc/keys/delete · /shutdown
 ```
 
 `/series` entries carry `host` (host-telemetry flag), `sid` (source id) and
 `ttype` (`container` | `service`). `/docker/collect` accepts `host`, `stats`,
 `host_stats`, `logs: [{name, type}]`, `transforms`, `interval`, `ssh_key`.
 `/sample/export` takes `{path, from, to, include_host, public_key}` — with a
-`public_key` (a stored key name or raw PEM) the sample is encrypted
+`public_key` (a stored key name or raw PEM — pick one in the save-metrics
+dialog's “Encrypt for” menu) the sample is encrypted
 (RSA-OAEP-wrapped AES-256-GCM); `/open` then needs `private_key` for that
 file, and reports `encrypted: true` in its error entry when it's missing.
 Keys live in `~/.cttc/keys/`. All timestamps are epoch milliseconds. The

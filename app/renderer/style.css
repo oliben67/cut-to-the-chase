@@ -289,6 +289,7 @@ body.popout-telemetry #splitter,
 body.popout-telemetry #btn-add,
 body.popout-telemetry #btn-load-sample,
 body.popout-telemetry #btn-clear-sources,
+body.popout-telemetry #btn-keys,
 body.popout-telemetry #style-switch,
 body.popout-telemetry #host-block {
   display: none;
@@ -310,6 +311,7 @@ body.popout-host #splitter,
 body.popout-host #btn-add,
 body.popout-host #btn-load-sample,
 body.popout-host #btn-clear-sources,
+body.popout-host #btn-keys,
 body.popout-host #style-switch,
 body.popout-host #btn-popout-telemetry {
   display: none;
@@ -517,4 +519,34 @@ pre.snapshot-body {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* keys-management dialog */
+.keys-list { display: flex; flex-direction: column; gap: 2px; margin: 8px 0; }
+.key-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.key-row .name { font-weight: 600; }
+.key-badge {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+.key-badge.private { border-color: var(--accent); color: var(--accent); }
+.key-row .spacer { margin-left: auto; }
+.keys-box { border: 1px solid var(--border); border-radius: 6px; margin: 8px 0; }
+.keys-box legend { font-size: 12px; color: var(--text-secondary); padding: 0 4px; }
+.keys-box input[type="text"] { flex: 1; min-width: 200px; }
+.keys-box textarea {
+  width: 100%;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  margin: 6px 0;
 }

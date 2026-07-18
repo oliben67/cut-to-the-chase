@@ -554,6 +554,68 @@
     }
   });
 
+  await T("keys dialog: generate, import, list badges, delete", async () => {
+    const tmp = "__e2e-key-" + Date.now().toString(36);
+    const rows = () => [...document.querySelectorAll("#keys-list .key-row")];
+    const rowOf = (n) => rows().find((r) => r.querySelector(".name").textContent === n);
+    $("btn-keys").click();
+    await until(() => dlgKeys.open, "keys dialog open");
+    try {
+      $("key-gen-name").value = tmp;
+      $("key-gen-btn").click();
+      await until(() => rowOf(tmp), "generated key listed");
+      ok(rowOf(tmp).querySelector(".key-badge").textContent.includes("private"), "own key badged private");
+      ok(rowOf(tmp).querySelector("button[title*='Copy']"), "copy button offered");
+
+      const pem = (await get("/cttc/keys")).keys.find((k) => k.name === tmp).public_pem;
+      $("key-import-name").value = tmp + "-pub";
+      $("key-import-pem").value = pem;
+      $("key-import-btn").click();
+      await until(() => rowOf(tmp + "-pub"), "imported key listed");
+      eq(rowOf(tmp + "-pub").querySelector(".key-badge").textContent, "public only", "imported key badged");
+
+      $("key-import-name").value = tmp + "-pub";        // duplicate name
+      $("key-import-pem").value = pem;
+      $("key-import-btn").click();
+      await until(() => $("keys-error").textContent.includes("already exists"), "duplicate rejected inline");
+
+      const realConfirm = window.confirm;
+      window.confirm = () => true;
+      try {
+        rowOf(tmp + "-pub").querySelector("button[title*='Delete']").click();
+        await until(() => !rowOf(tmp + "-pub"), "deleted via UI");
+      } finally {
+        window.confirm = realConfirm;
+      }
+      await post("/cttc/keys/delete", { name: tmp });
+      await renderKeysList();
+      ok(!rows().some((r) => r.querySelector(".name").textContent.startsWith("__e2e-key-")), "cleaned up");
+    } finally {
+      dlgKeys.close();
+      for (const n of [tmp, tmp + "-pub"]) await post("/cttc/keys/delete", { name: n }).catch(() => {});
+    }
+  });
+
+  await T("export dialog resolves host + encryption choices", async () => {
+    const tmp = "__e2e-exp-" + Date.now().toString(36);
+    await post("/cttc/keys/generate", { name: tmp });
+    try {
+      const p = askExportOptions();
+      await until(() => dlgExport.open, "export dialog open");
+      const values = [...$("export-key").options].map((o) => o.value);
+      ok(values.includes(""), "offers no-encryption");
+      ok(values.includes(tmp), "offers the stored key");
+      $("export-key").value = tmp;
+      $("export-host").checked = false;
+      $("dlg-export-ok").click();
+      const opts = await p;
+      eq(opts.publicKey, tmp, "chosen key returned");
+      eq(opts.includeHost, false, "host choice returned");
+    } finally {
+      await post("/cttc/keys/delete", { name: tmp }).catch(() => {});
+    }
+  });
+
   // destructive — must stay the last test: closes every source, then reopens
   // the demo files so the app is left usable.
   await T("clear-sources button closes everything", async () => {
