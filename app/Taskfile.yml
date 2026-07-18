@@ -1,0 +1,107 @@
+# https://taskfile.dev  —  requires Task ≥ 3.28
+version: '3'
+
+vars:
+  SERVER: server
+  # Strip any active venv from another project so uv always uses the local .venv.
+  UV: env -u VIRTUAL_ENV uv
+  # VSCode's extension host exports ELECTRON_RUN_AS_NODE, which turns the
+  # Electron binary into plain Node — strip it so the app can launch.
+  ELECTRON: env -u ELECTRON_RUN_AS_NODE npx electron
+
+# ── Default ────────────────────────────────────────────────────────────────
+tasks:
+  default:
+    desc: List all available tasks
+    silent: true
+    cmd: task --list
+
+  # ── Setup ─────────────────────────────────────────────────────────────────
+  install:
+    desc: Install all dependencies (Electron via npm, server venv via uv)
+    cmds:
+      - npm install
+      - "{{.UV}} sync --project {{.SERVER}}"
+
+  # ── Development ───────────────────────────────────────────────────────────
+  start:
+    desc: Launch the app (spawns the Python server automatically)
+    cmd: "{{.ELECTRON}} ."
+
+  start:files:
+    desc: "Launch the app with files opened      [usage: task start:files -- a.jsonl b.log]"
+    cmd: "{{.ELECTRON}} . {{.CLI_ARGS}}"
+
+  serve:
+    desc: "Run the Python server alone on a fixed port for API work   [usage: task serve -- 8765]"
+    dir: '{{.SERVER}}'
+    cmd: "{{.UV}} run server.py --port {{.CLI_ARGS | default \"8765\"}}"
+
+  screenshot:
+    desc: Headless UI verification — capture the demo to shot.png and quit
+    cmds:
+      - env -u ELECTRON_RUN_AS_NODE CTTC_SCREENSHOT={{.PWD}}/shot.png CTTC_CURSOR_OFFSET=765000
+        npx electron . demo/data/stats.jsonl demo/data/c3_api.log demo/data/c3_worker.log
+      - cmd: echo "Screenshot → shot.png"
+        silent: true
+
+  # ── Demo data ─────────────────────────────────────────────────────────────
+  demo:
+    desc: Generate 30 minutes of correlated demo history into demo/data/
+    cmd: "{{.UV}} run --project {{.SERVER}} python demo/generate_demo.py"
+
+  demo:live:
+    desc: Generate demo history and keep appending live ticks (Ctrl+C to stop)
+    interactive: true
+    cmd: "{{.UV}} run --project {{.SERVER}} python demo/generate_demo.py --live"
+
+  demo:start:
+    desc: Generate demo data, then launch the app with it
+    cmds:
+      - task: demo
+      - "{{.ELECTRON}} . demo/data/stats.jsonl demo/data/c3_api.log demo/data/c3_worker.log"
+
+  # ── Quality gates ─────────────────────────────────────────────────────────
+  check:
+    desc: Run all quality gates — JS syntax checks and server import (orjson present)
+    cmds:
+      - node --check main.js
+      - node --check preload.js
+      - node --check renderer/app.js
+      - "{{.UV}} run --project {{.SERVER}} python -c 'import sys; sys.path.insert(0, \"{{.SERVER}}\"); import server; print(\"server imports ok,\", server.JSON_IMPL)'"
+
+  ci:
+    desc: Full CI pipeline — install → check
+    cmds:
+      - task: install
+      - task: check
+
+  # ── Dependencies ──────────────────────────────────────────────────────────
+  deps:update:
+    desc: Update server packages to their latest allowed versions
+    dir: '{{.SERVER}}'
+    cmd: uv lock --upgrade
+
+  deps:tree:
+    desc: Show the server dependency tree
+    dir: '{{.SERVER}}'
+    cmd: uv tree
+
+  # ── Clean ─────────────────────────────────────────────────────────────────
+  clean:
+    desc: Remove generated demo data, screenshots, and caches
+    silent: true
+    cmd: |
+      rm -rf demo/data/ shot.png
+      find . -path './node_modules' -prune -o -path './{{.SERVER}}/.venv' -prune \
+        -o -type d -name '__pycache__' -print | xargs rm -rf 2>/dev/null || true
+      printf '\033[32m✓ Clean\033[0m\n'
+
+  clean:all:
+    desc: Remove everything including node_modules and the server venv (run task install to restore)
+    cmds:
+      - task: clean
+      - cmd: rm -rf node_modules/ {{.SERVER}}/.venv/
+        silent: true
+      - cmd: printf '\033[32m✓ Fully clean\033[0m\n'
+        silent: true

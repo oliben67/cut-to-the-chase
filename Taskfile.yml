@@ -1,0 +1,41 @@
+# https://taskfile.dev  —  requires Task ≥ 3.28
+version: '3'
+
+includes:
+  app:
+    taskfile: ./app/Taskfile.yml
+    dir: ./app
+
+# ── Default ────────────────────────────────────────────────────────────────
+tasks:
+  default:
+    desc: List all available tasks
+    silent: true
+    cmd: task --list
+
+  # ── Combined workflows ────────────────────────────────────────────────────
+  install:
+    desc: Install dependencies for every sub-project
+    cmds:
+      - task: app:install
+
+  check:
+    desc: Run all quality gates across every sub-project
+    cmds:
+      - task: app:check
+
+  ci:
+    desc: Full CI pipeline for all sub-projects
+    cmds:
+      - task: app:ci
+
+  # ── Clean ─────────────────────────────────────────────────────────────────
+  clean:
+    desc: Remove build artefacts and caches across all sub-projects
+    cmds:
+      - task: app:clean
+
+  clean:all:
+    desc: Remove everything including venvs and node_modules across all sub-projects
+    cmds:
+      - task: app:clean:all

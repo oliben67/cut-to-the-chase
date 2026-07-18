@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; connect-src http://127.0.0.1:* http://localhost:*; style-src 'self'; script-src 'self'; img-src 'self' data:" />
+  <title>CTTC Timeline</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header id="toolbar">
+    <strong class="app-title">CTTC Timeline</strong>
+    <button id="btn-add">＋ Add sources</button>
+    <label class="ctl">window ±<input id="win-secs" type="number" min="0" step="1" value="5" /> s</label>
+    <label class="ctl"><input id="chk-follow" type="checkbox" /> follow live</label>
+    <span class="btn-group">
+      <button id="btn-back" title="Pan half a window back">◀</button>
+      <button id="btn-now" title="Center the timeline on now">now</button>
+      <button id="btn-fwd" title="Pan half a window forward">▶</button>
+    </span>
+    <button id="btn-reset" title="Reset zoom (double-click chart)">reset zoom</button>
+    <button id="btn-style" title="Switch between line plot and histogram"></button>
+    <button id="btn-sample" title="Save a time range as a .cttc sample: click, then drag on the charts (shift+drag always works)">✂ sample</button>
+    <span id="status" class="muted"></span>
+    <span id="cursor-label" class="cursor-label"></span>
+  </header>
+
+  <main id="layout">
+    <section id="chart-block">
+      <div id="legend"></div>
+      <div id="charts"></div>
+      <div id="lanes"></div>
+      <div id="host-block" hidden>
+        <div id="host-head">
+          <span>Host telemetry</span>
+          <button id="btn-host-toggle"></button>
+        </div>
+        <div id="host-charts"></div>
+      </div>
+      <div id="empty-state" class="muted">No sources yet — click “＋ Add sources” to open log/stats files or attach to a Docker daemon (local or ssh://).</div>
+    </section>
+    <div id="splitter" title="Drag to resize the logs panel"></div>
+    <section id="panels"></section>
+  </main>
+
+  <div id="tooltip" hidden></div>
+
+  <dialog id="dlg-add">
+    <h2>Add sources</h2>
+    <div class="tabs">
+      <button class="tab active" data-tab="files">Files</button>
+      <button class="tab" data-tab="docker">Docker</button>
+    </div>
+
+    <div class="tab-page" id="page-files">
+      <button id="btn-pick">Choose files…</button>
+      <ul id="picked-files" class="muted"></ul>
+      <label class="ctl"><input id="files-live" type="checkbox" checked /> tail files for new lines (live)</label>
+    </div>
+
+    <div class="tab-page" id="page-docker" hidden>
+      <label class="ctl block">Docker host
+        <input id="docker-host" type="text" placeholder="empty = local daemon, or ssh://user@host" />
+      </label>
+      <label class="ctl block" id="ssh-key-row" hidden>SSH key
+        <select id="ssh-key"></select>
+      </label>
+      <button id="btn-ps">List containers</button>
+      <button id="btn-ps-refresh" hidden>Refresh</button>
+      <div id="docker-error" class="error"></div>
+      <label class="ctl"><input id="docker-stats" type="checkbox" checked /> collect <code>docker stats</code> telemetry <span id="docker-stats-note" class="tdoc"></span></label>
+      <label class="ctl"><input id="docker-host-stats" type="checkbox" checked /> collect host telemetry (CPU/MEM/NET of the docker host) <span id="docker-host-stats-note" class="tdoc"></span></label>
+      <label class="ctl block">poll interval <input id="docker-interval" type="number" min="1" value="5" /> s</label>
+      <div id="docker-targets"></div>
+    </div>
+
+    <fieldset id="transforms-box">
+      <legend>Transforms applied to new log sources</legend>
+      <div id="transforms-list" class="muted">none found</div>
+    </fieldset>
+
+    <div class="dlg-actions">
+      <button id="dlg-cancel">Cancel</button>
+      <button id="dlg-ok" class="primary">Add</button>
+    </div>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,226 @@
+#!/usr/bin/env bash
+# analyze-logs — Docker Swarm container stats log analyzer
+#
+# Usage: analyze-logs [FILE] [REFRESH_SECONDS]
+#   FILE             JSON stats log produced by jsonify-stats (default: ~/tst-logs.log)
+#   REFRESH_SECONDS  re-render every N seconds; omit for one-shot output
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# Ad-hoc jq queries — FILE is already a valid JSON array; use directly:
+#   jq '<expr>' FILE
+#
+#  1) Latest stats per service, sorted by CPU:
+#     jq -r '[.[]|select(.Name!="--")]|group_by(.Name|split(".")|.[0])|map(max_by(.timestamp))|sort_by(.CPUPerc|rtrimstr("%")|tonumber)|reverse|.[]|[(.Name|split(".")|.[0]),.CPUPerc,.MemPerc,(.MemUsage|split(" / ")|.[0]),.NetIO]|@tsv' FILE | column -t
+#
+#  2) Average CPU & memory per service (all samples):
+#     jq -r '[.[]|select(.Name!="--")]|group_by(.Name|split(".")|.[0])|map({s:(.[0].Name|split(".")|.[0]),c:([.[].CPUPerc|rtrimstr("%")|tonumber]|add/length),m:([.[].MemPerc|rtrimstr("%")|tonumber]|add/length)})|sort_by(.c)|reverse|.[]|[.s,"\(.c*10|round/10)%","\(.m*10|round/10)%"]|@tsv' FILE | column -t
+#
+#  3) Peak CPU per service with timestamp:
+#     jq -r '[.[]|select(.Name!="--")]|group_by(.Name|split(".")|.[0])|map({s:(.[0].Name|split(".")|.[0]),p:([.[].CPUPerc|rtrimstr("%")|tonumber]|max),at:(max_by(.CPUPerc|rtrimstr("%")|tonumber)|.timestamp)})|sort_by(.p)|reverse|.[]|[.s,"\(.p)%",.at]|@tsv' FILE | column -t
+#
+#  4) Top 20 highest CPU events (any service, any timestamp):
+#     jq -r '[.[]|select(.Name!="--")]|sort_by(.CPUPerc|rtrimstr("%")|tonumber)|reverse|.[0:20]|.[]|[.timestamp,(.Name|split(".")|.[0]),.CPUPerc,.MemPerc]|@tsv' FILE | column -t
+#
+#  5) Services that ever exceeded 50% CPU:
+#     jq -r '[.[]|select(.Name!="--")]|group_by(.Name|split(".")|.[0])|[.[]|select(any(.[]; .CPUPerc|rtrimstr("%")|tonumber > 50))|.[0].Name|split(".")|.[0]]|unique[]' FILE
+#
+#  6) CPU & memory over time for one service (CSV — pipe to gnuplot / Python):
+#     jq -r '.[]|select(.Name|startswith("c3_cembalo"))|[.timestamp,.CPUPerc,.MemPerc]|@csv' FILE
+#
+#  7) Memory hogs — latest snapshot, sorted by MemPerc:
+#     jq -r '[.[]|select(.Name!="--")]|group_by(.Name|split(".")|.[0])|map(max_by(.timestamp))|sort_by(.MemPerc|rtrimstr("%")|tonumber)|reverse|.[]|[(.Name|split(".")|.[0]),.MemPerc,.MemUsage]|@tsv' FILE | column -t
+#
+#  8) All containers captured at a specific timestamp:
+#     jq -r '.[]|select(.timestamp=="2026-07-15T12:53:15")|[(.Name|split(".")|.[0]),.CPUPerc,.MemPerc]|@tsv' FILE | column -t
+#
+#  9) Container count per poll (sanity check for missed snapshots):
+#     jq -r 'group_by(.timestamp)|.[]|"\(.[0].timestamp)\t\(length)"' FILE | column -t
+#
+# 10) Services with most container restarts (many unique task IDs):
+#     jq -r '[.[]|select(.Name!="--")]|group_by(.Name|split(".")|.[0])|map({s:(.[0].Name|split(".")|.[0]),n:([.[].Name]|unique|length)})|sort_by(.n)|reverse|.[]|"\(.n)\t\(.s)"' FILE | column -t
+#
+# 11) Redis memory & CPU trend (CSV for charting):
+#     jq -r '.[]|select(.Name|contains("redis"))|[.timestamp,.MemUsage,.MemPerc,.CPUPerc]|@csv' FILE
+#
+# 12) Sustained high CPU — % of samples above threshold per service:
+#     jq -r --argjson t 30 '[.[]|select(.Name!="--")]|group_by(.Name|split(".")|.[0])|map({s:(.[0].Name|split(".")|.[0]),hot:([.[].CPUPerc|rtrimstr("%")|tonumber]|map(select(.>=$t))|length),n:length})|map(.+{pct:(.hot/.n*100|round)})|sort_by(.pct)|reverse|.[]|select(.pct>0)|[.s,"\(.pct)% of samples","\(.hot)/\(.n) above \($t)%"]|@tsv' FILE | column -t
+# ─────────────────────────────────────────────────────────────────────────────
+
+FILE="${1:-$HOME/tst-logs.log}"
+INTERVAL="${2:-0}"
+
+if [[ ! -f "$FILE" ]]; then
+    echo "Error: file not found: $FILE" >&2
+    echo "Usage: analyze-logs [FILE] [REFRESH_SECONDS]" >&2
+    exit 1
+fi
+
+# Colors — $'...' produces actual ESC bytes; works in printf AND awk -v
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    RED=$'\033[0;31m' YEL=$'\033[0;33m' GRN=$'\033[0;32m'
+    CYN=$'\033[0;36m' BLD=$'\033[1m'    DIM=$'\033[2m'    RST=$'\033[0m'
+else
+    RED='' YEL='' GRN='' CYN='' BLD='' DIM='' RST=''
+fi
+
+CPU_WARN=25   # yellow at or above this threshold
+CPU_CRIT=50   # red at or above this threshold
+
+jf() { jq "$@" "$FILE"; }
+
+# Use a wide column width so column -t never wraps (COLUMNS=80 by default in some envs)
+tbl() { COLUMNS=300 column -t -s $'\t'; }
+
+section() { printf "\n%s── %s ──%s\n" "${BLD}${CYN}" "$1" "${RST}"; }
+
+# Colorize aligned table rows by the CPU column (pass column index as $1, default 2)
+color_rows() {
+    local col=${1:-2}
+    awk -v col="$col" \
+        -v RED="$RED" -v YEL="$YEL" -v RST="$RST" -v DIM="$DIM" \
+        -v WARN="$CPU_WARN" -v CRIT="$CPU_CRIT" '
+    NR == 1 { printf "%s%s%s\n", DIM, $0, RST; next }
+    {
+        cpu = $col; gsub(/%/, "", cpu); cpu = cpu + 0
+        if      (cpu >= CRIT) printf "%s%s%s\n", RED, $0, RST
+        else if (cpu >= WARN) printf "%s%s%s\n", YEL, $0, RST
+        else                  print $0
+    }'
+}
+
+show_header() {
+    local size
+    size=$(du -h "$FILE" | cut -f1)
+    printf "%sDocker Swarm Stats Analyzer%s  │  %s\n" "${BLD}" "${RST}" "$(date '+%Y-%m-%d %H:%M:%S')"
+    printf "%sFile  : %s  (%s)%s\n" "${DIM}" "$FILE" "$size" "${RST}"
+    jf -r '"Range : \(map(.timestamp)|min)  →  \(map(.timestamp)|max)",
+            "Data  : \(length) records  ·  \([.[].Name|split(".")|.[0]]|unique|length) services  ·  \([.[].Name]|unique|length) container instances"'
+}
+
+show_latest() {
+    section "Latest snapshot per service  [sorted by CPU ↓]"
+    {
+        printf 'SERVICE\tCPU%%\tMEM%%\tMEM_USED\tNET_I/O\tPIDs\n'
+        jf -r '
+            [.[] | select(.Name != "--")] |
+            group_by(.Name | split(".") | .[0]) |
+            map(max_by(.timestamp)) |
+            sort_by(.CPUPerc | rtrimstr("%") | tonumber) | reverse |
+            .[] | [
+                (.Name | split(".") | .[0]),
+                .CPUPerc,
+                .MemPerc,
+                (.MemUsage | split(" / ") | .[0]),
+                .NetIO,
+                .PIDs
+            ] | @tsv
+        '
+    } | tbl | color_rows 2
+}
+
+show_avg() {
+    section "Average CPU & Memory per service  [all samples]"
+    {
+        printf 'SERVICE\tAVG_CPU%%\tAVG_MEM%%\tSAMPLES\n'
+        jf -r '
+            [.[] | select(.Name != "--")] |
+            group_by(.Name | split(".") | .[0]) |
+            map({
+                svc: (.[0].Name | split(".") | .[0]),
+                cpu: ([.[].CPUPerc | rtrimstr("%") | tonumber] | (add / length * 10 | round) / 10),
+                mem: ([.[].MemPerc | rtrimstr("%") | tonumber] | (add / length * 10 | round) / 10),
+                n:   length
+            }) |
+            sort_by(.cpu) | reverse |
+            .[] | [.svc, "\(.cpu)%", "\(.mem)%", (.n | tostring)] | @tsv
+        '
+    } | tbl | color_rows 2
+}
+
+show_peak() {
+    section "Peak CPU per service"
+    {
+        printf 'SERVICE\tPEAK_CPU%%\tPEAK_MEM%%\tPEAK_AT\n'
+        jf -r '
+            [.[] | select(.Name != "--")] |
+            group_by(.Name | split(".") | .[0]) |
+            map({
+                svc:      (.[0].Name | split(".") | .[0]),
+                peak_cpu: ([.[].CPUPerc | rtrimstr("%") | tonumber] | max),
+                peak_mem: ([.[].MemPerc | rtrimstr("%") | tonumber] | max),
+                peak_at:  (max_by(.CPUPerc | rtrimstr("%") | tonumber) | .timestamp)
+            }) |
+            sort_by(.peak_cpu) | reverse |
+            .[] | [.svc, "\(.peak_cpu)%", "\(.peak_mem)%", .peak_at] | @tsv
+        '
+    } | tbl | color_rows 2
+}
+
+show_top_events() {
+    section "Top 15 CPU spike events  [global ranking]"
+    {
+        printf 'TIMESTAMP\tSERVICE\tCPU%%\tMEM%%\n'
+        jf -r '
+            [.[] | select(.Name != "--")] |
+            sort_by(.CPUPerc | rtrimstr("%") | tonumber) | reverse | .[0:15] |
+            .[] | [.timestamp, (.Name | split(".") | .[0]), .CPUPerc, .MemPerc] | @tsv
+        '
+    } | tbl | color_rows 3
+}
+
+show_sustained() {
+    section "Sustained high CPU  [% of samples at or above ${CPU_WARN}%]"
+    {
+        printf 'SERVICE\tHOT_SAMPLES%%\tABOVE_%d%%\tTOTAL\n' "$CPU_WARN"
+        jf -r --argjson t "$CPU_WARN" '
+            [.[] | select(.Name != "--")] |
+            group_by(.Name | split(".") | .[0]) |
+            map({
+                svc: (.[0].Name | split(".") | .[0]),
+                hot: ([.[].CPUPerc | rtrimstr("%") | tonumber] | map(select(. >= $t)) | length),
+                n:   length
+            }) |
+            map(. + {pct: ((.hot * 100) / .n | round)}) |
+            [.[] | select(.hot > 0)] |
+            sort_by(.pct) | reverse |
+            .[] | [.svc, "\(.pct)%", (.hot | tostring), (.n | tostring)] | @tsv
+        '
+    } | tbl | color_rows 2
+}
+
+show_restarts() {
+    local out
+    out=$(jf -r '
+        [.[] | select(.Name != "--")] |
+        group_by(.Name | split(".") | .[0]) |
+        map({svc: (.[0].Name | split(".") | .[0]), n: ([.[].Name] | unique | length)}) |
+        [.[] | select(.n > 1)] |
+        sort_by(.n) | reverse |
+        .[] | [(.n | tostring), .svc] | @tsv
+    ' 2>/dev/null)
+    if [[ -n "$out" ]]; then
+        section "Services with multiple container instances  [restarts / scaling]"
+        { printf 'INSTANCES\tSERVICE\n'; echo "$out"; } | tbl
+    fi
+}
+
+render() {
+    show_header
+    show_latest
+    show_avg
+    show_peak
+    show_top_events
+    show_sustained
+    show_restarts
+}
+
+if [[ "$INTERVAL" =~ ^[1-9][0-9]*$ ]]; then
+    while true; do
+        clear
+        render
+        printf "\n%sAuto-refresh every %ss — Ctrl+C to quit%s\n" "${DIM}" "$INTERVAL" "${RST}"
+        sleep "$INTERVAL"
+    done
+else
+    render
+fi
