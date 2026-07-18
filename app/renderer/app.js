@@ -730,10 +730,16 @@ function relist() {
   drawAll();
 }
 
+// the view/cursor handed to a new popout window so it opens on exactly the
+// same time range as this window (no blank boot, no zoom reset)
+function popoutView() {
+  return state.view ? { t0: state.view.t0, t1: state.view.t1, cursor: state.cursorT } : null;
+}
+
 // open one container's / loaded record's telemetry in its own synced window
 // (kept as a plain function so the E2E spec can stub it)
 function openSeriesPopout(name) {
-  window.cttc?.popout?.("series", name);
+  window.cttc?.popout?.("series", name, popoutView());
 }
 
 function seriesPopoutMenuEntry(s) {
@@ -1489,7 +1495,7 @@ class Panel {
     popout.onclick = () => {
       state.poppedOut.add(src.id);
       syncPanels();
-      window.cttc.popout("log", src.id);
+      window.cttc.popout("log", src.id, popoutView());
     };
     const close = document.createElement("button");
     close.className = "close";
@@ -1739,7 +1745,14 @@ async function refreshAll() {
     $("empty-state").hidden = state.sources.length > 0;
     syncPanels();
     if (range.min_ts != null && !hadView) {
-      resetZoom();
+      if (POPOUT_KIND) {
+        // popout fallback (no view handed over): fit quietly, never yank the
+        // opener's view via a broadcast
+        const pad = Math.max(1000, (range.max_ts - range.min_ts) * 0.01);
+        setView(range.min_ts - pad, range.max_ts + pad, { broadcast: false });
+      } else {
+        resetZoom();
+      }
     }
     await fetchSeries();
     setStatus(src.json_impl === "orjson" ? "" : "server running without orjson (slow parse)");
@@ -2115,12 +2128,12 @@ $("btn-freq-help").onclick = () => window.cttc.openHelp("frequency");
 $("btn-popout-telemetry").onclick = () => {
   state.poppedOut.add("telemetry");
   applyPopoutLayout();
-  window.cttc.popout("telemetry");
+  window.cttc.popout("telemetry", null, popoutView());
 };
 $("btn-popout-host").onclick = () => {
   state.poppedOut.add("host");
   drawAll();
-  window.cttc.popout("host");
+  window.cttc.popout("host", null, popoutView());
 };
 
 function syncStyleButton() {
@@ -2165,9 +2178,21 @@ buildStrips();
 syncStyleButton();
 applyPopoutLayout();
 // main window: default view is the present, ± DEFAULT_SPAN/2. Popped-out
-// panel windows start with no view so the first refreshAll() fits the full
-// available range instead (they then track the opener via sync-broadcast).
-if (!POPOUT_KIND) centerOnNow();
+// panel windows inherit the opener's exact view/cursor from the URL, so they
+// open on the same time range without resetting (or broadcasting) anything;
+// they then track the opener via sync-broadcast.
+if (!POPOUT_KIND) {
+  centerOnNow();
+} else {
+  const q = new URLSearchParams(location.search);
+  const v0 = parseFloat(q.get("v0")), v1 = parseFloat(q.get("v1")), vc = parseFloat(q.get("vc"));
+  if (Number.isFinite(v0) && Number.isFinite(v1)) {
+    setView(v0, v1, { broadcast: false });
+    if (Number.isFinite(vc)) setCursor(vc, { broadcast: false });
+  }
+  // no view handed over (shouldn't happen): the first refreshAll() falls
+  // back to fitting the full available range
+}
 const chartsResizeObserver = new ResizeObserver(() => {
   scheduleSeriesFetch();
   drawAll();

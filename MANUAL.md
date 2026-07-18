@@ -334,8 +334,9 @@ In addition, **right-click any container or loaded record in the legend →
 series: its CPU/MEM/NET strips and its matching log density lane, whatever
 its selection state in the main legend.
 
-Popped-out windows talk to the same data and stay fully in sync — moving the
-cursor or the view in one window moves it everywhere. Closing a pop-out
+A new pop-out opens on **exactly the time range and cursor you were looking
+at**. Popped-out windows talk to the same data and stay fully in sync —
+moving the cursor or the view in one window moves it everywhere. Closing a pop-out
 (with **⤴ Pop back** or the window's close button) returns focus to the
 window it was opened from — the main window, or another pop-out if that is
 where you opened it. Telemetry/host/log pop-outs are reintegrated into the

@@ -231,7 +231,7 @@ ipcMain.handle("save-text", (_e, name, text) =>
 // window (and each other) via the "sync-broadcast" relay below.
 const popoutWindows = new Map(); // "kind:id" -> BrowserWindow
 
-ipcMain.handle("popout", async (e, kind, id) => {
+ipcMain.handle("popout", async (e, kind, id, view) => {
   const key = `${kind}:${id || ""}`;
   const existing = popoutWindows.get(key);
   if (existing && !existing.isDestroyed()) {
@@ -253,6 +253,13 @@ ipcMain.handle("popout", async (e, kind, id) => {
   popoutWindows.set(key, win);
   const params = new URLSearchParams({ port: String(serverPort), popout: kind });
   if (id) params.set("id", id);
+  // hand the opener's current view/cursor over so the new window opens on
+  // exactly the same time range instead of blank-then-reset
+  if (view && view.t0 != null) {
+    params.set("v0", String(view.t0));
+    params.set("v1", String(view.t1));
+    if (view.cursor != null) params.set("vc", String(view.cursor));
+  }
   await win.loadFile(path.join(__dirname, "renderer", "index.html"), { search: params.toString() });
   win.on("closed", () => {
     popoutWindows.delete(key);
