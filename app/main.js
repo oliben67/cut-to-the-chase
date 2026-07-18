@@ -9,10 +9,10 @@ const SERVER_DIR = path.join(__dirname, "server");
 const APP_ICON = path.join(__dirname, "assets", "icon.png");
 // one-liner as published on GitHub (kept in sync with package.json's "description")
 const APP_TAGLINE = "Correlate container telemetry with service logs on a shared clickable timeline";
-// in-app "?" help buttons link here, one anchor per README section
-const HELP_URL = "https://github.com/oliben67/cut-to-the-chase#readme";
+// in-app "?" help buttons link here, one anchor per User Manual section
+const HELP_URL = "https://github.com/oliben67/cut-to-the-chase/blob/main/MANUAL.md";
 const HELP_TOPICS = {
-  frequency: "#interactions",
+  frequency: "#the-cursor-and-the-frequency-window",
 };
 let serverProc = null;
 let serverPort = null;
