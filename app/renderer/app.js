@@ -45,7 +45,6 @@ const state = {
   hoverX: null,           // crosshair pixel x (plot coords) or null
   hoverStrip: null,
   windowMs: 5000,
-  follow: false,
   series: null,           // /series payload for current view
   ticks: new Map(),       // log source id -> counts[]
   visible: new Map(),     // series name -> bool
@@ -202,6 +201,47 @@ const hostChartsEl = $("host-charts"), hostBlockEl = $("host-block");
 const chartNav = attachTimelineNav($("chart-nav"));
 const hostNav = attachTimelineNav($("host-nav"));
 
+/* ── instant hover hints ── every titled element gets its tooltip text shown
+   right away next to the cursor, instead of waiting for the browser's native
+   (and comparatively slow) title-attribute delay. We swap the real "title"
+   out while hovering so the native tooltip never gets a chance to appear. */
+const hintEl = $("hint");
+let hintTarget = null;
+
+function positionHint(e) {
+  const pad = 14;
+  hintEl.style.left = Math.max(4, Math.min(e.clientX + pad, innerWidth - hintEl.offsetWidth - 4)) + "px";
+  hintEl.style.top = Math.max(4, Math.min(e.clientY + pad, innerHeight - hintEl.offsetHeight - 4)) + "px";
+}
+function hideHint() {
+  if (hintTarget) {
+    hintTarget.setAttribute("title", hintTarget.dataset.hintTitle);
+    delete hintTarget.dataset.hintTitle;
+    hintTarget = null;
+  }
+  hintEl.hidden = true;
+}
+document.addEventListener("mouseover", (e) => {
+  const el = e.target.closest("[title]");
+  if (!el || el === hintTarget || !el.getAttribute("title")) return;
+  hideHint();
+  hintTarget = el;
+  el.dataset.hintTitle = el.getAttribute("title");
+  el.removeAttribute("title");
+  hintEl.textContent = hintTarget.dataset.hintTitle;
+  hintEl.hidden = false;
+  positionHint(e);
+});
+document.addEventListener("mousemove", (e) => {
+  if (!hintTarget) return;
+  if (!hintTarget.isConnected) { hideHint(); return; }
+  positionHint(e);
+});
+document.addEventListener("mouseout", (e) => {
+  if (hintTarget && (!e.relatedTarget || !hintTarget.contains(e.relatedTarget))) hideHint();
+});
+document.addEventListener("mousedown", hideHint);
+
 // this window is itself a popped-out panel: show only that panel, full-size.
 if (POPOUT_KIND === "telemetry") document.body.classList.add("popout-telemetry");
 if (POPOUT_KIND === "log") document.body.classList.add("popout-log");
@@ -290,11 +330,16 @@ function allSvcSeries() {
 function drawAll() {
   if (!state.view) return;
   const hasHost = seriesOf("host", false).length > 0;
+  // a host-telemetry source was added but hasn't produced any samples yet
+  // (docker stats / the ssh poller need a beat to report the first reading)
+  const hostLoading = !hasHost && state.sources.some((s) => s.kind === "stats" && s.is_host);
   const hostPoppedOut = !POPOUT_KIND && state.poppedOut.has("host");
   // a "telemetry"/"log" popout only ever shows containers, never the host.
-  hostBlockEl.hidden = POPOUT_KIND === "host" ? false : (POPOUT_KIND != null || !hasHost || hostPoppedOut);
-  hostChartsEl.hidden = !state.showHost;
-  $("host-nav").hidden = !state.showHost;
+  hostBlockEl.hidden = POPOUT_KIND === "host" ? false : (POPOUT_KIND != null || !(hasHost || hostLoading) || hostPoppedOut);
+  const showingHostArea = !hostBlockEl.hidden && state.showHost;
+  $("host-loading").hidden = !(showingHostArea && hostLoading);
+  hostChartsEl.hidden = !showingHostArea || hostLoading;
+  $("host-nav").hidden = !showingHostArea || hostLoading;
   $("btn-host-toggle").textContent = state.showHost ? "\u25be" : "\u25b8";
   $("btn-host-toggle").title = state.showHost ? "Hide host telemetry" : "Show host telemetry";
   STRIPS.forEach((spec, i) => drawStrip(stripCanvases[i], spec, "svc", i === STRIPS.length - 1));
@@ -569,7 +614,14 @@ function ctxMenu(e, entries) {
   ctxEl.style.top = Math.min(e.clientY, innerHeight - bb.height - 6) + "px";
 }
 window.addEventListener("click", closeCtxMenu);
-window.addEventListener("keydown", (e) => { if (e.key === "Escape") closeCtxMenu(); });
+window.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  closeCtxMenu();
+  if (sampleArmed) { setSampleArmed(false); setStatus(""); }
+  for (const p of panels.values()) {
+    if (p.selected.size) { p.selected.clear(); p.render(); }
+  }
+});
 
 // Track a so-far-unselected container: plot its telemetry and start following
 // its logs from the docker host its stats came from.
@@ -724,7 +776,12 @@ let sampleArmed = false;
 
 function setSampleArmed(v) {
   sampleArmed = v;
-  $("btn-sample").classList.toggle("armed", v);
+  document.body.classList.toggle("sample-armed", v);
+}
+
+function armSampleCapture() {
+  setSampleArmed(true);
+  setStatus("Capture metrics armed — drag across a chart to pick a time range (Esc to cancel)");
 }
 
 function timelineDown(c, e) {
@@ -1049,6 +1106,22 @@ $("dlg-snapshot-save-txt").onclick = async () => {
   }
 };
 
+// Shared "time" context menu: capture metrics / take snapshot / zoom / reset,
+// anchored on time `t`. Used both by right-clicking a chart (t = the point
+// under the cursor) and by right-clicking selected log entries (t = the
+// center of their timestamps). `onDone`, if given, runs once whichever
+// action was picked (used to clear a log panel's selection afterwards).
+function timeContextMenu(e, t, onDone) {
+  const wrap = (fn) => () => { onDone?.(); fn(); };
+  ctxMenu(e, [
+    ["✂ Capture metrics", wrap(armSampleCapture)],
+    ["📸 Take snapshot at this time", wrap(() => takeSnapshot(t))],
+    ["🔍+ Zoom in here", wrap(() => zoomAt(t, 0.5))],
+    ["🔍− Zoom out here", wrap(() => zoomAt(t, 2))],
+    ["↺ Reset zoom", wrap(resetZoom)],
+  ]);
+}
+
 function attachChartEvents() {
   for (const c of [...stripCanvases, ...hostCanvases]) {
     c.addEventListener("mousemove", (e) => {
@@ -1078,13 +1151,7 @@ function attachChartEvents() {
       const rect = c.getBoundingClientRect();
       const x = e.clientX - rect.left;
       if (x < MARGIN_L || !state.view) return;
-      const t = xToT(x);
-      ctxMenu(e, [
-        ["📸 Take snapshot at this time", () => takeSnapshot(t)],
-        ["🔍+ Zoom in here", () => zoomAt(t, 0.5)],
-        ["🔍− Zoom out here", () => zoomAt(t, 2)],
-        ["↺ Reset zoom", resetZoom],
-      ]);
+      timeContextMenu(e, xToT(x));
     });
   }
 }
@@ -1316,6 +1383,9 @@ class Panel {
     this.total = src.total;
     this.pages = new Map(); // pageIdx -> rows | Promise
     this.cursorIdx = null;
+    this.reversed = prefs.get("logNewestFirst", true); // true: newest entry on top
+    this.selected = new Map(); // dataIdx -> ts, entries picked for right-click actions
+    this.lastClickIdx = null; // anchor for shift-click range selection
 
     this.el = document.createElement("div");
     this.el.className = "panel";
@@ -1333,6 +1403,22 @@ class Panel {
     this.countEl.className = "muted";
     this.errEl = document.createElement("span");
     this.errEl.className = "error";
+    const orderToggle = document.createElement("button");
+    orderToggle.className = "icon-btn";
+    const syncOrderToggle = () => {
+      orderToggle.textContent = this.reversed ? "⬆" : "⬇";
+      orderToggle.title = this.reversed
+        ? "Showing newest entries first — click to show oldest first"
+        : "Showing oldest entries first — click to show newest first";
+    };
+    syncOrderToggle();
+    orderToggle.onclick = () => {
+      this.reversed = !this.reversed;
+      prefs.set("logNewestFirst", this.reversed);
+      syncOrderToggle();
+      this.body.scrollTop = 0;
+      this.render();
+    };
     const searchToggle = document.createElement("button");
     searchToggle.className = "icon-btn";
     searchToggle.textContent = "🔍";
@@ -1366,7 +1452,7 @@ class Panel {
       popback.onclick = () => window.close();
       right.append(popback);
     }
-    head.append(name, this.sampleBadge, this.countEl, this.errEl, searchToggle, right);
+    head.append(name, this.sampleBadge, this.countEl, this.errEl, orderToggle, searchToggle, right);
 
     this.searchBar = document.createElement("div");
     this.searchBar.className = "panel-search";
@@ -1433,26 +1519,43 @@ class Panel {
     return pr;
   }
 
+  // rows are stored oldest→newest (data index 0 = oldest); when `reversed`
+  // the newest entry is displayed at the top, so visual row position and
+  // data index run in opposite directions.
+  dataIndexAt(visualIdx) {
+    return this.reversed ? this.total - 1 - visualIdx : visualIdx;
+  }
+  visualIndexOf(dataIdx) {
+    return this.reversed ? this.total - 1 - dataIdx : dataIdx;
+  }
+
   async render() {
     const h = this.body.clientHeight;
     const i0 = Math.max(0, Math.floor(this.body.scrollTop / ROWH) - 10);
     const i1 = Math.min(this.total - 1, Math.ceil((this.body.scrollTop + h) / ROWH) + 10);
     if (i1 < i0) return;
-    const p0 = Math.floor(i0 / PAGE), p1 = Math.floor(i1 / PAGE);
+    let p0 = Infinity, p1 = -Infinity;
+    for (let i = i0; i <= i1; i++) {
+      const p = Math.floor(this.dataIndexAt(i) / PAGE);
+      if (p < p0) p0 = p;
+      if (p > p1) p1 = p;
+    }
     const pages = {};
     for (let p = p0; p <= p1; p++) pages[p] = await this.page(p);
 
     for (const r of this.body.querySelectorAll(".log-row")) r.remove();
     const frag = document.createDocumentFragment();
     for (let i = i0; i <= i1; i++) {
-      const row = pages[Math.floor(i / PAGE)]?.[i % PAGE];
+      const dataIdx = this.dataIndexAt(i);
+      const row = pages[Math.floor(dataIdx / PAGE)]?.[dataIdx % PAGE];
       if (!row) continue;
       const div = document.createElement("div");
       div.className = "log-row";
       div.style.top = i * ROWH + "px";
       if (state.cursorT != null && Math.abs(row.ts - state.cursorT) <= state.windowMs)
         div.classList.add("hl");
-      if (i === this.cursorIdx) div.classList.add("cursor-row");
+      if (dataIdx === this.cursorIdx) div.classList.add("cursor-row");
+      if (this.selected.has(dataIdx)) div.classList.add("selected");
       if (/\b(ERROR|FATAL|CRIT)/i.test(row.text)) div.classList.add("lvl-error");
       else if (/\bWARN/i.test(row.text)) div.classList.add("lvl-warn");
       if (this.searchQuery && row.text.toLowerCase().includes(this.searchQuery)) div.classList.add("search-hit");
@@ -1461,8 +1564,39 @@ class Panel {
       ts.textContent = fmtClock(row.ts, true);
       div.appendChild(ts);
       div.appendChild(document.createTextNode(row.text.split("\n")[0]));
-      div.title = new Date(row.ts).toISOString() + "\n" + row.text;
-      div.onclick = () => setCursor(row.ts);
+      div.title = new Date(row.ts).toISOString() + "\n" + row.text
+        + "\n(ctrl/cmd-click to select, shift-click to select a range, right-click for actions)";
+      div.onclick = (e) => {
+        if (e.shiftKey && this.lastClickIdx != null) {
+          const [a, b] = [Math.min(this.lastClickIdx, dataIdx), Math.max(this.lastClickIdx, dataIdx)];
+          for (let k = a; k <= b; k++) {
+            const r = pages[Math.floor(k / PAGE)]?.[k % PAGE];
+            if (r) this.selected.set(k, r.ts);
+          }
+          this.render();
+        } else if (e.metaKey || e.ctrlKey) {
+          if (this.selected.has(dataIdx)) this.selected.delete(dataIdx);
+          else this.selected.set(dataIdx, row.ts);
+          this.lastClickIdx = dataIdx;
+          this.render();
+        } else {
+          this.selected.clear();
+          this.lastClickIdx = dataIdx;
+          setCursor(row.ts);
+          this.render();
+        }
+      };
+      div.oncontextmenu = (e) => {
+        if (!this.selected.has(dataIdx)) {
+          this.selected.clear();
+          this.selected.set(dataIdx, row.ts);
+          this.lastClickIdx = dataIdx;
+          this.render();
+        }
+        const tsList = [...this.selected.values()];
+        const t = (Math.min(...tsList) + Math.max(...tsList)) / 2;
+        timeContextMenu(e, t, () => { this.selected.clear(); this.render(); });
+      };
       frag.appendChild(div);
     }
     this.body.appendChild(frag);
@@ -1472,14 +1606,16 @@ class Panel {
     try {
       const r = await get(`/index_at?source=${this.src.id}&t=${t}`);
       this.cursorIdx = r.index;
-      this.body.scrollTop = Math.max(0, r.index * ROWH - this.body.clientHeight / 2 + ROWH / 2);
+      const vi = this.visualIndexOf(r.index);
+      this.body.scrollTop = Math.max(0, vi * ROWH - this.body.clientHeight / 2 + ROWH / 2);
       this.render();
     } catch { /* source may have vanished */ }
   }
 
   async jumpToIndex(idx) {
     this.cursorIdx = idx;
-    this.body.scrollTop = Math.max(0, idx * ROWH - this.body.clientHeight / 2 + ROWH / 2);
+    const vi = this.visualIndexOf(idx);
+    this.body.scrollTop = Math.max(0, vi * ROWH - this.body.clientHeight / 2 + ROWH / 2);
     await this.render();
     const row = (await this.page(Math.floor(idx / PAGE)))?.[idx % PAGE];
     if (row) setCursor(row.ts); // keep the chart crosshair (and other panels) in sync
@@ -1502,9 +1638,6 @@ class Panel {
     }
   }
 
-  scrollToEnd() {
-    this.body.scrollTop = this.spacer.offsetHeight;
-  }
 }
 
 function syncPanels() {
@@ -1548,17 +1681,11 @@ async function refreshAll() {
     state.sources = src.sources;
     assignColorSlots(); // before anything draws, so slots don't depend on draw order
     const hadView = !!state.view;
-    const wasAtEnd = state.view && state.range && state.view.t1 >= state.range.max_ts;
     state.range = range;
     $("empty-state").hidden = state.sources.length > 0;
     syncPanels();
-    if (range.min_ts != null && (!hadView || (state.follow && wasAtEnd !== false))) {
-      if (!hadView) resetZoom();
-      else if (state.follow) {
-        const span = state.view.t1 - state.view.t0;
-        setView(range.max_ts - span, range.max_ts);
-        for (const p of panels.values()) p.scrollToEnd();
-      }
+    if (range.min_ts != null && !hadView) {
+      resetZoom();
     }
     await fetchSeries();
     setStatus(src.json_impl === "orjson" ? "" : "server running without orjson (slow parse)");
@@ -1605,9 +1732,9 @@ function updateDockerDupes() {
 $("btn-add").onclick = async () => {
   $("docker-targets").innerHTML = "";
   $("docker-error").textContent = "";
-  setContainersListed(false);
   updateDockerDupes();
   refreshSshKeyRow();
+  listContainers();
   try {
     const t = await get("/transforms");
     const box = $("transforms-list");
@@ -1626,6 +1753,18 @@ $("btn-add").onclick = async () => {
     }
   } catch { /* server down; dialog still usable once it's back */ }
   dlg.showModal();
+};
+
+// close every open source and forget the remembered last-session containers,
+// so the next launch starts with nothing and the add-sources dialog opens.
+$("btn-clear-sources").onclick = async () => {
+  try {
+    await Promise.all(state.sources.map((s) => post("/close", { id: s.id })));
+    prefs.set("lastDockerSessions", []);
+    await refreshAll();
+  } catch (err) {
+    alert(String(err.message || err));
+  }
 };
 
 /* ── load .cttc metrics (separate from the Docker "Add sources" flow) ──── */
@@ -1712,15 +1851,6 @@ $("ssh-key").onchange = async () => {
   rememberSshKey();
 };
 
-let containersListed = false;
-
-function setContainersListed(listed) {
-  containersListed = listed;
-  $("btn-ps").checked = listed;
-  $("btn-ps-label").textContent = listed ? "Hide containers" : "Show containers";
-  $("btn-ps-refresh").hidden = !listed;
-}
-
 async function listContainers() {
   $("docker-error").textContent = "";
   const box = $("docker-targets");
@@ -1759,23 +1889,11 @@ async function listContainers() {
     addGroup("Swarm services (docker service logs)", r.services, "service");
     addGroup("Containers (docker logs)", r.containers, "container");
     if (!r.services.length && !r.containers.length) box.textContent = "nothing running";
-    setContainersListed(true);
   } catch (err) {
     box.innerHTML = "";
     $("docker-error").textContent = String(err.message || err);
-    setContainersListed(false);
   }
 }
-
-$("btn-ps").onchange = (e) => {
-  if (!e.target.checked) {
-    $("docker-targets").innerHTML = "";
-    $("docker-error").textContent = "";
-    setContainersListed(false);
-    return;
-  }
-  listContainers();
-};
 
 $("btn-ps-refresh").onclick = () => listContainers();
 $("docker-host").oninput = () => {
@@ -1796,12 +1914,17 @@ $("dlg-ok").onclick = async () => {
     const stats = $("docker-stats").checked;
     const hostStats = $("docker-host-stats").checked;
     if (stats || hostStats || logs.length) {
-      await post("/docker/collect", {
+      const collectReq = {
         host, stats, logs, transforms,
         host_stats: hostStats,
         ssh_key: currentSshKey(),
         interval: Number($("docker-interval").value) || 5,
-      });
+      };
+      await post("/docker/collect", collectReq);
+      // remember this collection request so it can be restored on next launch
+      const sessions = prefs.get("lastDockerSessions", []);
+      sessions.push(collectReq);
+      prefs.set("lastDockerSessions", sessions);
       // containers picked here are the "selected" set shown in the legend
       for (const l of logs) setTrack(l.name, "sel");
     }
@@ -1818,11 +1941,7 @@ $("win-secs").onchange = (e) => {
   state.windowMs = Math.max(0, Number(e.target.value) || 0) * 1000;
   for (const p of panels.values()) p.render();
 };
-$("chk-follow").onchange = (e) => {
-  state.follow = e.target.checked;
-  if (state.follow) refreshAll();
-};
-$("btn-sample").onclick = () => setSampleArmed(!sampleArmed);
+$("btn-freq-help").onclick = () => window.cttc.openHelp("frequency");
 $("btn-popout-telemetry").onclick = () => {
   state.poppedOut.add("telemetry");
   applyPopoutLayout();
@@ -1835,10 +1954,10 @@ $("btn-popout-host").onclick = () => {
 };
 
 function syncStyleButton() {
-  $("btn-style").textContent = state.chartStyle === "bars" ? "▤ histogram" : "〜 lines";
+  $("chk-style").checked = state.chartStyle === "bars";
 }
-$("btn-style").onclick = () => {
-  state.chartStyle = state.chartStyle === "bars" ? "lines" : "bars";
+$("chk-style").onchange = (e) => {
+  state.chartStyle = e.target.checked ? "bars" : "lines";
   prefs.set("chartStyle", state.chartStyle);
   syncStyleButton();
   drawAll();
@@ -1904,5 +2023,19 @@ window.cttc?.onPopoutClosed?.(({ kind, id }) => {
   syncPanels();
 });
 
-refreshAll();
+refreshAll().then(async () => {
+  if (POPOUT_KIND) return; // popout windows never restore/add sources on their own
+  if (state.sources.length === 0) {
+    // nothing open yet (fresh install, or the last session's sources are all
+    // closed): try to reopen the containers/services collected last time.
+    const sessions = prefs.get("lastDockerSessions", []);
+    if (sessions.length) {
+      try {
+        await Promise.all(sessions.map((req) => post("/docker/collect", req)));
+        await refreshAll();
+      } catch { /* remembered host(s) unreachable; fall through below */ }
+    }
+  }
+  if (state.sources.length === 0) $("btn-add").click(); // still nothing: prompt right away
+});
 connectSSE();

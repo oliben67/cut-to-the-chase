@@ -10,13 +10,20 @@
 <body>
   <header id="toolbar">
     <strong class="app-title">CTTC Timeline</strong>
-    <button id="btn-add">＋ Add sources</button>
+    <button id="btn-add" title="Attach to a Docker daemon (local or ssh://) and pick containers/services to follow">＋ Add sources</button>
+    <button id="btn-clear-sources" title="Close every open source and start from scratch">🗑 Clear sources</button>
     <button id="btn-load-sample" title="Load a .cttc metrics file (possibly encrypted)">📂 Load metrics</button>
     <button id="btn-keys" title="Manage encryption keys for .cttc metrics files" hidden>🔑 Keys</button>
-    <label class="ctl">window ±<input id="win-secs" type="number" min="0" step="1" value="5" /> s</label>
-    <label class="ctl"><input id="chk-follow" type="checkbox" /> follow live</label>
-    <button id="btn-style" title="Switch between line plot and histogram"></button>
-    <button id="btn-sample" title="Save a time range as .cttc metrics: click, then drag on the charts (shift+drag always works)">✂ metrics</button>
+    <label class="ctl" title="Sampling frequency: size of the ± highlight window around the selected time">frequency<input id="win-secs" type="number" min="0" step="1" value="5" /> s</label>
+    <button id="btn-freq-help" class="icon-btn" title="Learn more about sampling frequency">?</button>
+    <label class="ctl switch-row" id="style-switch" title="Switch between line plot and histogram">
+      <span>〜 lines</span>
+      <span class="switch">
+        <input id="chk-style" type="checkbox" />
+        <span class="switch-track"><span class="switch-thumb"></span></span>
+      </span>
+      <span>▤ histogram</span>
+    </label>
     <span id="status" class="muted"></span>
     <span id="cursor-label" class="cursor-label"></span>
   </header>
@@ -43,12 +50,13 @@
         <div id="host-head">
           <span>Host telemetry</span>
           <div class="panel-head-right">
-            <button id="btn-popout-host" class="icon-btn" title="Open host telemetry in its own window">⧉</button>
             <button id="btn-host-toggle" class="icon-btn"></button>
+            <button id="btn-popout-host" class="icon-btn" title="Open host telemetry in its own window">⧉</button>
             <button id="btn-popback-host" class="popback" title="Pop back into the main window" hidden>⤴ Pop back</button>
           </div>
         </div>
         <div id="host-charts"></div>
+        <div id="host-loading" class="muted" hidden><span class="hourglass">⏳</span> Loading host telemetry…</div>
         <div id="host-nav" class="timeline-nav" title="Drag to pan, click to jump, click “now” to center on the present">
           <div class="tl-track">
             <div class="tl-thumb"></div>
@@ -63,6 +71,7 @@
   </main>
 
   <div id="tooltip" hidden></div>
+  <div id="hint" hidden></div>
 
   <dialog id="dlg-add">
     <h2>Add sources — Docker</h2>
@@ -75,14 +84,7 @@
         <select id="ssh-key"></select>
       </label>
       <div class="ctl">
-        <label class="ctl switch-row" title="List running Docker containers/services to pick as sources">
-          <span class="switch">
-            <input id="btn-ps" type="checkbox" />
-            <span class="switch-track"><span class="switch-thumb"></span></span>
-          </span>
-          <span id="btn-ps-label">Show containers</span>
-        </label>
-        <button id="btn-ps-refresh" hidden>Refresh</button>
+        <button id="btn-ps-refresh" title="Reload the list of containers/services from this host">Refresh</button>
       </div>
       <div id="docker-error" class="error"></div>
       <label class="ctl"><input id="docker-stats" type="checkbox" checked /> collect <code>docker stats</code> telemetry <span id="docker-stats-note" class="tdoc"></span></label>
@@ -97,8 +99,8 @@
     </fieldset>
 
     <div class="dlg-actions">
-      <button id="dlg-cancel">Cancel</button>
-      <button id="dlg-ok" class="primary">Add</button>
+      <button id="dlg-cancel" title="Close without adding sources">Cancel</button>
+      <button id="dlg-ok" class="primary" title="Start following the ticked containers/services">Add</button>
     </div>
   </dialog>
 
@@ -110,8 +112,8 @@
     </label>
     <div id="export-host-note" class="tdoc"></div>
     <div class="dlg-actions">
-      <button id="dlg-export-cancel">Cancel</button>
-      <button id="dlg-export-ok" class="primary">Save…</button>
+      <button id="dlg-export-cancel" title="Close without saving">Cancel</button>
+      <button id="dlg-export-ok" class="primary" title="Save the selected range as a .cttc file">Save…</button>
     </div>
   </dialog>
 
@@ -139,15 +141,15 @@
       </select>
     </label>
     <div class="btn-group" id="snapshot-view-switch">
-      <button id="snap-view-raw" class="primary">Raw</button>
-      <button id="snap-view-json">JSON</button>
+      <button id="snap-view-raw" class="primary" title="Show a human-readable table">Raw</button>
+      <button id="snap-view-json" title="Show the raw JSON payload">JSON</button>
     </div>
     <div id="snapshot-props" class="snapshot-body"></div>
     <pre id="snapshot-json" class="snapshot-body" hidden></pre>
     <div class="dlg-actions">
-      <button id="dlg-snapshot-close">Close</button>
-      <button id="dlg-snapshot-save-txt">💾 Save as TXT…</button>
-      <button id="dlg-snapshot-save" class="primary" hidden>💾 Save as JSON…</button>
+      <button id="dlg-snapshot-close" title="Close this snapshot">Close</button>
+      <button id="dlg-snapshot-save-txt" title="Save this snapshot as a plain-text file">💾 Save as TXT…</button>
+      <button id="dlg-snapshot-save" class="primary" hidden title="Save this snapshot as a JSON file">💾 Save as JSON…</button>
     </div>
   </dialog>
 

@@ -1138,6 +1138,7 @@ class State:
             else:
                 d["total"] = s.count
                 d["services"] = s.services()
+                d["is_host"] = getattr(s, "is_host", False)
             out.append(d)
         return out
 

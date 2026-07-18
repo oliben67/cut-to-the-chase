@@ -945,6 +945,8 @@ class TestState:
         assert d["svc"]["transforms"] == ["upper"]
         assert d["stats"]["kind"] == "stats" and d["stats"]["services"] == ["api"]
         assert d["stats"]["min_ts"] is not None
+        assert d["stats"]["is_host"] is False
+        assert "is_host" not in d["svc"]  # log sources don't carry the flag
 
     def test_collect_docker_all_sources(self, state, docker_cli, monkeypatch):
         monkeypatch.setattr(server.subprocess, "run", FakeRun([ok("")]))

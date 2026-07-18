@@ -27,23 +27,33 @@ the cursor to that line's time instead.
 
 - **Shared cursor** across charts, density lanes, and log panels; log rows are
   level-colored (ERROR/WARN) and virtually scrolled, so multi-million-line
-  files stay smooth.
-- **Line plot or histogram** rendering for every metric strip (toolbar toggle).
+  files stay smooth. Panels show the newest entry on top by default; a ⬆/⬇
+  toggle in each panel's header reverses that to oldest-on-top. Ctrl/Cmd-click
+  a row to select it (shift-click to select a range); right-click a selection
+  to get the same **capture metrics / take snapshot / zoom / reset zoom** menu
+  as the charts, centered on the selected entries' timestamp(s).
+- **Line plot or histogram** rendering for every metric strip (toolbar 〜/▤
+  slider).
 - **Timeline navigation**: drag to zoom, double-click any point on the charts
   or log density lanes to re-center every panel on that time, *reset zoom* to
-  fit the full data range, *follow live* to pin the view to incoming data.
-  The view starts centered on now (± 5 min).
+  fit the full data range. The view starts centered on now (± 5 min).
 - **Resizable layout**: drag the divider between charts and log panels to trade
   chart height for log space.
 - **Docker collection** from the local daemon or a remote one over
   `ssh://user@host`, with an **SSH key menu** (keys found in `~/.ssh`, or
   browse for one) — the choice is remembered per host. Container/service logs
   are followed with `docker logs -f -t` / `docker service logs -f -t`; stats
-  are polled with `docker stats` on a chosen interval.
+  are polled with `docker stats` on a chosen interval. Each successful
+  ＋ Add sources request is remembered and replayed automatically the next
+  time the app starts with no sources open; **🗑 Clear sources** closes
+  everything currently open and forgets that remembered set, for a clean
+  start. With no sources at all (first launch, or right after clearing), the
+  ＋ Add sources dialog opens on its own.
 - **Host telemetry**, on by default when collecting from docker: CPU / MEM /
   NET of the docker host itself (psutil for the local machine, `/proc` over
   ssh for remote hosts), rendered in its own strip group at the bottom of the
-  chart block with a hide/show toggle.
+  chart block with a hide/show toggle. Shows a "⏳ Loading host telemetry…"
+  placeholder until the first reading comes in.
 - **Three-state container legend** — `docker stats` reports every container on
   a host, but only the containers you *selected* in ＋ Add sources are plotted:
   - **selected** — normal legend entry, plotted; click to dim/undim,
@@ -52,15 +62,19 @@ the cursor to that line's time instead.
     **right-click → Track** starts plotting its telemetry *and* following its
     logs; right-click → Hide removes it from the list.
   - **hidden** — filtered out entirely; a `hidden (N)` chip restores them.
-- **Samples**: **shift+drag** on the timeline (or arm the `✂ sample` button and
-  drag) to export the selected time range — logs and metrics of every open
-  source, host included — as a zipped **`.cttc`** file. Load a `.cttc` back via
-  the toolbar's **📂 Load sample** button to analyze it later.
+- **Samples**: **shift+drag** on the timeline (or right-click a chart →
+  **✂ Capture metrics** and drag) to export the selected time range — logs and
+  metrics of every open source, host included — as a zipped **`.cttc`** file.
+  Load a `.cttc` back via the toolbar's **📂 Load sample** button to analyze it
+  later.
 - **Duplicate guards**: a container, stats collector, host-telemetry collector,
   or file that is already being collected shows as *already added* and can't be
   added twice.
 - **Transforms**: user-written Python modules applied to log records at ingest
   (see below).
+- **Instant hover hints**: every button and control shows its purpose right
+  next to the cursor as soon as you hover it — no waiting on the browser's
+  native tooltip delay.
 
 ## Repository layout
 
@@ -128,19 +142,23 @@ your local timezone; the cursor readout in the toolbar shows UTC.
 
 | Action | Effect |
 |---|---|
+| **🗑 Clear sources** | close every open source and forget the remembered last-session containers |
 | click chart / lane | set cursor at t; all panels jump to t and highlight ±window |
 | click log row | move cursor to that row's time |
+| ctrl/cmd-click log row | add/remove that row from the selection |
+| shift-click log row | select the range from the last-clicked row |
+| right-click a selected log row | menu: capture metrics / take snapshot / zoom in / zoom out / reset zoom, centered on the selection's timestamp(s) |
 | drag on chart / lane | zoom to selection (blue band) |
-| **shift+drag** (or `✂ sample` then drag) | export the selected range as a `.cttc` sample (orange band) |
+| **shift+drag** (or right-click → `✂ Capture metrics` then drag) | export the selected range as a `.cttc` sample (orange band) |
 | double-click chart / lane | re-center every panel on that point in time |
-| right-click chart / lane | menu: zoom in / zoom out / reset zoom / take snapshot |
+| right-click chart / lane | menu: capture metrics / take snapshot / zoom in / zoom out / reset zoom |
 | drag timeline-nav thumb | pan the view |
 | click timeline-nav track | jump/re-center the view there |
 | click "now" on the timeline-nav | center the view on the present, keeping the span |
-| 〜 lines / ▤ histogram | switch chart rendering style |
+| 〜/▤ slider | switch chart rendering style (lines vs. histogram) |
 | drag divider above log panels | resize charts vs. logs |
-| window ± | size of the highlight window around t |
-| follow live | keep the view pinned to the newest data, panels tail their end |
+| ⬆/⬇ on a log panel | reverse that panel between newest-first (default) and oldest-first |
+| frequency | sampling frequency: size of the ± highlight window around t |
 | legend entry (click) | dim/undim a selected series |
 | legend entry (right-click) | track / unselect / hide a container |
 | `others (N)` chip | expand/collapse not-selected containers |
@@ -148,7 +166,8 @@ your local timezone; the cursor readout in the toolbar shows UTC.
 | Host telemetry hide/show | collapse the host strip group |
 
 Chart style, strip height, host-panel visibility, container tracking states,
-and per-host SSH keys persist across launches.
+per-host SSH keys, and the last set of ＋ Add sources requests (replayed on
+the next launch if nothing else is open) persist across launches.
 
 ## Samples (`.cttc`)
 

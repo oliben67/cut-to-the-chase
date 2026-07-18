@@ -1,6 +1,6 @@
 "use strict";
 
-const { app, BrowserWindow, dialog, ipcMain, Menu } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain, Menu, shell } = require("electron");
 const { spawn } = require("child_process");
 const path = require("path");
 const readline = require("readline");
@@ -9,6 +9,11 @@ const SERVER_DIR = path.join(__dirname, "server");
 const APP_ICON = path.join(__dirname, "assets", "icon.png");
 // one-liner as published on GitHub (kept in sync with package.json's "description")
 const APP_TAGLINE = "Correlate container telemetry with service logs on a shared clickable timeline";
+// in-app "?" help buttons link here, one anchor per README section
+const HELP_URL = "https://github.com/oliben67/cut-to-the-chase#readme";
+const HELP_TOPICS = {
+  frequency: "#interactions",
+};
 let serverProc = null;
 let serverPort = null;
 
@@ -189,6 +194,11 @@ ipcMain.handle("pick-files", async () => {
     properties: ["openFile", "multiSelections"],
   });
   return r.canceled ? [] : r.filePaths;
+});
+
+ipcMain.handle("open-help", async (_e, topic) => {
+  const anchor = HELP_TOPICS[topic] || "";
+  await shell.openExternal(HELP_URL + anchor);
 });
 
 ipcMain.handle("save-file", async (_e, defaultName) => {

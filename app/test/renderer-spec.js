@@ -131,12 +131,12 @@
 
   /* ── toolbar controls ─────────────────────────────────────────────────── */
 
-  await T("chart style button toggles lines/bars and persists", () => {
+  await T("chart style switch toggles lines/bars and persists", () => {
     const before = state.chartStyle;
-    $("btn-style").click();
+    $("chk-style").click();
     ok(state.chartStyle !== before, "flipped");
     eq(prefs.get("chartStyle", null), state.chartStyle, "persisted");
-    $("btn-style").click();
+    $("chk-style").click();
     eq(state.chartStyle, before, "flipped back");
   });
 
@@ -289,18 +289,22 @@
     }
   });
 
-  await T("armed ✂ button routes the next drag to sample export", () => {
+  await T("'Capture metrics' context-menu entry arms the next drag for sample export", () => {
     const real = exportSample;
     const calls = [];
     exportSample = (a, b) => calls.push([a, b]);
     try {
-      $("btn-sample").click();
-      ok($("btn-sample").classList.contains("armed"), "armed");
       const c = stripCanvases[0];
+      mouse(c, "contextmenu", tToX(MID));
+      const menu = document.getElementById("ctxmenu");
+      const item = [...menu.querySelectorAll("button")].find((b) => b.textContent.includes("Capture metrics"));
+      ok(item, "menu has Capture metrics entry");
+      item.click();
+      ok(document.body.classList.contains("sample-armed"), "armed");
       mouse(c, "mousedown", tToX(MID - 60000));
       mouse(c, "mouseup", tToX(MID + 60000));
       eq(calls.length, 1);
-      ok(!$("btn-sample").classList.contains("armed"), "disarmed after use");
+      ok(!document.body.classList.contains("sample-armed"), "disarmed after use");
     } finally {
       exportSample = real;
     }
@@ -355,6 +359,44 @@
     ok(r.index != null && r.index >= 0, "found an INFO row");
     const none = await get(`/logs/find?source=${sid}&q=__no_such_text__`);
     eq(none.index, null);
+  });
+
+  await T("selecting log entries opens a time-anchored context menu, centered on their timestamps", async () => {
+    const p = [...panels.values()][0];
+    p.selected.clear();
+    await p.render();
+    let rows = [...p.body.querySelectorAll(".log-row")];
+    ok(rows.length >= 2, "at least 2 rows rendered for the test");
+
+    mouse(rows[0], "click", 5, 20, { ctrlKey: true });
+    await until(() => p.selected.size === 1, "first row selected");
+    rows = [...p.body.querySelectorAll(".log-row")];
+    mouse(rows[1], "click", 5, 20, { ctrlKey: true });
+    await until(() => p.selected.size === 2, "second row added to selection");
+
+    rows = [...p.body.querySelectorAll(".log-row")];
+    ok(rows[0].classList.contains("selected") && rows[1].classList.contains("selected"), "selected rows highlighted");
+
+    const tsList = [...p.selected.values()];
+    const expectedT = (Math.min(...tsList) + Math.max(...tsList)) / 2;
+
+    const realSnapshot = takeSnapshot;
+    let gotT = null;
+    takeSnapshot = (t) => { gotT = t; };
+    try {
+      rows[0].dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 5, clientY: 5 }));
+      const menu = document.getElementById("ctxmenu");
+      ok(menu, "menu open");
+      const items = [...menu.querySelectorAll("button")];
+      const labels = items.map((b) => b.textContent).join("|");
+      ok(labels.includes("Capture metrics"), labels);
+      const snapItem = items.find((b) => b.textContent.includes("Take snapshot"));
+      snapItem.click();
+      eq(gotT, expectedT, "menu centered on selected entries' timestamps");
+      eq(p.selected.size, 0, "selection cleared after the action");
+    } finally {
+      takeSnapshot = realSnapshot;
+    }
   });
 
   /* ── snapshots ────────────────────────────────────────────────────────── */
@@ -467,6 +509,72 @@
     const thumb = document.querySelector("#chart-nav .tl-thumb");
     ok(thumb, "thumb exists");
     ok(thumb.style.left !== "" || thumb.style.width !== "", "thumb positioned");
+  });
+
+  /* ── newest features ──────────────────────────────────────────────────── */
+
+  await T("frequency help button is wired to the help IPC", () => {
+    ok(typeof $("btn-freq-help").onclick === "function", "button has a handler");
+    ok(typeof window.cttc?.openHelp === "function", "openHelp exposed via preload");
+  });
+
+  await T("host block shows the loading state before first host sample", () => {
+    state.sources.push({ id: "__hload", kind: "stats", is_host: true,
+                         path: "docker://local/host", live: true, name: "host@local" });
+    try {
+      drawAll();
+      eq(hostBlockEl.hidden, false, "host block appears");
+      eq($("host-loading").hidden, false, "loading indicator shown");
+      eq(hostChartsEl.hidden, true, "charts hidden while loading");
+    } finally {
+      state.sources = state.sources.filter((s) => s.id !== "__hload");
+      drawAll();
+      eq(hostBlockEl.hidden, true, "host block gone again");
+    }
+  });
+
+  await T("log panel order toggle flips newest/oldest-first and persists", async () => {
+    const p = [...panels.values()][0];
+    const startReversed = p.reversed;
+    ok(p.total >= 2, "panel has rows");
+    eq(p.dataIndexAt(0), startReversed ? p.total - 1 : 0, "visual->data mapping");
+    eq(p.visualIndexOf(p.dataIndexAt(5)), 5, "mapping is its own inverse");
+    const toggle = [...p.el.querySelectorAll("button")].find(
+      (b) => b.textContent === "⬆" || b.textContent === "⬇");
+    ok(toggle, "order toggle present");
+    toggle.click();
+    eq(p.reversed, !startReversed, "flipped");
+    eq(prefs.get("logNewestFirst", null), p.reversed, "persisted");
+    eq(p.dataIndexAt(0), p.reversed ? p.total - 1 : 0, "mapping follows the flip");
+    toggle.click();
+    eq(p.reversed, startReversed, "restored");
+  });
+
+  await T("container list refresh button re-lists docker targets", () => {
+    const real = listContainers;
+    let calls = 0;
+    listContainers = () => { calls++; };
+    try {
+      $("btn-ps-refresh").click();
+      eq(calls, 1, "refresh re-lists");
+    } finally {
+      listContainers = real;
+    }
+  });
+
+  // destructive — must stay the last test: closes every source, then reopens
+  // the demo files so the app is left usable.
+  await T("clear-sources button closes everything", async () => {
+    const files = state.sources
+      .filter((s) => !String(s.path).startsWith("docker://"))
+      .map((s) => ({ path: s.path, live: false }));
+    ok(files.length >= 2, "have demo files to restore");
+    $("btn-clear-sources").click();
+    await until(() => state.sources.length === 0, "all sources closed");
+    eq($("empty-state").hidden, false, "empty state visible again");
+    await post("/open", { files });
+    await refreshAll();
+    ok(state.sources.length >= 2, "demo files restored");
   });
 
   localStorage.clear();

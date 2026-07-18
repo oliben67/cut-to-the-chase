@@ -111,7 +111,7 @@ button {
 }
 button:hover { border-color: var(--accent); }
 button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-#btn-sample.armed { background: var(--accent); border-color: var(--accent); color: #fff; }
+body.sample-armed .strip { cursor: cell; }
 
 #layout { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
 
@@ -252,10 +252,20 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
   font-weight: 600;
   color: var(--text-secondary);
 }
-#host-head button { font-size: 11px; }
 #host-charts[hidden] { display: none; }
 #host-block[hidden] { display: none; }
 #host-nav[hidden] { display: none; }
+#host-loading { padding: 20px 16px; text-align: center; }
+#host-loading[hidden] { display: none; }
+.hourglass {
+  display: inline-block;
+  animation: hourglass-flip 1.4s ease-in-out infinite;
+  transform-origin: 50% 55%;
+}
+@keyframes hourglass-flip {
+  0%, 40% { transform: rotate(0deg); }
+  60%, 100% { transform: rotate(180deg); }
+}
 
 /* hide/pop-out style buttons always cluster at the far right of their panel
    header, regardless of which of them are hidden. */
@@ -279,7 +289,7 @@ body.popout-telemetry #splitter,
 body.popout-telemetry #btn-add,
 body.popout-telemetry #btn-load-sample,
 body.popout-telemetry #btn-keys,
-body.popout-telemetry #btn-sample,
+body.popout-telemetry #style-switch,
 body.popout-telemetry #host-block {
   display: none;
 }
@@ -300,7 +310,7 @@ body.popout-host #splitter,
 body.popout-host #btn-add,
 body.popout-host #btn-load-sample,
 body.popout-host #btn-keys,
-body.popout-host #btn-sample,
+body.popout-host #style-switch,
 body.popout-host #btn-popout-telemetry {
   display: none;
 }
@@ -425,6 +435,7 @@ button.popback[hidden] { display: none; }
 .log-row:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
 .log-row.hl { background: var(--hl); }
 .log-row.cursor-row { border-left-color: var(--accent); }
+.log-row.selected { outline: 1px solid var(--accent); outline-offset: -1px; background: color-mix(in srgb, var(--accent) 14%, transparent); }
 .log-row .ts { color: var(--muted); margin-right: 6px; }
 .log-row.lvl-error { border-left-color: var(--critical); }
 .log-row.lvl-warn { border-left-color: var(--warning); }
@@ -445,6 +456,21 @@ button.popback[hidden] { display: none; }
 #tooltip .tt-row { display: flex; align-items: center; gap: 6px; font-variant-numeric: tabular-nums; }
 #tooltip .tt-row .legend-swatch { flex: 0 0 auto; }
 #tooltip .tt-val { margin-left: auto; padding-left: 12px; }
+
+#hint {
+  position: fixed;
+  z-index: 200;
+  pointer-events: none;
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.18);
+  padding: 4px 8px;
+  font-size: 11px;
+  max-width: 280px;
+  color: var(--text-primary);
+}
+#hint[hidden] { display: none; }
 
 dialog {
   background: var(--surface-1);
