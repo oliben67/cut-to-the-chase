@@ -258,10 +258,11 @@ $("btn-popout-host").hidden = !window.cttc?.popout || POPOUT_KIND != null;
 // inside a popped-out panel window, replace the pop-out button with a
 // "pop back" button that just closes this window (the opener reintegrates
 // the panel once it sees the window close, via onPopoutClosed below).
-$("btn-popback-telemetry").hidden = POPOUT_KIND !== "telemetry";
-$("btn-popback-host").hidden = POPOUT_KIND !== "host";
-$("btn-popback-telemetry").onclick = () => window.close();
-$("btn-popback-host").onclick = () => window.close();
+for (const kind of ["telemetry", "host"]) {
+  const b = $(`btn-popback-${kind}`);
+  b.hidden = POPOUT_KIND !== kind;
+  b.onclick = () => window.close();
+}
 
 /* ── time/pixel mapping ─────────────────────────────────────────────────── */
 
@@ -565,15 +566,19 @@ function drawLane(c) {
   drawVerticals(ctx, LANE_H);
 }
 
+// double-click anywhere on the timeline (strips or lanes) re-centers every
+// panel on that point in time, keeping the current zoom span
+function timelineDblclick(c, e) {
+  const rect = c.getBoundingClientRect();
+  const x = e.clientX - rect.left;
+  if (x < MARGIN_L || !state.view) return;
+  recenterOn(xToT(x));
+}
+
 function attachLaneEvents(c) {
   c.addEventListener("mousedown", (e) => timelineDown(c, e));
   c.addEventListener("mouseup", (e) => timelineUp(c, e));
-  c.addEventListener("dblclick", (e) => {
-    const rect = c.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    if (x < MARGIN_L || !state.view) return;
-    recenterOn(xToT(x));
-  });
+  c.addEventListener("dblclick", (e) => timelineDblclick(c, e));
   c.addEventListener("mousemove", (e) => {
     const rect = c.getBoundingClientRect();
     const x = e.clientX - rect.left;
@@ -1141,12 +1146,7 @@ function attachChartEvents() {
     });
     c.addEventListener("mousedown", (e) => timelineDown(c, e));
     c.addEventListener("mouseup", (e) => timelineUp(c, e));
-    c.addEventListener("dblclick", (e) => {
-      const rect = c.getBoundingClientRect();
-      const x = e.clientX - rect.left;
-      if (x < MARGIN_L || !state.view) return;
-      recenterOn(xToT(x));
-    });
+    c.addEventListener("dblclick", (e) => timelineDblclick(c, e));
     c.addEventListener("contextmenu", (e) => {
       const rect = c.getBoundingClientRect();
       const x = e.clientX - rect.left;
@@ -1239,12 +1239,6 @@ function zoomAt(t, factor) {
 }
 
 const DEFAULT_SPAN = 10 * 60 * 1000; // initial window: now ± 5 min
-
-function pan(frac) {
-  if (!state.view) return;
-  const d = (state.view.t1 - state.view.t0) * frac;
-  setView(state.view.t0 + d, state.view.t1 + d);
-}
 
 function centerOnNow() {
   const span = state.view ? state.view.t1 - state.view.t0 : DEFAULT_SPAN;
@@ -1780,8 +1774,22 @@ $("btn-load-sample").onclick = async () => {
   const files = paths.filter((p) => p.endsWith(".cttc") && !open.has(p));
   if (!files.length) return;
   try {
-    const r = await post("/open", { files: files.map((path) => ({ path, live: false })) });
-    if (r.errors?.length) alert(r.errors.map((e) => `${e.path}: ${e.error}`).join("\n"));
+    let errors = (await post("/open", { files: files.map((path) => ({ path, live: false })) })).errors || [];
+    // encrypted files: the server flags them so we can ask for the key and retry
+    const locked = errors.filter((e) => e.encrypted);
+    if (locked.length) {
+      errors = errors.filter((e) => !e.encrypted);
+      const key = prompt(
+        `${locked.map((e) => basename(e.path)).join(", ")} is encrypted.\n` +
+        "Private key (a name from ~/.cttc/keys, or a full PEM):");
+      if (key) {
+        const retry = await post("/open", {
+          files: locked.map((e) => ({ path: e.path, live: false, private_key: key })),
+        });
+        errors.push(...(retry.errors || []));
+      }
+    }
+    if (errors.length) alert(errors.map((e) => `${e.path}: ${e.error}`).join("\n"));
     await refreshAll();
     resetZoom(); // show the full timeline, including the newly loaded metrics
   } catch (err) {

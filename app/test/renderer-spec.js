@@ -94,14 +94,6 @@
     near(xToT(tToX(MID + 12345)), MID + 12345, 100, "round trip");
   });
 
-  await T("pan shifts by the given fraction of a span", () => {
-    setView(MID, MID + 60000);
-    pan(0.5);
-    near(state.view.t0, MID + 30000, 1);
-    pan(-0.5);
-    near(state.view.t0, MID, 1);
-  });
-
   await T("zoomAt scales the span around t", () => {
     setView(MID - 30000, MID + 30000);
     zoomAt(MID, 0.5);

@@ -288,7 +288,7 @@ body.popout-telemetry #panels,
 body.popout-telemetry #splitter,
 body.popout-telemetry #btn-add,
 body.popout-telemetry #btn-load-sample,
-body.popout-telemetry #btn-keys,
+body.popout-telemetry #btn-clear-sources,
 body.popout-telemetry #style-switch,
 body.popout-telemetry #host-block {
   display: none;
@@ -309,7 +309,7 @@ body.popout-host #panels,
 body.popout-host #splitter,
 body.popout-host #btn-add,
 body.popout-host #btn-load-sample,
-body.popout-host #btn-keys,
+body.popout-host #btn-clear-sources,
 body.popout-host #style-switch,
 body.popout-host #btn-popout-telemetry {
   display: none;
@@ -319,17 +319,6 @@ body.popout-host #btn-popout-telemetry {
 .btn-group button { border-radius: 0; margin-left: -1px; }
 .btn-group button:first-child { border-radius: 6px 0 0 6px; margin-left: 0; }
 .btn-group button:last-child { border-radius: 0 6px 6px 0; }
-.lane-row { display: flex; align-items: center; }
-.lane-label {
-  flex: 0 0 110px;
-  padding: 0 8px 0 12px;
-  font-size: 11px;
-  color: var(--text-secondary);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  text-align: right;
-}
 .lane-canvas { flex: 1 1 auto; display: block; cursor: crosshair; }
 
 #panels {
@@ -482,7 +471,6 @@ dialog {
 }
 dialog::backdrop { background: rgba(0, 0, 0, 0.35); }
 dialog h2 { margin: 0 0 10px; font-size: 15px; }
-.tab-page { margin-bottom: 10px; }
 #docker-targets { max-height: 180px; overflow-y: auto; margin-top: 8px; }
 #docker-targets label { display: block; padding: 1px 0; }
 #docker-targets label.added { opacity: 0.55; }

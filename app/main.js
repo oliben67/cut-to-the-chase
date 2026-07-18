@@ -203,34 +203,28 @@ ipcMain.handle("open-help", async (_e, topic) => {
 
 ipcMain.handle("save-file", async (_e, defaultName) => {
   const r = await dialog.showSaveDialog({
-    title: "Save sample",
+    title: "Save metrics",
     defaultPath: defaultName,
-    filters: [{ name: "CTTC sample", extensions: ["cttc"] }],
+    filters: [{ name: "CTTC metrics", extensions: ["cttc"] }],
   });
   return r.canceled ? null : r.filePath;
 });
 
-ipcMain.handle("save-json", async (_e, defaultName, jsonText) => {
+// snapshot exports: same dialog + write, only the file type differs
+async function saveSnapshotAs(defaultName, contents, filter) {
   const r = await dialog.showSaveDialog({
     title: "Save snapshot",
     defaultPath: defaultName,
-    filters: [{ name: "JSON", extensions: ["json"] }],
+    filters: [filter],
   });
   if (r.canceled || !r.filePath) return null;
-  await require("fs").promises.writeFile(r.filePath, jsonText, "utf-8");
+  await require("fs").promises.writeFile(r.filePath, contents, "utf-8");
   return r.filePath;
-});
-
-ipcMain.handle("save-text", async (_e, defaultName, text) => {
-  const r = await dialog.showSaveDialog({
-    title: "Save snapshot",
-    defaultPath: defaultName,
-    filters: [{ name: "Text", extensions: ["txt"] }],
-  });
-  if (r.canceled || !r.filePath) return null;
-  await require("fs").promises.writeFile(r.filePath, text, "utf-8");
-  return r.filePath;
-});
+}
+ipcMain.handle("save-json", (_e, name, text) =>
+  saveSnapshotAs(name, text, { name: "JSON", extensions: ["json"] }));
+ipcMain.handle("save-text", (_e, name, text) =>
+  saveSnapshotAs(name, text, { name: "Text", extensions: ["txt"] }));
 
 // panels ("telemetry", or a log source by id) popped out into their own
 // window; still talk to the same server and stay in sync with the main
