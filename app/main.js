@@ -239,7 +239,7 @@ ipcMain.handle("popout", async (e, kind, id) => {
     return;
   }
   const opener = BrowserWindow.fromWebContents(e.sender);
-  const big = kind === "telemetry" || kind === "host";
+  const big = kind === "telemetry" || kind === "host" || kind === "series";
   const win = new BrowserWindow({
     width: big ? 1000 : 640,
     height: big ? 620 : 520,
@@ -256,7 +256,10 @@ ipcMain.handle("popout", async (e, kind, id) => {
   await win.loadFile(path.join(__dirname, "renderer", "index.html"), { search: params.toString() });
   win.on("closed", () => {
     popoutWindows.delete(key);
-    if (opener && !opener.isDestroyed()) opener.webContents.send("popout-closed", { kind, id });
+    if (opener && !opener.isDestroyed()) {
+      opener.webContents.send("popout-closed", { kind, id });
+      opener.focus(); // return to wherever the pop-out originated (main or another pop-out)
+    }
   });
 });
 

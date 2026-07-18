@@ -554,6 +554,34 @@
     }
   });
 
+  await T("legend right-click offers a per-series pop-out", async () => {
+    const real = openSeriesPopout;
+    const calls = [];
+    openSeriesPopout = (n) => calls.push(n);
+    try {
+      setTrack(names[1], "mut");
+      renderLegend();
+      let item = [...$("legend").querySelectorAll(".legend-item")].find((i) => i.textContent.includes(NAME));
+      let bb = item.getBoundingClientRect();
+      item.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: bb.left + 4, clientY: bb.bottom + 2 }));
+      let entry = [...document.querySelectorAll("#ctxmenu button")].find((b) => b.textContent.includes("its own window"));
+      ok(entry, "entry offered on a selected container");
+      entry.click();
+      eq(calls[0], NAME, "pop-out requested for that container");
+      item = $("legend").querySelector(".legend-item.disabled");
+      bb = item.getBoundingClientRect();
+      item.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: bb.left + 4, clientY: bb.bottom + 2 }));
+      entry = [...document.querySelectorAll("#ctxmenu button")].find((b) => b.textContent.includes("its own window"));
+      ok(entry, "entry offered on a not-selected container too");
+      closeCtxMenu();
+    } finally {
+      openSeriesPopout = real;
+      delete state.track[names[1]];
+      prefs.set("track", state.track);
+      renderLegend();
+    }
+  });
+
   await T("keys dialog: generate, import, list badges, delete", async () => {
     const tmp = "__e2e-key-" + Date.now().toString(36);
     const rows = () => [...document.querySelectorAll("#keys-list .key-row")];

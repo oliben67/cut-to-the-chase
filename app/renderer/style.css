@@ -294,6 +294,17 @@ body.popout-telemetry #style-switch,
 body.popout-telemetry #host-block {
   display: none;
 }
+/* a single series popped out: telemetry-style layout, one series only */
+body.popout-series #panels,
+body.popout-series #splitter,
+body.popout-series #btn-add,
+body.popout-series #btn-clear-sources,
+body.popout-series #btn-keys,
+body.popout-series #btn-load-sample,
+body.popout-series #style-switch,
+body.popout-series #host-block {
+  display: none;
+}
 body.popout-log #chart-block,
 body.popout-log #splitter {
   display: none;

@@ -246,6 +246,13 @@ document.addEventListener("mousedown", hideHint);
 if (POPOUT_KIND === "telemetry") document.body.classList.add("popout-telemetry");
 if (POPOUT_KIND === "log") document.body.classList.add("popout-log");
 if (POPOUT_KIND === "host") document.body.classList.add("popout-host");
+// a single container/series in its own window: same layout as the telemetry
+// popout, but every chart is filtered down to that one series
+if (POPOUT_KIND === "series") {
+  document.body.classList.add("popout-series");
+  document.title = `${POPOUT_ID} — CTTC`;
+  document.querySelector("#chart-head span").textContent = POPOUT_ID;
+}
 
 // in the main window, hide whichever panels have been popped out elsewhere.
 function applyPopoutLayout() {
@@ -263,6 +270,8 @@ for (const kind of ["telemetry", "host"]) {
   b.hidden = POPOUT_KIND !== kind;
   b.onclick = () => window.close();
 }
+// a series popout reuses the telemetry header's pop-back button
+if (POPOUT_KIND === "series") $("btn-popback-telemetry").hidden = false;
 
 /* ── time/pixel mapping ─────────────────────────────────────────────────── */
 
@@ -318,6 +327,10 @@ function sizeCanvas(c, cssH) {
 function seriesOf(group, respectVisibility = true) {
   return (state.series?.services || []).filter((s) => {
     if (!!s.host !== (group === "host")) return false;
+    if (group === "svc" && POPOUT_KIND === "series") {
+      // a series popout shows exactly its one series, whatever its track state
+      return s.name === POPOUT_ID && !isSampleHidden(s.sid);
+    }
     if (group === "svc" && trackStateOf(s) !== "sel") return false;
     if (isSampleHidden(s.sid)) return false;
     return !respectVisibility || state.visible.get(s.name) !== false;
@@ -521,7 +534,9 @@ function drawVerticals(ctx, h) {
 /* ── density lanes (one per log source) ─────────────────────────────────── */
 
 function drawLanes() {
-  const logs = state.sources.filter((s) => s.kind === "log" && !isSampleHidden(s.id));
+  let logs = state.sources.filter((s) => s.kind === "log" && !isSampleHidden(s.id));
+  // a series popout keeps only the lanes of the same-named log source(s)
+  if (POPOUT_KIND === "series") logs = logs.filter((s) => s.name === POPOUT_ID);
   // rebuild DOM if the set changed
   const want = logs.map((s) => s.id).join(",");
   if (lanesEl.dataset.ids !== want) {
@@ -715,13 +730,27 @@ function relist() {
   drawAll();
 }
 
+// open one container's / loaded record's telemetry in its own synced window
+// (kept as a plain function so the E2E spec can stub it)
+function openSeriesPopout(name) {
+  window.cttc?.popout?.("series", name);
+}
+
+function seriesPopoutMenuEntry(s) {
+  return window.cttc?.popout
+    ? [[`⧉ Open “${s.name}” in its own window`, () => openSeriesPopout(s.name)]]
+    : [];
+}
+
 function renderLegend() {
   legendEl.innerHTML = "";
   renderSampleFiles();
-  const all = allSvcSeries();
-  const sel = all.filter((s) => trackStateOf(s) === "sel");
-  const mut = all.filter((s) => trackStateOf(s) === "mut");
-  const hid = all.filter((s) => trackStateOf(s) === "hid");
+  let all = allSvcSeries();
+  // a series popout's legend shows just its one series, always as selected
+  if (POPOUT_KIND === "series") all = all.filter((s) => s.name === POPOUT_ID);
+  const sel = all.filter((s) => POPOUT_KIND === "series" || trackStateOf(s) === "sel");
+  const mut = POPOUT_KIND === "series" ? [] : all.filter((s) => trackStateOf(s) === "mut");
+  const hid = POPOUT_KIND === "series" ? [] : all.filter((s) => trackStateOf(s) === "hid");
 
   for (const s of sel) {
     const sample = !isLiveSid(s.sid);
@@ -733,6 +762,7 @@ function renderLegend() {
       relist();
     };
     item.oncontextmenu = (e) => ctxMenu(e, [
+      ...seriesPopoutMenuEntry(s),
       [`Unselect “${s.name}” (keep listed, disabled)`, () => { setTrack(s.name, "mut"); relist(); }],
       [`Hide “${s.name}” entirely`, () => { setTrack(s.name, "hid"); relist(); }],
     ]);
@@ -753,6 +783,7 @@ function renderLegend() {
         const item = legendItem(s.name, "disabled");
         item.title = "not selected — right-click to track or hide";
         item.oncontextmenu = (e) => ctxMenu(e, [
+          ...seriesPopoutMenuEntry(s),
           [`Track “${s.name}” (logs + telemetry)`, () => startTracking(s)],
           [`Hide “${s.name}” entirely`, () => { setTrack(s.name, "hid"); relist(); }],
         ]);

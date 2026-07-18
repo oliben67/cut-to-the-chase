@@ -329,10 +329,17 @@ The ⧉ buttons move a panel into its own window:
 - **Host telemetry**,
 - any **log panel**.
 
+In addition, **right-click any container or loaded record in the legend →
+“⧉ Open … in its own window”** to get a window dedicated to that single
+series: its CPU/MEM/NET strips and its matching log density lane, whatever
+its selection state in the main legend.
+
 Popped-out windows talk to the same data and stay fully in sync — moving the
-cursor or the view in one window moves it everywhere. The main window hides
-the popped-out panel until you press **⤴ Pop back** (or close the window),
-which reintegrates it.
+cursor or the view in one window moves it everywhere. Closing a pop-out
+(with **⤴ Pop back** or the window's close button) returns focus to the
+window it was opened from — the main window, or another pop-out if that is
+where you opened it. Telemetry/host/log pop-outs are reintegrated into the
+main window on close; series pop-outs are extra views, so nothing moves.
 
 ## Transforms
 
@@ -372,7 +379,7 @@ ingestion — the error is recorded on the affected record instead.
 | drag divider above log panels | resize charts vs. logs |
 | frequency | size of the ± highlight window around the cursor |
 | legend entry click | dim/undim a selected series |
-| legend entry right-click | track / unselect / hide a container |
+| legend entry right-click | track / unselect / hide a container, or open it in its own window |
 | `others (N)` chip | expand/collapse not-selected containers |
 | `hidden (N)` chip | restore hidden containers |
 | sample-file switch in the legend | show/hide everything from that `.cttc` file |
