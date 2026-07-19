@@ -99,6 +99,9 @@ space; the position is remembered.
 
 ### Collecting from Docker
 
+![The Add sources dialog: docker host field, telemetry checkboxes, poll
+interval, and the transforms list](docs/images/dlg-add-sources.png)
+
 **＋ Add sources** attaches to a Docker daemon. Leave the host field empty
 for the local daemon. The dialog lists the running containers and swarm
 services (use **Refresh** to re-list); tick the ones whose logs you want to
@@ -268,6 +271,9 @@ Right-click a chart (or a log selection) → **📸 Take snapshot** to capture a
 single point in time: every container's and host's telemetry values nearest
 that instant, plus the nearby log entries from each source.
 
+![A snapshot: per-source cpu/mem/net values at the chosen instant and the
+nearest log entry from each source](docs/images/dlg-snapshot.png)
+
 Options in the snapshot dialog:
 
 - **Include all open containers/hosts** — untick to keep only the currently
@@ -306,6 +312,9 @@ displayed.
 **🔑 Keys** manages the keys used to encrypt/decrypt `.cttc` files. They are
 plain PEM files in `~/.cttc/keys/` (private keys are created owner-only,
 mode 600 — the same trust model as `~/.ssh`).
+
+![The Encryption keys dialog: a keypair with its public+private badge and
+copy/delete actions, plus the generate and import forms](docs/images/dlg-keys.png)
 
 - **Generate** — create an RSA-3072 keypair for yourself. Badge:
   `public + private`.

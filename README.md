@@ -8,19 +8,9 @@ bottom, and one scrollable panel per service log below.
 **Click anywhere on a chart (or lane) at time t → every log panel jumps to
 its entries at t** and highlights the ± window around it.
 
-```
-┌───────────────────────────────────────────────┐
-│  CPU % ────────╱╲──────────│──────────────    │  ← charts (click = set cursor t)
-│  MEM % ────────────────────│──────────────    │
-│  NET   ────────╱╲──────────│──────────────    │
-│  api   ▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮│▮▮▮▮▮▮▮▮          │  ← density lanes
-│  Host telemetry                               │
-│  CPU % ──────╱─╲───────────│──────────────    │  ← docker host vitals
-├───────────────────────────────────────────────┤
-│  api log        ····· [t] ·····               │  ← panels scroll to t,
-│  worker log     ····· [t] ·····               │    highlight ±window
-└───────────────────────────────────────────────┘
-```
+![CTTC with the cursor on a worker spike: charts on top, density lanes, and
+log panels that have jumped to that moment, with ERROR/WARN rows
+edge-colored](docs/images/app-overview.png)
 
 In short, CTTC can:
 
