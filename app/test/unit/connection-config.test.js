@@ -95,6 +95,15 @@ test("invalid JSON in the file throws with the file path in the message", () => 
   assert.throws(() => loadConnectionConfig({ env: {}, configPath: p }), new RegExp(p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 });
 
+test("a leading UTF-8 BOM (e.g. from Windows PowerShell's -Encoding UTF8) doesn't break parsing", () => {
+  const p = tmpConfigPath();
+  const json = JSON.stringify({ mode: "ssh-tunnel", ssh_target: "deploy@host", remote_port: 8765 });
+  fs.writeFileSync(p, "﻿" + json, "utf8");
+  assert.deepEqual(loadConnectionConfig({ env: {}, configPath: p }), {
+    mode: "ssh-tunnel", sshTarget: "deploy@host", sshKey: null, remotePort: 8765,
+  });
+});
+
 test("defaultConfigPath resolves under the given env's HOME", () => {
   const got = defaultConfigPath({ HOME: "/home/alice" });
   assert.equal(got, path.join("/home/alice", ".cttc", "connection.json"));

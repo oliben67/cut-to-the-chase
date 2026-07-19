@@ -22,6 +22,10 @@ function readConfigFile(configPath) {
   } catch (err) {
     throw new Error(`could not read connection config ${configPath}: ${err.message}`);
   }
+  // Node's utf8 read doesn't strip a byte-order-mark, and JSON.parse treats
+  // a leading BOM as invalid syntax -- easy to hit on Windows, where several
+  // common tools (PowerShell's `-Encoding UTF8` in particular) write one.
+  if (raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
   try {
     return JSON.parse(raw);
   } catch (err) {

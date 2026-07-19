@@ -276,6 +276,38 @@ syntactically fine to package — a fresh `docker compose up` (or at minimum
 checking `docker logs` after one) is the actual test, and it's worth
 re-running after any new local module lands, not just after the first one.
 
+## The container's host doesn't have to be the monitored host — validated
+
+Nothing above requires the machine running the CTTC server *container* to be
+the same machine whose Docker daemon it's watching. That decoupling already
+existed in the code before this remote-server work started —
+`docker_cmd(host)` builds `[docker, -H, host]`, and `host` can be
+`ssh://user@another-machine` just as easily as `None` (the local socket) —
+but it had never actually been exercised with the CTTC server itself running
+in a container, so it was worth proving rather than assuming.
+
+Validated for real, across two genuinely separate physical machines: a CTTC
+container built and run on one host (**no Docker socket mounted into it at
+all** — just a single SSH private key), asked via `/docker/collect` to
+monitor `ssh://user@a-completely-different-host`. Every layer of data came
+back correctly from the *other* machine: `docker ps`-equivalent listing,
+`docker stats` telemetry (6 samples), host telemetry over the existing
+`HostStatsSource._sample_ssh()` path (2 samples — this is the *ssh-to-a-
+different-host* sampler, not the `psutil`/`pid: host` one, and it's the one
+that actually ran here), and real log entries (71) — all while the
+container itself had zero local Docker awareness.
+
+Practical implication for `docker-compose.yml`: the `/var/run/docker.sock`
+mount there is only for the common case (container host *is* the Docker
+host, the default in this repo's compose file). It's not required for this
+topology — a deployment where the CTTC container runs somewhere lightweight
+and only reaches out over `ssh://` to the real Docker host(s) needs no
+socket mount at all, just an SSH private key made available to it (e.g. a
+volume mount) and that key's path passed as `ssh_key` in `/docker/collect`
+requests. Worth a follow-up compose variant if this topology turns out to be
+common in practice, rather than everyone hand-rolling their own `docker run`
+for it.
+
 ## Single collector, multiple viewers
 
 The decision: for a given monitored system (a Docker host), there is **one**
@@ -547,6 +579,20 @@ or the equivalent as environment variables (`CTTC_MODE`, `CTTC_SSH_TARGET`,
 …) for scripted/MDM-pushed deployment. This mirrors how the app already
 treats `CTTC_TEST`/`CTTC_SCREENSHOT`/`CTTC_EVAL` as environment-driven,
 invisible-by-default switches (see [main.js](../../app/main.js)).
+
+**Windows note, found while building a Windows client test bundle:**
+`connection.json` needs to be plain, BOM-less UTF-8. Windows PowerShell's
+`Set-Content -Encoding UTF8` (the obvious way to write this file from a
+setup script) prepends a byte-order-mark, and `JSON.parse()` treats a
+leading BOM as invalid syntax — `loadConnectionConfig()` failed with
+"invalid JSON in connection config" on a file that looked completely
+correct opened in a text editor. Two fixes landed together:
+`readConfigFile()` now strips a leading BOM defensively (so *any* tool that
+writes this file, not just one setup script, can't reintroduce this), and
+the reference PowerShell setup script writes the file via
+`[System.IO.File]::WriteAllText(..., (New-Object System.Text.UTF8Encoding
+$false))` instead of `Set-Content` to avoid emitting one in the first
+place.
 
 ## Open questions still needing a decision
 
