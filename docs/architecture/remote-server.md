@@ -2,6 +2,22 @@
 
 **Status:** exploration / design proposal — not implemented.
 
+## Product context this design has to preserve
+
+CTTC's entire value proposition is **correlating log entries with metrics**
+— letting someone see that this CPU/MEM/NET spike lines up with that error
+burst, and infer which app/container actually caused an incident. Every
+decision below is judged against one question: *does this keep every
+metric and every log entry the user is looking at on one honest, shared
+timeline, with nothing missing and nothing duplicated?* That's the real
+reason "one collector per host, never two" and "close the duplication race"
+matter in [Single collector, multiple viewers](#single-collector-multiple-viewers)
+— two overlapping collectors for the same container wouldn't just be
+untidy, they'd hand the user two slightly-different CPU curves for one
+container and no way to know which is real, which is exactly the kind of
+ambiguity that breaks the "infer causal impact" use case this tool exists
+for.
+
 ## Problem
 
 Today, CTTC is one Electron process that spawns a local Python server as a
@@ -218,6 +234,15 @@ to only ever have one client because nothing else could reach it.
   host-switcher inside one window. Keeps the "minimal UI change" goal
   intact; multi-host-in-one-window is a materially bigger feature
   (cross-server legend/merging) that nothing here requires.
+- **Transport latency can't skew correlation.** Every timestamp on the
+  shared timeline is stamped at *ingest*, server-side — a log line's own
+  embedded timestamp, or `now_iso()` when a `docker stats` snapshot returns
+  (see `DockerStatsSource._loop`) — never when a client happens to receive
+  it. An SSH tunnel (or any network hop) adds *display* latency between the
+  collector and a viewer, but every viewer still sees the same ingest
+  timestamps on the same events, so two people looking at the same host
+  through different tunnels still get one consistent, correlatable
+  timeline, not two skewed ones.
 
 ## File transfer (upload / download)
 
@@ -272,6 +297,14 @@ Proposed change: give sample export/import the same shape.
   `.cttc` files, many concurrent uploads), it lifts out behind the same
   route prefix on a different port/container without the collector code
   ever noticing.
+- **Uploaded sources stay first-class, not a side view.** Once opened, a
+  file uploaded this way must become an ordinary entry in `state.sources` —
+  same legend, same shared cursor, same timeline as anything the collector
+  gathered. Correlating a log someone uploaded (say, a log pulled from a
+  system CTTC doesn't have live access to) against telemetry the collector
+  *is* gathering live is a real, intended use of the tool, not an edge
+  case — nothing about this design should special-case "uploaded" sources
+  into a separate, non-correlatable view.
 
 ## Encryption keys need to move client-side
 
