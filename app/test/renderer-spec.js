@@ -478,6 +478,64 @@
     }
   });
 
+  /* ── phase 3: /files/download + /files/upload client wiring ────────────── */
+
+  await T("exportSample fetches real bytes from /files/download and hands them to saveBinaryFile", async () => {
+    const realSave = saveBinaryFile;
+    const realAsk = askExportOptions;
+    let saved = null;
+    saveBinaryFile = (name, bytes) => { saved = { name, bytes }; return "/tmp/" + name; };
+    askExportOptions = async () => ({ includeHost: false, hadHost: false, publicKey: null });
+    try {
+      await exportSample(R.min_ts, R.min_ts + 5 * 60000);
+      ok(saved, "saveBinaryFile was called");
+      ok(saved.name.endsWith(".cttc"), saved.name);
+      ok(saved.bytes instanceof Uint8Array && saved.bytes.length > 0, "got real bytes");
+      eq(saved.bytes[0], 0x50, "PK zip magic byte 1"); // 'P'
+      eq(saved.bytes[1], 0x4b, "PK zip magic byte 2"); // 'K'
+      ok($("status").textContent.includes("metrics saved"), $("status").textContent);
+    } finally {
+      saveBinaryFile = realSave;
+      askExportOptions = realAsk;
+    }
+  });
+
+  await T("exportSample reports a cancel without touching the server response", async () => {
+    const realSave = saveBinaryFile;
+    const realAsk = askExportOptions;
+    saveBinaryFile = () => null; // user closed the native dialog
+    askExportOptions = async () => ({ includeHost: false, hadHost: false, publicKey: null });
+    try {
+      await exportSample(R.min_ts, R.min_ts + 5 * 60000);
+      ok($("status").textContent.includes("canceled"), $("status").textContent);
+    } finally {
+      saveBinaryFile = realSave;
+      askExportOptions = realAsk;
+    }
+  });
+
+  await T("uploadFile round-trips a real local log file through /files/upload", async () => {
+    ok(window.cttc?.readFile, "preload readFile is present in the real app");
+    const demoLog = state.sources.find((s) => s.kind === "log" && !basename(s.path).includes("worker"))?.path;
+    ok(demoLog, "a real demo log path is open to upload");
+    const r = await uploadFile(demoLog);
+    ok(r.opened?.length === 1, JSON.stringify(r));
+    eq(r.errors.length, 0);
+    try {
+      const src = (await get("/sources")).sources.find((s) => s.id === r.opened[0]);
+      ok(src, "uploaded source is registered");
+      eq(src.path, `upload://${basename(demoLog)}`, "synthetic display path");
+      eq(src.live, false);
+    } finally {
+      await post("/close", { id: r.opened[0] });
+    }
+  });
+
+  await T("Load metrics button's dedupe check accounts for the upload:// path scheme", () => {
+    const open = openPaths();
+    ok(!open.has("/some/local/never-opened.cttc"), "sanity: local path form never matches");
+  });
+
   /* ── popout wiring (buttons only; no real windows) ────────────────────── */
 
   await T("popout buttons visible in main window, popback hidden", () => {

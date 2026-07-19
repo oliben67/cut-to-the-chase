@@ -45,6 +45,8 @@ from cryptography.hazmat.primitives.serialization import (
     PublicFormat,
 )
 
+import files  # local sibling module (server/files.py) -- upload/download endpoints
+
 try:
     import orjson
 
@@ -1053,18 +1055,22 @@ class State:
             ))
         return opened
 
-    def export_sample(
-        self, path: str, t0: float, t1: float, public_key: str | None = None, include_host: bool = True
-    ) -> dict:
-        """Write a .cttc sample: a zip of per-source log/metric slices in
-        [t0, t1] plus a manifest, for every currently open source (unless
-        include_host is False, which excludes host-telemetry sources). When
-        public_key is given (a stored key name or a raw PEM string), the zip
-        is AES-256-GCM encrypted under a one-time key that is itself wrapped
-        with that RSA public key — only the matching private key can open it."""
+    def build_sample_bytes(
+        self, t0: float, t1: float, public_key: str | None = None, include_host: bool = True
+    ) -> tuple[bytes, list[dict]]:
+        """Build a .cttc sample's bytes: a zip of per-source log/metric
+        slices in [t0, t1] plus a manifest, for every currently open source
+        (unless include_host is False, which excludes host-telemetry
+        sources). When public_key is given (a stored key name or a raw PEM
+        string), the zip is AES-256-GCM encrypted under a one-time key that
+        is itself wrapped with that RSA public key — only the matching
+        private key can open it. Returns (data, meta); meta's length is the
+        "how many sources" count callers report. Split out of
+        export_sample() so files.download_sample() (phase 3 of
+        docs/architecture/remote-server.md) can hand a client the bytes
+        directly instead of writing them to a server-side path."""
         with self.lock:
             items = list(self.sources.values())
-        p = Path(path).expanduser()
         meta = []
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
@@ -1101,6 +1107,15 @@ class State:
         data = buf.getvalue()
         if public_key:
             data = encrypt_bytes(data, resolve_public_key(public_key))
+        return data, meta
+
+    def export_sample(
+        self, path: str, t0: float, t1: float, public_key: str | None = None, include_host: bool = True
+    ) -> dict:
+        """Write a .cttc sample to a server-side path. See
+        build_sample_bytes() for the format and encryption behavior."""
+        data, meta = self.build_sample_bytes(t0, t1, public_key, include_host)
+        p = Path(path).expanduser()
         p.write_bytes(data)
         return {"path": str(p), "sources": len(meta), "encrypted": bool(public_key)}
 
@@ -1256,11 +1271,25 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_binary(self, data: bytes, filename: str, source_count: int, code=200):
+        self.send_response(code)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("X-CTTC-Source-Count", str(source_count))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        # response headers are invisible to cross-origin fetch() reads unless
+        # explicitly exposed -- the renderer needs this one for its status line
+        self.send_header("Access-Control-Expose-Headers", "X-CTTC-Source-Count, Content-Disposition")
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers",
+                        "Content-Type, X-CTTC-Filename, X-CTTC-Private-Key, X-CTTC-Transforms")
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -1321,6 +1350,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._send({"index": idx})
             elif u.path == "/events":
                 self._sse()
+            elif u.path == "/files/download":
+                t0, t1 = float(q["from"]), float(q["to"])
+                include_host = q.get("include_host", "1").lower() not in ("0", "false")
+                data, filename, count = files.download_sample(
+                    st, t0, t1, q.get("public_key") or None, include_host
+                )
+                self._send_binary(data, filename, count)
             else:
                 self._send({"error": "not found"}, 404)
         except (KeyError, ValueError) as e:
@@ -1328,8 +1364,37 @@ class Handler(BaseHTTPRequestHandler):
         except BrokenPipeError:
             pass
 
+    def _handle_upload(self):
+        """POST /files/upload -- body is the raw file bytes (not JSON), so
+        do_POST dispatches here before its generic JSON body parse. Mirrors
+        /open's per-file response shape ({opened, errors}) so the renderer
+        can reuse its existing encrypted-file retry handling unchanged."""
+        st = self.state
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            data = self.rfile.read(length) if length else b""
+            filename = self.headers.get("X-CTTC-Filename") or "upload"
+            pk_header = self.headers.get("X-CTTC-Private-Key")
+            private_key = base64.b64decode(pk_header).decode() if pk_header else None
+            transforms = [t for t in (self.headers.get("X-CTTC-Transforms") or "").split(",") if t]
+            try:
+                opened = files.upload_and_open(st, filename, data, private_key, transforms)
+                errors = []
+            except EncryptedSampleError as e:
+                opened, errors = [], [{"path": filename, "error": str(e), "encrypted": True}]
+            except Exception as e:
+                opened, errors = [], [{"path": filename, "error": str(e)}]
+            if opened:
+                st.broadcast({"type": "sources"})
+            self._send({"opened": opened, "errors": errors, "sources": st.describe()})
+        except BrokenPipeError:
+            pass
+
     def do_POST(self):
         u = urlparse(self.path)
+        if u.path == "/files/upload":
+            self._handle_upload()
+            return
         length = int(self.headers.get("Content-Length") or 0)
         body = jloads(self.rfile.read(length)) if length else {}
         st = self.state

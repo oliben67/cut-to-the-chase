@@ -8,7 +8,9 @@ psutil and the HTTP stack are exercised for real. Run:
 
 from __future__ import annotations
 
+import base64
 import http.client
+import io
 import json
 import socket
 import struct
@@ -1266,6 +1268,25 @@ def post(base, path, body=None):
         return e.code, json.loads(e.read())
 
 
+def get_raw(base, path):
+    """Like get(), but for binary (non-JSON) responses: /files/download."""
+    try:
+        with urllib.request.urlopen(base + path, timeout=5) as r:
+            return r.status, dict(r.headers), r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, dict(e.headers), e.read()
+
+
+def post_raw(base, path, data, headers=None):
+    """Like post(), but for a raw binary body + custom headers: /files/upload."""
+    req = urllib.request.Request(base + path, data=data, method="POST", headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+
 class TestHttpApi:
     def test_sources_and_range(self, api):
         base, _ = api
@@ -1537,6 +1558,133 @@ class TestHttpApi:
         t.join(timeout=5)
         assert not t.is_alive()
         httpd.server_close()
+
+
+# ── /files/* (phase 3: upload/download, docs/architecture/remote-server.md) ──
+
+
+class TestFilesEndpoints:
+    def test_download_returns_binary_cttc(self, api):
+        base, _ = api
+        t0 = ms(2026, 1, 2, 3, 0, 0)
+        code, headers, data = get_raw(base, f"/files/download?from={t0}&to={t0 + 60000}")
+        assert code == 200
+        assert headers["Content-Type"] == "application/octet-stream"
+        assert 'filename="sample-' in headers["Content-Disposition"]
+        assert headers["Content-Disposition"].endswith('.cttc"')
+        z = zipfile.ZipFile(io.BytesIO(data))
+        assert "manifest.json" in z.namelist()
+
+    def test_download_exposes_source_count_header(self, api):
+        base, _ = api
+        t0 = ms(2026, 1, 2, 3, 0, 0)
+        code, headers, _data = get_raw(base, f"/files/download?from={t0}&to={t0 + 60000}")
+        assert headers["X-CTTC-Source-Count"] == "2"  # the log + stats sources the api fixture opens
+        exposed = headers["Access-Control-Expose-Headers"]
+        assert "X-CTTC-Source-Count" in exposed and "Content-Disposition" in exposed
+
+    def test_download_requires_from_and_to(self, api):
+        base, _ = api
+        assert get_raw(base, "/files/download")[0] == 400
+        assert get_raw(base, "/files/download?from=0")[0] == 400
+
+    def test_download_include_host_false(self, api, state):
+        base, st = api
+        for s in st.sources.values():
+            if s.kind == "stats":
+                s.is_host = True
+        t0 = ms(2026, 1, 2, 3, 0, 0)
+        code, _h, data = get_raw(base, f"/files/download?from={t0}&to={t0 + 60000}&include_host=0")
+        z = zipfile.ZipFile(io.BytesIO(data))
+        sources = json.loads(z.read("manifest.json"))["sources"]
+        assert all(s["type"] != "stats" for s in sources)  # the host-marked stats source is excluded
+        assert any(s["type"] == "log" for s in sources)     # the unrelated log source is unaffected
+
+    def test_download_encrypted(self, api, keyhome):
+        base, _ = api
+        server.generate_keypair("dlhttp")
+        t0 = ms(2026, 1, 2, 3, 0, 0)
+        code, _h, data = get_raw(base, f"/files/download?from={t0}&to={t0 + 60000}&public_key=dlhttp")
+        assert code == 200
+        assert server.is_encrypted_sample(data)
+
+    def test_upload_plain_log(self, api):
+        base, st = api
+        data = b"2026-01-02T03:00:00Z hello\n2026-01-02T03:00:01Z world\n"
+        code, j = post_raw(base, "/files/upload", data, {"X-CTTC-Filename": "up.log"})
+        assert code == 200
+        assert len(j["opened"]) == 1 and j["errors"] == []
+        src = st.sources[j["opened"][0]]
+        assert src.path == "upload://up.log" and src.total() == 2
+
+    def test_upload_no_filename_header_still_works(self, api):
+        base, _ = api
+        code, j = post_raw(base, "/files/upload", b"2026-01-02T03:00:00Z a\n")
+        assert code == 200 and len(j["opened"]) == 1
+
+    def test_upload_applies_transforms_header(self, api):
+        base, st = api
+        code, j = post_raw(base, "/files/upload", b"2026-01-02T03:00:00Z hi\n",
+                           {"X-CTTC-Filename": "t.log", "X-CTTC-Transforms": "upper"})
+        assert code == 200
+        assert st.sources[j["opened"][0]].slice(0, 1)[0]["text"] == "HI"
+
+    def test_upload_bad_data_reports_error_not_500(self, api):
+        base, _ = api
+        code, j = post_raw(base, "/files/upload", b"not a zip", {"X-CTTC-Filename": "bad.cttc"})
+        assert code == 200  # request itself succeeded; the failure is reported in errors
+        assert j["opened"] == [] and len(j["errors"]) == 1
+        assert "bad.cttc" == j["errors"][0]["path"]
+
+    def test_upload_encrypted_cttc_round_trip_over_http(self, api, keyhome):
+        base, st = api
+        server.generate_keypair("uphttp")
+        t0 = ms(2026, 1, 2, 3, 0, 0)
+        _c, _h, blob = get_raw(base, f"/files/download?from={t0}&to={t0 + 60000}&public_key=uphttp")
+
+        # without the key: reported as a locked file, not a crash
+        code, j = post_raw(base, "/files/upload", blob, {"X-CTTC-Filename": "locked.cttc"})
+        assert code == 200 and j["opened"] == [] and j["errors"][0]["encrypted"] is True
+
+        # with the key, base64-encoded per the header contract: succeeds
+        key_b64 = base64.b64encode(b"uphttp").decode()
+        code, j = post_raw(base, "/files/upload", blob,
+                           {"X-CTTC-Filename": "locked.cttc", "X-CTTC-Private-Key": key_b64})
+        assert code == 200 and len(j["opened"]) >= 1 and j["errors"] == []
+
+    def test_upload_broadcasts_sources_event_only_on_success(self, api):
+        base, st = api
+        seen = []
+        st.broadcast = lambda ev: seen.append(ev)
+        post_raw(base, "/files/upload", b"not a zip", {"X-CTTC-Filename": "bad.cttc"})
+        assert seen == []  # nothing opened -> no broadcast
+        post_raw(base, "/files/upload", b"2026-01-02T03:00:00Z a\n", {"X-CTTC-Filename": "ok.log"})
+        assert seen == [{"type": "sources"}]
+
+    def test_upload_broken_pipe_swallowed(self, api, monkeypatch):
+        base, st = api
+
+        def explode():
+            raise BrokenPipeError()
+
+        monkeypatch.setattr(st, "describe", explode)
+        conn = http.client.HTTPConnection(base.split("//")[1], timeout=2)
+        conn.request("POST", "/files/upload", body=b"2026-01-02T03:00:00Z a\n",
+                    headers={"X-CTTC-Filename": "x.log"})
+        with pytest.raises(Exception):                  # server sends nothing back
+            conn.getresponse()
+        conn.close()
+
+    def test_options_preflight_allows_upload_headers(self, api):
+        base, _ = api
+        conn = http.client.HTTPConnection(base.split("//")[1], timeout=5)
+        conn.request("OPTIONS", "/files/upload")
+        resp = conn.getresponse()
+        allowed = resp.getheader("Access-Control-Allow-Headers")
+        assert "X-CTTC-Filename" in allowed
+        assert "X-CTTC-Private-Key" in allowed
+        assert "X-CTTC-Transforms" in allowed
+        conn.close()
 
 
 # ── main() ───────────────────────────────────────────────────────────────────

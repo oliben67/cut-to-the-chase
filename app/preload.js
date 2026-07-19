@@ -4,7 +4,8 @@ const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("cttc", {
   pickFiles: () => ipcRenderer.invoke("pick-files"),
-  saveFile: (defaultName) => ipcRenderer.invoke("save-file", defaultName),
+  saveBinary: (defaultName, bytes) => ipcRenderer.invoke("save-binary", defaultName, bytes),
+  readFile: (filePath) => ipcRenderer.invoke("read-file", filePath),
   saveJson: (defaultName, jsonText) => ipcRenderer.invoke("save-json", defaultName, jsonText),
   saveText: (defaultName, text) => ipcRenderer.invoke("save-text", defaultName, text),
   popout: (kind, id, view) => ipcRenderer.invoke("popout", kind, id, view),

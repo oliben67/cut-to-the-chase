@@ -912,6 +912,24 @@ async function askExportOptions() {
   });
 }
 
+// write bytes to a local file: Electron's native save dialog when available
+// (window.cttc.saveBinary, via main.js), else a plain-browser download --
+// works the same whether the bytes came from a same-machine embedded server
+// or a remote one, since the fetch that produced them already happened.
+async function saveBinaryFile(name, bytes) {
+  if (window.cttc?.saveBinary) return window.cttc.saveBinary(name, bytes);
+  const blob = new Blob([bytes], { type: "application/octet-stream" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  return name; // no real filesystem path in this fallback; used for the status line only
+}
+
 async function exportSample(t0, t1) {
   const opts = await askExportOptions();
   if (!opts) return;
@@ -928,19 +946,23 @@ async function exportSample(t0, t1) {
     }
   }
   const name = `metrics-${new Date(t0).toISOString().slice(0, 19).replace(/[T:]/g, "-")}.cttc`;
-  let path = window.cttc?.saveFile ? await window.cttc.saveFile(name)
-                                   : prompt("Save metrics as (.cttc):", name);
-  if (!path) return;
-  if (!path.endsWith(".cttc")) path += ".cttc";
   try {
-    const r = await post("/sample/export", {
-      path, from: t0, to: t1,
-      include_host: opts.includeHost,
-      public_key: opts.publicKey,
-    });
-    const enc = r.encrypted ? `, encrypted for “${opts.publicKey}”` : "";
-    setStatus(r.sources ? `metrics saved: ${r.path} (${r.sources} sources${enc})`
-                        : "metrics saved, but no data in the selected range");
+    // fetch the sample's bytes from the server itself (works identically
+    // whether server.py is this same machine's embedded process or a
+    // remote one reached over an ssh tunnel -- see docs/architecture/
+    // remote-server.md phase 3) rather than asking it to write to a path
+    // that might not exist on whichever machine actually ran it
+    const params = new URLSearchParams({ from: t0, to: t1, include_host: opts.includeHost ? "1" : "0" });
+    if (opts.publicKey) params.set("public_key", opts.publicKey);
+    const res = await fetch(`${API}/files/download?${params}`);
+    if (!res.ok) throw new Error((await res.json().catch(() => null))?.error || `download failed: ${res.status}`);
+    const sourceCount = Number(res.headers.get("X-CTTC-Source-Count") || 0);
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const path = await saveBinaryFile(name, bytes);
+    if (!path) { setStatus("metrics export canceled"); return; }
+    const enc = opts.publicKey ? `, encrypted for “${opts.publicKey}”` : "";
+    setStatus(sourceCount ? `metrics saved: ${path} (${sourceCount} sources${enc})`
+                          : "metrics saved, but no data in the selected range");
   } catch (err) {
     setStatus("metrics export failed: " + (err.message || err));
   }
@@ -1836,6 +1858,25 @@ $("btn-clear-sources").onclick = async () => {
 
 /* ── load .cttc metrics (separate from the Docker "Add sources" flow) ──── */
 
+// reads a local path's bytes (via main.js, which has fs access the renderer
+// doesn't) and POSTs them to /files/upload -- works identically whether
+// server.py is this machine's embedded process or a remote one (see
+// docs/architecture/remote-server.md phase 3), unlike sending the path
+// itself, which only means anything when client and server share a
+// filesystem. privateKey (a stored key name or a raw PEM) is base64-encoded
+// into a header since HTTP header values can't safely carry raw newlines.
+async function uploadFile(localPath, privateKey) {
+  const filename = basename(localPath);
+  if (!window.cttc?.readFile) {
+    return { opened: [], errors: [{ path: filename, error: "cannot read local files in this environment" }] };
+  }
+  const bytes = await window.cttc.readFile(localPath);
+  const headers = { "X-CTTC-Filename": filename };
+  if (privateKey) headers["X-CTTC-Private-Key"] = btoa(privateKey);
+  const res = await fetch(`${API}/files/upload`, { method: "POST", body: bytes, headers });
+  return res.json().catch(() => ({ opened: [], errors: [{ path: filename, error: `upload failed: ${res.status}` }] }));
+}
+
 $("btn-load-sample").onclick = async () => {
   let paths = [];
   if (window.cttc?.pickFiles) paths = await window.cttc.pickFiles();
@@ -1844,22 +1885,23 @@ $("btn-load-sample").onclick = async () => {
     if (p) paths = [p];
   }
   const open = openPaths();
-  const files = paths.filter((p) => p.endsWith(".cttc") && !open.has(p));
+  const files = paths.filter((p) => p.endsWith(".cttc") && !open.has(`upload://${basename(p)}`));
   if (!files.length) return;
   try {
-    let errors = (await post("/open", { files: files.map((path) => ({ path, live: false })) })).errors || [];
+    let errors = [];
+    for (const path of files) errors.push(...((await uploadFile(path)).errors || []));
     // encrypted files: the server flags them so we can ask for the key and retry
     const locked = errors.filter((e) => e.encrypted);
     if (locked.length) {
       errors = errors.filter((e) => !e.encrypted);
       const key = prompt(
-        `${locked.map((e) => basename(e.path)).join(", ")} is encrypted.\n` +
+        `${locked.map((e) => e.path).join(", ")} is encrypted.\n` +
         "Private key (a name from ~/.cttc/keys, or a full PEM):");
       if (key) {
-        const retry = await post("/open", {
-          files: locked.map((e) => ({ path: e.path, live: false, private_key: key })),
-        });
-        errors.push(...(retry.errors || []));
+        for (const e of locked) {
+          const path = files.find((p) => basename(p) === e.path);
+          errors.push(...((await uploadFile(path, key)).errors || []));
+        }
       }
     }
     if (errors.length) alert(errors.map((e) => `${e.path}: ${e.error}`).join("\n"));

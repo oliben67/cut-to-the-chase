@@ -204,13 +204,28 @@ ipcMain.handle("open-help", async (_e, topic) => {
   await shell.openExternal(HELP_URL + anchor);
 });
 
-ipcMain.handle("save-file", async (_e, defaultName) => {
+// phase 3 of docs/architecture/remote-server.md: the renderer fetches a
+// sample's bytes from the server itself (GET /files/download) rather than
+// asking this process to tell the server where to write on a filesystem
+// they might not share -- this process's job is just the native save
+// dialog + writing those already-fetched bytes locally.
+ipcMain.handle("save-binary", async (_e, defaultName, bytes) => {
   const r = await dialog.showSaveDialog({
     title: "Save metrics",
     defaultPath: defaultName,
     filters: [{ name: "CTTC metrics", extensions: ["cttc"] }],
   });
-  return r.canceled ? null : r.filePath;
+  if (r.canceled || !r.filePath) return null;
+  await require("fs").promises.writeFile(r.filePath, Buffer.from(bytes));
+  return r.filePath;
+});
+
+// counterpart for uploads: the renderer picks a local path via pick-files,
+// then needs this process's fs access to actually read it before POSTing
+// the bytes to /files/upload itself (this process never talks to the CTTC
+// server API -- same "thin glue" split as everywhere else in main.js).
+ipcMain.handle("read-file", async (_e, filePath) => {
+  return await require("fs").promises.readFile(filePath);
 });
 
 // snapshot exports: same dialog + write, only the file type differs

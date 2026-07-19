@@ -1,9 +1,9 @@
 # Running the CTTC server remotely (no local Docker required)
 
-**Status:** phases 1-2 (SSH-tunnel transport + server container; collector
-de-duplication) implemented on `feature/remote-server-ssh-tunnel`. Phases
-3-5 below are still design only. See [Using phase 1](#using-phase-1) for
-how to actually run it.
+**Status:** phases 1-3 (SSH-tunnel transport + server container; collector
+de-duplication; file transfer) implemented on
+`feature/remote-server-ssh-tunnel`. Phases 4-5 below are still design only.
+See [Using phase 1](#using-phase-1) for how to actually run it.
 
 ## Product context this design has to preserve
 
@@ -75,7 +75,7 @@ design:
 2. **File transfer needs real upload/download endpoints**, designed as a
    separable module from day one so it can be split into its own
    container later if it needs to scale independently. See
-   [File transfer](#file-transfer-upload--download). This also surfaced a
+   [File transfer](#file-transfer-upload--download--implemented). This also surfaced a
    real security gap in the *existing* encryption-key design that needs
    fixing as part of this work — see
    [Encryption keys need to move client-side](#encryption-keys-need-to-move-client-side).
@@ -315,7 +315,56 @@ to only ever have one client because nothing else could reach it.
   through different tunnels still get one consistent, correlatable
   timeline, not two skewed ones.
 
-## File transfer (upload / download)
+## File transfer (upload / download) — implemented
+
+Shipped as designed below, with a few concrete decisions made along the
+way:
+
+- `POST /files/upload` takes the raw file bytes as the request body (not
+  multipart) plus three headers: `X-CTTC-Filename` (required),
+  `X-CTTC-Private-Key` (optional, **base64-encoded** — a raw header can't
+  safely carry a multi-line PEM's newlines), `X-CTTC-Transforms`
+  (optional, comma-separated). Response shape matches `/open`'s
+  `{opened, errors}` exactly, `errors[].encrypted` included, so the
+  renderer's existing "locked file, prompt for a key and retry" logic
+  needed no new branches, just a different fetch underneath it.
+- `GET /files/download?from&to&public_key&include_host` returns the zip
+  (or encrypted blob) as the response body, plus a
+  `X-CTTC-Source-Count` header (cross-origin `fetch()` can't read
+  response headers unless the server explicitly
+  `Access-Control-Expose-Headers`s them — easy to miss, would have shown
+  up as `undefined` in the status line silently) so the client can still
+  say "saved: N sources" without the server needing to return JSON.
+- `State.export_sample()`'s zip-building was split into
+  `State.build_sample_bytes() -> (data, meta)`, with `export_sample()`
+  reduced to "build, then write to a path" — a pure refactor, the
+  existing path-based `/sample/export` endpoint (still used by
+  `--static`/CLI flows) is untouched and its tests passed unmodified.
+- An uploaded source's `.path` is set to a synthetic `upload://<filename>`
+  after opening (the scratch temp file is deleted immediately after — both
+  `open_file`/`load_sample` fully consume their input into memory, and a
+  non-live source's `.path` is never read again afterward). This is a
+  display-only change with one real consequence: the renderer's
+  already-open check for "Load metrics" compares against
+  `upload://<basename>` now, not the picked local path.
+- On the client, **`window.cttc.saveFile` (path-only, no write) was
+  removed**, not left dead — `saveBinary(name, bytes)` replaced its one
+  caller. `readFile(path)` was added alongside it so the renderer (which
+  has no fs access) can hand local bytes to `/files/upload` itself; per
+  the existing "main.js is thin glue" pattern, `main.js` still never talks
+  to the CTTC server API — it only reads/writes local files and shows
+  native dialogs, same division of responsibility as everywhere else in
+  the app.
+- A real, non-obvious test-infrastructure finding:
+  `contextBridge.exposeInMainWorld`-exposed objects (`window.cttc.*`) are
+  **not configurable** — `delete window.cttc.readFile` throws in strict
+  mode. An E2E test attempting to simulate a degraded environment that way
+  had to be dropped rather than worked around; the equivalent
+  `saveBinaryFile` fallback (plain-browser `Blob` download when
+  `window.cttc` is entirely absent) has the same untestable-in-Electron
+  property and was left unverified at the E2E layer for the same reason —
+  both are simple enough by inspection that this was judged an acceptable
+  gap rather than worth restructuring production code around.
 
 Two flows in the current UI assume the Electron client and `server.py`
 share a filesystem — true today (same machine), false once the server
@@ -514,10 +563,18 @@ for path B:
    run against the pre-fix code as a check that the test itself has teeth,
    reliably fails there (8/8 runs), confirming it wasn't passing
    vacuously. 100% line coverage maintained (157 server tests total).
-3. **File transfer module.** New `/files/upload` + streaming
-   `/sample/export` response, a `saveBinary` IPC call alongside the
-   existing `saveJson`/`saveText`, built as a separable module per the
-   decision above.
+3. **File transfer module — done.** `server/files.py` (`download_sample`,
+   `upload_and_open`) plus `GET /files/download` / `POST /files/upload`
+   on `server.py`; `main.js` gained `saveBinary`/`readFile` and dropped
+   the now-unused `saveFile`; `exportSample()` and the Load-metrics
+   handler in `app.js` rewired to fetch/POST bytes instead of exchanging
+   server-side paths. 100% coverage maintained on `server.py` and the new
+   `files.py` (182 server tests); renderer E2E covers the real
+   fetch-based upload/download round trip (53 tests). Full details and a
+   couple of real findings from building it (the
+   `Access-Control-Expose-Headers` gotcha, `contextBridge` object
+   immutability) in
+   [File transfer (upload / download) — implemented](#file-transfer-upload--download--implemented).
 4. **Client-side key management.** Port key generate/import/list/delete
    and sample decryption to Electron/Node `crypto`; retire (or gate behind
    embedded-mode-only) the server's `/cttc/keys/*` endpoints and `/open`'s
