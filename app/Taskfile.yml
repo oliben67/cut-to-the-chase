@@ -63,15 +63,20 @@ tasks:
 
   # ── Tests ─────────────────────────────────────────────────────────────────
   test:
-    desc: Run everything — server unit tests (with coverage) then renderer E2E
+    desc: Run everything — server unit tests (with coverage), main-process unit tests, then renderer E2E
     cmds:
       - task: test:server
+      - task: test:unit
       - task: test:e2e
 
   test:server:
     desc: Server test suite with line coverage (uv run pytest)
     dir: '{{.SERVER}}'
     cmd: "{{.UV}} run --group dev pytest tests/ -q --cov=server --cov-report=term-missing"
+
+  test:unit:
+    desc: Main-process unit tests (lib/*.js) — Node's built-in test runner, no Electron needed
+    cmd: node --test test/unit/*.test.js
 
   test:e2e:
     desc: Renderer E2E — runs test/renderer-spec.js inside the real app against demo data
@@ -84,6 +89,8 @@ tasks:
       - node --check main.js
       - node --check preload.js
       - node --check renderer/app.js
+      - node --check lib/connection-config.js
+      - node --check lib/ssh-tunnel.js
       - "{{.UV}} run --project {{.SERVER}} python -c 'import sys; sys.path.insert(0, \"{{.SERVER}}\"); import server; print(\"server imports ok,\", server.JSON_IMPL)'"
 
   ci:

@@ -5,6 +5,7 @@
   "main": "main.js",
   "scripts": {
     "start": "electron .",
+    "test:unit": "node --test test/unit/*.test.js",
     "test:e2e": "./test/run-e2e.sh"
   },
   "devDependencies": {
