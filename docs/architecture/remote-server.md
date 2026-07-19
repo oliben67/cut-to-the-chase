@@ -245,14 +245,36 @@ socket, the `/docker/ps` and `/sources` HTTP endpoints responded correctly
 from within the container's network namespace, and host-telemetry sampling
 produced real readings with `pid: host` + `network_mode: host` in place.
 
-One caveat from that validation, specific to the *test* environment rather
-than the design: on Docker Desktop for Mac, `network_mode: host` joins the
-container to the LinuxKit VM's network namespace, not literally macOS's —
-so external reachability from outside the VM couldn't be exercised here.
-On a real Linux Docker host (the actual deployment target), `network_mode:
-host` shares the physical host's network namespace directly, and the
-SSH-tunnel path works exactly as described. Worth a first real-host smoke
-test before relying on this in production.
+That first pass had one gap, specific to the *test* environment rather than
+the design: on Docker Desktop for Mac, `network_mode: host` joins the
+container to the LinuxKit VM's network namespace, not literally macOS's, so
+external reachability from outside the VM couldn't be exercised there.
+
+**That gap is now closed.** The full path was validated against a real,
+separate Linux Docker host reached over the network (not Docker Desktop):
+`server/` was `rsync`'d over, `docker compose up -d --build` run for real,
+and Electron on a different machine connected to it purely by ssh'ing in —
+no fake-ssh fixture this time, the actual `ssh` binary. Every layer was
+real: an actual `docker exec ... docker ps` inside the deployed container
+matched that host's real containers (itself plus two unrelated ones already
+running there), and the app displayed real telemetry (including host CPU/
+MEM/**NET numbers that reflected genuine network activity on that
+physical machine**, the exact thing Docker Desktop's VM networking
+couldn't prove) and 71 real log entries from a container on that host, all
+over a real SSH tunnel across a real LAN.
+
+This is also where a real bug turned up: `files.py` (added in phase 3) was
+never added to the Dockerfile's `COPY` list, so the built image ran fine
+locally (nothing in the build graph needed it) but crash-looped on start
+with `ModuleNotFoundError` the moment `server.py`'s `import files` executed
+— invisible to `docker build` succeeding, only visible once something
+actually tried to *run* the container. Fixed by adding `files.py` to the
+`COPY` line; re-verified with the same real-host deployment. Worth noting
+as a general lesson for this Dockerfile going forward: a successful `docker
+build` doesn't prove the image runs, only that the copied files were
+syntactically fine to package — a fresh `docker compose up` (or at minimum
+checking `docker logs` after one) is the actual test, and it's worth
+re-running after any new local module lands, not just after the first one.
 
 ## Single collector, multiple viewers
 
