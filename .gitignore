@@ -8,3 +8,4 @@ stay-the-course/
 .prompts/
 *.cttc
 .coverage
+dist/
