@@ -965,6 +965,84 @@ class TestState:
                                       interval=0.05, host_stats=False)
         assert opened == []
 
+    def test_collect_docker_dedupes_stats_and_host_stats(self, state, docker_cli, monkeypatch):
+        monkeypatch.setattr(server.subprocess, "run", FakeRun([ok("")]))
+        first = state.collect_docker(None, stats=True, logs=[], transforms=[],
+                                     interval=0.05, host_stats=True)
+        second = state.collect_docker(None, stats=True, logs=[], transforms=[],
+                                      interval=0.05, host_stats=True)
+        assert first == second
+        assert len(state.sources) == 2  # not 4 -- the second call reused both
+        for sid in first:
+            state.close_source(sid)
+
+    def test_collect_docker_dedupes_logs(self, state, docker_cli, monkeypatch):
+        monkeypatch.setattr(server.subprocess, "run", FakeRun([ok("")]))
+        monkeypatch.setattr(server.subprocess, "Popen", lambda *a, **k: FakeProc([]))
+        first = state.collect_docker(None, stats=False, host_stats=False,
+                                     logs=[{"name": "web", "type": "container"}],
+                                     transforms=[], interval=0.05)
+        second = state.collect_docker(None, stats=False, host_stats=False,
+                                      logs=[{"name": "web", "type": "container"}],
+                                      transforms=[], interval=0.05)
+        assert first == second
+        assert len(state.sources) == 1
+        state.close_source(first[0])
+
+    def test_collect_docker_distinct_targets_not_deduped(self, state, docker_cli, monkeypatch):
+        monkeypatch.setattr(server.subprocess, "run", FakeRun([ok("")]))
+        monkeypatch.setattr(server.subprocess, "Popen", lambda *a, **k: FakeProc([]))
+        by_name = state.collect_docker(None, stats=False, host_stats=False,
+                                       logs=[{"name": "web", "type": "container"}],
+                                       transforms=[], interval=0.05)
+        by_type = state.collect_docker(None, stats=False, host_stats=False,
+                                       logs=[{"name": "web", "type": "service"}],  # same name, different type
+                                       transforms=[], interval=0.05)
+        by_host = state.collect_docker("ssh://u@other", stats=False, host_stats=False,
+                                       logs=[{"name": "web", "type": "container"}],  # same name/type, different host
+                                       transforms=[], interval=0.05)
+        ids = by_name + by_type + by_host
+        assert len(set(ids)) == 3  # all distinct -- nothing wrongly collapsed
+        for sid in ids:
+            state.close_source(sid)
+
+    def test_collect_docker_reuse_ignores_the_second_call_s_settings(self, state, docker_cli, monkeypatch):
+        monkeypatch.setattr(server.subprocess, "run", FakeRun([ok("")]))
+        first = state.collect_docker(None, stats=True, logs=[], transforms=[],
+                                     interval=1.0, host_stats=False)
+        state.collect_docker(None, stats=True, logs=[], transforms=[],
+                             interval=99.0, host_stats=False)  # different interval, same target
+        src = state.sources[first[0]]
+        assert src.interval == 1.0  # untouched by the second, reused call
+        state.close_source(first[0])
+
+    def test_collect_docker_concurrent_requests_for_the_same_target_start_only_one(
+        self, state, docker_cli, monkeypatch
+    ):
+        """The real point of _open_or_reuse: not just 'sequential calls
+        dedupe' but that a genuine race between simultaneous requests can't
+        both win. N threads all request the identical target at once."""
+        monkeypatch.setattr(server.subprocess, "run", FakeRun([ok("")]))
+        n = 16
+        barrier = threading.Barrier(n)
+        results = [None] * n
+
+        def worker(i):
+            barrier.wait()  # maximize actual overlap
+            results[i] = state.collect_docker(None, stats=True, logs=[], transforms=[],
+                                              interval=0.05, host_stats=False)[0]
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+        assert all(r is not None for r in results), "a worker didn't finish"
+        assert len(set(results)) == 1, f"expected one winner id, got {set(results)}"
+        assert len(state.sources) == 1
+        state.close_source(results[0])
+
     def test_broadcast_full_queue_dropped(self, state):
         import queue as q
         full = q.Queue(maxsize=1)

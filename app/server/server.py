@@ -1000,38 +1000,57 @@ class State:
             self.sources[sid] = src
         return src
 
+    def _open_or_reuse(self, path: str, make):
+        """Return the id of a source already open at exactly this target
+        path, or construct one via make(sid) and register it. The
+        check-then-insert happens under one continuous lock hold so two
+        concurrent requests for the same target (two clients racing to add
+        the same container, or a session-restore racing a manual re-add)
+        can never both win and start a second collector polling the same
+        thing -- see docs/architecture/remote-server.md's "Single
+        collector, multiple viewers": two collectors for one target would
+        hand a viewer two slightly-different series for it with no way to
+        tell which is real, which breaks the correlation this tool exists
+        for, not just duplicate bookkeeping.
+
+        A reused source keeps whatever interval/ssh_key/transforms it was
+        originally started with -- a second request's differing settings
+        are silently ignored rather than mutating a collector another
+        client may already be relying on. Close and reopen it to change
+        those."""
+        with self.lock:
+            for s in self.sources.values():
+                if getattr(s, "path", None) == path:
+                    return s.id
+            sid = f"s{self.next_id}"
+            self.next_id += 1
+            self.sources[sid] = make(sid)
+            return sid
+
     def collect_docker(self, host: str | None, stats: bool, logs: list[dict],
                        transforms: list[str], interval: float, host_stats: bool = True,
                        ssh_key: str | None = None):
         opened = []
         hostname = (host or "local").split("@")[-1]
+        hostkey = host or "local"
         if stats:
-            with self.lock:
-                sid = f"s{self.next_id}"
-                self.next_id += 1
-            src = DockerStatsSource(sid, f"stats@{hostname}", host, interval, self, ssh_key=ssh_key)
-            with self.lock:
-                self.sources[sid] = src
-            opened.append(sid)
+            opened.append(self._open_or_reuse(
+                f"docker://{hostkey}/stats",
+                lambda sid: DockerStatsSource(sid, f"stats@{hostname}", host, interval, self, ssh_key=ssh_key),
+            ))
         if host_stats:
-            with self.lock:
-                sid = f"s{self.next_id}"
-                self.next_id += 1
-            src = HostStatsSource(sid, f"host@{hostname}", host, interval, self, ssh_key=ssh_key)
-            with self.lock:
-                self.sources[sid] = src
-            opened.append(sid)
+            opened.append(self._open_or_reuse(
+                f"docker://{hostkey}/host",
+                lambda sid: HostStatsSource(sid, f"host@{hostname}", host, interval, self, ssh_key=ssh_key),
+            ))
         for item in logs:
             target = item["name"]
             ttype = item.get("type", "container")
-            fns = self.registry.load(transforms)
-            with self.lock:
-                sid = f"s{self.next_id}"
-                self.next_id += 1
-            src = DockerLogSource(sid, target, host, ttype, target, fns, self, ssh_key=ssh_key)
-            with self.lock:
-                self.sources[sid] = src
-            opened.append(sid)
+            fns = self.registry.load(transforms)  # loaded eagerly; harmless to discard on reuse
+            opened.append(self._open_or_reuse(
+                f"docker://{hostkey}/{ttype}/{target}",
+                lambda sid, t=target, ty=ttype, f=fns: DockerLogSource(sid, t, host, ty, t, f, self, ssh_key=ssh_key),
+            ))
         return opened
 
     def export_sample(

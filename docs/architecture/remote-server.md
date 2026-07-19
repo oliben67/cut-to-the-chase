@@ -1,8 +1,9 @@
 # Running the CTTC server remotely (no local Docker required)
 
-**Status:** phase 1 (SSH-tunnel transport + server container) implemented
-on `feature/remote-server-ssh-tunnel`. Phases 2-5 below are still design
-only. See [Using phase 1](#using-phase-1) for how to actually run it.
+**Status:** phases 1-2 (SSH-tunnel transport + server container; collector
+de-duplication) implemented on `feature/remote-server-ssh-tunnel`. Phases
+3-5 below are still design only. See [Using phase 1](#using-phase-1) for
+how to actually run it.
 
 ## Product context this design has to preserve
 
@@ -502,10 +503,17 @@ for path B:
    config loader; `server.py`/`index.html`/`renderer/app.js` untouched.
    Ship the Dockerfile/compose file for the remote host (`pid: host`,
    `network_mode: host`, docker socket mount).
-2. **Collector de-duplication.** The small server-side guard in
-   `State.collect_docker()` described in
-   [Single collector, multiple viewers](#single-collector-multiple-viewers).
-   Independently useful even before remote mode ships.
+2. **Collector de-duplication — done.** `State._open_or_reuse()` in
+   `server.py`: a target already open (matched by its exact
+   `docker://{host}/{stats|host|type/name}` path) is returned as-is,
+   check-then-insert under one continuous lock hold rather than the
+   previous two-separate-acquisitions version, which really could start
+   two collectors for the same target under real concurrent load. Proven,
+   not just written: a 16-thread test hitting the identical target through
+   a `threading.Barrier` reliably produces exactly one collector — and,
+   run against the pre-fix code as a check that the test itself has teeth,
+   reliably fails there (8/8 runs), confirming it wasn't passing
+   vacuously. 100% line coverage maintained (157 server tests total).
 3. **File transfer module.** New `/files/upload` + streaming
    `/sample/export` response, a `saveBinary` IPC call alongside the
    existing `saveJson`/`saveText`, built as a separable module per the
