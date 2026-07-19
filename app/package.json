@@ -6,9 +6,41 @@
   "scripts": {
     "start": "electron .",
     "test:unit": "node --test test/unit/*.test.js",
-    "test:e2e": "./test/run-e2e.sh"
+    "test:e2e": "./test/run-e2e.sh",
+    "dist:win": "electron-builder --win nsis --x64",
+    "dist:win:zip": "electron-builder --win zip --x64"
   },
   "devDependencies": {
-    "electron": "^43.1.1"
+    "electron": "^43.1.1",
+    "electron-builder": "^26.15.3"
+  },
+  "build": {
+    "appId": "com.olivierbien67.cttc",
+    "productName": "CTTC",
+    "asar": true,
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer/**/*",
+      "assets/**/*",
+      "lib/**/*",
+      "package.json",
+      "!server/**",
+      "!demo/**",
+      "!test/**"
+    ],
+    "directories": {
+      "output": "dist"
+    },
+    "win": {
+      "target": ["nsis"],
+      "icon": "assets/icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
   }
 }
