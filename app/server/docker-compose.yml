@@ -1,0 +1,19 @@
+# Run on the Docker-enabled host. Clients then connect via an SSH tunnel
+# to 127.0.0.1:8765 on *this* host -- nothing here needs to be exposed to
+# the network; see docs/architecture/remote-server.md.
+services:
+  cttc-server:
+    build: .
+    image: cttc-server:latest
+    restart: unless-stopped
+    # both required for accurate host telemetry (HostStatsSource uses
+    # psutil, which without these only sees this container's own cgroup/
+    # network-namespace view, not the physical host's):
+    pid: host
+    network_mode: host
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - cttc-keys:/root/.cttc   # persists generated/imported encryption keys
+
+volumes:
+  cttc-keys:

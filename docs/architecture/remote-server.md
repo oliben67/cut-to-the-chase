@@ -1,6 +1,8 @@
 # Running the CTTC server remotely (no local Docker required)
 
-**Status:** exploration / design proposal — not implemented.
+**Status:** phase 1 (SSH-tunnel transport + server container) implemented
+on `feature/remote-server-ssh-tunnel`. Phases 2-5 below are still design
+only. See [Using phase 1](#using-phase-1) for how to actually run it.
 
 ## Product context this design has to preserve
 
@@ -139,18 +141,22 @@ implement it only if a real deployment needs it.
 ## Containerizing the server
 
 Either architecture needs the server running as a long-lived container on
-the Docker-enabled host, independent of any Electron process. Sketch:
+the Docker-enabled host, independent of any Electron process. Implemented
+as [server/Dockerfile](../../app/server/Dockerfile) and
+[server/docker-compose.yml](../../app/server/docker-compose.yml) — a
+distilled version:
 
 ```dockerfile
 FROM python:3.12-slim
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      docker-ce-cli openssh-client && rm -rf /var/lib/apt/lists/*
-RUN pip install uv
-COPY app/server /srv/cttc-server
+# docker CLI only (static binary, arch-matched via $TARGETARCH) + openssh-client
+RUN ... curl -fsSL https://download.docker.com/linux/static/stable/${arch}/docker-*.tgz | tar -xz ...
+RUN pip install --no-cache-dir uv
 WORKDIR /srv/cttc-server
-RUN uv sync --frozen
+COPY pyproject.toml ./
+RUN uv sync --no-dev   # uv treats "dev" as included by default; exclude it explicitly
+COPY server.py transforms ./
 EXPOSE 8765
-ENTRYPOINT ["uv", "run", "server.py", "--port", "8765"]
+ENTRYPOINT ["uv", "run", "--no-sync", "server.py", "--port", "8765"]
 ```
 
 ```yaml
@@ -168,20 +174,84 @@ volumes:
   cttc-keys:
 ```
 
-Two things worth calling out because they're easy to get wrong silently:
+Things worth calling out because they're easy to get wrong silently:
 
-- **`docker-ce-cli` only, not the full engine** — the container needs the
-  CLI binary and the mounted socket, never its own nested daemon.
+- **Static `docker` binary, not `docker-ce-cli` via apt** — Debian slim has
+  no clean `docker-ce-cli`-only package without adding Docker's apt repo;
+  downloading the static binary from `download.docker.com` and discarding
+  `curl` afterward keeps the image lean and avoids pulling in package
+  manager machinery for a full engine install this container never needs
+  (it only ever talks to the *mounted* socket, never runs its own dockerd).
+- **`uv sync --no-dev` is required, not optional** — verified by actually
+  building the image: plain `uv sync` pulled in `pytest`/`pytest-cov`/
+  `coverage` because uv treats a group literally named `dev` as included
+  by default. Without `--no-dev` the "production" image silently ships
+  test tooling.
+- **`server.py` needed zero changes for this** — it still hardcodes a
+  `127.0.0.1` bind. With `network_mode: host`, that loopback *is* the
+  host's loopback, so the host's ssh tunnel reaches it exactly as if this
+  were a same-machine embedded server. No `--bind 0.0.0.0` flag was added
+  (there's deliberately nowhere for one to go).
 - **Host telemetry accuracy.** `HostStatsSource._sample_local()` uses
   `psutil`, which by default reports the *container's* view (its cgroup
   limits, its network namespace), not the physical host's — exactly the gap
   `pid: host` + `network_mode: host` closes (the same technique
   node-exporter/cAdvisor-style agents use). Without both, host telemetry
   will silently report container-scoped numbers that look plausible but are
-  wrong. Worth a loud comment in the compose file, and probably a startup
-  self-check in `HostStatsSource` that warns if `/proc/1/comm` doesn't look
-  like host `init` (a `pid: host` giveaway) when host-telemetry is
-  requested.
+  wrong.
+- **`.dockerignore` matters here more than usual** — without one, `.venv/`,
+  `tests/`, `.pytest_cache/`, and `uv.lock` (all present in a normal dev
+  checkout of `server/`) get sent to the docker daemon as build context
+  even though nothing COPYs them in. Added
+  [server/.dockerignore](../../app/server/.dockerignore); confirmed it
+  drops the transferred context from megabytes to a few hundred bytes.
+
+### Using phase 1
+
+On the Docker-enabled host:
+
+```sh
+cd app/server
+docker compose up -d --build
+```
+
+On the client machine, `~/.cttc/connection.json`:
+
+```json
+{
+  "mode": "ssh-tunnel",
+  "ssh_target": "deploy@docker-host.internal",
+  "ssh_key": "~/.ssh/cttc_deploy",
+  "remote_port": 8765
+}
+```
+
+Then `npm start` as usual — nothing else changes. (Env vars `CTTC_MODE`,
+`CTTC_SSH_TARGET`, `CTTC_SSH_KEY`, `CTTC_REMOTE_PORT` override the file, for
+scripted deployment; see
+[lib/connection-config.js](../../app/lib/connection-config.js).)
+
+**Verified, not just built:** the whole pipeline was validated for real, not
+only unit-tested — a standalone `server.py` instance was started, Electron
+was launched in `ssh-tunnel` mode pointed at it through
+[test/fixtures/fake-ssh.js](../../app/test/fixtures/fake-ssh.js) (a real
+subprocess proxying real sockets, not a mock), and the renderer loaded real
+telemetry and log data over that tunnel with a UI pixel-identical to
+embedded mode. Separately, the container image itself was built and run
+against a real Docker daemon: `docker ps` from inside the container
+correctly matched the host's actual container list through the mounted
+socket, the `/docker/ps` and `/sources` HTTP endpoints responded correctly
+from within the container's network namespace, and host-telemetry sampling
+produced real readings with `pid: host` + `network_mode: host` in place.
+
+One caveat from that validation, specific to the *test* environment rather
+than the design: on Docker Desktop for Mac, `network_mode: host` joins the
+container to the LinuxKit VM's network namespace, not literally macOS's —
+so external reachability from outside the VM couldn't be exercised here.
+On a real Linux Docker host (the actual deployment target), `network_mode:
+host` shares the physical host's network namespace directly, and the
+SSH-tunnel path works exactly as described. Worth a first real-host smoke
+test before relying on this in production.
 
 ## Single collector, multiple viewers
 
@@ -450,3 +520,21 @@ for path B:
 
 Phases 1–3 are independent of each other and can land in any order; phase 4
 depends on phase 3 (decryption needs the downloaded bytes to decrypt).
+
+## Future direction: a VS Code extension client (not this phase)
+
+Flagged for a later exploration, not started: packaging the CTTC *client*
+as a VS Code extension instead of (or alongside) the Electron app — viewing
+correlated telemetry/logs inside the editor.
+
+One thing worth banking now while it's fresh: phase 1's decision to keep
+`lib/connection-config.js` and `lib/ssh-tunnel.js` as plain Node modules
+with zero `electron` dependency (see
+[What changes in Electron for the SSH-tunnel path](#what-changes-in-electron-for-the-ssh-tunnel-path))
+means they already run unmodified in *any* Node host process — a VS Code
+extension's extension host is exactly that. The remote-server transport
+this phase built isn't Electron-specific despite living in `app/main.js`
+today; a future VS Code extension would reuse both modules as-is rather
+than reimplementing tunnel management. Whether the *rest* of the client
+(the canvas-based renderer, IPC-shaped interactions) ports as cleanly is
+the real question for that future exploration — not answered here.
