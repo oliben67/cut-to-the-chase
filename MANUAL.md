@@ -103,22 +103,28 @@ space; the position is remembered.
 interval, and the transforms list](docs/images/dlg-add-sources.png)
 
 **＋ Add sources** attaches to a Docker daemon. Leave the host field empty
-for the local daemon. The dialog lists the running containers and swarm
-services (use **Refresh** to re-list); tick the ones whose logs you want to
-follow. Logs are streamed with `docker logs -f -t` (or
-`docker service logs -f -t` for swarm services).
+for the local daemon. Telemetry and logs are two independent kinds of data
+CTTC can collect, so the dialog splits them into two sections — **everything
+in both is ticked by default**; untick whatever you don't want.
 
-Two checkboxes control telemetry, both on by default:
-
-- **collect `docker stats` telemetry** — polls CPU/MEM/NET for *every*
-  container on the host on the chosen interval. Only the containers you
-  ticked are *plotted*; the rest wait in the legend's *others* group (see
+- **📊 Telemetry** — two checkboxes:
+  - **collect `docker stats` telemetry** — polls CPU/MEM/NET for *every*
+    container on the host on the chosen interval. Only *selected* containers
+    (see below) are actually *plotted*; the rest wait in the legend's
+    *others* group (see [The container legend](#the-container-legend)).
+  - **collect host telemetry** — CPU/MEM/NET of the docker host machine
+    itself, shown in its own strip group at the bottom.
+- **📝 Logs** — the dialog lists the running containers and swarm services
+  (use **Refresh** to re-list); every one is ticked, which both starts
+  following its logs (`docker logs -f -t`, or `docker service logs -f -t`
+  for swarm services) *and* marks it *selected* so its telemetry plots
+  immediately. Untick anything you don't want followed and plotted yet — you
+  can always right-click it later to track it (see
   [The container legend](#the-container-legend)).
-- **collect host telemetry** — CPU/MEM/NET of the docker host machine
-  itself, shown in its own strip group at the bottom.
 
-Anything already being collected shows as *already added* and cannot be
-added twice. Ticked transforms (see [Transforms](#transforms)) apply to the
+Anything already being collected shows as *already added*, is checked but
+disabled, and cannot be added twice. Ticked transforms (see
+[Transforms](#transforms)) apply to the
 new log sources.
 
 ### Remote hosts over SSH

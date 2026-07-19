@@ -2054,6 +2054,7 @@ async function listContainers() {
         const label = document.createElement("label");
         const cb = document.createElement("input");
         cb.type = "checkbox";
+        cb.checked = true; // every detected container/service is followed by default
         cb.value = it.name;
         cb.dataset.type = type;
         label.append(cb, ` ${it.name} `);
