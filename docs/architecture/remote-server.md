@@ -45,6 +45,22 @@ little change as possible to the current UI and interaction flow.**
 
 Every one of those facts matters for what changes and what doesn't.
 
+## Decisions
+
+Two of the open questions below have been answered, and both sharpen the
+design:
+
+1. **One collector per monitored system, shared by every viewer.** Not
+   one container per client. See
+   [Single collector, multiple viewers](#single-collector-multiple-viewers).
+2. **File transfer needs real upload/download endpoints**, designed as a
+   separable module from day one so it can be split into its own
+   container later if it needs to scale independently. See
+   [File transfer](#file-transfer-upload--download). This also surfaced a
+   real security gap in the *existing* encryption-key design that needs
+   fixing as part of this work — see
+   [Encryption keys need to move client-side](#encryption-keys-need-to-move-client-side).
+
 ## Two candidate architectures
 
 ### A. SSH tunnel to a remote server container (recommended default)
@@ -151,6 +167,163 @@ Two things worth calling out because they're easy to get wrong silently:
   like host `init` (a `pid: host` giveaway) when host-telemetry is
   requested.
 
+## Single collector, multiple viewers
+
+The decision: for a given monitored system (a Docker host), there is **one**
+gathering process — one server container polling that host's `docker
+stats`, following its logs, sampling its vitals — and every Electron client
+interested in that host connects to that same instance. No per-client
+containers, no per-client collectors.
+
+The good news: **most of what this needs already exists**, because
+`server.py`'s `State` was never designed as single-user — it just happened
+to only ever have one client because nothing else could reach it.
+
+- **Per-viewer state already lives client-side, not server-side.**
+  `state.track` (selected/hidden containers), `state.view` (zoom/pan),
+  `state.cursorT`, chart style, strip height — all of it is
+  `localStorage` in the *renderer*, not anything `server.py` tracks. Two
+  people looking at the same server can independently zoom, select
+  different containers, and scrub to different times without stepping on
+  each other. Nothing to build here.
+- **The shared, de-duplicated part is exactly what `State.sources` already
+  is** — one `DockerStatsSource`/`DockerLogSource`/`HostStatsSource` per
+  collected target, visible identically to every client via `/sources` and
+  `/series`. A second client's *"Add sources"* dialog already calls
+  `/docker/ps` + checks `openPaths()` against the live `/sources` list and
+  marks already-open containers *"already added"* ([app.js
+  `updateDockerDupes`/`listContainers`](../../app/renderer/app.js)) — so
+  today, two simultaneous clients pointed at the same server already won't
+  double-collect the same container, *as long as each has fetched
+  `/sources` before submitting*.
+- **The one real gap: a race.** If two clients open the dialog and hit
+  *Add* within the same instant — before either has re-fetched
+  `/sources` — `collect_docker()` currently has no server-side check and
+  will happily start two `DockerStatsSource`/`DockerLogSource` pairs
+  polling the same container. Low-probability, but "not duplicated as much
+  as possible" means closing it rather than leaving it to client-side
+  timing. Fix is small and self-contained: before creating a new
+  `DockerStatsSource`/`HostStatsSource`/`DockerLogSource` in
+  `State.collect_docker()`, check `self.sources` for an existing source
+  whose `.path` matches the target being requested
+  (`docker://{host}/stats`, `docker://{host}/host`,
+  `docker://{host}/{type}/{name}`) and return its id instead of creating a
+  duplicate. This is a pure server-side addition — no protocol change, no
+  client change, and it also protects the single-client case (e.g. a
+  double-click on *Add*, or `lastDockerSessions` restore racing a manual
+  re-add after a crash).
+- **Cross-host scope stays one-window-per-host.** If someone needs to watch
+  two different Docker hosts at once, that's two Electron windows (or two
+  `connection.json`s), each tunneled to its own server container — not a
+  host-switcher inside one window. Keeps the "minimal UI change" goal
+  intact; multi-host-in-one-window is a materially bigger feature
+  (cross-server legend/merging) that nothing here requires.
+
+## File transfer (upload / download)
+
+Two flows in the current UI assume the Electron client and `server.py`
+share a filesystem — true today (same machine), false once the server
+runs on a different host:
+
+- **📂 Load metrics** — `pickFiles()` returns a path *on the client*;
+  `/open` and `load_sample()` read that path *on the server*. Works only by
+  coincidence of both being the same machine.
+- **✂ Capture metrics (Save)** — `/sample/export` already builds the whole
+  zip in memory (`io.BytesIO()` in
+  [`export_sample`](../../app/server/server.py)) before ever touching
+  disk — encouraging, since it means the "write to `path`" step is already
+  the *only* thing that's server-filesystem-specific, not the zip-building
+  itself.
+
+One flow **already gets this right** and is the pattern to copy: **Save
+snapshot as TXT/JSON**. The snapshot's data is assembled from ordinary JSON
+API calls (`/point`, `/logs`) in the renderer, then handed to
+`window.cttc.saveJson`/`saveText`, which round-trip through
+`ipcMain.handle("save-json"/"save-text")` in `main.js` and write the bytes
+**on the client** via a native save dialog. No server filesystem access at
+all. See [main.js `saveSnapshotAs`](../../app/main.js).
+
+Proposed change: give sample export/import the same shape.
+
+- **Download (export).** `/sample/export` gains a mode that returns the
+  zip (or encrypted blob) **as the HTTP response body**
+  (`Content-Type: application/octet-stream`,
+  `Content-Disposition: attachment; filename=...`) instead of / in addition
+  to writing to a server-side `path`. The renderer fetches those bytes,
+  passes them to a new `window.cttc.saveBinary(name, bytes)` IPC call
+  (same shape as `saveJson`/`saveText`, just `Buffer`-based instead of
+  UTF-8 text), and Electron's native save dialog writes them on the client
+  — identical user-visible flow to today, just no shared filesystem
+  required.
+- **Upload (load / add local files).** A new endpoint, e.g.
+  `POST /files/upload` — client streams the picked file's bytes up
+  (`multipart/form-data` or raw body + a `name` header), server writes
+  them to a scratch path and runs the *existing* `load_sample()` /
+  `open_file()` logic against that path unchanged. From the client's
+  perspective: pick a file → it opens, exactly like today; the bytes just
+  take a detour through the network instead of already being local.
+- **Keep it a separable module.** Per the ask, structure this as its own
+  route prefix and its own file (`server/files.py` or similar) with a
+  narrow interface into `State` (hand it bytes, get back opened source ids
+  / a zip blob), rather than folding upload/download logic into the
+  existing endpoint handlers. That's what makes "spin it off into its own
+  container later" a refactor instead of a rewrite — the day file traffic
+  needs to scale independently of the telemetry/log collectors (large
+  `.cttc` files, many concurrent uploads), it lifts out behind the same
+  route prefix on a different port/container without the collector code
+  ever noticing.
+
+## Encryption keys need to move client-side
+
+Designing the upload/download story surfaced a real problem in the
+**existing** (already-shipped) sample-encryption feature, not something new
+this proposal introduces — but it only becomes *live* once a server can
+have more than one user.
+
+Today, `~/.cttc/keys/` and the whole 🔑 Keys dialog assume "the machine
+running `server.py`" and "the one person using CTTC" are the same entity —
+reasonable when true. `resolve_private_key()` reads a private key straight
+off that machine's disk with no notion of *which client* is asking. Once
+one server is shared by multiple viewers, that assumption breaks in a way
+that defeats the point of encryption:
+
+- Every connected client can call `/cttc/keys/generate|import|delete` and
+  see the same keyring — including **other people's private keys**.
+- `/open` with `private_key: "alice"` on a shared server means *anyone*
+  who can reach the API can decrypt anything encrypted for Alice, not just
+  Alice. The "encrypt for a specific recipient" feature stops meaning
+  anything.
+
+Fix: **private keys, and the operations that need them, move to the
+client.** Concretely:
+
+- **Encryption (needs only the public key) can stay server-side as-is.**
+  `resolve_public_key()` already accepts a raw PEM string, not just a
+  stored name — `/sample/export`'s `public_key` field already supports a
+  client supplying the PEM directly with no server-side key storage
+  involved at all. No change required here.
+- **Decryption moves to the client.** Instead of `/open` taking a
+  `private_key` name/PEM and decrypting server-side, the *download* path
+  above hands the (still-encrypted) bytes to Electron, and decryption
+  happens locally — Node's built-in `crypto` module covers the exact
+  primitives `server.py` uses (`crypto.privateDecrypt` with OAEP padding
+  for the wrapped AES key, `crypto.createDecipheriv("aes-256-gcm", ...)`
+  for the payload), so this is a port, not a redesign.
+- **`~/.cttc/keys/` becomes a client-side concern.** The 🔑 Keys dialog's
+  generate/import/list/delete operations move to run against the local
+  Electron install (a small main-process module backed by Node `crypto`
+  + local files) instead of `/cttc/keys/*` on the server. The server's
+  key-management endpoints either go away entirely or stay only for the
+  local/embedded (single-user, same-machine) deployment mode, gated off
+  when running in shared/remote mode.
+
+This is scoped as **required for the shared-server model to be honest about
+its security properties**, not a nice-to-have — shipping shared-server mode
+with server-side private keys would be a regression from what the feature
+currently promises (documented in
+[MANUAL.md](../../MANUAL.md#encryption-keys): *"the private key never
+leaves this machine"* — true today, false under naive shared-server reuse).
+
 ## What changes in Electron for the SSH-tunnel path
 
 `main.js` gains a second `startServer`-shaped function alongside the
@@ -200,40 +373,47 @@ or the equivalent as environment variables (`CTTC_MODE`, `CTTC_SSH_TARGET`,
 treats `CTTC_TEST`/`CTTC_SCREENSHOT`/`CTTC_EVAL` as environment-driven,
 invisible-by-default switches (see [main.js](../../app/main.js)).
 
-## Open questions that need a decision before implementing
+## Open questions still needing a decision
 
-These are judgment calls about the deployment model, not implementation
-details — flagging them rather than picking silently:
+Shared-vs-per-client and file semantics are settled (see
+[Decisions](#decisions)). What's left is narrower and mostly matters only
+for path B:
 
-1. **Shared vs. per-client server.** `State` in `server.py` is one global
-   object — if two client machines point at the same container, they see
-   *each other's* open sources, tracked/hidden state, everything. Is that
-   the intent (a shared team dashboard), or does each client need its own
-   container (spun up on demand — needs an orchestration story: who starts
-   a container per connecting user, how is idle cleanup handled)?
-2. **File-based sources.** `/open` and "load .cttc metrics" currently read
-   a path on whichever machine runs `server.py`. In remote mode, a path
-   picked in the client's file dialog won't exist on the remote host. Is
-   this out of scope for v1 (Docker-collection-only clients don't need
-   local file loading), or does it need upload/download endpoints added to
-   `server.py` (a real feature, not a config change)?
-3. **Token distribution (path B only).** Who generates/rotates the shared
+1. **Token distribution (path B only).** Who generates/rotates the shared
    token, and how does it reach each client's `connection.json` — manually,
    via MDM, via a short-lived provisioning step?
-4. **TLS termination ownership (path B only).** Is there already a reverse
+2. **TLS termination ownership (path B only).** Is there already a reverse
    proxy / ingress in these environments, or does this project need to ship
    one (a Caddy sidecar in the compose file is the least-effort default)?
+3. **Client-side key storage location.** Moving key management to Electron
+   (see [Encryption keys need to move client-side](#encryption-keys-need-to-move-client-side))
+   needs a concrete home for `~/.cttc/keys/`-equivalent files on the client
+   — reuse the same path convention (simplest, and lets someone move from
+   embedded to remote mode without losing their keys), or use Electron's
+   `app.getPath("userData")`? Leaning toward keeping `~/.cttc/keys/`
+   either way, for that continuity, but flagging it rather than assuming.
 
 ## Suggested phasing
 
-1. Ship the SSH-tunnel path only. Zero changes to `server.py`,
-   `index.html`, or `renderer/app.js`; `main.js` gains the tunnel manager
-   and a config loader; ship the Dockerfile/compose file for the remote
-   host. This alone unblocks the stated problem (no Docker CLI on the
-   client) for any environment where SSH egress is allowed.
-2. Only build path B (token + TLS + CSP changes) if a real deployment shows
-   up that blocks SSH — it's strictly more code and more attack surface for
-   a case that may never materialize.
-3. Decide questions 1–2 above before phase 1 lands, since they affect
-   whether "remote mode" is a single flag or needs a small provisioning
-   API.
+1. **SSH-tunnel transport.** `main.js` gains the tunnel manager and a
+   config loader; `server.py`/`index.html`/`renderer/app.js` untouched.
+   Ship the Dockerfile/compose file for the remote host (`pid: host`,
+   `network_mode: host`, docker socket mount).
+2. **Collector de-duplication.** The small server-side guard in
+   `State.collect_docker()` described in
+   [Single collector, multiple viewers](#single-collector-multiple-viewers).
+   Independently useful even before remote mode ships.
+3. **File transfer module.** New `/files/upload` + streaming
+   `/sample/export` response, a `saveBinary` IPC call alongside the
+   existing `saveJson`/`saveText`, built as a separable module per the
+   decision above.
+4. **Client-side key management.** Port key generate/import/list/delete
+   and sample decryption to Electron/Node `crypto`; retire (or gate behind
+   embedded-mode-only) the server's `/cttc/keys/*` endpoints and `/open`'s
+   `private_key` parameter once the client can decrypt locally.
+5. **Path B (token + TLS + CSP)** only if a real deployment blocks SSH
+   egress — still deferred, still strictly more code/attack-surface than
+   phases 1–4 need.
+
+Phases 1–3 are independent of each other and can land in any order; phase 4
+depends on phase 3 (decryption needs the downloaded bytes to decrypt).
