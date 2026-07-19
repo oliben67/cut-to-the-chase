@@ -31,7 +31,7 @@ COPY pyproject.toml ./
 # uv treats the "dev" group as included by default -- --no-dev keeps
 # pytest/pytest-cov/coverage out of the deployed image
 RUN uv sync --no-dev
-COPY server.py ./
+COPY server.py files.py ./
 COPY transforms ./transforms
 
 EXPOSE 8765

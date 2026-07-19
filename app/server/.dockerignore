@@ -1,6 +1,6 @@
-# Only pyproject.toml, server.py, and transforms/ are ever COPYed into the
-# image; everything else here is local dev/test state that shouldn't even
-# be sent to the docker daemon as build context.
+# Only pyproject.toml, server.py, files.py, and transforms/ are ever COPYed
+# into the image; everything else here is local dev/test state that
+# shouldn't even be sent to the docker daemon as build context.
 .venv/
 __pycache__/
 .pytest_cache/
