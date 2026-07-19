@@ -4,6 +4,8 @@ const { app, BrowserWindow, dialog, ipcMain, Menu, shell } = require("electron")
 const { spawn } = require("child_process");
 const path = require("path");
 const readline = require("readline");
+const { loadConnectionConfig } = require("./lib/connection-config");
+const { startTunnel } = require("./lib/ssh-tunnel");
 
 const SERVER_DIR = path.join(__dirname, "server");
 const APP_ICON = path.join(__dirname, "assets", "icon.png");
@@ -16,6 +18,7 @@ const HELP_TOPICS = {
 };
 let serverProc = null;
 let serverPort = null;
+let tunnel = null; // set instead of serverProc in ssh-tunnel mode (see lib/ssh-tunnel.js)
 
 function startServer(extraArgs) {
   return new Promise((resolve, reject) => {
@@ -276,6 +279,32 @@ ipcMain.on("sync-broadcast", (e, msg) => {
   }
 });
 
+// Connecting to the server has two shapes: "embedded" (default, unchanged
+// from before this existed) spawns it locally via uv; "ssh-tunnel" connects
+// to a server already running in a container on a remote docker-enabled
+// host instead, over a local port-forward, for clients that can't have
+// Docker installed locally. See docs/architecture/remote-server.md. Either
+// way the renderer only ever sees http://127.0.0.1:<serverPort> — it can't
+// tell the two apart.
+async function connectToServer(fileArgs) {
+  const cfg = loadConnectionConfig();
+  if (cfg.mode === "embedded") {
+    await startServer(fileArgs);
+    return;
+  }
+  if (fileArgs.length) {
+    // file paths are local to *this* machine; meaningless against a shared
+    // remote server, so they're ignored rather than silently mis-sent
+    console.error(`[tunnel] ignoring command-line files in ssh-tunnel mode: ${fileArgs.join(", ")}`);
+  }
+  // CTTC_SSH_BIN overrides the ssh binary (verification hook, same idea as
+  // CTTC_TEST/CTTC_EVAL/CTTC_SCREENSHOT below): lets tests point the tunnel
+  // manager at test/fixtures/fake-ssh.js instead of a real ssh + remote host.
+  tunnel = await startTunnel(cfg, { sshBin: process.env.CTTC_SSH_BIN || "ssh" });
+  serverPort = tunnel.localPort;
+  console.log(`[tunnel] connected to ${cfg.sshTarget} — local port ${serverPort}`);
+}
+
 app.whenReady().then(async () => {
   installMenu();
   // the window `icon` option is ignored on macOS; the running app's Dock icon
@@ -284,7 +313,7 @@ app.whenReady().then(async () => {
   try {
     // files passed on the command line open at startup: npm start -- file1 file2
     const fileArgs = process.argv.slice(app.isPackaged ? 1 : 2).filter((a) => !a.startsWith("-"));
-    await startServer(fileArgs);
+    await connectToServer(fileArgs);
   } catch (err) {
     dialog.showErrorBox("CTTC Timeline", String(err.message || err));
     app.quit();
@@ -297,6 +326,12 @@ app.whenReady().then(async () => {
 });
 
 function stopServer() {
+  if (tunnel) {
+    // the remote server is shared infrastructure, not this process's child —
+    // never POST /shutdown to it; just tear down our local ssh forward
+    tunnel.stop();
+    return;
+  }
   if (serverProc) {
     try {
       // graceful: lets the server stop docker collectors and ssh sessions
