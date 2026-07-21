@@ -433,7 +433,10 @@ function runSetupWizard() {
         nodeIntegration: false,
       },
     });
-    wizardWindow.once("ready-to-show", () => wizardWindow.show());
+    wizardWindow.once("ready-to-show", () => {
+      wizardWindow.show();
+      closeSplash();
+    });
     wizardWindow.setMenuBarVisibility(false);
     wizardWindow.loadFile(path.join(__dirname, "renderer", "setup-wizard.html"));
     wizardWindow.on("closed", () => {
@@ -558,6 +561,15 @@ ipcMain.handle("update-image", async (_e, payload) => {
 });
 
 app.whenReady().then(async () => {
+  // Shown before anything else, including installMenu() and the
+  // hasLocalDocker() check below -- hasLocalDocker() shells out to `docker
+  // info` synchronously (spawnSync) and can block the main process for
+  // several seconds on a slow/starting daemon, which otherwise left the
+  // app showing nothing at all during that time. The wizard path closes
+  // this itself once its own window is ready to show (see
+  // runSetupWizard()'s 'ready-to-show' handler) instead of stacking a
+  // second loading window on top of it.
+  showSplash();
   installMenu();
   // the window `icon` option is ignored on macOS; the running app's Dock icon
   // must be set explicitly (only affects unpackaged runs — packaged apps use .icns)
@@ -567,11 +579,8 @@ app.whenReady().then(async () => {
     const fileArgs = process.argv.slice(app.isPackaged ? 1 : 2).filter((a) => !a.startsWith("-"));
     const cfg = loadConnectionConfig();
     if (cfg.mode === "embedded" && !hasLocalDocker()) {
-      // the wizard has its own "please wait" state once the user submits --
-      // no splash here, or first run would show two loading screens stacked
       await runSetupWizard();
     } else {
-      showSplash();
       await connectToServer(fileArgs);
     }
   } catch (err) {

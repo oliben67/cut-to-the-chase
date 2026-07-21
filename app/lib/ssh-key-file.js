@@ -31,7 +31,7 @@ function icacls(args) {
 
 // ssh refuses a private key that's readable by anyone but its owner. On
 // Windows that's icacls (mirrors deploy.ps1's step 2); elsewhere it's chmod.
-// Grants (RW), not (R)-only: a read-only grant would lock the *owner* out of
+// Grants (R,W), not (R)-only: a read-only grant would lock the *owner* out of
 // ever overwriting the file too, breaking a second run of the wizard with
 // EPERM the moment it tries to rewrite an already-restricted file. Errors
 // are checked: a silently-failed /inheritance:r or /grant:r can leave the
@@ -40,7 +40,10 @@ function icacls(args) {
 function restrictKeyPermissions(keyPath) {
   if (process.platform === "win32") {
     const r1 = icacls([keyPath, "/inheritance:r"]);
-    const r2 = icacls([keyPath, "/grant:r", `${OWNER_RIGHTS_SID}:(RW)`]);
+    // icacls permission masks combine simple rights with a comma, not by
+    // concatenating letters -- "(RW)" is not valid syntax and fails with
+    // "Invalid parameter", which is exactly the error this was meant to fix.
+    const r2 = icacls([keyPath, "/grant:r", `${OWNER_RIGHTS_SID}:(R,W)`]);
     if (!r1.ok || !r2.ok) {
       // Don't leave the file locked down worse than before -- restore
       // normal inherited permissions (which always include the owner)
