@@ -134,12 +134,18 @@ function installMenu() {
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
-// Shown while connectToServer() is starting the embedded server or an
-// existing ssh-tunnel config -- skipped for the setup wizard path (see
-// app.whenReady below), which has its own "please wait" state and would
-// otherwise stack a second loading window on top of it.
+// Shown from the moment the app starts until the main window has actually
+// painted -- bridges both the potentially-slow connectToServer() call
+// (docker pull/load, ssh tunnel, ...) and the main BrowserWindow's own
+// load/render time, so there's never a blank Electron window on screen in
+// between. Idempotent: safe to call again if one's already up (e.g. right
+// before createWindow(), after a path that already showed it earlier).
+// Skipped only while the setup wizard's own window is up (see
+// app.whenReady below) -- that's already a fully-drawn "please wait" UI of
+// its own, so stacking a second loading window on top would be redundant.
 let splashWindow = null;
 function showSplash() {
+  if (splashWindow && !splashWindow.isDestroyed()) return splashWindow;
   splashWindow = new BrowserWindow({
     width: 280,
     height: 220,
@@ -163,11 +169,21 @@ async function createWindow() {
     width: 1440,
     height: 940,
     icon: APP_ICON,
+    // Created hidden -- shown only on 'ready-to-show' below, once the page
+    // has actually rendered its first frame. Without this, the window
+    // paints as a blank white/gray rectangle the instant it's constructed,
+    // well before index.html/app.js have anything to show -- exactly the
+    // "long time before any UI" gap the splash screen exists to cover.
+    show: false,
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
     },
+  });
+  win.once("ready-to-show", () => {
+    win.show();
+    closeSplash();
   });
   win.webContents.on("console-message", (_e, level, msg) => {
     if (level >= 2) console.error(`[renderer] ${msg}`);
@@ -410,12 +426,14 @@ function runSetupWizard() {
       height: 640,
       resizable: false,
       icon: APP_ICON,
+      show: false, // shown on 'ready-to-show' below -- avoids a blank flash before setup-wizard.html renders
       webPreferences: {
         preload: path.join(__dirname, "preload.js"),
         contextIsolation: true,
         nodeIntegration: false,
       },
     });
+    wizardWindow.once("ready-to-show", () => wizardWindow.show());
     wizardWindow.setMenuBarVisibility(false);
     wizardWindow.loadFile(path.join(__dirname, "renderer", "setup-wizard.html"));
     wizardWindow.on("closed", () => {
@@ -562,8 +580,11 @@ app.whenReady().then(async () => {
     app.quit();
     return;
   }
+  // Bridges the gap between the wizard window closing (or the splash
+  // already up from the branch above) and the main window's first paint --
+  // showSplash() is idempotent, so this is a no-op if one's already shown.
+  showSplash();
   await createWindow();
-  closeSplash();
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
