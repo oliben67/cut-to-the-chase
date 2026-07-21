@@ -29,6 +29,13 @@ tasks:
     cmds:
       - task: app:ci
 
+  # ── Release ───────────────────────────────────────────────────────────────
+  release:win:
+    desc: "Build the Windows installer + deploy bundle   [usage: task release:win -- --keys-dir /path/to/keys]"
+    cmds:
+      - task: app:release:win
+        vars: { CLI_ARGS: '{{.CLI_ARGS}}' }
+
   # ── Clean ─────────────────────────────────────────────────────────────────
   clean:
     desc: Remove build artefacts and caches across all sub-projects

@@ -99,6 +99,11 @@ tasks:
       - task: install
       - task: check
 
+  # ── Release ───────────────────────────────────────────────────────────────
+  release:win:
+    desc: "Build the Windows installer + deploy bundle   [usage: task release:win -- --keys-dir /path/to/keys]"
+    cmd: npm run release:win -- {{.CLI_ARGS}}
+
   # ── Dependencies ──────────────────────────────────────────────────────────
   deps:update:
     desc: Update server packages to their latest allowed versions
