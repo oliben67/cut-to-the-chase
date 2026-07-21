@@ -82,9 +82,17 @@ function writeKeyFile(contents, name = "cttc_ssh_key") {
     // broken state the explicit ACL is currently in.
     icacls([keyPath, "/reset"]);
   }
-  // ssh is picky about trailing whitespace/newline conventions from a
-  // copy-paste; normalize to a single trailing newline.
-  fs.writeFileSync(keyPath, contents.trim() + "\n", { encoding: "utf8" });
+  // ssh's key parser reads the base64 body line by line and chokes on
+  // anything but a bare \n -- a pasted-in key (or one copied from a file
+  // that already had Windows line endings) can carry \r\n internally, not
+  // just at the very end, which trim() alone doesn't touch and produces
+  // exactly the "invalid format" ssh reports when it can't parse a line.
+  // Also strip a leading UTF-8 BOM (e.g. a file saved by Windows Notepad),
+  // which would otherwise corrupt the "-----BEGIN ..." header line.
+  let normalized = contents;
+  if (normalized.charCodeAt(0) === 0xfeff) normalized = normalized.slice(1);
+  normalized = normalized.replace(/\r\n/g, "\n").trim() + "\n";
+  fs.writeFileSync(keyPath, normalized, { encoding: "utf8" });
   restrictKeyPermissions(keyPath);
   return keyPath;
 }
