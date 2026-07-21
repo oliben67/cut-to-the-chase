@@ -17,8 +17,8 @@
     "output": "dist"
   },
   "extraResources": [
-    { "from": "../releases/repo/image.json", "to": "image.json" },
-    { "from": "../releases/repo/docker-compose.yml", "to": "docker-compose.registry.yml" }
+    { "from": "../releases/_repo/image.json", "to": "image.json" },
+    { "from": "../releases/_repo/docker-compose.yml", "to": "docker-compose.registry.yml" }
   ],
   "win": {
     "target": ["nsis"],
