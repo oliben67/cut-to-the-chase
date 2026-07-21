@@ -561,6 +561,8 @@ pre.snapshot-body {
 .key-badge.private { border-color: var(--accent); color: var(--accent); }
 .key-row .spacer { margin-left: auto; }
 .keys-box { border: 1px solid var(--border); border-radius: 6px; margin: 8px 0; }
+.keys-box .radio-row { display: flex; align-items: center; gap: 6px; font-size: 13px; margin: 4px 0; }
+.keys-box .radio-row input { width: auto; }
 .keys-box legend { font-size: 12px; color: var(--text-secondary); padding: 0 4px; }
 .keys-box input[type="text"] { flex: 1; min-width: 200px; }
 .keys-box textarea {

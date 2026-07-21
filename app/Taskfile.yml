@@ -91,6 +91,9 @@ tasks:
       - node --check renderer/app.js
       - node --check lib/connection-config.js
       - node --check lib/ssh-tunnel.js
+      - node --check lib/server-provision.js
+      - node --check lib/docker-check.js
+      - node --check lib/ssh-key-file.js
       - "{{.UV}} run --project {{.SERVER}} python -c 'import sys; sys.path.insert(0, \"{{.SERVER}}\"); import server; print(\"server imports ok,\", server.JSON_IMPL)'"
 
   ci:
@@ -101,7 +104,7 @@ tasks:
 
   # ── Release ───────────────────────────────────────────────────────────────
   release:win:
-    desc: "Build the Windows installer + deploy bundle   [usage: task release:win -- --keys-dir /path/to/keys]"
+    desc: "Build the Windows installer + deploy bundle   [usage: task release:win]"
     cmd: npm run release:win -- {{.CLI_ARGS}}
 
   # ── Dependencies ──────────────────────────────────────────────────────────

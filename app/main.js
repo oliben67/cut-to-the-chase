@@ -5,9 +5,9 @@ const { spawn } = require("child_process");
 const path = require("path");
 const readline = require("readline");
 const { loadConnectionConfig, saveConnectionConfig, clearConnectionConfig } = require("./lib/connection-config");
-const { startTunnel } = require("./lib/ssh-tunnel");
 const { hasLocalDocker } = require("./lib/docker-check");
 const { writeKeyFile } = require("./lib/ssh-key-file");
+const { ensureLocalContainer, ensureRemoteContainer } = require("./lib/server-provision");
 
 const SERVER_DIR = path.join(__dirname, "server");
 const APP_ICON = path.join(__dirname, "assets", "icon.png");
@@ -344,16 +344,29 @@ ipcMain.on("sync-broadcast", (e, msg) => {
   }
 });
 
-// Connecting to the server has two shapes: "embedded" (default, unchanged
-// from before this existed) spawns it locally via uv; "ssh-tunnel" connects
-// to a server already running in a container on a remote docker-enabled
-// host instead, over a local port-forward, for clients that can't have
-// Docker installed locally. See docs/architecture/remote-server.md. Either
-// way the renderer only ever sees http://127.0.0.1:<serverPort> — it can't
-// tell the two apart.
+// Connecting to the server has three shapes:
+// - "embedded" + no local Docker (only reachable in an unpackaged dev
+//   checkout -- see app.whenReady below, which routes packaged installs
+//   with no Docker to the setup wizard instead): spawns server.py locally
+//   via uv, same as always.
+// - "embedded" + local Docker present: the packaged app's real default --
+//   docker-load (or, once a registry is wired up, docker-pull) the server
+//   image and run it as a local container instead of a bare uv/python
+//   process (see app/lib/server-provision.js).
+// - "ssh-tunnel": provisions (load/pull + `docker compose up`) the
+//   container on the configured Docker-enabled host over ssh, then opens
+//   the usual local port-forward to it.
+// Either way the renderer only ever sees http://127.0.0.1:<serverPort> —
+// it can't tell embedded, local-container, and tunneled apart.
 async function connectToServer(fileArgs) {
   const cfg = loadConnectionConfig();
   if (cfg.mode === "embedded") {
+    if (app.isPackaged && hasLocalDocker()) {
+      const { port } = await ensureLocalContainer();
+      serverPort = port;
+      console.log(`[docker] server container running locally — port ${serverPort}`);
+      return;
+    }
     await startServer(fileArgs);
     return;
   }
@@ -365,7 +378,7 @@ async function connectToServer(fileArgs) {
   // CTTC_SSH_BIN overrides the ssh binary (verification hook, same idea as
   // CTTC_TEST/CTTC_EVAL/CTTC_SCREENSHOT below): lets tests point the tunnel
   // manager at test/fixtures/fake-ssh.js instead of a real ssh + remote host.
-  tunnel = await startTunnel(cfg, { sshBin: process.env.CTTC_SSH_BIN || "ssh" });
+  tunnel = await ensureRemoteContainer(cfg, { sshBin: process.env.CTTC_SSH_BIN || "ssh" });
   serverPort = tunnel.localPort;
   console.log(`[tunnel] connected to ${cfg.sshTarget} — local port ${serverPort}`);
 }
@@ -411,7 +424,7 @@ function runSetupWizard() {
           sshPort: payload.sshPort,
           remotePort: 8765, // the CTTC server's fixed container port; see docker-compose.yml
         };
-        tunnel = await startTunnel(cfg, { sshBin: process.env.CTTC_SSH_BIN || "ssh" });
+        tunnel = await ensureRemoteContainer(cfg, { sshBin: process.env.CTTC_SSH_BIN || "ssh" });
         serverPort = tunnel.localPort;
         saveConnectionConfig(cfg);
         settled = true;
@@ -426,28 +439,29 @@ function runSetupWizard() {
   });
 }
 
+// Neither Run Setup nor Update Image hot-swap the already-loaded window's
+// server connection (its page was loaded with the *old* serverPort baked
+// into the URL, and a new ssh-tunnel gets a new random local port) --
+// simplest and safest is to save/apply the change, then offer to relaunch
+// the app so it goes through the normal startup path from a clean slate.
+async function offerRestart(message) {
+  const r = await dialog.showMessageBox({
+    type: "info",
+    message,
+    buttons: ["Restart Now", "Later"],
+    defaultId: 0,
+    cancelId: 1,
+  });
+  if (r.response === 0) {
+    app.relaunch();
+    app.exit(0);
+  }
+}
+
 // Settings > Run Setup: reachable any time, not just at first launch (see
-// dlg-keys's "Remote connection" section in index.html). Reconfiguring the
-// connection mid-session isn't hot-swapped into the already-loaded window --
-// simplest and safest is to save the new config, then relaunch the app so it
-// goes through the normal startup path (including the docker/wizard check)
-// from a clean slate.
+// dlg-keys's "Remote connection" section in index.html).
 ipcMain.handle("run-setup", async () => {
   const cfg = loadConnectionConfig();
-
-  async function offerRestart() {
-    const r = await dialog.showMessageBox({
-      type: "info",
-      message: "Restart CTTC to apply the new connection settings?",
-      buttons: ["Restart Now", "Later"],
-      defaultId: 0,
-      cancelId: 1,
-    });
-    if (r.response === 0) {
-      app.relaunch();
-      app.exit(0);
-    }
-  }
 
   // "revert to local" only makes sense if there's an ssh-tunnel to revert
   // *from*, and only offered when there's local Docker to fall back *to*.
@@ -464,7 +478,7 @@ ipcMain.handle("run-setup", async () => {
     if (choice.response === 1) {
       if (tunnel) tunnel.stop();
       clearConnectionConfig();
-      await offerRestart();
+      await offerRestart("Restart CTTC to apply the new connection settings?");
       return;
     }
   }
@@ -475,7 +489,35 @@ ipcMain.handle("run-setup", async () => {
   } catch {
     return; // cancelled -- nothing changed, no need to restart
   }
-  await offerRestart();
+  await offerRestart("Restart CTTC to apply the new connection settings?");
+});
+
+// Settings > Update server image: pushes a new image (by registry ref or a
+// local tar.gz) to wherever the server currently runs -- locally if Docker
+// is present, otherwise the configured ssh-tunnel host. Unlike Run Setup
+// this doesn't touch connection.json (the *target* doesn't change, only
+// which image runs there).
+ipcMain.handle("update-image", async (_e, payload) => {
+  const source =
+    payload.sourceType === "tarball" ? { type: "tarball", path: payload.tarballPath } : { type: "registry", ref: payload.ref };
+  try {
+    if (hasLocalDocker()) {
+      await ensureLocalContainer({ source });
+      await offerRestart("Image updated locally. Restart CTTC to reconnect?");
+      return { ok: true };
+    }
+    const cfg = loadConnectionConfig();
+    if (cfg.mode !== "ssh-tunnel") {
+      return { ok: false, error: "No local Docker and no ssh-tunnel configured -- run Setup first." };
+    }
+    if (tunnel) tunnel.stop();
+    tunnel = await ensureRemoteContainer(cfg, { sshBin: process.env.CTTC_SSH_BIN || "ssh", source });
+    serverPort = tunnel.localPort;
+    await offerRestart("Image updated on the remote host. Restart CTTC to reconnect?");
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err.message || String(err) };
+  }
 });
 
 app.whenReady().then(async () => {

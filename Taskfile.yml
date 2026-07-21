@@ -31,7 +31,7 @@ tasks:
 
   # ── Release ───────────────────────────────────────────────────────────────
   release:win:
-    desc: "Build the Windows installer + deploy bundle   [usage: task release:win -- --keys-dir /path/to/keys]"
+    desc: "Build the Windows installer + deploy bundle   [usage: task release:win]"
     cmds:
       - task: app:release:win
         vars: { CLI_ARGS: '{{.CLI_ARGS}}' }

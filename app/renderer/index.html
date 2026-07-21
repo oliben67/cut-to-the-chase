@@ -164,6 +164,24 @@
         <button id="run-setup-btn" title="Reconfigure (or set up for the first time) the ssh-tunnel connection">Run Setup…</button>
       </div>
     </fieldset>
+    <fieldset class="keys-box">
+      <legend>Update server image</legend>
+      <p class="dlg-section-help muted">Updates wherever the server currently runs — this machine if Docker is
+      present locally, otherwise the configured ssh-tunnel host.</p>
+      <label class="radio-row"><input type="radio" name="image-source" value="registry" checked /> Registry image reference</label>
+      <label class="radio-row"><input type="radio" name="image-source" value="tarball" /> Local .tar.gz file</label>
+      <div class="ctl" id="image-ref-row">
+        <input id="image-ref" type="text" placeholder="ghcr.io/oliben67/cttc-server:0.0.2" />
+      </div>
+      <div class="ctl" id="image-tarball-row" hidden>
+        <input id="image-tarball-path" type="text" readonly disabled placeholder="No file selected" />
+        <button type="button" id="image-tarball-browse">Browse…</button>
+      </div>
+      <div id="image-update-error" class="error"></div>
+      <div class="ctl">
+        <button id="update-image-btn" title="Load/pull this image and restart the server container">Update Image</button>
+      </div>
+    </fieldset>
     <div class="dlg-actions">
       <button id="dlg-keys-close">Close</button>
     </div>
