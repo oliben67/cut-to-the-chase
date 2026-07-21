@@ -91,7 +91,7 @@ function scpArgs({ sshKey, sshPort }) {
  * (from Settings > "Update server image", see main.js's "update-image"
  * handler) explicitly overrides the default of "whatever's bundled":
  *   { type: "tarball", path: "C:\\path\\to\\cttc-server.tar.gz" }
- *   { type: "registry", ref: "ghcr.io/oliben67/cttc-server:0.0.2" }
+ *   { type: "registry", ref: "osteck/cttc-server:0.0.2" }
  * With no override: prefers the tarball baked into this install,
  * falling back to image.json's registry ref (a placeholder until a real
  * registry is wired up).
