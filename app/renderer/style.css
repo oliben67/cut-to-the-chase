@@ -10,7 +10,9 @@
   --baseline: #c3c2b7;
   --border: rgba(11, 11, 11, 0.10);
   --accent: #2a78d6;
-  --hl: rgba(42, 120, 214, 0.14);
+  /* user-configurable via File > Preferences > Theme (see app.js prefs.hlColor) */
+  --hl-color: #eaff00;
+  --hl: color-mix(in srgb, var(--hl-color) 30%, transparent);
   --critical: #d03b3b;
   --warning: #fab219;
   --series-1: #2a78d6;
@@ -33,7 +35,8 @@
     --baseline: #383835;
     --border: rgba(255, 255, 255, 0.10);
     --accent: #3987e5;
-    --hl: rgba(57, 135, 229, 0.22);
+    --hl-color: #eaff00;
+    --hl: color-mix(in srgb, var(--hl-color) 40%, transparent);
     --critical: #d03b3b;
     --warning: #fab219;
     --series-1: #3987e5;
@@ -289,7 +292,6 @@ body.popout-telemetry #splitter,
 body.popout-telemetry #btn-add,
 body.popout-telemetry #btn-load-sample,
 body.popout-telemetry #btn-clear-sources,
-body.popout-telemetry #btn-keys,
 body.popout-telemetry #style-switch,
 body.popout-telemetry #host-block {
   display: none;
@@ -299,7 +301,6 @@ body.popout-series #panels,
 body.popout-series #splitter,
 body.popout-series #btn-add,
 body.popout-series #btn-clear-sources,
-body.popout-series #btn-keys,
 body.popout-series #btn-load-sample,
 body.popout-series #style-switch,
 body.popout-series #host-block {
@@ -322,7 +323,6 @@ body.popout-host #splitter,
 body.popout-host #btn-add,
 body.popout-host #btn-load-sample,
 body.popout-host #btn-clear-sources,
-body.popout-host #btn-keys,
 body.popout-host #style-switch,
 body.popout-host #btn-popout-telemetry {
   display: none;
@@ -436,6 +436,10 @@ button.popback[hidden] { display: none; }
 }
 .log-row:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
 .log-row.hl { background: var(--hl); }
+/* dotted boundary marking the top/bottom edge of a contiguous run of
+   highlighted log entries (see the .hl-top/.hl-bottom logic in app.js) */
+.log-row.hl-top { border-top: 2px dashed var(--hl-color); }
+.log-row.hl-bottom { border-bottom: 2px dashed var(--hl-color); }
 .log-row.cursor-row { border-left-color: var(--accent); }
 .log-row.selected { outline: 1px solid var(--accent); outline-offset: -1px; background: color-mix(in srgb, var(--accent) 14%, transparent); }
 .log-row .ts { color: var(--muted); margin-right: 6px; }

@@ -644,7 +644,7 @@
     const tmp = "__e2e-key-" + Date.now().toString(36);
     const rows = () => [...document.querySelectorAll("#keys-list .key-row")];
     const rowOf = (n) => rows().find((r) => r.querySelector(".name").textContent === n);
-    $("btn-keys").click();
+    openSettingsDialog();
     await until(() => dlgKeys.open, "keys dialog open");
     try {
       $("key-gen-name").value = tmp;

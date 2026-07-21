@@ -1627,6 +1627,10 @@ class Panel {
 
     for (const r of this.body.querySelectorAll(".log-row")) r.remove();
     const frag = document.createDocumentFragment();
+    // dotted top/bottom border marks the edges of a contiguous run of
+    // highlighted rows (not every row), so track the previous row's state
+    // across loop iterations.
+    let prevHl = false, prevDiv = null;
     for (let i = i0; i <= i1; i++) {
       const dataIdx = this.dataIndexAt(i);
       const row = pages[Math.floor(dataIdx / PAGE)]?.[dataIdx % PAGE];
@@ -1634,8 +1638,15 @@ class Panel {
       const div = document.createElement("div");
       div.className = "log-row";
       div.style.top = i * ROWH + "px";
-      if (state.cursorT != null && Math.abs(row.ts - state.cursorT) <= state.windowMs)
+      const isHl = state.cursorT != null && Math.abs(row.ts - state.cursorT) <= state.windowMs;
+      if (isHl) {
         div.classList.add("hl");
+        if (!prevHl) div.classList.add("hl-top");
+      } else if (prevHl) {
+        prevDiv.classList.add("hl-bottom");
+      }
+      prevHl = isHl;
+      prevDiv = div;
       if (dataIdx === this.cursorIdx) div.classList.add("cursor-row");
       if (this.selected.has(dataIdx)) div.classList.add("selected");
       if (/\b(ERROR|FATAL|CRIT)/i.test(row.text)) div.classList.add("lvl-error");
@@ -1681,6 +1692,7 @@ class Panel {
       };
       frag.appendChild(div);
     }
+    if (prevHl && prevDiv) prevDiv.classList.add("hl-bottom"); // last rendered row ends a run
     this.body.appendChild(frag);
   }
 
@@ -1982,11 +1994,46 @@ async function renderKeysList() {
   }
 }
 
-$("btn-keys").onclick = () => {
+// reached via File > Preferences > Settings (formerly a "🔑 Keys" toolbar button)
+function openSettingsDialog() {
   renderKeysList();
   dlgKeys.showModal();
-};
+}
 $("dlg-keys-close").onclick = () => dlgKeys.close();
+
+/* ── theme preferences (dlg-theme) ───────────────────────────────────────
+   Reached via File > Preferences > Theme. Currently just the log-highlight
+   color (the background + dotted top/bottom border painted on log rows
+   within the sampling frequency window around the selected time — see
+   Panel.render()'s "hl"/"hl-top"/"hl-bottom" classes). */
+
+const DEFAULT_HL_COLOR = "#eaff00"; // light neon yellow
+const dlgTheme = $("dlg-theme");
+
+function applyHlColor(color) {
+  document.documentElement.style.setProperty("--hl-color", color);
+}
+applyHlColor(prefs.get("hlColor", DEFAULT_HL_COLOR));
+
+function openThemeDialog() {
+  $("theme-hl-color").value = prefs.get("hlColor", DEFAULT_HL_COLOR);
+  dlgTheme.showModal();
+}
+$("theme-hl-color").oninput = (e) => applyHlColor(e.target.value); // live preview
+$("dlg-theme-reset").onclick = () => {
+  $("theme-hl-color").value = DEFAULT_HL_COLOR;
+  applyHlColor(DEFAULT_HL_COLOR);
+};
+$("dlg-theme-save").onclick = () => {
+  const color = $("theme-hl-color").value;
+  prefs.set("hlColor", color);
+  applyHlColor(color);
+  dlgTheme.close();
+};
+$("dlg-theme-close").onclick = () => {
+  applyHlColor(prefs.get("hlColor", DEFAULT_HL_COLOR)); // discard live preview
+  dlgTheme.close();
+};
 
 $("key-gen-btn").onclick = async () => {
   const name = $("key-gen-name").value.trim();
@@ -2260,6 +2307,18 @@ window.cttc?.onPopoutClosed?.(({ kind, id }) => {
   drawAll();
   syncPanels();
 });
+
+// File menu actions (main.js's application menu; popped-out panel windows
+// don't have the matching toolbar/dialogs wired up, so they ignore these).
+if (!POPOUT_KIND) {
+  window.cttc?.onMenuAction?.((action) => {
+    if (action === "add-sources") $("btn-add").click();
+    else if (action === "load-metrics") $("btn-load-sample").click();
+    else if (action === "open-theme") openThemeDialog();
+    else if (action === "open-settings") openSettingsDialog();
+  });
+}
+
 
 refreshAll().then(async () => {
   if (POPOUT_KIND) return; // popout windows never restore/add sources on their own

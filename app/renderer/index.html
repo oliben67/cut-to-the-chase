@@ -13,7 +13,6 @@
     <button id="btn-add" title="Attach to a Docker daemon (local or ssh://) and pick containers/services to follow">＋ Add sources</button>
     <button id="btn-clear-sources" title="Close every open source and start from scratch">🗑 Clear sources</button>
     <button id="btn-load-sample" title="Load a .cttc metrics file (possibly encrypted)">📂 Load metrics</button>
-    <button id="btn-keys" title="Manage encryption keys for .cttc metrics files">🔑 Keys</button>
     <label class="ctl" title="Sampling frequency: size of the ± highlight window around the selected time">frequency<input id="win-secs" type="number" min="0" step="1" value="5" /> s</label>
     <button id="btn-freq-help" class="icon-btn" title="Learn more about sampling frequency">?</button>
     <label class="ctl switch-row" id="style-switch" title="Switch between line plot and histogram">
@@ -136,7 +135,8 @@
   </dialog>
 
   <dialog id="dlg-keys">
-    <h2>Encryption keys</h2>
+    <h2>Settings</h2>
+    <h3>Encryption keys</h3>
     <p class="muted">Keys live in <code>~/.cttc/keys/</code>. Generate a keypair for yourself,
     or import a public key someone shared so you can encrypt metrics for them.
     Share your <em>public</em> key by copying it — the private key never leaves this machine.</p>
@@ -159,6 +159,23 @@
     </fieldset>
     <div class="dlg-actions">
       <button id="dlg-keys-close">Close</button>
+    </div>
+  </dialog>
+
+  <dialog id="dlg-theme">
+    <h2>Theme</h2>
+    <p class="muted">Customize the timeline's appearance.</p>
+    <fieldset class="keys-box">
+      <legend>Log highlight color</legend>
+      <p class="dlg-section-help muted">Color used to highlight log entries within the sampling frequency window around the selected time.</p>
+      <label class="ctl block">
+        <input id="theme-hl-color" type="color" value="#eaff00" />
+      </label>
+    </fieldset>
+    <div class="dlg-actions">
+      <button id="dlg-theme-reset" title="Reset to the default highlight color">Reset</button>
+      <button id="dlg-theme-close" title="Close without saving changes">Cancel</button>
+      <button id="dlg-theme-save" class="primary" title="Save this highlight color">Save</button>
     </div>
   </dialog>
 
