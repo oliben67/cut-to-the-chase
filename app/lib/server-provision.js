@@ -1,48 +1,56 @@
 "use strict";
 
 const fs = require("fs");
-const os = require("os");
 const path = require("path");
 const { spawn } = require("child_process");
 const { startTunnel, waitForPortOpen } = require("./ssh-tunnel");
 
-// Where prepare-image.ps1 (releases/windows) stages the offline-built image
-// tarball + its docker-compose.yml for CTTC to pick up on first run.
-function offlineImageDir() {
-  return path.join(os.homedir(), ".cttc", "offline-image");
-}
-function offlineTarballPath() {
-  return path.join(offlineImageDir(), "cttc-server.tar.gz");
-}
-function offlineComposePath() {
-  return path.join(offlineImageDir(), "docker-compose.yml");
-}
-function hasOfflineImage() {
-  return fs.existsSync(offlineTarballPath());
+// The server image tarball + both docker-compose variants ship as
+// electron-builder extraResources (see app/package.json's
+// "build.extraResources") -- baked into the installer at build time by
+// releases/windows/build-image/build-bundle.sh, which builds+saves the
+// image *before* `npm run dist:win` packages it in. Nothing needs staging
+// by any install-time script: the running app just reads its own
+// resources directory. resourcesDir lets main.js pass process.resourcesPath
+// when packaged; the default here is the dev/unpackaged fallback (reads
+// straight out of the checked-out releases/ tree).
+function defaultResourcesDir() {
+  return path.join(__dirname, "..", "..", "releases", "windows");
 }
 
-// releases/windows/repo/{image.json,docker-compose.yml} get bundled as
-// electron-builder extraResources (see app/package.json's "build.extraResources")
-// -- resourcesPath lets tests/dev point this at the checked-out repo copy instead.
-function defaultRepoDir() {
-  return path.join(__dirname, "..", "..", "releases", "windows", "repo");
+function bundledTarballPath({ resourcesDir } = {}) {
+  return resourcesDir
+    ? path.join(resourcesDir, "cttc-server.tar.gz")
+    : path.join(defaultResourcesDir(), "build-image", "cttc-server.tar.gz");
+}
+function bundledOfflineComposePath({ resourcesDir } = {}) {
+  return resourcesDir
+    ? path.join(resourcesDir, "docker-compose.offline.yml")
+    : path.join(defaultResourcesDir(), "build-image", "docker-compose.yml");
+}
+function hasBundledTarball({ resourcesDir } = {}) {
+  return fs.existsSync(bundledTarballPath({ resourcesDir }));
 }
 
 /**
  * Reads image.json: {image, tag} identifying the registry image to `docker
- * pull` when there's no offline tarball staged. NOTE: as of writing this
- * points at a placeholder -- no image has actually been published there
- * yet. hasOfflineImage() is checked first everywhere below specifically so
- * that doesn't matter until a real registry is wired up.
+ * pull` when there's no bundled tarball (there always should be one once a
+ * release is built via build-bundle.sh -- this is the fallback for, e.g., a
+ * dev checkout that hasn't built one locally). NOTE: as of writing image.json
+ * points at a placeholder -- no image has actually been published there yet.
  */
 function readImageRef({ resourcesDir } = {}) {
-  const p = path.join(resourcesDir || defaultRepoDir(), "image.json");
+  const p = resourcesDir
+    ? path.join(resourcesDir, "image.json")
+    : path.join(defaultResourcesDir(), "repo", "image.json");
   const { image, tag } = JSON.parse(fs.readFileSync(p, "utf8"));
   return { image, tag, ref: `${image}:${tag}` };
 }
 
-function repoComposePath({ resourcesDir } = {}) {
-  return path.join(resourcesDir || defaultRepoDir(), "docker-compose.yml");
+function registryComposePath({ resourcesDir } = {}) {
+  return resourcesDir
+    ? path.join(resourcesDir, "docker-compose.registry.yml")
+    : path.join(defaultResourcesDir(), "repo", "docker-compose.yml");
 }
 
 function run(spawnFn, cmd, args, opts = {}) {
@@ -76,24 +84,28 @@ function scpArgs({ sshKey, sshPort }) {
 /**
  * Resolves what image to run and which compose file goes with it. `source`
  * (from Settings > "Update server image", see main.js's "update-image"
- * handler) explicitly overrides the default of "whatever's staged/bundled":
+ * handler) explicitly overrides the default of "whatever's bundled":
  *   { type: "tarball", path: "C:\\path\\to\\cttc-server.tar.gz" }
  *   { type: "registry", ref: "ghcr.io/oliben67/cttc-server:0.0.2" }
- * With no override: prefers the offline tarball prepare-image.ps1 staged,
+ * With no override: prefers the tarball baked into this install,
  * falling back to image.json's registry ref (a placeholder until a real
  * registry is wired up).
  */
 function resolveSource(source, { resourcesDir } = {}) {
   if (source?.type === "tarball") {
-    return { kind: "tarball", tarballPath: source.path, composeFile: offlineComposePath() };
+    return { kind: "tarball", tarballPath: source.path, composeFile: bundledOfflineComposePath({ resourcesDir }) };
   }
   if (source?.type === "registry") {
-    return { kind: "registry", ref: source.ref, composeFile: repoComposePath({ resourcesDir }) };
+    return { kind: "registry", ref: source.ref, composeFile: registryComposePath({ resourcesDir }) };
   }
-  if (hasOfflineImage()) {
-    return { kind: "tarball", tarballPath: offlineTarballPath(), composeFile: offlineComposePath() };
+  if (hasBundledTarball({ resourcesDir })) {
+    return {
+      kind: "tarball",
+      tarballPath: bundledTarballPath({ resourcesDir }),
+      composeFile: bundledOfflineComposePath({ resourcesDir }),
+    };
   }
-  return { kind: "registry", ref: readImageRef({ resourcesDir }).ref, composeFile: repoComposePath({ resourcesDir }) };
+  return { kind: "registry", ref: readImageRef({ resourcesDir }).ref, composeFile: registryComposePath({ resourcesDir }) };
 }
 
 /**
@@ -151,12 +163,11 @@ async function ensureRemoteContainer(cfg, { spawnFn = spawn, sshBin = "ssh", scp
 }
 
 module.exports = {
-  offlineImageDir,
-  offlineTarballPath,
-  offlineComposePath,
-  hasOfflineImage,
+  bundledTarballPath,
+  bundledOfflineComposePath,
+  hasBundledTarball,
   readImageRef,
-  repoComposePath,
+  registryComposePath,
   ensureLocalContainer,
   ensureRemoteContainer,
 };

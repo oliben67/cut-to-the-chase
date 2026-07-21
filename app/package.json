@@ -9,7 +9,7 @@
     "test:e2e": "./test/run-e2e.sh",
     "dist:win": "electron-builder --win nsis --x64",
     "dist:win:zip": "electron-builder --win zip --x64",
-    "release:win": "npm run dist:win && ../releases/windows/build-image/build-bundle.sh"
+    "release:win": "../releases/windows/build-image/build-bundle.sh"
   },
   "devDependencies": {
     "electron": "^43.1.1",
@@ -34,8 +34,10 @@
       "output": "dist"
     },
     "extraResources": [
+      { "from": "../releases/windows/build-image/cttc-server.tar.gz", "to": "cttc-server.tar.gz" },
+      { "from": "../releases/windows/build-image/docker-compose.yml", "to": "docker-compose.offline.yml" },
       { "from": "../releases/windows/repo/image.json", "to": "image.json" },
-      { "from": "../releases/windows/repo/docker-compose.yml", "to": "docker-compose.yml" }
+      { "from": "../releases/windows/repo/docker-compose.yml", "to": "docker-compose.registry.yml" }
     ],
     "win": {
       "target": ["nsis"],

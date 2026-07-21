@@ -358,11 +358,20 @@ ipcMain.on("sync-broadcast", (e, msg) => {
 //   the usual local port-forward to it.
 // Either way the renderer only ever sees http://127.0.0.1:<serverPort> —
 // it can't tell embedded, local-container, and tunneled apart.
+// The image tarball + compose files are electron-builder extraResources
+// (see app/package.json) -- only present under process.resourcesPath once
+// packaged. In an unpackaged dev checkout there's nothing there, so
+// server-provision.js's own dev fallback (reading straight out of
+// releases/windows/) is used instead.
+function resourcesDirForApp() {
+  return app.isPackaged ? process.resourcesPath : undefined;
+}
+
 async function connectToServer(fileArgs) {
   const cfg = loadConnectionConfig();
   if (cfg.mode === "embedded") {
     if (app.isPackaged && hasLocalDocker()) {
-      const { port } = await ensureLocalContainer();
+      const { port } = await ensureLocalContainer({ resourcesDir: resourcesDirForApp() });
       serverPort = port;
       console.log(`[docker] server container running locally — port ${serverPort}`);
       return;
@@ -378,7 +387,10 @@ async function connectToServer(fileArgs) {
   // CTTC_SSH_BIN overrides the ssh binary (verification hook, same idea as
   // CTTC_TEST/CTTC_EVAL/CTTC_SCREENSHOT below): lets tests point the tunnel
   // manager at test/fixtures/fake-ssh.js instead of a real ssh + remote host.
-  tunnel = await ensureRemoteContainer(cfg, { sshBin: process.env.CTTC_SSH_BIN || "ssh" });
+  tunnel = await ensureRemoteContainer(cfg, {
+    sshBin: process.env.CTTC_SSH_BIN || "ssh",
+    resourcesDir: resourcesDirForApp(),
+  });
   serverPort = tunnel.localPort;
   console.log(`[tunnel] connected to ${cfg.sshTarget} — local port ${serverPort}`);
 }
@@ -424,7 +436,10 @@ function runSetupWizard() {
           sshPort: payload.sshPort,
           remotePort: 8765, // the CTTC server's fixed container port; see docker-compose.yml
         };
-        tunnel = await ensureRemoteContainer(cfg, { sshBin: process.env.CTTC_SSH_BIN || "ssh" });
+        tunnel = await ensureRemoteContainer(cfg, {
+          sshBin: process.env.CTTC_SSH_BIN || "ssh",
+          resourcesDir: resourcesDirForApp(),
+        });
         serverPort = tunnel.localPort;
         saveConnectionConfig(cfg);
         settled = true;
@@ -502,7 +517,7 @@ ipcMain.handle("update-image", async (_e, payload) => {
     payload.sourceType === "tarball" ? { type: "tarball", path: payload.tarballPath } : { type: "registry", ref: payload.ref };
   try {
     if (hasLocalDocker()) {
-      await ensureLocalContainer({ source });
+      await ensureLocalContainer({ source, resourcesDir: resourcesDirForApp() });
       await offerRestart("Image updated locally. Restart CTTC to reconnect?");
       return { ok: true };
     }
@@ -511,7 +526,11 @@ ipcMain.handle("update-image", async (_e, payload) => {
       return { ok: false, error: "No local Docker and no ssh-tunnel configured -- run Setup first." };
     }
     if (tunnel) tunnel.stop();
-    tunnel = await ensureRemoteContainer(cfg, { sshBin: process.env.CTTC_SSH_BIN || "ssh", source });
+    tunnel = await ensureRemoteContainer(cfg, {
+      sshBin: process.env.CTTC_SSH_BIN || "ssh",
+      source,
+      resourcesDir: resourcesDirForApp(),
+    });
     serverPort = tunnel.localPort;
     await offerRestart("Image updated on the remote host. Restart CTTC to reconnect?");
     return { ok: true };
