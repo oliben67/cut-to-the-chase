@@ -8,25 +8,30 @@ const { startTunnel, waitForPortOpen } = require("./ssh-tunnel");
 // The server image tarball + both docker-compose variants ship as
 // electron-builder extraResources (see app/package.json's
 // "build.extraResources") -- baked into the installer at build time by
-// releases/windows/build-image/build-bundle.sh, which builds+saves the
-// image *before* `npm run dist:win` packages it in. Nothing needs staging
-// by any install-time script: the running app just reads its own
-// resources directory. resourcesDir lets main.js pass process.resourcesPath
-// when packaged; the default here is the dev/unpackaged fallback (reads
-// straight out of the checked-out releases/ tree).
-function defaultResourcesDir() {
-  return path.join(__dirname, "..", "..", "releases", "windows");
+// releases/shared/build-image.sh + each platform's build-bundle.sh, which
+// build+save the image *before* `npm run dist:{win,mac,linux}` packages it
+// in. Nothing needs staging by any install-time script: the running app
+// just reads its own resources directory. resourcesDir lets main.js pass
+// process.resourcesPath when packaged; the defaults here are the
+// dev/unpackaged fallback (read straight out of the checked-out releases/
+// tree) -- the image tarball itself is shared across all three platforms
+// (releases/shared/), while image.json/the registry compose file live in
+// releases/repo/ (also shared -- it's the same registry image regardless
+// of the client's host OS).
+function defaultSharedDir() {
+  return path.join(__dirname, "..", "..", "releases", "shared");
+}
+function defaultRepoDir() {
+  return path.join(__dirname, "..", "..", "releases", "repo");
 }
 
 function bundledTarballPath({ resourcesDir } = {}) {
-  return resourcesDir
-    ? path.join(resourcesDir, "cttc-server.tar.gz")
-    : path.join(defaultResourcesDir(), "build-image", "cttc-server.tar.gz");
+  return resourcesDir ? path.join(resourcesDir, "cttc-server.tar.gz") : path.join(defaultSharedDir(), "cttc-server.tar.gz");
 }
 function bundledOfflineComposePath({ resourcesDir } = {}) {
   return resourcesDir
     ? path.join(resourcesDir, "docker-compose.offline.yml")
-    : path.join(defaultResourcesDir(), "build-image", "docker-compose.yml");
+    : path.join(defaultSharedDir(), "docker-compose.yml");
 }
 function hasBundledTarball({ resourcesDir } = {}) {
   return fs.existsSync(bundledTarballPath({ resourcesDir }));
@@ -36,13 +41,13 @@ function hasBundledTarball({ resourcesDir } = {}) {
  * Reads image.json: {image, tag} identifying the registry image to `docker
  * pull` when there's no bundled tarball (there always should be one once a
  * release is built via build-bundle.sh -- this is the fallback for, e.g., a
- * dev checkout that hasn't built one locally). NOTE: as of writing image.json
- * points at a placeholder -- no image has actually been published there yet.
+ * dev checkout that hasn't built one locally). releases/shared/build-image.sh
+ * tags + pushes to this ref on every release build (best-effort -- it's not
+ * the app's default path, see server-provision.js's module doc, but is kept
+ * live rather than left as a dead placeholder).
  */
 function readImageRef({ resourcesDir } = {}) {
-  const p = resourcesDir
-    ? path.join(resourcesDir, "image.json")
-    : path.join(defaultResourcesDir(), "repo", "image.json");
+  const p = resourcesDir ? path.join(resourcesDir, "image.json") : path.join(defaultRepoDir(), "image.json");
   const { image, tag } = JSON.parse(fs.readFileSync(p, "utf8"));
   return { image, tag, ref: `${image}:${tag}` };
 }
@@ -50,7 +55,7 @@ function readImageRef({ resourcesDir } = {}) {
 function registryComposePath({ resourcesDir } = {}) {
   return resourcesDir
     ? path.join(resourcesDir, "docker-compose.registry.yml")
-    : path.join(defaultResourcesDir(), "repo", "docker-compose.yml");
+    : path.join(defaultRepoDir(), "docker-compose.yml");
 }
 
 function run(spawnFn, cmd, args, opts = {}) {

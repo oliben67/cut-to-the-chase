@@ -1,0 +1,33 @@
+{
+  "appId": "com.olivierbien67.cttc",
+  "productName": "CTTC",
+  "asar": true,
+  "files": [
+    "main.js",
+    "preload.js",
+    "renderer/**/*",
+    "assets/**/*",
+    "lib/**/*",
+    "package.json",
+    "!server/**",
+    "!demo/**",
+    "!test/**"
+  ],
+  "directories": {
+    "output": "dist"
+  },
+  "extraResources": [
+    { "from": "../releases/repo/image.json", "to": "image.json" },
+    { "from": "../releases/repo/docker-compose.yml", "to": "docker-compose.registry.yml" }
+  ],
+  "win": {
+    "target": ["nsis"],
+    "icon": "assets/icon.png"
+  },
+  "nsis": {
+    "oneClick": false,
+    "allowToChangeInstallationDirectory": true,
+    "createDesktopShortcut": true,
+    "createStartMenuShortcut": true
+  }
+}

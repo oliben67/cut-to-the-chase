@@ -9,7 +9,12 @@
     "test:e2e": "./test/run-e2e.sh",
     "dist:win": "electron-builder --win nsis --x64",
     "dist:win:zip": "electron-builder --win zip --x64",
-    "release:win": "../releases/windows/build-image/build-bundle.sh"
+    "dist:win:slim": "electron-builder --win nsis --x64 --config electron-builder.win-slim.json",
+    "dist:mac": "electron-builder --mac dmg",
+    "dist:linux": "electron-builder --linux AppImage",
+    "release:win": "../releases/windows/build-bundle.sh",
+    "release:mac": "../releases/macos/build-bundle.sh",
+    "release:linux": "../releases/linux/build-bundle.sh"
   },
   "devDependencies": {
     "electron": "^43.1.1",
@@ -34,20 +39,32 @@
       "output": "dist"
     },
     "extraResources": [
-      { "from": "../releases/windows/build-image/cttc-server.tar.gz", "to": "cttc-server.tar.gz" },
-      { "from": "../releases/windows/build-image/docker-compose.yml", "to": "docker-compose.offline.yml" },
-      { "from": "../releases/windows/repo/image.json", "to": "image.json" },
-      { "from": "../releases/windows/repo/docker-compose.yml", "to": "docker-compose.registry.yml" }
+      { "from": "../releases/repo/image.json", "to": "image.json" },
+      { "from": "../releases/repo/docker-compose.yml", "to": "docker-compose.registry.yml" }
     ],
     "win": {
       "target": ["nsis"],
-      "icon": "assets/icon.png"
+      "icon": "assets/icon.png",
+      "extraResources": [
+        { "from": "../releases/shared/cttc-server.tar.gz", "to": "cttc-server.tar.gz" },
+        { "from": "../releases/shared/docker-compose.yml", "to": "docker-compose.offline.yml" }
+      ]
     },
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true
+    },
+    "mac": {
+      "target": ["dmg"],
+      "icon": "assets/icon.png",
+      "category": "public.app-category.developer-tools"
+    },
+    "linux": {
+      "target": ["AppImage"],
+      "icon": "assets/icon.png",
+      "category": "Development"
     }
   }
 }

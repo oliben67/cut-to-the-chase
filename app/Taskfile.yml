@@ -107,6 +107,14 @@ tasks:
     desc: "Build the Windows installer + deploy bundle   [usage: task release:win]"
     cmd: npm run release:win -- {{.CLI_ARGS}}
 
+  release:mac:
+    desc: "Build the macOS installer + deploy bundle   [usage: task release:mac]"
+    cmd: npm run release:mac -- {{.CLI_ARGS}}
+
+  release:linux:
+    desc: "Build the Linux AppImage + deploy bundle   [usage: task release:linux]"
+    cmd: npm run release:linux -- {{.CLI_ARGS}}
+
   # ── Dependencies ──────────────────────────────────────────────────────────
   deps:update:
     desc: Update server packages to their latest allowed versions
