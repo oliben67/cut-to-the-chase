@@ -92,9 +92,34 @@ function writeKeyFile(contents, name = "cttc_ssh_key") {
   let normalized = contents;
   if (normalized.charCodeAt(0) === 0xfeff) normalized = normalized.slice(1);
   normalized = normalized.replace(/\r\n/g, "\n").trim() + "\n";
+  // Fail here, clearly, rather than let a garbled/wrong-encoding/wrong-file
+  // key silently get written and only surface later as ssh's opaque
+  // "invalid format" once it's already too late to tell the user why.
+  if (!/^-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(normalized)) {
+    throw new Error(
+      "That doesn't look like a private key (no '-----BEGIN ... PRIVATE KEY-----' header) -- " +
+        "check you picked the private key, not the .pub file, and that it wasn't saved in an unexpected encoding."
+    );
+  }
   fs.writeFileSync(keyPath, normalized, { encoding: "utf8" });
   restrictKeyPermissions(keyPath);
   return keyPath;
+}
+
+/**
+ * Reads a key file's actual text, regardless of which encoding it was saved
+ * in. Blindly reading as utf8 (the previous behavior) silently produces
+ * garbage -- and the same "invalid format" ssh error as a line-ending
+ * problem -- for a file saved as UTF-16, which is a real risk on Windows:
+ * PowerShell's `>`/Out-File default to UTF-16LE-with-BOM, so a key
+ * generated or re-saved via PowerShell without an explicit -Encoding often
+ * ends up in that encoding rather than plain UTF-8/ASCII.
+ */
+function decodeKeyFile(sourcePath) {
+  const buf = fs.readFileSync(sourcePath);
+  if (buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xfe) return buf.toString("utf16le");
+  if (buf.length >= 2 && buf[0] === 0xfe && buf[1] === 0xff) return buf.swap16().toString("utf16le"); // UTF-16BE
+  return buf.toString("utf8");
 }
 
 /**
@@ -104,7 +129,7 @@ function writeKeyFile(contents, name = "cttc_ssh_key") {
  * shouldn't change) whatever permissions it already has wherever it lives.
  */
 function copyKeyFile(sourcePath, name = "cttc_ssh_key") {
-  return writeKeyFile(fs.readFileSync(sourcePath, "utf8"), name);
+  return writeKeyFile(decodeKeyFile(sourcePath), name);
 }
 
 module.exports = { keysDir, restrictKeyPermissions, writeKeyFile, copyKeyFile };
