@@ -6,7 +6,7 @@ const path = require("path");
 const readline = require("readline");
 const { loadConnectionConfig, saveConnectionConfig, clearConnectionConfig } = require("./lib/connection-config");
 const { hasLocalDocker } = require("./lib/docker-check");
-const { writeKeyFile } = require("./lib/ssh-key-file");
+const { writeKeyFile, copyKeyFile } = require("./lib/ssh-key-file");
 const { ensureLocalContainer, ensureRemoteContainer } = require("./lib/server-provision");
 
 const SERVER_DIR = path.join(__dirname, "server");
@@ -429,7 +429,7 @@ function runSetupWizard() {
     ipcMain.handle("setup-wizard-submit", async (_e, payload) => {
       try {
         const sshKey =
-          payload.keyMode === "paste" ? writeKeyFile(payload.keyContents) : payload.keyPath;
+          payload.keyMode === "paste" ? writeKeyFile(payload.keyContents) : copyKeyFile(payload.keyPath);
         const cfg = {
           sshTarget: `${payload.sshUser}@${payload.sshHost}`,
           sshKey,
