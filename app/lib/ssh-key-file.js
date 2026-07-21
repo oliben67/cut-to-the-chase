@@ -12,17 +12,20 @@ function keysDir() {
   return path.join(os.homedir(), ".cttc", "keys");
 }
 
-// The well-known "OWNER RIGHTS" SID -- whatever the file's *current* owner
-// is, regardless of their actual username. Deliberately used instead of
-// `${os.userInfo().username}:(RW)`: a bare username can fail to resolve
-// under icacls (domain-joined machines where the short name is ambiguous,
-// unusual characters, machines where the process runs as a different
-// account than expected, etc.), and *that* silent failure is exactly what
-// caused the "could not restrict permissions" error even after the
-// /reset-before-write fix below -- the grant itself was failing, not just
-// a stale ACL from a previous run. The SID form can't suffer a username
-// lookup failure since it isn't a username at all.
-const OWNER_RIGHTS_SID = "*S-1-3-4";
+// The account to grant on Windows. NOT the well-known "OWNER RIGHTS" SID
+// (*S-1-3-4) -- that was tried here previously to sidestep icacls username
+// resolution issues, but Win32-OpenSSH's own key-permission check
+// explicitly rejects it as a grantee ("Bad permissions... Try removing
+// permissions for user: \\OWNER RIGHTS (S-1-3-4)") and refuses to load the
+// key at all -- it insists on the *real* account. "DOMAIN\username" (both
+// from env vars, which Windows always sets correctly for the current
+// process) is more robust than a bare username for icacls, which is what
+// the earlier fix actually needed -- the real bug turned out to be the
+// "(RW)" vs "(R,W)" syntax error below, not username resolution.
+function currentAccount() {
+  if (process.env.USERDOMAIN && process.env.USERNAME) return `${process.env.USERDOMAIN}\\${process.env.USERNAME}`;
+  return os.userInfo().username;
+}
 
 function icacls(args) {
   const r = spawnSync("icacls", args, { encoding: "utf8" });
@@ -43,7 +46,7 @@ function restrictKeyPermissions(keyPath) {
     // icacls permission masks combine simple rights with a comma, not by
     // concatenating letters -- "(RW)" is not valid syntax and fails with
     // "Invalid parameter", which is exactly the error this was meant to fix.
-    const r2 = icacls([keyPath, "/grant:r", `${OWNER_RIGHTS_SID}:(R,W)`]);
+    const r2 = icacls([keyPath, "/grant:r", `${currentAccount()}:(R,W)`]);
     if (!r1.ok || !r2.ok) {
       // Don't leave the file locked down worse than before -- restore
       // normal inherited permissions (which always include the owner)
