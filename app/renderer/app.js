@@ -2001,6 +2001,10 @@ function openSettingsDialog() {
 }
 $("dlg-keys-close").onclick = () => dlgKeys.close();
 
+// hands off to main.js -- setup involves native windows/dialogs and a
+// restart, none of which belongs in this dialog's own DOM
+$("run-setup-btn").onclick = () => window.cttc.runSetup();
+
 /* ── theme preferences (dlg-theme) ───────────────────────────────────────
    Reached via File > Preferences > Theme. Currently just the log-highlight
    color (the background + dotted top/bottom border painted on log rows

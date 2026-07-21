@@ -8,7 +8,8 @@
     "test:unit": "node --test test/unit/*.test.js",
     "test:e2e": "./test/run-e2e.sh",
     "dist:win": "electron-builder --win nsis --x64",
-    "dist:win:zip": "electron-builder --win zip --x64"
+    "dist:win:zip": "electron-builder --win zip --x64",
+    "release:win": "npm run dist:win && ../releases/windows/src/build-bundle.sh"
   },
   "devDependencies": {
     "electron": "^43.1.1",

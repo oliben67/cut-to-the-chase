@@ -96,4 +96,13 @@ function saveConnectionConfig(cfg, { configPath } = {}) {
   return resolvedPath;
 }
 
-module.exports = { loadConnectionConfig, saveConnectionConfig, defaultConfigPath };
+/**
+ * Deletes connection.json, reverting to embedded mode (today's default) --
+ * used by the "revert to local" path in main.js's Run Setup flow.
+ */
+function clearConnectionConfig({ configPath } = {}) {
+  const resolvedPath = configPath || defaultConfigPath(process.env);
+  if (fs.existsSync(resolvedPath)) fs.unlinkSync(resolvedPath);
+}
+
+module.exports = { loadConnectionConfig, saveConnectionConfig, clearConnectionConfig, defaultConfigPath };

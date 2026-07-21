@@ -15,4 +15,5 @@ contextBridge.exposeInMainWorld("cttc", {
   onSync: (cb) => ipcRenderer.on("sync-broadcast", (_e, msg) => cb(msg)),
   onMenuAction: (cb) => ipcRenderer.on("menu-action", (_e, action) => cb(action)),
   submitSetup: (payload) => ipcRenderer.invoke("setup-wizard-submit", payload),
+  runSetup: () => ipcRenderer.invoke("run-setup"),
 });

@@ -4,7 +4,7 @@ const { app, BrowserWindow, dialog, ipcMain, Menu, shell } = require("electron")
 const { spawn } = require("child_process");
 const path = require("path");
 const readline = require("readline");
-const { loadConnectionConfig, saveConnectionConfig } = require("./lib/connection-config");
+const { loadConnectionConfig, saveConnectionConfig, clearConnectionConfig } = require("./lib/connection-config");
 const { startTunnel } = require("./lib/ssh-tunnel");
 const { hasLocalDocker } = require("./lib/docker-check");
 const { writeKeyFile } = require("./lib/ssh-key-file");
@@ -132,6 +132,30 @@ function installMenu() {
     },
   ];
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
+
+// Shown while connectToServer() is starting the embedded server or an
+// existing ssh-tunnel config -- skipped for the setup wizard path (see
+// app.whenReady below), which has its own "please wait" state and would
+// otherwise stack a second loading window on top of it.
+let splashWindow = null;
+function showSplash() {
+  splashWindow = new BrowserWindow({
+    width: 280,
+    height: 220,
+    frame: false,
+    resizable: false,
+    alwaysOnTop: true,
+    icon: APP_ICON,
+    webPreferences: { contextIsolation: true, nodeIntegration: false },
+  });
+  splashWindow.loadFile(path.join(__dirname, "renderer", "splash.html"));
+  return splashWindow;
+}
+
+function closeSplash() {
+  if (splashWindow && !splashWindow.isDestroyed()) splashWindow.destroy();
+  splashWindow = null;
 }
 
 async function createWindow() {
@@ -402,6 +426,58 @@ function runSetupWizard() {
   });
 }
 
+// Settings > Run Setup: reachable any time, not just at first launch (see
+// dlg-keys's "Remote connection" section in index.html). Reconfiguring the
+// connection mid-session isn't hot-swapped into the already-loaded window --
+// simplest and safest is to save the new config, then relaunch the app so it
+// goes through the normal startup path (including the docker/wizard check)
+// from a clean slate.
+ipcMain.handle("run-setup", async () => {
+  const cfg = loadConnectionConfig();
+
+  async function offerRestart() {
+    const r = await dialog.showMessageBox({
+      type: "info",
+      message: "Restart CTTC to apply the new connection settings?",
+      buttons: ["Restart Now", "Later"],
+      defaultId: 0,
+      cancelId: 1,
+    });
+    if (r.response === 0) {
+      app.relaunch();
+      app.exit(0);
+    }
+  }
+
+  // "revert to local" only makes sense if there's an ssh-tunnel to revert
+  // *from*, and only offered when there's local Docker to fall back *to*.
+  if (cfg.mode === "ssh-tunnel" && hasLocalDocker()) {
+    const choice = await dialog.showMessageBox({
+      type: "question",
+      message: "CTTC is connected over an SSH tunnel, and a local Docker was detected.",
+      detail: "Reconfigure the SSH tunnel, or revert to sampling this machine directly?",
+      buttons: ["Configure SSH Tunnel…", "Revert to Local", "Cancel"],
+      defaultId: 0,
+      cancelId: 2,
+    });
+    if (choice.response === 2) return;
+    if (choice.response === 1) {
+      if (tunnel) tunnel.stop();
+      clearConnectionConfig();
+      await offerRestart();
+      return;
+    }
+  }
+
+  if (tunnel) tunnel.stop(); // about to be replaced by the wizard below
+  try {
+    await runSetupWizard();
+  } catch {
+    return; // cancelled -- nothing changed, no need to restart
+  }
+  await offerRestart();
+});
+
 app.whenReady().then(async () => {
   installMenu();
   // the window `icon` option is ignored on macOS; the running app's Dock icon
@@ -412,16 +488,21 @@ app.whenReady().then(async () => {
     const fileArgs = process.argv.slice(app.isPackaged ? 1 : 2).filter((a) => !a.startsWith("-"));
     const cfg = loadConnectionConfig();
     if (cfg.mode === "embedded" && !hasLocalDocker()) {
+      // the wizard has its own "please wait" state once the user submits --
+      // no splash here, or first run would show two loading screens stacked
       await runSetupWizard();
     } else {
+      showSplash();
       await connectToServer(fileArgs);
     }
   } catch (err) {
+    closeSplash();
     dialog.showErrorBox("CTTC Timeline", String(err.message || err));
     app.quit();
     return;
   }
   await createWindow();
+  closeSplash();
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });

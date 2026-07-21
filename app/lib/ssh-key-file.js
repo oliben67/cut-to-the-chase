@@ -15,11 +15,25 @@ function keysDir() {
 // Windows that's icacls (mirrors deploy.ps1's step 2); elsewhere it's chmod.
 // Grants (RW), not (R)-only: a read-only grant would lock the *owner* out of
 // ever overwriting the file too, breaking a second run of the wizard with
-// EPERM the moment it tries to rewrite an already-restricted file.
+// EPERM the moment it tries to rewrite an already-restricted file. Errors
+// are checked: a silently-failed /inheritance:r or /grant:r can leave the
+// file with an emptier ACL than before (nobody, not even the owner, granted
+// access), which is the actual EPERM this whole function exists to prevent.
 function restrictKeyPermissions(keyPath) {
   if (process.platform === "win32") {
-    spawnSync("icacls", [keyPath, "/inheritance:r"]);
-    spawnSync("icacls", [keyPath, "/grant:r", `${os.userInfo().username}:(RW)`]);
+    const username = os.userInfo().username;
+    const r1 = spawnSync("icacls", [keyPath, "/inheritance:r"]);
+    const r2 = spawnSync("icacls", [keyPath, "/grant:r", `${username}:(RW)`]);
+    if (r1.status !== 0 || r2.status !== 0) {
+      // Don't leave the file locked down worse than before -- restore
+      // normal inherited permissions (which always include the owner)
+      // rather than an ACL that grants no one access.
+      spawnSync("icacls", [keyPath, "/reset"]);
+      throw new Error(
+        `could not restrict permissions on ${keyPath} (icacls failed) -- ` +
+          "the key was saved with default (not locked-down) permissions."
+      );
+    }
   } else {
     fs.chmodSync(keyPath, 0o600);
   }
@@ -34,11 +48,12 @@ function writeKeyFile(contents, name = "cttc_ssh_key") {
   fs.mkdirSync(dir, { recursive: true });
   const keyPath = path.join(dir, name);
   if (process.platform === "win32" && fs.existsSync(keyPath)) {
-    // An earlier (R)-only run may have locked out even the owner's write
-    // access -- the owner can always re-grant themselves permissions on a
-    // file they own regardless of its current ACL, so restore write access
-    // before truncating it below.
-    spawnSync("icacls", [keyPath, "/grant:r", `${os.userInfo().username}:(RW)`]);
+    // A previous run may have left this file's ACL locked down (or, if that
+    // run's icacls call itself failed, with no access granted to anyone at
+    // all) -- /reset restores the permissions it would've inherited from
+    // ~/.cttc/keys, which always includes the owner, regardless of whatever
+    // broken state the explicit ACL is currently in.
+    spawnSync("icacls", [keyPath, "/reset"]);
   }
   // ssh is picky about trailing whitespace/newline conventions from a
   // copy-paste; normalize to a single trailing newline.

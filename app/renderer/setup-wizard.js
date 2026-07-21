@@ -13,6 +13,7 @@ for (const radio of document.querySelectorAll('input[name="key-mode"]')) {
     const paste = radio.value === "paste" && radio.checked;
     keyPathRow.hidden = paste;
     keyPasteEl.hidden = !paste;
+    keyPasteEl.disabled = !paste;
   });
 }
 

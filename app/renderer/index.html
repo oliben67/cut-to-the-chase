@@ -157,6 +157,13 @@
       <textarea id="key-import-pem" rows="4" placeholder="-----BEGIN PUBLIC KEY-----"></textarea>
       <button id="key-import-btn" title="Store this public key so you can encrypt metrics for its owner">Import</button>
     </fieldset>
+    <fieldset class="keys-box">
+      <legend>Remote connection</legend>
+      <p class="dlg-section-help muted">Point CTTC at a Docker-enabled host over SSH, or revert to sampling this machine directly.</p>
+      <div class="ctl">
+        <button id="run-setup-btn" title="Reconfigure (or set up for the first time) the ssh-tunnel connection">Run Setup…</button>
+      </div>
+    </fieldset>
     <div class="dlg-actions">
       <button id="dlg-keys-close">Close</button>
     </div>
