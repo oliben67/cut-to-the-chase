@@ -19,7 +19,7 @@ function getFreeLocalPort() {
   });
 }
 
-function buildSshArgs({ localPort, remotePort, sshTarget, sshKey }) {
+function buildSshArgs({ localPort, remotePort, sshTarget, sshKey, sshPort }) {
   const args = [
     "-N", "-L", `127.0.0.1:${localPort}:127.0.0.1:${remotePort}`,
     "-o", "BatchMode=yes",           // never prompt -- fail instead of hanging on a password
@@ -27,6 +27,7 @@ function buildSshArgs({ localPort, remotePort, sshTarget, sshKey }) {
     "-o", "ConnectTimeout=10",
   ];
   if (sshKey) args.push("-i", sshKey, "-o", "IdentitiesOnly=yes");
+  if (sshPort) args.push("-p", String(sshPort));
   args.push(sshTarget);
   return args;
 }
@@ -75,13 +76,19 @@ function waitForPortOpen(host, port, { timeoutMs = 15000, intervalMs = 150, sign
  * until the local end is actually accepting connections. Mirrors
  * main.js's startServer() shape: resolves to {localPort, stop()}.
  *
- * @param {{sshTarget: string, sshKey: string|null, remotePort: number}} cfg
+ * @param {{sshTarget: string, sshKey: string|null, remotePort: number, sshPort?: number}} cfg
  * @param {{spawnFn?: Function, sshBin?: string, timeoutMs?: number}} [opts]
  *   spawnFn/sshBin are injectable for testing (see test/unit/ssh-tunnel.test.js).
  */
 async function startTunnel(cfg, { spawnFn = spawn, sshBin = "ssh", timeoutMs = 15000 } = {}) {
   const localPort = await getFreeLocalPort();
-  const args = buildSshArgs({ localPort, remotePort: cfg.remotePort, sshTarget: cfg.sshTarget, sshKey: cfg.sshKey });
+  const args = buildSshArgs({
+    localPort,
+    remotePort: cfg.remotePort,
+    sshTarget: cfg.sshTarget,
+    sshKey: cfg.sshKey,
+    sshPort: cfg.sshPort,
+  });
   const proc = spawnFn(sshBin, args, { stdio: ["ignore", "pipe", "pipe"] });
 
   let stderr = "";

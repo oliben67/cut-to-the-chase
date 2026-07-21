@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; style-src 'self'; script-src 'self'" />
+  <title>CTTC Setup</title>
+  <link rel="stylesheet" href="setup-wizard.css" />
+</head>
+<body>
+  <main id="wizard">
+    <h1>Connect CTTC to a remote host</h1>
+    <p class="muted">
+      No local Docker was found, so there's nothing for CTTC to sample on this
+      machine. Point it at a Docker-enabled host over SSH instead.
+    </p>
+
+    <form id="form">
+      <label>SSH username
+        <input id="ssh-user" type="text" required autocomplete="off" />
+      </label>
+      <label>Remote SSH host
+        <input id="ssh-host" type="text" required autocomplete="off" placeholder="docker-host.example.com" />
+      </label>
+      <label>SSH port
+        <input id="ssh-port" type="number" min="1" max="65535" value="22" required />
+      </label>
+
+      <fieldset>
+        <legend>SSH private key</legend>
+        <label class="radio-row"><input type="radio" name="key-mode" value="path" checked /> Use a key file already on this machine</label>
+        <label class="radio-row"><input type="radio" name="key-mode" value="paste" /> Paste the key's contents</label>
+
+        <div id="key-path-row">
+          <input id="key-path" type="text" readonly placeholder="No file selected" />
+          <button type="button" id="btn-browse">Browse…</button>
+        </div>
+        <textarea id="key-paste" rows="6" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----" hidden></textarea>
+      </fieldset>
+
+      <div id="error" class="error" hidden></div>
+
+      <div class="actions">
+        <button type="submit" id="btn-connect">Connect</button>
+      </div>
+    </form>
+
+    <div id="wait" class="wait" hidden>
+      <div class="spinner"></div>
+      <p>Establishing SSH tunnel, please wait…</p>
+    </div>
+  </main>
+  <script src="setup-wizard.js"></script>
+</body>
+</html>

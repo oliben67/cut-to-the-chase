@@ -4,8 +4,10 @@ const { app, BrowserWindow, dialog, ipcMain, Menu, shell } = require("electron")
 const { spawn } = require("child_process");
 const path = require("path");
 const readline = require("readline");
-const { loadConnectionConfig } = require("./lib/connection-config");
+const { loadConnectionConfig, saveConnectionConfig } = require("./lib/connection-config");
 const { startTunnel } = require("./lib/ssh-tunnel");
+const { hasLocalDocker } = require("./lib/docker-check");
+const { writeKeyFile } = require("./lib/ssh-key-file");
 
 const SERVER_DIR = path.join(__dirname, "server");
 const APP_ICON = path.join(__dirname, "assets", "icon.png");
@@ -78,6 +80,14 @@ function showAboutDialog() {
   });
 }
 
+// menu items that just trigger something in the renderer (open a dialog,
+// click a toolbar button) go through this instead of an ipcMain.handle,
+// since there's nothing for main.js itself to do — see preload.js's
+// onMenuAction / app.js's listener for the renderer side.
+function broadcastMenuAction(action) {
+  for (const win of BrowserWindow.getAllWindows()) win.webContents.send("menu-action", action);
+}
+
 function installMenu() {
   const isMac = process.platform === "darwin";
   const template = [
@@ -97,6 +107,22 @@ function installMenu() {
           ],
         }]
       : []),
+    {
+      label: "File",
+      submenu: [
+        { label: "Add Sources…", accelerator: "CmdOrCtrl+O", click: () => broadcastMenuAction("add-sources") },
+        { label: "Load Metrics…", accelerator: "CmdOrCtrl+L", click: () => broadcastMenuAction("load-metrics") },
+        { type: "separator" },
+        {
+          label: "Preferences",
+          submenu: [
+            { label: "Theme…", click: () => broadcastMenuAction("open-theme") },
+            { label: "Settings…", click: () => broadcastMenuAction("open-settings") },
+          ],
+        },
+        ...(isMac ? [] : [{ type: "separator" }, { role: "quit" }]),
+      ],
+    },
     { role: "editMenu" },
     { role: "viewMenu" },
     { role: "windowMenu" },
@@ -191,9 +217,9 @@ async function createWindow() {
   }
 }
 
-ipcMain.handle("pick-files", async () => {
+ipcMain.handle("pick-files", async (_e, title) => {
   const r = await dialog.showOpenDialog({
-    title: "Open log / stats files",
+    title: title || "Open log / stats files",
     properties: ["openFile", "multiSelections"],
   });
   return r.canceled ? [] : r.filePaths;
@@ -320,6 +346,62 @@ async function connectToServer(fileArgs) {
   console.log(`[tunnel] connected to ${cfg.sshTarget} — local port ${serverPort}`);
 }
 
+// Embedded mode with no local Docker has nothing to sample -- offer to set
+// up an ssh-tunnel connection to a Docker-enabled host instead of just
+// starting an empty embedded server. The wizard window itself establishes
+// the tunnel (so it can show its own "please wait" / error state) and sets
+// `tunnel`/`serverPort` directly on success; closing it without succeeding
+// rejects, which the caller treats the same as any other startup failure.
+let wizardWindow = null;
+function runSetupWizard() {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    wizardWindow = new BrowserWindow({
+      width: 520,
+      height: 640,
+      resizable: false,
+      icon: APP_ICON,
+      webPreferences: {
+        preload: path.join(__dirname, "preload.js"),
+        contextIsolation: true,
+        nodeIntegration: false,
+      },
+    });
+    wizardWindow.setMenuBarVisibility(false);
+    wizardWindow.loadFile(path.join(__dirname, "renderer", "setup-wizard.html"));
+    wizardWindow.on("closed", () => {
+      wizardWindow = null;
+      if (!settled) {
+        ipcMain.removeHandler("setup-wizard-submit");
+        reject(new Error("Setup was cancelled."));
+      }
+    });
+
+    ipcMain.handle("setup-wizard-submit", async (_e, payload) => {
+      try {
+        const sshKey =
+          payload.keyMode === "paste" ? writeKeyFile(payload.keyContents) : payload.keyPath;
+        const cfg = {
+          sshTarget: `${payload.sshUser}@${payload.sshHost}`,
+          sshKey,
+          sshPort: payload.sshPort,
+          remotePort: 8765, // the CTTC server's fixed container port; see docker-compose.yml
+        };
+        tunnel = await startTunnel(cfg, { sshBin: process.env.CTTC_SSH_BIN || "ssh" });
+        serverPort = tunnel.localPort;
+        saveConnectionConfig(cfg);
+        settled = true;
+        ipcMain.removeHandler("setup-wizard-submit");
+        wizardWindow.destroy();
+        resolve();
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, error: err.message || String(err) };
+      }
+    });
+  });
+}
+
 app.whenReady().then(async () => {
   installMenu();
   // the window `icon` option is ignored on macOS; the running app's Dock icon
@@ -328,7 +410,12 @@ app.whenReady().then(async () => {
   try {
     // files passed on the command line open at startup: npm start -- file1 file2
     const fileArgs = process.argv.slice(app.isPackaged ? 1 : 2).filter((a) => !a.startsWith("-"));
-    await connectToServer(fileArgs);
+    const cfg = loadConnectionConfig();
+    if (cfg.mode === "embedded" && !hasLocalDocker()) {
+      await runSetupWizard();
+    } else {
+      await connectToServer(fileArgs);
+    }
   } catch (err) {
     dialog.showErrorBox("CTTC Timeline", String(err.message || err));
     app.quit();

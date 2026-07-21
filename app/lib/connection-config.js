@@ -60,7 +60,40 @@ function loadConnectionConfig({ env = process.env, configPath } = {}) {
     throw new Error(`ssh-tunnel mode requires a valid remote_port between 1-65535 (got ${JSON.stringify(remotePortRaw)})`);
   }
 
-  return { mode: "ssh-tunnel", sshTarget, sshKey, remotePort };
+  // ssh_port is optional -- absent means ssh's own default (22)
+  const sshPortRaw = env.CTTC_SSH_PORT || fileCfg.ssh_port;
+  const sshPort = sshPortRaw ? Number(sshPortRaw) : undefined;
+  if (sshPortRaw && (!Number.isInteger(sshPort) || sshPort <= 0 || sshPort > 65535)) {
+    throw new Error(`ssh-tunnel mode's ssh_port must be between 1-65535 (got ${JSON.stringify(sshPortRaw)})`);
+  }
+
+  return { mode: "ssh-tunnel", sshTarget, sshKey, remotePort, ...(sshPort ? { sshPort } : {}) };
 }
 
-module.exports = { loadConnectionConfig, defaultConfigPath };
+/**
+ * Writes an ssh-tunnel connection.json (mirrors deploy.ps1's step 4) so the
+ * setup wizard (see main.js's runSetupWizard) and the PowerShell deploy path
+ * produce byte-identical config files.
+ * @param {{sshTarget: string, sshKey: string, remotePort: number, sshPort?: number}} cfg
+ * @param {{configPath?: string}} [opts]
+ */
+function saveConnectionConfig(cfg, { configPath } = {}) {
+  const resolvedPath = configPath || defaultConfigPath(process.env);
+  fs.mkdirSync(path.dirname(resolvedPath), { recursive: true });
+  const json = JSON.stringify(
+    {
+      mode: "ssh-tunnel",
+      ssh_target: cfg.sshTarget,
+      ssh_key: cfg.sshKey,
+      remote_port: cfg.remotePort,
+      ...(cfg.sshPort ? { ssh_port: cfg.sshPort } : {}),
+    },
+    null,
+    2
+  );
+  // BOM-less UTF-8 -- see readConfigFile's comment; write it the same way here.
+  fs.writeFileSync(resolvedPath, json, { encoding: "utf8" });
+  return resolvedPath;
+}
+
+module.exports = { loadConnectionConfig, saveConnectionConfig, defaultConfigPath };
