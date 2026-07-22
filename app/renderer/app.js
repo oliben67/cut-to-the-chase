@@ -11,6 +11,15 @@ const API = `http://127.0.0.1:${PORT}`;
 const POPOUT_KIND = new URLSearchParams(location.search).get("popout") || null;
 const POPOUT_ID = new URLSearchParams(location.search).get("id") || null;
 
+// Mirrors main-process logging (including the server subprocess's own
+// stdout/stderr, piped through main.js) into this window's own DevTools
+// console (Help > Developer Tools) -- the one place logs are visible
+// regardless of how the app was launched (double-clicked, no terminal
+// attached, ...). See main.js's mainLog/mainError/broadcastLog.
+window.cttc?.onMainLog?.(({ level, text }) => {
+  (level === "error" ? console.error : console.log)(`[main] ${text}`);
+});
+
 async function get(path) {
   const r = await fetch(API + path);
   if (!r.ok) throw new Error(`${path}: ${r.status}`);

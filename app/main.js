@@ -22,6 +22,28 @@ let serverProc = null;
 let serverPort = null;
 let tunnel = null; // set instead of serverProc in ssh-tunnel mode (see lib/ssh-tunnel.js)
 
+// Every window's DevTools console (Help > Developer Tools) is the one place
+// a user can see logs regardless of whether the app was launched from a
+// terminal or double-clicked -- so main-process logging (including the
+// server subprocess's own stdout/stderr, piped through here) is mirrored
+// there via IPC, in addition to the usual console.log/error that only ever
+// reaches a terminal if one happens to be attached.
+function broadcastLog(level, text) {
+  for (const win of BrowserWindow.getAllWindows()) {
+    win.webContents.send("main-log", { level, text });
+  }
+}
+function mainLog(...args) {
+  const text = args.map(String).join(" ");
+  console.log(text);
+  broadcastLog("log", text);
+}
+function mainError(...args) {
+  const text = args.map(String).join(" ");
+  console.error(text);
+  broadcastLog("error", text);
+}
+
 function startServer(extraArgs) {
   return new Promise((resolve, reject) => {
     // uv provisions the venv (orjson) on first run; --project pins it to server/
@@ -33,7 +55,7 @@ function startServer(extraArgs) {
     serverProc.on("error", (err) =>
       reject(new Error(`could not start server via uv: ${err.message}`))
     );
-    serverProc.stderr.on("data", (d) => console.error(`[server] ${d}`.trimEnd()));
+    serverProc.stderr.on("data", (d) => mainError(`[server] ${d}`.trimEnd()));
 
     const rl = readline.createInterface({ input: serverProc.stdout });
     const timer = setTimeout(() => reject(new Error("server did not report a port in 30s")), 30000);
@@ -42,14 +64,14 @@ function startServer(extraArgs) {
       try {
         const info = JSON.parse(line);
         serverPort = info.port;
-        console.log(`[server] listening on ${info.port} (json: ${info.json})`);
+        mainLog(`[server] listening on ${info.port} (json: ${info.json})`);
         resolve(info.port);
       } catch {
         reject(new Error(`unexpected server output: ${line}`));
       }
     });
     serverProc.on("exit", (code) => {
-      console.log(`[server] exited (${code})`);
+      mainLog(`[server] exited (${code})`);
       serverProc = null;
     });
   });
@@ -398,7 +420,7 @@ async function connectToServer(fileArgs) {
     if (app.isPackaged && (await hasLocalDocker())) {
       const { port } = await ensureLocalContainer({ resourcesDir: resourcesDirForApp() });
       serverPort = port;
-      console.log(`[docker] server container running locally — port ${serverPort}`);
+      mainLog(`[docker] server container running locally — port ${serverPort}`);
       return;
     }
     await startServer(fileArgs);
@@ -407,7 +429,7 @@ async function connectToServer(fileArgs) {
   if (fileArgs.length) {
     // file paths are local to *this* machine; meaningless against a shared
     // remote server, so they're ignored rather than silently mis-sent
-    console.error(`[tunnel] ignoring command-line files in ssh-tunnel mode: ${fileArgs.join(", ")}`);
+    mainError(`[tunnel] ignoring command-line files in ssh-tunnel mode: ${fileArgs.join(", ")}`);
   }
   // CTTC_SSH_BIN overrides the ssh binary (verification hook, same idea as
   // CTTC_TEST/CTTC_EVAL/CTTC_SCREENSHOT below): lets tests point the tunnel
@@ -417,7 +439,7 @@ async function connectToServer(fileArgs) {
     resourcesDir: resourcesDirForApp(),
   });
   serverPort = tunnel.localPort;
-  console.log(`[tunnel] connected to ${cfg.sshTarget} — local port ${serverPort}`);
+  mainLog(`[tunnel] connected to ${cfg.sshTarget} — local port ${serverPort}`);
 }
 
 // Right after the tunnel comes up, check whether the tunnel-host itself has
@@ -626,7 +648,7 @@ app.whenReady().then(async () => {
         try {
           const { port } = await ensureLocalContainer({ resourcesDir: resourcesDirForApp() });
           serverPort = port;
-          console.log(`[docker] server container running locally — port ${serverPort}`);
+          mainLog(`[docker] server container running locally — port ${serverPort}`);
         } catch {
           await startServer(fileArgs);
         }

@@ -1572,7 +1572,7 @@ class TestFilesEndpoints:
 
 
 class TestMain:
-    def test_main_serves_and_shuts_down(self, tmp_path, monkeypatch, capsys):
+    def test_main_serves_and_shuts_down(self, tmp_path, monkeypatch, capsys, caplog):
         good = tmp_path / "ok.log"
         good.write_text("2026-01-02T03:00:00Z hi\n")
         captured = {}
@@ -1602,7 +1602,7 @@ class TestMain:
         assert not t.is_alive()
         out = capsys.readouterr()
         assert f'"port":{port}' in out.out.replace(" ", "")
-        assert "could not open" in out.err
+        assert "could not open" in caplog.text
         assert server.NAIVE_TZ is not None and server.NAIVE_TZ != timezone.utc or old_tz != timezone.utc
         server.NAIVE_TZ = timezone.utc          # restore module global for other tests
 

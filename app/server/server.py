@@ -19,6 +19,7 @@ import bisect
 import hashlib
 import importlib.util
 import io
+import logging
 import os
 import queue
 import re
@@ -36,6 +37,12 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import files  # local sibling module (server/files.py) -- upload/download endpoints
+
+# stdout is reserved for exactly one line -- the {"port": N} json main.js
+# reads to know we're listening (see main()) -- so all logging goes to
+# stderr, which main.js already pipes into its own console (and, via
+# mainError/broadcastLog, into every window's DevTools console too).
+logger = logging.getLogger("cttc")
 
 try:
     import orjson
@@ -593,6 +600,7 @@ class DockerPsError(RuntimeError):
 def docker_ps(host: str | None, ssh_key: str | None = None) -> dict:
     """List containers (and swarm services, when the daemon is a manager)."""
     host = normalize_docker_host(host)
+    logger.info("docker_ps: host=%s", host or "local")
     base = docker_cmd(host)
     env = ssh_key_env(ssh_key)
     log = []
@@ -892,6 +900,7 @@ class State:
         read_all(src)
         with self.lock:
             self.sources[sid] = src
+        logger.info("opened source %s: %s (%s, live=%s)", sid, path, kind, live)
         return src
 
     def _open_or_reuse(self, path: str, make):
@@ -925,6 +934,8 @@ class State:
                        transforms: list[str], interval: float, host_stats: bool = True,
                        ssh_key: str | None = None):
         host = normalize_docker_host(host)
+        logger.info("collect_docker: host=%s stats=%s host_stats=%s logs=%d interval=%s",
+                 host or "local", stats, host_stats, len(logs), interval)
         opened = []
         hostname = (host or "local").split("@")[-1]
         hostkey = host or "local"
@@ -1046,6 +1057,7 @@ class State:
             src = self.sources.pop(sid, None)
         if src is not None and hasattr(src, "stop"):
             src.stop()
+        logger.info("closed source %s%s", sid, f" ({src.path})" if src is not None else " (already gone)")
 
     def describe(self):
         out = []
@@ -1317,12 +1329,14 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._send({"error": "not found"}, 404)
         except (KeyError, ValueError) as e:
+            logger.warning("bad request on %s: %s", u.path, e)
             self._send({"error": f"bad request: {e}"}, 400)
         except RuntimeError as e:
             # docker_ps/collect_docker raise this for a failed docker/ssh
             # call (bad host, missing key, connection refused, ...) -- must
             # still send a real response, or the client just sees a bare
             # "failed to fetch" instead of the actual ssh/docker error.
+            logger.error("%s failed: %s", u.path, e)
             payload = {"error": str(e)}
             if isinstance(e, DockerPsError):
                 payload["log"] = e.log
@@ -1359,6 +1373,13 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    logging.basicConfig(
+        level=logging.DEBUG if os.environ.get("CTTC_DEBUG") else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+        stream=sys.stderr,
+    )
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=0)
     ap.add_argument("--transforms-dir", default=str(Path(__file__).parent / "transforms"))
@@ -1376,15 +1397,17 @@ def main():
     Handler.state = state
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     threading.Thread(target=tail_loop, args=(state,), daemon=True).start()
+    logger.info("transforms loaded from %s", args.transforms_dir)
 
     for f in args.files:
         try:
             state.open_file(f, "auto", None, live=not args.static, transforms=[])
         except Exception as e:
-            print(f"warning: could not open {f}: {e}", file=sys.stderr)
+            logger.warning("could not open %s: %s", f, e)
 
     sys.stdout.write(jdumps({"port": server.server_address[1], "json": JSON_IMPL}).decode() + "\n")
     sys.stdout.flush()
+    logger.info("listening on 127.0.0.1:%d", server.server_address[1])
     try:
         server.serve_forever()
     except KeyboardInterrupt:
