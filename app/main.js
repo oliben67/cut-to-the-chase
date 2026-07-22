@@ -61,7 +61,6 @@ function showAboutDialog() {
     `Chromium ${process.versions.chrome}`,
     `Node.js ${process.versions.node}`,
     "Python >=3.11 (via uv)",
-    "cryptography >=49.0.0",
     "orjson >=3.10",
     "psutil >=5.9",
   ];
@@ -88,51 +87,34 @@ function broadcastMenuAction(action) {
   for (const win of BrowserWindow.getAllWindows()) win.webContents.send("menu-action", action);
 }
 
+// The native OS menu (Menu.buildFromTemplate) can't have its row spacing
+// tuned by CSS on either macOS or Windows, so the File/Edit/View/Window/Help
+// bar is instead built as HTML in index.html/app.js (menubar-action below
+// handles the items that need main-process access; simple ones still go
+// through broadcastMenuAction/onMenuAction like before). No application menu
+// is installed at all -- installMenu() just makes that explicit.
 function installMenu() {
-  const isMac = process.platform === "darwin";
-  const template = [
-    ...(isMac
-      ? [{
-          label: app.name,
-          submenu: [
-            { label: `About ${app.name}`, click: showAboutDialog },
-            { type: "separator" },
-            { role: "services" },
-            { type: "separator" },
-            { role: "hide" },
-            { role: "hideOthers" },
-            { role: "unhide" },
-            { type: "separator" },
-            { role: "quit" },
-          ],
-        }]
-      : []),
-    {
-      label: "File",
-      submenu: [
-        { label: "Add Sources…", accelerator: "CmdOrCtrl+O", click: () => broadcastMenuAction("add-sources") },
-        { label: "Load Metrics…", accelerator: "CmdOrCtrl+L", click: () => broadcastMenuAction("load-metrics") },
-        { type: "separator" },
-        {
-          label: "Preferences",
-          submenu: [
-            { label: "Theme…", click: () => broadcastMenuAction("open-theme") },
-            { label: "Settings…", click: () => broadcastMenuAction("open-settings") },
-          ],
-        },
-        ...(isMac ? [] : [{ type: "separator" }, { role: "quit" }]),
-      ],
-    },
-    { role: "editMenu" },
-    { role: "viewMenu" },
-    { role: "windowMenu" },
-    {
-      role: "help",
-      submenu: [{ label: `About ${app.name}`, click: showAboutDialog }],
-    },
-  ];
-  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+  Menu.setApplicationMenu(null);
 }
+
+// Edit/View/Window/quit-ish actions from the custom HTML menu bar that need
+// something only main.js (or webContents) can do; File actions and dialog
+// toggles are handled renderer-side and never reach here (see app.js).
+ipcMain.handle("menubar-action", (e, action) => {
+  const win = BrowserWindow.fromWebContents(e.sender);
+  switch (action) {
+    case "about": showAboutDialog(); break;
+    case "reload": win?.webContents.reload(); break;
+    case "toggle-devtools": win?.webContents.toggleDevTools(); break;
+    case "zoom-in": win?.webContents.setZoomLevel(win.webContents.getZoomLevel() + 0.5); break;
+    case "zoom-out": win?.webContents.setZoomLevel(win.webContents.getZoomLevel() - 0.5); break;
+    case "zoom-reset": win?.webContents.setZoomLevel(0); break;
+    case "toggle-fullscreen": win?.setFullScreen(!win.isFullScreen()); break;
+    case "minimize": win?.minimize(); break;
+    case "close": win?.close(); break;
+    case "quit": app.quit(); break;
+  }
+});
 
 // Shown from the moment the app starts until the main window has actually
 // painted -- bridges both the potentially-slow connectToServer() call
@@ -460,6 +442,7 @@ function runSetupWizard() {
         tunnel = await ensureRemoteContainer(cfg, {
           sshBin: process.env.CTTC_SSH_BIN || "ssh",
           resourcesDir: resourcesDirForApp(),
+          onLog: (line) => wizardWindow?.webContents.send("setup-log", line),
         });
         serverPort = tunnel.localPort;
         saveConnectionConfig(cfg);

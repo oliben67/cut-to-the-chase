@@ -58,15 +58,25 @@ function registryComposePath({ resourcesDir } = {}) {
     : path.join(defaultRepoDir(), "docker-compose.yml");
 }
 
-function run(spawnFn, cmd, args, opts = {}) {
+function run(spawnFn, cmd, args, opts = {}, onLog) {
+  const line = `${cmd} ${args.join(" ")}`;
+  onLog?.(`$ ${line}`);
   return new Promise((resolve, reject) => {
     const proc = spawnFn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], ...opts });
     let stderr = "";
-    proc.stderr?.on("data", (d) => { stderr += d; });
-    proc.on("error", (err) => reject(new Error(`could not run ${cmd}: ${err.message}`)));
+    proc.stderr?.on("data", (d) => { stderr += d; onLog?.(String(d)); });
+    proc.on("error", (err) => {
+      onLog?.(`  error: ${err.message}`);
+      reject(new Error(`could not run ${cmd}: ${err.message}`));
+    });
     proc.on("exit", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`${cmd} ${args.join(" ")} exited (code ${code}): ${stderr.trim() || "no output"}`));
+      if (code === 0) {
+        onLog?.(`  → exit 0`);
+        resolve();
+      } else {
+        onLog?.(`  → exit ${code}`);
+        reject(new Error(`${cmd} ${args.join(" ")} exited (code ${code}): ${stderr.trim() || "no output"}`));
+      }
     });
   });
 }
@@ -139,31 +149,33 @@ async function ensureLocalContainer({ spawnFn = spawn, resourcesDir, port = 8765
  * (registry path), execs the equivalent docker load/pull + compose up
  * there, then opens the usual ssh-tunnel port-forward to it.
  * @param {{sshTarget: string, sshKey: string|null, sshPort?: number, remotePort: number}} cfg
- * @param {{source?: {type: "tarball", path: string} | {type: "registry", ref: string}}} [opts]
+ * @param {{source?: {type: "tarball", path: string} | {type: "registry", ref: string}, onLog?: (line: string) => void}} [opts]
  */
-async function ensureRemoteContainer(cfg, { spawnFn = spawn, sshBin = "ssh", scpBin = "scp", resourcesDir, source } = {}) {
+async function ensureRemoteContainer(cfg, { spawnFn = spawn, sshBin = "ssh", scpBin = "scp", resourcesDir, source, onLog } = {}) {
   const remoteDir = "cttc-server";
   const ssh = sshExecArgs(cfg);
   const scp = scpArgs(cfg);
   const target = cfg.sshTarget;
   const resolved = resolveSource(source, { resourcesDir });
 
-  await run(spawnFn, sshBin, [...ssh, `mkdir -p ${remoteDir}`]);
+  await run(spawnFn, sshBin, [...ssh, `mkdir -p ${remoteDir}`], {}, onLog);
 
   if (resolved.kind === "tarball") {
-    await run(spawnFn, scpBin, [...scp, resolved.tarballPath, resolved.composeFile, `${target}:${remoteDir}/`]);
+    await run(spawnFn, scpBin, [...scp, resolved.tarballPath, `${target}:${remoteDir}/`], {}, onLog);
+    await run(spawnFn, scpBin, [...scp, resolved.composeFile, `${target}:${remoteDir}/docker-compose.yml`], {}, onLog);
     await run(spawnFn, sshBin, [
       ...ssh,
       `cd ${remoteDir} && docker load -i ${path.basename(resolved.tarballPath)} && docker compose -f docker-compose.yml up -d`,
-    ]);
+    ], {}, onLog);
   } else {
-    await run(spawnFn, scpBin, [...scp, resolved.composeFile, `${target}:${remoteDir}/docker-compose.yml`]);
+    await run(spawnFn, scpBin, [...scp, resolved.composeFile, `${target}:${remoteDir}/docker-compose.yml`], {}, onLog);
     await run(spawnFn, sshBin, [
       ...ssh,
       `cd ${remoteDir} && docker pull ${resolved.ref} && CTTC_IMAGE=${resolved.ref} docker compose -f docker-compose.yml up -d`,
-    ]);
+    ], {}, onLog);
   }
 
+  onLog?.(`$ ssh -L ${cfg.remotePort}:127.0.0.1:${cfg.remotePort} ${target} (tunnel)`);
   return startTunnel(cfg, { spawnFn, sshBin });
 }
 

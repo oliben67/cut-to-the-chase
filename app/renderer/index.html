@@ -8,13 +8,67 @@
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
+  <nav id="menubar">
+    <div class="menu" data-menu="file">
+      <button class="menu-label" type="button">File</button>
+      <div class="menu-list" role="menu">
+        <button data-action="add-sources">Add Sources… <span class="acc">Ctrl+O</span></button>
+        <button data-action="load-metrics">Load Metrics… <span class="acc">Ctrl+L</span></button>
+        <div class="menu-sep"></div>
+        <span class="menu-sub-label">Preferences</span>
+        <button data-action="open-theme" class="menu-indent">Theme…</button>
+        <button data-action="open-settings" class="menu-indent">Settings…</button>
+        <div class="menu-sep"></div>
+        <button data-action="quit">Quit <span class="acc">Ctrl+Q</span></button>
+      </div>
+    </div>
+    <div class="menu" data-menu="edit">
+      <button class="menu-label" type="button">Edit</button>
+      <div class="menu-list" role="menu">
+        <button data-action="undo">Undo <span class="acc">Ctrl+Z</span></button>
+        <button data-action="redo">Redo <span class="acc">Ctrl+Shift+Z</span></button>
+        <div class="menu-sep"></div>
+        <button data-action="cut">Cut <span class="acc">Ctrl+X</span></button>
+        <button data-action="copy">Copy <span class="acc">Ctrl+C</span></button>
+        <button data-action="paste">Paste <span class="acc">Ctrl+V</span></button>
+        <button data-action="select-all">Select All <span class="acc">Ctrl+A</span></button>
+      </div>
+    </div>
+    <div class="menu" data-menu="view">
+      <button class="menu-label" type="button">View</button>
+      <div class="menu-list" role="menu">
+        <button data-action="reload">Reload <span class="acc">Ctrl+R</span></button>
+        <button data-action="toggle-devtools">Toggle Developer Tools <span class="acc">F12</span></button>
+        <div class="menu-sep"></div>
+        <button data-action="zoom-in">Zoom In <span class="acc">Ctrl+=</span></button>
+        <button data-action="zoom-out">Zoom Out <span class="acc">Ctrl+-</span></button>
+        <button data-action="zoom-reset">Actual Size <span class="acc">Ctrl+0</span></button>
+        <div class="menu-sep"></div>
+        <button data-action="toggle-fullscreen">Toggle Full Screen <span class="acc">F11</span></button>
+      </div>
+    </div>
+    <div class="menu" data-menu="window">
+      <button class="menu-label" type="button">Window</button>
+      <div class="menu-list" role="menu">
+        <button data-action="minimize">Minimize <span class="acc">Ctrl+M</span></button>
+        <button data-action="close">Close <span class="acc">Ctrl+W</span></button>
+      </div>
+    </div>
+    <div class="menu" data-menu="help">
+      <button class="menu-label" type="button">Help</button>
+      <div class="menu-list" role="menu">
+        <button data-action="about">About CTTC</button>
+      </div>
+    </div>
+  </nav>
+
   <header id="toolbar">
     <strong class="app-title">CTTC Timeline</strong>
     <button id="btn-add" title="Attach to a Docker daemon (local or ssh://) and pick containers/services to follow">＋ Add sources</button>
     <button id="btn-clear-sources" title="Close every open source and start from scratch">🗑 Clear sources</button>
     <button id="btn-load-sample" title="Load a .cttc metrics file (possibly encrypted)">📂 Load metrics</button>
-    <label class="ctl" title="Sampling frequency: size of the ± highlight window around the selected time">frequency<input id="win-secs" type="number" min="0" step="1" value="5" /> s</label>
-    <button id="btn-freq-help" class="icon-btn" title="Learn more about sampling frequency">?</button>
+    <label class="ctl" title="Poll interval: size of the ± highlight window around the selected time">poll interval<input id="win-secs" type="number" min="0" step="1" value="5" /> s</label>
+    <button id="btn-freq-help" class="icon-btn" title="Learn more about the poll interval">?</button>
     <label class="ctl switch-row" id="style-switch" title="Switch between line plot and histogram">
       <span>〜 lines</span>
       <span class="switch">
@@ -83,13 +137,12 @@
       <label class="ctl block">Docker host
         <input id="docker-host" type="text" placeholder="empty = local daemon, or ssh://user@host" />
       </label>
-      <label class="ctl block" id="ssh-key-row" hidden>SSH key
-        <select id="ssh-key"></select>
-      </label>
       <div class="ctl">
         <button id="btn-ps-refresh" title="Reload the list of containers/services from this host">Refresh</button>
+        <button id="btn-activity-toggle" class="linklike" type="button" hidden>Show activity</button>
       </div>
       <div id="docker-error" class="error"></div>
+      <pre id="docker-activity" class="activity-log" hidden></pre>
     </div>
 
     <p class="dlg-intro muted">
@@ -128,10 +181,6 @@
       Include host telemetry (CPU/MEM/NET of the docker host)
     </label>
     <div id="export-host-note" class="tdoc"></div>
-    <label class="ctl block" title="Encrypt the file so only the holder of the matching private key can open it">
-      Encrypt for
-      <select id="export-key"></select>
-    </label>
     <div class="dlg-actions">
       <button id="dlg-export-cancel" title="Close without saving">Cancel</button>
       <button id="dlg-export-ok" class="primary" title="Save the selected range as a .cttc file">Save…</button>
@@ -140,27 +189,6 @@
 
   <dialog id="dlg-keys">
     <h2>Settings</h2>
-    <h3>Encryption keys</h3>
-    <p class="muted">Keys live in <code>~/.cttc/keys/</code>. Generate a keypair for yourself,
-    or import a public key someone shared so you can encrypt metrics for them.
-    Share your <em>public</em> key by copying it — the private key never leaves this machine.</p>
-    <div id="keys-list" class="keys-list"></div>
-    <div id="keys-error" class="error"></div>
-    <fieldset class="keys-box">
-      <legend>Generate a new keypair</legend>
-      <div class="ctl">
-        <input id="key-gen-name" type="text" placeholder="key name (letters, digits, . _ -)" />
-        <button id="key-gen-btn" title="Create an RSA-3072 keypair under ~/.cttc/keys/">Generate</button>
-      </div>
-    </fieldset>
-    <fieldset class="keys-box">
-      <legend>Import a public key</legend>
-      <div class="ctl block">
-        <input id="key-import-name" type="text" placeholder="key name" />
-      </div>
-      <textarea id="key-import-pem" rows="4" placeholder="-----BEGIN PUBLIC KEY-----"></textarea>
-      <button id="key-import-btn" title="Store this public key so you can encrypt metrics for its owner">Import</button>
-    </fieldset>
     <fieldset class="keys-box">
       <legend>Remote connection</legend>
       <p class="dlg-section-help muted">Point CTTC at a Docker-enabled host over SSH, or revert to sampling this machine directly.</p>
@@ -196,7 +224,7 @@
     <p class="muted">Customize the timeline's appearance.</p>
     <fieldset class="keys-box">
       <legend>Log highlight color</legend>
-      <p class="dlg-section-help muted">Color used to highlight log entries within the sampling frequency window around the selected time.</p>
+      <p class="dlg-section-help muted">Color used to highlight log entries within the poll interval window around the selected time.</p>
       <label class="ctl block">
         <input id="theme-hl-color" type="color" value="#eaff00" />
       </label>

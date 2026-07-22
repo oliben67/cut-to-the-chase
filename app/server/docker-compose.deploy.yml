@@ -15,7 +15,3 @@ services:
     network_mode: host
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - cttc-keys:/root/.cttc   # persists generated/imported encryption keys
-
-volumes:
-  cttc-keys:

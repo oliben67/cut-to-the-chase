@@ -22,9 +22,25 @@ document.getElementById("btn-browse").addEventListener("click", async () => {
   if (paths.length) keyPathEl.value = paths[0];
 });
 
+const activityEl = document.getElementById("activity");
+const activityLogEl = document.getElementById("activity-log");
+const btnActivityToggle = document.getElementById("btn-activity-toggle");
+
+btnActivityToggle.addEventListener("click", () => {
+  activityLogEl.hidden = !activityLogEl.hidden;
+  btnActivityToggle.textContent = activityLogEl.hidden ? "Show activity" : "Hide activity";
+});
+
+window.cttc.onSetupLog((line) => {
+  activityEl.hidden = false;
+  activityLogEl.textContent += (activityLogEl.textContent ? "\n" : "") + line;
+  activityLogEl.scrollTop = activityLogEl.scrollHeight;
+});
+
 form.addEventListener("submit", async (e) => {
   e.preventDefault();
   errorEl.hidden = true;
+  activityLogEl.textContent = "";
 
   const keyMode = document.querySelector('input[name="key-mode"]:checked').value;
   const payload = {

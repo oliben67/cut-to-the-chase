@@ -14,7 +14,9 @@ contextBridge.exposeInMainWorld("cttc", {
   broadcastSync: (msg) => ipcRenderer.send("sync-broadcast", msg),
   onSync: (cb) => ipcRenderer.on("sync-broadcast", (_e, msg) => cb(msg)),
   onMenuAction: (cb) => ipcRenderer.on("menu-action", (_e, action) => cb(action)),
+  menubarAction: (action) => ipcRenderer.invoke("menubar-action", action),
   submitSetup: (payload) => ipcRenderer.invoke("setup-wizard-submit", payload),
+  onSetupLog: (cb) => ipcRenderer.on("setup-log", (_e, line) => cb(line)),
   runSetup: () => ipcRenderer.invoke("run-setup"),
   updateImage: (payload) => ipcRenderer.invoke("update-image", payload),
 });

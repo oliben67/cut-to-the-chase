@@ -9,8 +9,8 @@
 # Multi-stage on alpine: curl, the docker CLI tarball, and uv's own install
 # footprint are only needed to *produce* the venv and fetch the docker binary
 # -- none of that belongs in the shipped image, so it all stays in `builder`.
-# alpine (musl) over slim (glibc) roughly halves the base image; cryptography,
-# orjson and psutil all ship musllinux wheels so no compiler is needed here.
+# alpine (musl) over slim (glibc) roughly halves the base image; orjson and
+# psutil both ship musllinux wheels so no compiler is needed here.
 FROM python:3.12-alpine AS builder
 
 ARG DOCKER_CLI_VERSION=27.3.1

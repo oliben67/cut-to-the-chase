@@ -19,16 +19,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-def download_sample(state, t0: float, t1: float, public_key: str | None, include_host: bool):
+def download_sample(state, t0: float, t1: float, include_host: bool):
     """-> (data, filename, source_count) for the .cttc sample covering
     [t0, t1] -- the byte-returning counterpart to State.export_sample()."""
-    data, meta = state.build_sample_bytes(t0, t1, public_key, include_host)
+    data, meta = state.build_sample_bytes(t0, t1, include_host)
     ts = datetime.fromtimestamp(t0 / 1000, tz=timezone.utc).strftime("%Y-%m-%d-%H-%M-%S")
     filename = f"sample-{ts}.cttc"
     return data, filename, len(meta)
 
 
-def upload_and_open(state, filename: str, data: bytes, private_key: str | None, transforms: list[str]):
+def upload_and_open(state, filename: str, data: bytes, transforms: list[str]):
     """Write the uploaded bytes to a scratch file, open it exactly like a
     local file would be (.cttc -> load_sample, anything else -> open_file,
     always static/non-live since the server has no way to get new bytes
@@ -42,10 +42,9 @@ def upload_and_open(state, filename: str, data: bytes, private_key: str | None, 
     anything with live=False; export reads s.rows/s.series, not s.path) --
     safe to delete it immediately after.
 
-    Returns the list of opened source ids. Raises EncryptedSampleError
-    (propagated from load_sample) for a locked .cttc with no/wrong key, and
-    any exception open_file/load_sample themselves raise -- callers should
-    catch and report these the same way /open's per-file loop already does.
+    Returns the list of opened source ids. Any exception open_file/
+    load_sample themselves raise propagates -- callers should catch and
+    report these the same way /open's per-file loop already does.
     """
     suffix = Path(filename).suffix or ".log"
     fd, tmp_path = tempfile.mkstemp(suffix=suffix, prefix="cttc-upload-")
@@ -53,7 +52,7 @@ def upload_and_open(state, filename: str, data: bytes, private_key: str | None, 
         with os.fdopen(fd, "wb") as f:
             f.write(data)
         if filename.endswith(".cttc"):
-            opened = state.load_sample(tmp_path, private_key)
+            opened = state.load_sample(tmp_path)
         else:
             src = state.open_file(tmp_path, "auto", filename, live=False, transforms=transforms)
             opened = [src.id]

@@ -663,7 +663,7 @@ async function startTracking(s) {
           host: host === "local" ? null : host,
           stats: false, host_stats: false, transforms: [],
           logs: [{ name: s.name, type: ttype }],
-          ssh_key: prefs.get("sshKeys", {})[host] || null,
+          ssh_key: null,
           interval: 5,
         });
       } catch (err) {
@@ -872,25 +872,6 @@ function currentDockerHost() {
 
 const dlgExport = $("dlg-export");
 
-// fill a <select> with the stored public keys (value = key name); the first
-// option means "no encryption" / "pick one"
-async function fillKeySelect(sel, emptyLabel) {
-  sel.innerHTML = "";
-  const none = document.createElement("option");
-  none.value = "";
-  none.textContent = emptyLabel;
-  sel.appendChild(none);
-  try {
-    for (const k of (await get("/cttc/keys")).keys) {
-      if (!k.has_public) continue;
-      const o = document.createElement("option");
-      o.value = k.name;
-      o.textContent = k.name + (k.has_private ? " (yours)" : "");
-      sel.appendChild(o);
-    }
-  } catch { /* server down: only "no encryption" is offered */ }
-}
-
 async function askExportOptions() {
   const hasHost = hasHostSeries();
   const cb = $("export-host");
@@ -898,17 +879,12 @@ async function askExportOptions() {
   $("export-host-note").textContent = hasHost
     ? "Currently being collected — included automatically unless you uncheck this."
     : "Not currently collected — checking this starts collecting it now (this past range won't have host data yet, but later saved metrics will).";
-  await fillKeySelect($("export-key"), "no encryption");
   return new Promise((resolve) => {
     const done = (ok) => {
       dlgExport.close();
       $("dlg-export-ok").onclick = null;
       $("dlg-export-cancel").onclick = null;
-      resolve(ok ? {
-        includeHost: cb.checked,
-        hadHost: hasHost,
-        publicKey: $("export-key").value || null,
-      } : null);
+      resolve(ok ? { includeHost: cb.checked, hadHost: hasHost } : null);
     };
     $("dlg-export-ok").onclick = () => done(true);
     $("dlg-export-cancel").onclick = () => done(false);
@@ -942,7 +918,7 @@ async function exportSample(t0, t1) {
       const host = currentDockerHost();
       await post("/docker/collect", {
         host, stats: false, host_stats: true, logs: [], transforms: [],
-        ssh_key: prefs.get("sshKeys", {})[host] || null,
+        ssh_key: null,
         interval: 5,
       });
     } catch (err) {
@@ -957,15 +933,13 @@ async function exportSample(t0, t1) {
     // remote-server.md phase 3) rather than asking it to write to a path
     // that might not exist on whichever machine actually ran it
     const params = new URLSearchParams({ from: t0, to: t1, include_host: opts.includeHost ? "1" : "0" });
-    if (opts.publicKey) params.set("public_key", opts.publicKey);
     const res = await fetch(`${API}/files/download?${params}`);
     if (!res.ok) throw new Error((await res.json().catch(() => null))?.error || `download failed: ${res.status}`);
     const sourceCount = Number(res.headers.get("X-CTTC-Source-Count") || 0);
     const bytes = new Uint8Array(await res.arrayBuffer());
     const path = await saveBinaryFile(name, bytes);
     if (!path) { setStatus("metrics export canceled"); return; }
-    const enc = opts.publicKey ? `, encrypted for “${opts.publicKey}”` : "";
-    setStatus(sourceCount ? `metrics saved: ${path} (${sourceCount} sources${enc})`
+    setStatus(sourceCount ? `metrics saved: ${path} (${sourceCount} sources)`
                           : "metrics saved, but no data in the selected range");
   } catch (err) {
     setStatus("metrics export failed: " + (err.message || err));
@@ -1838,7 +1812,7 @@ $("btn-add").onclick = async () => {
   $("docker-targets").innerHTML = "";
   $("docker-error").textContent = "";
   updateDockerDupes();
-  refreshSshKeyRow();
+  renderActivityLog(null);
   listContainers();
   try {
     const t = await get("/transforms");
@@ -1879,16 +1853,14 @@ $("btn-clear-sources").onclick = async () => {
 // server.py is this machine's embedded process or a remote one (see
 // docs/architecture/remote-server.md phase 3), unlike sending the path
 // itself, which only means anything when client and server share a
-// filesystem. privateKey (a stored key name or a raw PEM) is base64-encoded
-// into a header since HTTP header values can't safely carry raw newlines.
-async function uploadFile(localPath, privateKey) {
+// filesystem.
+async function uploadFile(localPath) {
   const filename = basename(localPath);
   if (!window.cttc?.readFile) {
     return { opened: [], errors: [{ path: filename, error: "cannot read local files in this environment" }] };
   }
   const bytes = await window.cttc.readFile(localPath);
   const headers = { "X-CTTC-Filename": filename };
-  if (privateKey) headers["X-CTTC-Private-Key"] = btoa(privateKey);
   const res = await fetch(`${API}/files/upload`, { method: "POST", body: bytes, headers });
   return res.json().catch(() => ({ opened: [], errors: [{ path: filename, error: `upload failed: ${res.status}` }] }));
 }
@@ -1904,22 +1876,8 @@ $("btn-load-sample").onclick = async () => {
   const files = paths.filter((p) => p.endsWith(".cttc") && !open.has(`upload://${basename(p)}`));
   if (!files.length) return;
   try {
-    let errors = [];
+    const errors = [];
     for (const path of files) errors.push(...((await uploadFile(path)).errors || []));
-    // encrypted files: the server flags them so we can ask for the key and retry
-    const locked = errors.filter((e) => e.encrypted);
-    if (locked.length) {
-      errors = errors.filter((e) => !e.encrypted);
-      const key = prompt(
-        `${locked.map((e) => e.path).join(", ")} is encrypted.\n` +
-        "Private key (a name from ~/.cttc/keys, or a full PEM):");
-      if (key) {
-        for (const e of locked) {
-          const path = files.find((p) => basename(p) === e.path);
-          errors.push(...((await uploadFile(path, key)).errors || []));
-        }
-      }
-    }
     if (errors.length) alert(errors.map((e) => `${e.path}: ${e.error}`).join("\n"));
     await refreshAll();
     resetZoom(); // show the full timeline, including the newly loaded metrics
@@ -1928,79 +1886,10 @@ $("btn-load-sample").onclick = async () => {
   }
 };
 
-/* ── encryption keys management (dlg-keys) ──────────────────────────────── */
-
 const dlgKeys = $("dlg-keys");
-
-async function renderKeysList() {
-  const box = $("keys-list");
-  $("keys-error").textContent = "";
-  let keys = [];
-  try {
-    keys = (await get("/cttc/keys")).keys;
-  } catch (err) {
-    $("keys-error").textContent = String(err.message || err);
-    return;
-  }
-  box.innerHTML = "";
-  if (!keys.length) {
-    box.innerHTML = '<div class="muted">no keys yet</div>';
-    return;
-  }
-  for (const k of keys) {
-    const row = document.createElement("div");
-    row.className = "key-row";
-    const name = document.createElement("span");
-    name.className = "name";
-    name.textContent = k.name;
-    row.appendChild(name);
-    const badge = document.createElement("span");
-    badge.className = "key-badge" + (k.has_private ? " private" : "");
-    badge.textContent = k.has_private ? "public + private" : "public only";
-    badge.title = k.has_private
-      ? "You hold the private key: you can open metrics encrypted for this key."
-      : "Imported public key: you can encrypt metrics for its owner, not open them.";
-    row.appendChild(badge);
-    const spacer = document.createElement("span");
-    spacer.className = "spacer";
-    row.appendChild(spacer);
-    if (k.has_public) {
-      const copy = document.createElement("button");
-      copy.className = "icon-btn";
-      copy.textContent = "📋";
-      copy.title = "Copy the public key (share it so others can encrypt metrics for you)";
-      copy.onclick = async () => {
-        await navigator.clipboard.writeText(k.public_pem);
-        setStatus(`public key “${k.name}” copied to clipboard`);
-      };
-      row.appendChild(copy);
-    }
-    const del = document.createElement("button");
-    del.className = "icon-btn";
-    del.textContent = "🗑";
-    del.title = k.has_private
-      ? "Delete this keypair — metrics encrypted for it become unreadable!"
-      : "Delete this imported public key";
-    del.onclick = async () => {
-      const warn = k.has_private
-        ? `Delete keypair “${k.name}”?\n\nThe private key is destroyed: any metrics encrypted for it can never be opened again.`
-        : `Delete imported public key “${k.name}”?`;
-      if (!confirm(warn)) return;
-      try {
-        await post("/cttc/keys/delete", { name: k.name });
-        renderKeysList();
-      } catch (err) {
-        $("keys-error").textContent = String(err.message || err);
-      }
-    };
-    row.appendChild(del);
-    box.appendChild(row);
-  }
-}
 
 // reached via File > Preferences > Settings (formerly a "🔑 Keys" toolbar button)
 function openSettingsDialog() {
-  renderKeysList();
   dlgKeys.showModal();
 }
 $("dlg-keys-close").onclick = () => dlgKeys.close();
@@ -2090,92 +1979,28 @@ $("dlg-theme-close").onclick = () => {
   dlgTheme.close();
 };
 
-$("key-gen-btn").onclick = async () => {
-  const name = $("key-gen-name").value.trim();
-  try {
-    const r = await post("/cttc/keys/generate", { name });
-    $("key-gen-name").value = "";
-    setStatus(`keypair “${r.name}” generated`);
-    renderKeysList();
-  } catch (err) {
-    $("keys-error").textContent = String(err.message || err);
+/* ── docker host activity log (ssh:// connections) ──────────────────────── */
+
+function renderActivityLog(entries) {
+  const toggle = $("btn-activity-toggle");
+  const pre = $("docker-activity");
+  if (!entries || !entries.length) {
+    toggle.hidden = true;
+    pre.hidden = true;
+    pre.textContent = "";
+    return;
   }
-};
-
-$("key-import-btn").onclick = async () => {
-  const name = $("key-import-name").value.trim();
-  const pem = $("key-import-pem").value.trim();
-  try {
-    const r = await post("/cttc/keys/import", { name, public_pem: pem });
-    $("key-import-name").value = "";
-    $("key-import-pem").value = "";
-    setStatus(`public key “${r.name}” imported`);
-    renderKeysList();
-  } catch (err) {
-    $("keys-error").textContent = String(err.message || err);
-  }
-};
-
-/* ── ssh key selection (ssh:// docker hosts) ────────────────────────────── */
-
-const BROWSE = "__browse__";
-
-function currentSshKey() {
-  const v = $("ssh-key").value;
-  return $("ssh-key-row").hidden || !v || v === BROWSE ? null : v;
+  toggle.hidden = false;
+  pre.textContent = entries
+    .map((e) => `$ ${e.cmd}\n  → exit ${e.returncode} (${e.ms}ms)${e.stderr ? `\n  ${e.stderr}` : ""}`)
+    .join("\n\n");
 }
 
-function rememberSshKey() {
-  const host = $("docker-host").value.trim();
-  if (!host) return;
-  const map = prefs.get("sshKeys", {});
-  map[host] = currentSshKey();
-  prefs.set("sshKeys", map);
-}
-
-async function refreshSshKeyRow() {
-  const host = $("docker-host").value.trim();
-  const row = $("ssh-key-row");
-  row.hidden = !host.startsWith("ssh://");
-  if (row.hidden) return;
-  const sel = $("ssh-key");
-  const remembered = prefs.get("sshKeys", {})[host] ?? null;
-  const chosen = sel.dataset.filled ? currentSshKey() : null;
-  let keys = [];
-  try {
-    keys = (await get("/ssh/keys")).keys;
-  } catch { /* server down; the default option still works */ }
-  sel.innerHTML = "";
-  const add = (value, label) => {
-    const o = document.createElement("option");
-    o.value = value;
-    o.textContent = label;
-    sel.appendChild(o);
-  };
-  add("", "default (ssh config / agent)");
-  for (const k of keys) add(k, k.replace(/^.*\/\.ssh\//, "~/.ssh/"));
-  add(BROWSE, "browse…");
-  const want = chosen || remembered;
-  if (want && ![...sel.options].some((o) => o.value === want)) add(want, want);
-  sel.value = want || "";
-  sel.dataset.filled = "1";
-}
-
-$("ssh-key").onchange = async () => {
-  const sel = $("ssh-key");
-  if (sel.value === BROWSE) {
-    const paths = window.cttc?.pickFiles ? await window.cttc.pickFiles() : [];
-    if (paths.length) {
-      const o = document.createElement("option");
-      o.value = paths[0];
-      o.textContent = paths[0];
-      sel.insertBefore(o, sel.querySelector(`option[value="${BROWSE}"]`));
-      sel.value = paths[0];
-    } else {
-      sel.value = "";
-    }
-  }
-  rememberSshKey();
+$("btn-activity-toggle").onclick = () => {
+  const pre = $("docker-activity");
+  const toggle = $("btn-activity-toggle");
+  pre.hidden = !pre.hidden;
+  toggle.textContent = pre.hidden ? "Show activity" : "Hide activity";
 };
 
 async function listContainers() {
@@ -2184,7 +2009,8 @@ async function listContainers() {
   const host = $("docker-host").value.trim() || null;
   box.textContent = "listing…";
   try {
-    const r = await post("/docker/ps", { host, ssh_key: currentSshKey() });
+    const r = await post("/docker/ps", { host });
+    renderActivityLog(r.log);
     box.innerHTML = "";
     const open = openPaths();
     const hostKey = host || "local";
@@ -2224,10 +2050,7 @@ async function listContainers() {
 }
 
 $("btn-ps-refresh").onclick = () => listContainers();
-$("docker-host").oninput = () => {
-  updateDockerDupes();
-  refreshSshKeyRow();
-};
+$("docker-host").oninput = () => updateDockerDupes();
 
 $("dlg-cancel").onclick = () => dlg.close();
 
@@ -2245,7 +2068,7 @@ $("dlg-ok").onclick = async () => {
       const collectReq = {
         host, stats, logs, transforms,
         host_stats: hostStats,
-        ssh_key: currentSshKey(),
+        ssh_key: null,
         interval: Number($("docker-interval").value) || 5,
       };
       await post("/docker/collect", collectReq);
@@ -2377,6 +2200,98 @@ if (!POPOUT_KIND) {
     else if (action === "load-metrics") $("btn-load-sample").click();
     else if (action === "open-theme") openThemeDialog();
     else if (action === "open-settings") openSettingsDialog();
+  });
+}
+
+/* ── custom menu bar (replaces the native OS menu — its row spacing can't
+   be styled via CSS on either macOS or Windows) ─────────────────────────── */
+{
+  const menubar = $("menubar");
+  const isMac = navigator.platform.toUpperCase().includes("MAC");
+  if (isMac) {
+    for (const acc of menubar.querySelectorAll(".acc")) {
+      acc.textContent = acc.textContent
+        .replace(/Ctrl\+Shift\+/, "⇧⌘")
+        .replace(/Ctrl\+/, "⌘");
+    }
+  }
+
+  let openMenu = null;
+  function closeMenu() {
+    if (!openMenu) return;
+    openMenu.classList.remove("open");
+    openMenu = null;
+  }
+  for (const menu of menubar.querySelectorAll(".menu")) {
+    const label = menu.querySelector(".menu-label");
+    label.onclick = () => {
+      if (openMenu === menu) { closeMenu(); return; }
+      closeMenu();
+      menu.classList.add("open");
+      openMenu = menu;
+    };
+    label.onmouseenter = () => {
+      if (openMenu && openMenu !== menu) {
+        closeMenu();
+        menu.classList.add("open");
+        openMenu = menu;
+      }
+    };
+  }
+  document.addEventListener("click", (e) => { if (!menubar.contains(e.target)) closeMenu(); });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeMenu(); });
+
+  const RENDERER_ACTIONS = {
+    "add-sources": () => $("btn-add").click(),
+    "load-metrics": () => $("btn-load-sample").click(),
+    "open-theme": () => openThemeDialog(),
+    "open-settings": () => openSettingsDialog(),
+    undo: () => document.execCommand("undo"),
+    redo: () => document.execCommand("redo"),
+    cut: () => document.execCommand("cut"),
+    copy: () => document.execCommand("copy"),
+    paste: () => document.execCommand("paste"),
+    "select-all": () => document.execCommand("selectAll"),
+  };
+
+  function runMenuAction(action) {
+    closeMenu();
+    const fn = RENDERER_ACTIONS[action];
+    if (fn) fn();
+    else window.cttc?.menubarAction?.(action); // about/reload/devtools/zoom/fullscreen/minimize/close/quit
+  }
+
+  menubar.addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-action]");
+    if (btn) runMenuAction(btn.dataset.action);
+  });
+
+  // Accelerators for actions with no native browser default (edit shortcuts
+  // like Ctrl+C/V/Z work out of the box in inputs/contenteditable and are
+  // deliberately left alone here).
+  const ACCELERATORS = {
+    "mod+o": "add-sources",
+    "mod+l": "load-metrics",
+    "mod+r": "reload",
+    f12: "toggle-devtools",
+    "mod+=": "zoom-in",
+    "mod+-": "zoom-out",
+    "mod+0": "zoom-reset",
+    f11: "toggle-fullscreen",
+    "mod+m": "minimize",
+    "mod+w": "close",
+    "mod+q": "quit",
+  };
+  window.addEventListener("keydown", (e) => {
+    const mod = isMac ? e.metaKey : e.ctrlKey;
+    const key = e.key.toLowerCase();
+    if (["control", "meta", "shift", "alt"].includes(key)) return;
+    const combo = mod ? `mod+${key}` : key;
+    const action = ACCELERATORS[combo];
+    if (action) {
+      e.preventDefault();
+      runMenuAction(action);
+    }
   });
 }
 

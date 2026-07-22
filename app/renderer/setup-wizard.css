@@ -7,7 +7,7 @@ body {
 #wizard {
   max-width: 460px;
   margin: 40px auto;
-  padding: 0 24px;
+  padding: 0 24px 48px;
 }
 h1 { font-size: 18px; }
 .muted { color: #999; font-size: 13px; }
@@ -57,3 +57,42 @@ button:disabled { opacity: 0.6; cursor: default; }
   animation: spin 0.8s linear infinite;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+#activity {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  max-height: 50%;
+  display: flex;
+  flex-direction: column;
+  background: #181818;
+  border-top: 1px solid #444;
+  padding: 6px 16px;
+  box-sizing: border-box;
+}
+#activity[hidden] { display: none; }
+.linklike {
+  background: none;
+  border: none;
+  padding: 4px 0;
+  color: #6ea8fe;
+  text-decoration: underline;
+  font-size: 12px;
+  align-self: flex-start;
+}
+.activity-log {
+  margin: 0;
+  padding: 8px;
+  overflow-y: auto;
+  flex: 1 1 auto;
+  min-height: 60px;
+  max-height: calc(50vh - 36px);
+  background: #111;
+  border: 1px solid #333;
+  border-radius: 4px;
+  color: #ccc;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  white-space: pre-wrap;
+}

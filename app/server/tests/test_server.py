@@ -8,7 +8,6 @@ psutil and the HTTP stack are exercised for real. Run:
 
 from __future__ import annotations
 
-import base64
 import http.client
 import io
 import json
@@ -1087,6 +1086,14 @@ class TestSampleRoundTrip:
         r = state.export_sample(str(out), 0.0, 1.0)   # both log and stats out of range
         assert r["sources"] == 0
         assert zipfile.ZipFile(out).namelist() == ["manifest.json"]
+
+    def test_export_include_host_false(self, state, stats_file, tmp_path):
+        src = state.open_file(str(stats_file), "auto", None, live=False, transforms=[])
+        src.is_host = True
+        out = tmp_path / "nohost.cttc"
+        t0 = ms(2026, 1, 2, 3, 0, 0)
+        r = state.export_sample(str(out), t0, t0 + 60000, include_host=False)
+        assert r["sources"] == 0
         assert server.State(tmp_path).load_sample(str(out)) == []
 
     def test_load_sample_skips_blank_log_lines(self, state, tmp_path):
@@ -1101,136 +1108,6 @@ class TestSampleRoundTrip:
         src = state.sources[opened[0]]
         assert src.total() == 2
         assert src.slice(1, 1)[0]["text"] == ""       # missing text defaults to empty
-
-
-# ── sample encryption ────────────────────────────────────────────────────────
-
-
-@pytest.fixture
-def keyhome(tmp_path, monkeypatch):
-    """Redirect ~/.cttc/keys into a temp dir so tests never touch real keys."""
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
-    return tmp_path
-
-
-class TestKeyManagement:
-    def test_generate_list_and_files(self, keyhome):
-        r = server.generate_keypair("alice")
-        assert r == {"name": "alice", "has_public": True, "has_private": True,
-                     "public_pem": r["public_pem"]}
-        assert r["public_pem"].startswith("-----BEGIN PUBLIC KEY-----")
-        d = keyhome / ".cttc" / "keys"
-        assert (d / "alice.key.pem").stat().st_mode & 0o777 == 0o600
-        assert server.list_keypairs() == [
-            {"name": "alice", "has_public": True, "has_private": True,
-             "public_pem": r["public_pem"]}
-        ]
-
-    def test_generate_duplicate_rejected(self, keyhome):
-        server.generate_keypair("bob")
-        with pytest.raises(ValueError, match="already exists"):
-            server.generate_keypair("bob")
-
-    @pytest.mark.parametrize("bad", ["", "  ", "a/b", "x y", "é", "a\\b"])
-    def test_bad_key_names_rejected(self, keyhome, bad):
-        with pytest.raises(ValueError, match="key name"):
-            server.generate_keypair(bad)
-
-    def test_import_public_key(self, keyhome):
-        pem = server.generate_keypair("src")["public_pem"]
-        r = server.import_public_key("friend", pem)
-        assert r == {"name": "friend", "has_public": True, "has_private": False}
-        listed = {k["name"]: k for k in server.list_keypairs()}
-        assert listed["friend"]["has_private"] is False
-        with pytest.raises(ValueError, match="already exists"):
-            server.import_public_key("friend", pem)
-
-    def test_import_invalid_pem_rejected(self, keyhome):
-        with pytest.raises(Exception):
-            server.import_public_key("junk", "not a pem")
-
-    def test_delete_keypair(self, keyhome):
-        server.generate_keypair("gone")
-        assert server.delete_keypair("gone") == {"ok": True, "name": "gone"}
-        assert server.list_keypairs() == []
-        with pytest.raises(ValueError, match="unknown key"):
-            server.delete_keypair("gone")
-
-    def test_delete_public_only_key(self, keyhome):
-        pem = server.generate_keypair("mine")["public_pem"]
-        server.import_public_key("theirs", pem)
-        server.delete_keypair("theirs")
-        assert [k["name"] for k in server.list_keypairs()] == ["mine"]
-
-    def test_delete_bad_name_rejected(self, keyhome):
-        with pytest.raises(ValueError, match="key name"):
-            server.delete_keypair("../escape")
-
-    def test_resolvers(self, keyhome):
-        pem = server.generate_keypair("kr")["public_pem"]
-        assert server.resolve_public_key("kr") == pem.encode()
-        # raw PEM passthrough (resolver strips surrounding whitespace)
-        assert server.resolve_public_key(pem).strip() == pem.encode().strip()
-        priv = server.resolve_private_key("kr")
-        assert b"PRIVATE KEY" in priv
-        assert server.resolve_private_key(priv.decode()).strip() == priv.strip()
-        with pytest.raises(ValueError, match="unknown public key"):
-            server.resolve_public_key("ghost")
-        with pytest.raises(ValueError, match="unknown private key"):
-            server.resolve_private_key("ghost")
-
-
-class TestEncryptDecrypt:
-    def test_round_trip(self, keyhome):
-        server.generate_keypair("rt")
-        blob = server.encrypt_bytes(b"payload " * 1000, server.resolve_public_key("rt"))
-        assert server.is_encrypted_sample(blob)
-        assert blob.startswith(server.ENC_MAGIC)
-        out = server.decrypt_bytes(blob, server.resolve_private_key("rt"))
-        assert out == b"payload " * 1000
-
-    def test_wrong_key_fails(self, keyhome):
-        server.generate_keypair("k1")
-        server.generate_keypair("k2")
-        blob = server.encrypt_bytes(b"secret", server.resolve_public_key("k1"))
-        with pytest.raises(ValueError, match="decryption failed"):
-            server.decrypt_bytes(blob, server.resolve_private_key("k2"))
-
-    def test_not_encrypted_rejected(self):
-        with pytest.raises(ValueError, match="not an encrypted sample"):
-            server.decrypt_bytes(b"PK\x03\x04zipdata", b"irrelevant")
-
-    def test_is_encrypted_sample(self):
-        assert server.is_encrypted_sample(server.ENC_MAGIC + b"x") is True
-        assert server.is_encrypted_sample(b"PK\x03\x04") is False
-
-
-class TestEncryptedSampleRoundTrip:
-    def test_encrypted_export_and_load(self, state, log_file, keyhome, tmp_path):
-        state.open_file(str(log_file), "auto", None, live=False, transforms=[])
-        server.generate_keypair("me")
-        out = tmp_path / "enc.cttc"
-        t0 = ms(2026, 1, 2, 3, 0, 0)
-        r = state.export_sample(str(out), t0, t0 + 60000, public_key="me")
-        assert r["encrypted"] is True
-        raw = out.read_bytes()
-        assert server.is_encrypted_sample(raw)
-        assert b"alpha" not in raw                    # log text is not in the clear
-
-        st2 = server.State(tmp_path)
-        with pytest.raises(server.EncryptedSampleError, match="private key is required"):
-            st2.load_sample(str(out))
-        opened = st2.load_sample(str(out), private_key="me")
-        assert len(opened) == 1
-        assert st2.sources[opened[0]].slice(0, 1)[0]["text"] == "alpha"
-
-    def test_export_include_host_false(self, state, stats_file, tmp_path):
-        src = state.open_file(str(stats_file), "auto", None, live=False, transforms=[])
-        src.is_host = True
-        out = tmp_path / "nohost.cttc"
-        t0 = ms(2026, 1, 2, 3, 0, 0)
-        r = state.export_sample(str(out), t0, t0 + 60000, include_host=False)
-        assert r["sources"] == 0 and r["encrypted"] is False
 
 
 # ── HTTP API ─────────────────────────────────────────────────────────────────
@@ -1435,43 +1312,6 @@ class TestHttpApi:
         _, j = get(base, f"/logs/find?source={sid}&q=zzz")
         assert j["index"] is None
 
-    def test_cttc_key_endpoints(self, api, keyhome):
-        base, _ = api
-        code, j = post(base, "/cttc/keys/generate", {"name": "webkey"})
-        assert code == 200 and j["has_private"] is True
-        pem = j["public_pem"]
-        code, j = post(base, "/cttc/keys/import", {"name": "peer", "public_pem": pem})
-        assert code == 200 and j["has_private"] is False
-        _, j = get(base, "/cttc/keys")
-        assert [k["name"] for k in j["keys"]] == ["peer", "webkey"]
-        assert all("PUBLIC KEY" in k["public_pem"] for k in j["keys"])
-        code, j = post(base, "/cttc/keys/generate", {"name": "web key!"})
-        assert code == 400 and "key name" in j["error"]
-        code, j = post(base, "/cttc/keys/generate", {})
-        assert code == 400
-        code, j = post(base, "/cttc/keys/delete", {"name": "peer"})
-        assert code == 200 and j["ok"] is True
-        _, j = get(base, "/cttc/keys")
-        assert [k["name"] for k in j["keys"]] == ["webkey"]
-        code, j = post(base, "/cttc/keys/delete", {"name": "peer"})
-        assert code == 400 and "unknown key" in j["error"]
-
-    def test_encrypted_sample_over_http(self, api, keyhome, tmp_path):
-        base, _ = api
-        _, j = post(base, "/cttc/keys/generate", {"name": "httpkey"})
-        out = tmp_path / "enc-http.cttc"
-        t0 = ms(2026, 1, 2, 3, 0, 0)
-        code, j = post(base, "/sample/export",
-                       {"path": str(out), "from": t0, "to": t0 + 60000, "public_key": "httpkey"})
-        assert code == 200 and j["encrypted"] is True
-
-        code, j = post(base, "/open", {"files": [{"path": str(out)}]})
-        assert code == 200 and j["opened"] == []
-        assert j["errors"][0]["encrypted"] is True    # renderer uses this to prompt for a key
-
-        code, j = post(base, "/open", {"files": [{"path": str(out), "private_key": "httpkey"}]})
-        assert code == 200 and len(j["opened"]) == 2 and j["errors"] == []
-
     def test_export_include_host_flag_over_http(self, api, tmp_path):
         base, st = api
         for s in st.sources.values():
@@ -1600,14 +1440,6 @@ class TestFilesEndpoints:
         assert all(s["type"] != "stats" for s in sources)  # the host-marked stats source is excluded
         assert any(s["type"] == "log" for s in sources)     # the unrelated log source is unaffected
 
-    def test_download_encrypted(self, api, keyhome):
-        base, _ = api
-        server.generate_keypair("dlhttp")
-        t0 = ms(2026, 1, 2, 3, 0, 0)
-        code, _h, data = get_raw(base, f"/files/download?from={t0}&to={t0 + 60000}&public_key=dlhttp")
-        assert code == 200
-        assert server.is_encrypted_sample(data)
-
     def test_upload_plain_log(self, api):
         base, st = api
         data = b"2026-01-02T03:00:00Z hello\n2026-01-02T03:00:01Z world\n"
@@ -1635,22 +1467,6 @@ class TestFilesEndpoints:
         assert code == 200  # request itself succeeded; the failure is reported in errors
         assert j["opened"] == [] and len(j["errors"]) == 1
         assert "bad.cttc" == j["errors"][0]["path"]
-
-    def test_upload_encrypted_cttc_round_trip_over_http(self, api, keyhome):
-        base, st = api
-        server.generate_keypair("uphttp")
-        t0 = ms(2026, 1, 2, 3, 0, 0)
-        _c, _h, blob = get_raw(base, f"/files/download?from={t0}&to={t0 + 60000}&public_key=uphttp")
-
-        # without the key: reported as a locked file, not a crash
-        code, j = post_raw(base, "/files/upload", blob, {"X-CTTC-Filename": "locked.cttc"})
-        assert code == 200 and j["opened"] == [] and j["errors"][0]["encrypted"] is True
-
-        # with the key, base64-encoded per the header contract: succeeds
-        key_b64 = base64.b64encode(b"uphttp").decode()
-        code, j = post_raw(base, "/files/upload", blob,
-                           {"X-CTTC-Filename": "locked.cttc", "X-CTTC-Private-Key": key_b64})
-        assert code == 200 and len(j["opened"]) >= 1 and j["errors"] == []
 
     def test_upload_broadcasts_sources_event_only_on_success(self, api):
         base, st = api
