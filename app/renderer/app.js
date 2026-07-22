@@ -19,7 +19,11 @@ async function get(path) {
 async function post(path, body) {
   const r = await fetch(API + path, { method: "POST", body: JSON.stringify(body || {}) });
   const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(j.error || `${path}: ${r.status}`);
+  if (!r.ok) {
+    const e = new Error(j.error || `${path}: ${r.status}`);
+    e.log = j.log; // docker/ps failures carry the attempted commands (see renderActivityLog)
+    throw e;
+  }
   return j;
 }
 
@@ -2005,11 +2009,21 @@ $("btn-activity-toggle").onclick = () => {
 
 async function listContainers() {
   $("docker-error").textContent = "";
+  renderActivityLog(null);
   const box = $("docker-targets");
   const host = $("docker-host").value.trim() || null;
-  box.textContent = "listing…";
+  const label = host ? `Connecting to ${host}…` : "Listing local containers…";
+  const t0 = Date.now();
+  box.textContent = label;
+  // ssh connections can take a while (or hang) before the server even
+  // responds -- without this, "Refresh" looks identical whether it's about
+  // to succeed, still connecting, or has silently wedged.
+  const tick = setInterval(() => {
+    box.textContent = `${label} (${Math.round((Date.now() - t0) / 1000)}s)`;
+  }, 1000);
   try {
     const r = await post("/docker/ps", { host });
+    clearInterval(tick);
     renderActivityLog(r.log);
     box.innerHTML = "";
     const open = openPaths();
@@ -2044,8 +2058,15 @@ async function listContainers() {
     addGroup("Containers (docker logs)", r.containers, "container");
     if (!r.services.length && !r.containers.length) box.textContent = "nothing running";
   } catch (err) {
+    clearInterval(tick);
     box.innerHTML = "";
-    $("docker-error").textContent = String(err.message || err);
+    renderActivityLog(err.log);
+    // a bare network-level failure (server unreachable, tunnel down, ...)
+    // has no err.log and a browser-generated message that isn't useful on
+    // its own -- say so plainly instead of the raw "Failed to fetch".
+    $("docker-error").textContent = err.log
+      ? String(err.message || err)
+      : `Could not reach the CTTC server itself (${String(err.message || err)}) — check the connection/tunnel.`;
   }
 }
 

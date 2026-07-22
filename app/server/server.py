@@ -568,6 +568,15 @@ def list_ssh_keys() -> list[str]:
     return keys
 
 
+class DockerPsError(RuntimeError):
+    """Like RuntimeError, but carries the activity log gathered so far -- so
+    a failed docker/ps call still shows the client *what was attempted*
+    (exact commands, exit codes, stderr) instead of just an error string."""
+    def __init__(self, message: str, log: list):
+        super().__init__(message)
+        self.log = log
+
+
 def docker_ps(host: str | None, ssh_key: str | None = None) -> dict:
     """List containers (and swarm services, when the daemon is a manager)."""
     base = docker_cmd(host)
@@ -576,7 +585,15 @@ def docker_ps(host: str | None, ssh_key: str | None = None) -> dict:
 
     def run_logged(args):
         t0 = time.monotonic()
-        out = subprocess.run(args, capture_output=True, text=True, timeout=30, env=env)
+        try:
+            out = subprocess.run(args, capture_output=True, text=True, timeout=30, env=env)
+        except subprocess.TimeoutExpired:
+            log.append({
+                "cmd": " ".join(args), "returncode": None,
+                "ms": round((time.monotonic() - t0) * 1000),
+                "stderr": "timed out after 30s (host unreachable, or hung waiting on an ssh prompt)",
+            })
+            raise DockerPsError(f"{' '.join(args)} timed out after 30s", log)
         log.append({
             "cmd": " ".join(args),
             "returncode": out.returncode,
@@ -587,7 +604,7 @@ def docker_ps(host: str | None, ssh_key: str | None = None) -> dict:
 
     out = run_logged(base + ["ps", "--format", "json"])
     if out.returncode != 0:
-        raise RuntimeError(out.stderr.strip() or "docker ps failed")
+        raise DockerPsError(out.stderr.strip() or "docker ps failed", log)
     containers = [jloads(line) for line in out.stdout.splitlines() if line.strip()]
     services = []
     svc = run_logged(base + ["service", "ls", "--format", "json"])
@@ -1280,7 +1297,10 @@ class Handler(BaseHTTPRequestHandler):
             # call (bad host, missing key, connection refused, ...) -- must
             # still send a real response, or the client just sees a bare
             # "failed to fetch" instead of the actual ssh/docker error.
-            self._send({"error": str(e)}, 502)
+            payload = {"error": str(e)}
+            if isinstance(e, DockerPsError):
+                payload["log"] = e.log
+            self._send(payload, 502)
 
     def _log_source(self, sid):
         with self.state.lock:

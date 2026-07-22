@@ -660,6 +660,22 @@ class TestDockerCmdAndPs:
         with pytest.raises(RuntimeError, match="no daemon"):
             server.docker_ps(None)
 
+    def test_ps_failure_carries_attempted_log(self, docker_cli, monkeypatch):
+        monkeypatch.setattr(server.subprocess, "run", FakeRun([fail("permission denied")]))
+        with pytest.raises(server.DockerPsError) as ei:
+            server.docker_ps(None)
+        assert ei.value.log[0]["returncode"] != 0
+        assert "permission denied" in ei.value.log[0]["stderr"]
+
+    def test_ps_timeout_raises_with_log(self, docker_cli, monkeypatch):
+        def run(*a, **k):
+            raise server.subprocess.TimeoutExpired(cmd="docker ps", timeout=30)
+
+        monkeypatch.setattr(server.subprocess, "run", run)
+        with pytest.raises(server.DockerPsError, match="timed out") as ei:
+            server.docker_ps(None)
+        assert ei.value.log[0]["returncode"] is None
+
     def test_ps_passes_ssh_key_env(self, docker_cli, monkeypatch):
         run = FakeRun([ok(""), ok("")])
         monkeypatch.setattr(server.subprocess, "run", run)
@@ -1292,6 +1308,18 @@ class TestHttpApi:
         monkeypatch.setattr(server, "docker_ps", boom)
         code, j = post(base, "/docker/ps", {"host": "ssh://u@h"})
         assert code == 502 and "Permission denied" in j["error"]
+
+    def test_docker_ps_endpoint_reports_attempted_log(self, api, monkeypatch):
+        # DockerPsError (unlike a plain RuntimeError) carries the commands
+        # actually attempted, so the client can render them even on failure.
+        base, _ = api
+
+        def boom(host, ssh_key=None):
+            raise server.DockerPsError("timed out", [{"cmd": "docker ps", "returncode": None, "ms": 30000, "stderr": "timed out"}])
+
+        monkeypatch.setattr(server, "docker_ps", boom)
+        code, j = post(base, "/docker/ps", {"host": "ssh://u@h"})
+        assert code == 502 and j["log"][0]["cmd"] == "docker ps"
 
     def test_docker_collect_endpoint(self, api, docker_cli, monkeypatch):
         base, st = api
