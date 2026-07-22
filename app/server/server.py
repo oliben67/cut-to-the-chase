@@ -1275,6 +1275,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._send({"error": "not found"}, 404)
         except (KeyError, ValueError) as e:
             self._send({"error": f"bad request: {e}"}, 400)
+        except RuntimeError as e:
+            # docker_ps/collect_docker raise this for a failed docker/ssh
+            # call (bad host, missing key, connection refused, ...) -- must
+            # still send a real response, or the client just sees a bare
+            # "failed to fetch" instead of the actual ssh/docker error.
+            self._send({"error": str(e)}, 502)
 
     def _log_source(self, sid):
         with self.state.lock:

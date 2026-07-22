@@ -1281,6 +1281,18 @@ class TestHttpApi:
         _, j = post(base, "/docker/ps", {"host": "ssh://u@h", "ssh_key": "/k"})
         assert j["host"] == "ssh://u@h" and j["key"] == "/k"
 
+    def test_docker_ps_endpoint_reports_runtime_error(self, api, monkeypatch):
+        # a failed ssh/docker call must still get a real response (not a
+        # dropped connection the client sees as "failed to fetch")
+        base, _ = api
+
+        def boom(host, ssh_key=None):
+            raise RuntimeError("Permission denied (publickey)")
+
+        monkeypatch.setattr(server, "docker_ps", boom)
+        code, j = post(base, "/docker/ps", {"host": "ssh://u@h"})
+        assert code == 502 and "Permission denied" in j["error"]
+
     def test_docker_collect_endpoint(self, api, docker_cli, monkeypatch):
         base, st = api
         monkeypatch.setattr(server.subprocess, "run", FakeRun([ok("")]))

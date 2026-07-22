@@ -135,8 +135,15 @@ function showSplash() {
     resizable: false,
     alwaysOnTop: true,
     icon: APP_ICON,
+    // Created hidden -- shown only once splash.html has actually rendered
+    // its first frame (see 'ready-to-show' below). Without this the window
+    // is mapped and painted blank (native background color, no content)
+    // the instant it's constructed, which is the "blank background" flash
+    // this window exists to avoid in the first place.
+    show: false,
     webPreferences: { contextIsolation: true, nodeIntegration: false },
   });
+  splashWindow.once("ready-to-show", () => splashWindow?.show());
   splashWindow.loadFile(path.join(__dirname, "renderer", "splash.html"));
   return splashWindow;
 }
@@ -368,7 +375,7 @@ function resourcesDirForApp() {
 async function connectToServer(fileArgs) {
   const cfg = loadConnectionConfig();
   if (cfg.mode === "embedded") {
-    if (app.isPackaged && hasLocalDocker()) {
+    if (app.isPackaged && (await hasLocalDocker())) {
       const { port } = await ensureLocalContainer({ resourcesDir: resourcesDirForApp() });
       serverPort = port;
       console.log(`[docker] server container running locally — port ${serverPort}`);
@@ -484,7 +491,7 @@ ipcMain.handle("run-setup", async () => {
 
   // "revert to local" only makes sense if there's an ssh-tunnel to revert
   // *from*, and only offered when there's local Docker to fall back *to*.
-  if (cfg.mode === "ssh-tunnel" && hasLocalDocker()) {
+  if (cfg.mode === "ssh-tunnel" && (await hasLocalDocker())) {
     const choice = await dialog.showMessageBox({
       type: "question",
       message: "CTTC is connected over an SSH tunnel, and a local Docker was detected.",
@@ -520,7 +527,7 @@ ipcMain.handle("update-image", async (_e, payload) => {
   const source =
     payload.sourceType === "tarball" ? { type: "tarball", path: payload.tarballPath } : { type: "registry", ref: payload.ref };
   try {
-    if (hasLocalDocker()) {
+    if (await hasLocalDocker()) {
       await ensureLocalContainer({ source, resourcesDir: resourcesDirForApp() });
       await offerRestart("Image updated locally. Restart CTTC to reconnect?");
       return { ok: true };
@@ -546,9 +553,9 @@ ipcMain.handle("update-image", async (_e, payload) => {
 app.whenReady().then(async () => {
   // Shown before anything else, including installMenu() and the
   // hasLocalDocker() check below -- hasLocalDocker() shells out to `docker
-  // info` synchronously (spawnSync) and can block the main process for
-  // several seconds on a slow/starting daemon, which otherwise left the
-  // app showing nothing at all during that time. The wizard path closes
+  // info` (async; see lib/docker-check.js) and can take a few seconds
+  // against a slow/starting daemon or a plain "no docker on PATH" miss. The
+  // wizard path closes this itself once its own window is ready to show (see
   // this itself once its own window is ready to show (see
   // runSetupWizard()'s 'ready-to-show' handler) instead of stacking a
   // second loading window on top of it.
@@ -561,7 +568,7 @@ app.whenReady().then(async () => {
     // files passed on the command line open at startup: npm start -- file1 file2
     const fileArgs = process.argv.slice(app.isPackaged ? 1 : 2).filter((a) => !a.startsWith("-"));
     const cfg = loadConnectionConfig();
-    if (cfg.mode === "embedded" && !hasLocalDocker()) {
+    if (cfg.mode === "embedded" && !(await hasLocalDocker())) {
       await runSetupWizard();
     } else {
       await connectToServer(fileArgs);
