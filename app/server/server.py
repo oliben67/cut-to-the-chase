@@ -1250,6 +1250,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send({"error": f"bad request: {e}"}, 400)
         except BrokenPipeError:
             pass
+        except Exception as e:
+            # see the matching catch-all in do_POST for why this exists
+            logger.exception("unhandled error on %s", u.path)
+            self._send({"error": f"unexpected server error: {e}"}, 500)
 
     def _handle_upload(self):
         """POST /files/upload -- body is the raw file bytes (not JSON), so
@@ -1341,6 +1345,16 @@ class Handler(BaseHTTPRequestHandler):
             if isinstance(e, DockerPsError):
                 payload["log"] = e.log
             self._send(payload, 502)
+        except Exception as e:
+            # Catch-all last resort: any *other* exception type escaping a
+            # route handler (OSError from a wedged subprocess, a bug in new
+            # code, ...) used to propagate straight out of do_POST, which
+            # http.server treats as "close the connection with no response
+            # at all" -- the client just sees ERR_EMPTY_RESPONSE /
+            # ERR_TOO_MANY_RETRIES with zero indication of what broke
+            # server-side. Always send *something* back instead.
+            logger.exception("unhandled error on %s", u.path)
+            self._send({"error": f"unexpected server error: {e}"}, 500)
 
     def _log_source(self, sid):
         with self.state.lock:

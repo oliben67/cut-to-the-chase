@@ -31,6 +31,12 @@ async function post(path, body) {
   if (!r.ok) {
     const e = new Error(j.error || `${path}: ${r.status}`);
     e.log = j.log; // docker/ps failures carry the attempted commands (see renderActivityLog)
+    // true iff the CTTC server itself sent this response (any non-2xx with
+    // a body) -- distinct from fetch() rejecting outright (server
+    // unreachable/reset/no response at all), which never reaches this line
+    // and so never sets this flag. Needed because a real server-side error
+    // can still have no .log (e.g. a plain 500, not a DockerPsError).
+    e.serverResponded = true;
     throw e;
   }
   return j;
@@ -2095,13 +2101,17 @@ async function listContainers() {
     clearInterval(tick);
     box.innerHTML = "";
     renderActivityLog(err.log);
-    // a bare network-level failure (server unreachable, tunnel down, ...)
-    // has no err.log and a browser-generated message that isn't useful on
-    // its own -- say so plainly instead of the raw "Failed to fetch". When
-    // err.log IS present, the 127.0.0.1 hop succeeded and it was the
-    // server's own ssh/docker call (to <host>) that failed -- spelled out
-    // so it's unambiguous which of the two hops broke.
-    $("docker-error").textContent = err.log
+    // A bare network-level failure (fetch() itself rejected -- server
+    // unreachable, tunnel down, connection reset with zero bytes sent) has
+    // no err.serverResponded and a browser-generated message that isn't
+    // useful on its own. Anything the CTTC server actually responded to
+    // (err.serverResponded) means the 127.0.0.1 hop succeeded and it was
+    // the server's own ssh/docker call (or an unexpected server-side bug)
+    // that failed -- spelled out so it's unambiguous which of the two hops
+    // broke. Deliberately NOT keyed on err.log: a plain 500 (an unhandled
+    // exception, not a DockerPsError) has no log either, but the server did
+    // respond.
+    $("docker-error").textContent = err.serverResponded
       ? `The CTTC server reached out to ${host || "the local daemon"} and failed: ${String(err.message || err)}`
       : `Could not reach the CTTC server itself at 127.0.0.1:${PORT} (${String(err.message || err)}) — check the connection/tunnel.`;
   } finally {

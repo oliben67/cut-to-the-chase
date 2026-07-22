@@ -1346,6 +1346,22 @@ class TestHttpApi:
         code, j = post(base, "/docker/ps", {"host": "ssh://u@h"})
         assert code == 502 and j["log"][0]["cmd"] == "docker ps"
 
+    def test_unhandled_exception_still_gets_a_response(self, api, monkeypatch):
+        # any exception type NOT explicitly handled (an OSError from a
+        # wedged subprocess, a plain bug, ...) used to propagate out of
+        # do_POST entirely -- http.server then just drops the connection
+        # with zero bytes sent, which the browser reports as
+        # ERR_EMPTY_RESPONSE / ERR_TOO_MANY_RETRIES with no diagnostic at
+        # all. Must always get a real (500) response instead.
+        base, _ = api
+
+        def boom(host, ssh_key=None):
+            raise OSError("wedged subprocess pipe")
+
+        monkeypatch.setattr(server, "docker_ps", boom)
+        code, j = post(base, "/docker/ps", {"host": "ssh://u@h"})
+        assert code == 500 and "wedged subprocess pipe" in j["error"]
+
     def test_docker_collect_endpoint(self, api, docker_cli, monkeypatch):
         base, st = api
         monkeypatch.setattr(server.subprocess, "run", FakeRun([ok("")]))
