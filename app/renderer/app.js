@@ -52,6 +52,7 @@ const state = {
   hoverGroup: "svc",      // strip group under the pointer: "svc" | "host"
   chartStyle: prefs.get("chartStyle", "lines"), // "lines" | "bars"
   showHost: prefs.get("showHost", true),
+  showLanes: prefs.get("showLanes", false), // per-log-source "entry occurred here" bars, between telemetry and host
   track: prefs.get("track", {}),           // series name -> "sel" | "mut" | "hid"
   showOthers: prefs.get("showOthers", true), // list not-selected containers in legend
   poppedOut: new Set(),   // "telemetry" and/or log source ids moved to their own window
@@ -356,10 +357,13 @@ function drawAll() {
   $("host-nav").hidden = !showingHostArea || hostLoading;
   $("btn-host-toggle").textContent = state.showHost ? "\u25be" : "\u25b8";
   $("btn-host-toggle").title = state.showHost ? "Hide host telemetry" : "Show host telemetry";
+  lanesEl.hidden = !state.showLanes;
+  $("btn-lanes-toggle").textContent = state.showLanes ? "\u25be" : "\u25b8";
+  $("btn-lanes-toggle").title = state.showLanes ? "Hide log entry markers" : "Show log entry markers";
   STRIPS.forEach((spec, i) => drawStrip(stripCanvases[i], spec, "svc", i === STRIPS.length - 1));
   if (hasHost && state.showHost && !hostBlockEl.hidden)
     STRIPS.forEach((spec, i) => drawStrip(hostCanvases[i], spec, "host", i === STRIPS.length - 1));
-  drawLanes();
+  if (state.showLanes) drawLanes();
   updateTimelineNav(chartNav);
   updateTimelineNav(hostNav);
 }
@@ -554,7 +558,7 @@ function drawLanes() {
   for (const c of lanesEl.querySelectorAll("canvas")) drawLane(c);
 }
 
-const LANE_H = 18;
+const LANE_H = 8; // was 18 -- these are just "an entry happened here" tick marks, not worth the same weight as the strips
 
 function drawLane(c) {
   const sid = c.dataset.sid;
@@ -574,7 +578,7 @@ function drawLane(c) {
       if (!counts[b]) continue;
       ctx.globalAlpha = live ? 0.35 + 0.65 * (counts[b] / maxC) : 0.85;
       const x = MARGIN_L + (b / n) * pw;
-      ctx.fillRect(x, 3, Math.max(1, pw / n - 0.5), LANE_H - 6);
+      ctx.fillRect(x, 1, Math.max(1, pw / n - 0.5), LANE_H - 2);
     }
     ctx.globalAlpha = 1;
   }
@@ -2290,6 +2294,12 @@ $("chk-style").onchange = (e) => {
 $("btn-host-toggle").onclick = () => {
   state.showHost = !state.showHost;
   prefs.set("showHost", state.showHost);
+  drawAll();
+};
+
+$("btn-lanes-toggle").onclick = () => {
+  state.showLanes = !state.showLanes;
+  prefs.set("showLanes", state.showLanes);
   drawAll();
 };
 

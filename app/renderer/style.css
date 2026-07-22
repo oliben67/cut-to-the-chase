@@ -242,7 +242,19 @@ body.sample-armed .strip { cursor: cell; }
   pointer-events: auto;
 }
 
+#lanes-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 12px 2px;
+  border-top: 1px solid var(--border);
+  margin-top: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
 #lanes { padding-top: 2px; }
+#lanes[hidden] { display: none; }
 
 #host-head {
   display: flex;
@@ -316,6 +328,7 @@ body.popout-log #panels { flex: 1 1 auto; }
 body.popout-host #legend,
 body.popout-host #charts,
 body.popout-host #chart-nav,
+body.popout-host #lanes-head,
 body.popout-host #lanes,
 body.popout-host #empty-state,
 body.popout-host #panels,

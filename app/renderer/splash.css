@@ -10,6 +10,7 @@ body {
   background: #1e1e1e;
   color: #ccc;
   -webkit-user-select: none;
+  user-select: none;
 }
 p { margin: 0; font-size: 13px; }
 .spinner {
