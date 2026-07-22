@@ -13,5 +13,14 @@ services:
     # network-namespace view, not the physical host's):
     pid: host
     network_mode: host
+    environment:
+      - SSH_AUTH_SOCK=/ssh-agent
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      # Lets `docker -H ssh://...` (Add Sources with an ssh:// host) reach a
+      # *third* machine, authenticating as whatever key this host's own
+      # ssh-agent already has loaded -- no key ever lives in the container.
+      # Falls back to /dev/null (a harmless no-op mount) when this host has
+      # no SSH_AUTH_SOCK exported, e.g. no agent running: see
+      # docs/architecture/remote-server.md.
+      - ${SSH_AUTH_SOCK:-/dev/null}:/ssh-agent

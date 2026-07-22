@@ -42,6 +42,20 @@ FROM python:3.12-alpine
 RUN apk add --no-cache ca-certificates openssh-client
 COPY --from=builder /usr/local/bin/docker /usr/local/bin/docker
 
+# `docker -H ssh://...` (Add Sources with an ssh:// host, e.g. to reach a
+# *third* machine from this container) execs plain ssh with no flags of its
+# own, so without this it either hangs on an interactive host-key prompt (no
+# tty, no stdin -- capture_output=True in server.py) or fails outright on
+# first contact with a host. accept-new is TOFU-on-first-connection, same
+# trust model most people already accept from an interactive `ssh` the first
+# time; it still detects a *changed* key later, unlike StrictHostKeyChecking
+# no/UserKnownHostsFile=/dev/null. Container filesystem is ephemeral, so this
+# effectively re-TOFUs every container restart -- acceptable since restarts
+# are an operator action, not something reachable by whatever's on the other
+# end of the ssh connection.
+RUN mkdir -p /etc/ssh/ssh_config.d && printf 'Host *\n  StrictHostKeyChecking accept-new\n' \
+    > /etc/ssh/ssh_config.d/99-cttc-accept-new.conf
+
 WORKDIR /srv/cttc-server
 COPY --from=builder /srv/cttc-server ./
 # uv itself (the dependency manager) never needs to run in the final image --
