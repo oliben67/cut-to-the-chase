@@ -27,6 +27,18 @@ async function post(path, body) {
   return j;
 }
 
+// ssh is the only remote transport CTTC supports, so a Docker host string
+// with no scheme (e.g. "user@other-server", exactly what you'd type after
+// `ssh `) is unambiguous shorthand for ssh://user@other-server -- without
+// this, that shorthand silently fell through to the local daemon instead
+// (docker -H user@host isn't a valid endpoint, and HostStatsSource/etc all
+// gate their ssh handling on an explicit "ssh://" prefix).
+function normalizeDockerHost(raw) {
+  const host = (raw || "").trim();
+  if (!host) return null;
+  return /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(host) ? host : `ssh://${host}`;
+}
+
 /* ── persisted UI preferences ───────────────────────────────────────────── */
 
 const prefs = {
@@ -1799,7 +1811,7 @@ function openPaths() {
 }
 
 function updateDockerDupes() {
-  const hostKey = $("docker-host").value.trim() || "local";
+  const hostKey = normalizeDockerHost($("docker-host").value) || "local";
   const paths = openPaths();
   for (const [cbId, noteId, path] of [
     ["docker-stats", "docker-stats-note", `docker://${hostKey}/stats`],
@@ -2011,7 +2023,7 @@ async function listContainers() {
   $("docker-error").textContent = "";
   renderActivityLog(null);
   const box = $("docker-targets");
-  const host = $("docker-host").value.trim() || null;
+  const host = normalizeDockerHost($("docker-host").value);
   const label = host ? `Connecting to ${host}…` : "Listing local containers…";
   const t0 = Date.now();
   box.textContent = label;
@@ -2072,13 +2084,19 @@ async function listContainers() {
 
 $("btn-ps-refresh").onclick = () => listContainers();
 $("docker-host").oninput = () => updateDockerDupes();
+$("docker-host").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    listContainers();
+  }
+});
 
 $("dlg-cancel").onclick = () => dlg.close();
 
 $("dlg-ok").onclick = async () => {
   const transforms = chosenTransforms();
   try {
-    const host = $("docker-host").value.trim() || null;
+    const host = normalizeDockerHost($("docker-host").value);
     const logs = [...$("docker-targets").querySelectorAll("input:checked:not(:disabled)")].map((cb) => ({
       name: cb.value,
       type: cb.dataset.type,

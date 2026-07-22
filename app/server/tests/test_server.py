@@ -630,6 +630,19 @@ def docker_cli(monkeypatch):
     monkeypatch.setattr(server.shutil, "which", lambda name: f"/usr/bin/{name}")
 
 
+class TestNormalizeDockerHost:
+    def test_none_and_empty(self):
+        assert server.normalize_docker_host(None) is None
+        assert server.normalize_docker_host("") is None
+
+    def test_bare_user_at_host_gets_ssh_scheme(self):
+        assert server.normalize_docker_host("user@other-server") == "ssh://user@other-server"
+
+    def test_already_schemed_left_alone(self):
+        assert server.normalize_docker_host("ssh://user@other-server") == "ssh://user@other-server"
+        assert server.normalize_docker_host("tcp://1.2.3.4:2375") == "tcp://1.2.3.4:2375"
+
+
 class TestDockerCmdAndPs:
     def test_docker_cmd_missing(self, monkeypatch):
         monkeypatch.setattr(server.shutil, "which", lambda n: None)
@@ -639,6 +652,12 @@ class TestDockerCmdAndPs:
     def test_docker_cmd_host_flag(self, docker_cli):
         assert server.docker_cmd("ssh://u@h") == ["/usr/bin/docker", "-H", "ssh://u@h"]
         assert server.docker_cmd(None) == ["/usr/bin/docker"]
+
+    def test_ps_normalizes_bare_user_at_host(self, docker_cli, monkeypatch):
+        run = FakeRun([ok(""), ok("")])
+        monkeypatch.setattr(server.subprocess, "run", run)
+        server.docker_ps("u@h")
+        assert run.calls[0][0] == ["/usr/bin/docker", "-H", "ssh://u@h", "ps", "--format", "json"]
 
     def test_ps_ok_with_services(self, docker_cli, monkeypatch):
         run = FakeRun([

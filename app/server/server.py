@@ -519,6 +519,19 @@ class StatsSource:
 
 # ── docker collectors (local daemon or ssh://user@host) ──────────────────────
 
+_HOST_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
+
+
+def normalize_docker_host(host: str | None) -> str | None:
+    """ssh is the only remote transport CTTC supports, so a host string with
+    no scheme (e.g. "user@other-server") is unambiguous shorthand for
+    ssh://user@other-server. The client already normalizes this (see
+    normalizeDockerHost in app.js); this is defense in depth for any other
+    caller of the HTTP API."""
+    if not host:
+        return None
+    return host if _HOST_SCHEME_RE.match(host) else f"ssh://{host}"
+
 
 def docker_cmd(host: str | None) -> list[str]:
     exe = shutil.which("docker")
@@ -579,6 +592,7 @@ class DockerPsError(RuntimeError):
 
 def docker_ps(host: str | None, ssh_key: str | None = None) -> dict:
     """List containers (and swarm services, when the daemon is a manager)."""
+    host = normalize_docker_host(host)
     base = docker_cmd(host)
     env = ssh_key_env(ssh_key)
     log = []
@@ -899,6 +913,7 @@ class State:
     def collect_docker(self, host: str | None, stats: bool, logs: list[dict],
                        transforms: list[str], interval: float, host_stats: bool = True,
                        ssh_key: str | None = None):
+        host = normalize_docker_host(host)
         opened = []
         hostname = (host or "local").split("@")[-1]
         hostkey = host or "local"

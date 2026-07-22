@@ -97,6 +97,24 @@ function installMenu() {
   Menu.setApplicationMenu(null);
 }
 
+// Electron shows no context menu at all by default (unlike a regular
+// browser) -- text inputs/textareas got no right-click Cut/Copy/Paste/Select
+// All without this. Attach to every window's webContents so it works
+// anywhere text is editable (Add Sources' host field, the setup wizard's
+// key-paste textarea, ...).
+function attachEditContextMenu(win) {
+  win.webContents.on("context-menu", (_e, params) => {
+    if (!params.isEditable) return;
+    Menu.buildFromTemplate([
+      { label: "Cut", role: "cut", enabled: params.editFlags.canCut },
+      { label: "Copy", role: "copy", enabled: params.editFlags.canCopy },
+      { label: "Paste", role: "paste", enabled: params.editFlags.canPaste },
+      { type: "separator" },
+      { label: "Select All", role: "selectAll", enabled: params.editFlags.canSelectAll },
+    ]).popup({ window: win });
+  });
+}
+
 // Edit/View/Window/quit-ish actions from the custom HTML menu bar that need
 // something only main.js (or webContents) can do; File actions and dialog
 // toggles are handled renderer-side and never reach here (see app.js).
@@ -177,6 +195,7 @@ async function createWindow() {
   win.webContents.on("console-message", (_e, level, msg) => {
     if (level >= 2) console.error(`[renderer] ${msg}`);
   });
+  attachEditContextMenu(win);
   await win.loadFile(path.join(__dirname, "renderer", "index.html"), {
     search: `port=${serverPort}`,
   });
@@ -324,6 +343,7 @@ ipcMain.handle("popout", async (e, kind, id, view) => {
     },
   });
   popoutWindows.set(key, win);
+  attachEditContextMenu(win);
   const params = new URLSearchParams({ port: String(serverPort), popout: kind });
   if (id) params.set("id", id);
   // hand the opener's current view/cursor over so the new window opens on
@@ -427,6 +447,7 @@ function runSetupWizard() {
       closeSplash();
     });
     wizardWindow.setMenuBarVisibility(false);
+    attachEditContextMenu(wizardWindow);
     wizardWindow.loadFile(path.join(__dirname, "renderer", "setup-wizard.html"));
     wizardWindow.on("closed", () => {
       wizardWindow = null;

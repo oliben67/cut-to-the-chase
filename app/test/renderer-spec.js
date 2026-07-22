@@ -446,6 +446,14 @@
     eq($("docker-activity").hidden, true, "hidden again after second click");
   });
 
+  await T("normalizeDockerHost defaults a schemeless host to ssh://", () => {
+    eq(normalizeDockerHost(""), null, "empty is local");
+    eq(normalizeDockerHost("   "), null, "blank is local");
+    eq(normalizeDockerHost("user@other-server"), "ssh://user@other-server", "bare user@host gets ssh://");
+    eq(normalizeDockerHost("ssh://user@other-server"), "ssh://user@other-server", "already-schemed left alone");
+    eq(normalizeDockerHost("tcp://1.2.3.4:2375"), "tcp://1.2.3.4:2375", "other schemes left alone too");
+  });
+
   await T("openPaths reflects open sources", () => {
     const paths = openPaths();
     for (const s of state.sources) ok(paths.has(s.path), s.path);

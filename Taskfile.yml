@@ -48,6 +48,16 @@ tasks:
       - task: app:release:linux
         vars: { CLI_ARGS: '{{.CLI_ARGS}}' }
 
+  release:all:
+    desc: "Build all three platforms' installers + deploy bundles   [usage: task release:all]"
+    cmds:
+      - task: app:release:win
+        vars: { CLI_ARGS: '{{.CLI_ARGS}}' }
+      - task: app:release:mac
+        vars: { CLI_ARGS: '{{.CLI_ARGS}}' }
+      - task: app:release:linux
+        vars: { CLI_ARGS: '{{.CLI_ARGS}}' }
+
   # ── Clean ─────────────────────────────────────────────────────────────────
   clean:
     desc: Remove build artefacts and caches across all sub-projects

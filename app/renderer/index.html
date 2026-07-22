@@ -137,10 +137,10 @@
 
     <div>
       <label class="ctl block">Docker host
-        <input id="docker-host" type="text" placeholder="empty = local daemon, or ssh://user@host" />
+        <input id="docker-host" type="text" placeholder="empty = local daemon, or user@host (ssh:// optional)" />
       </label>
       <div class="ctl">
-        <button id="btn-ps-refresh" title="Reload the list of containers/services from this host">Refresh</button>
+        <button id="btn-ps-refresh" title="Connects from the CTTC server container's host, over ssh, to this target's docker daemon and lists its containers/services">Connect</button>
         <button id="btn-activity-toggle" class="linklike" type="button" hidden>Show activity</button>
       </div>
       <div id="docker-error" class="error"></div>

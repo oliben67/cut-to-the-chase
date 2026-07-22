@@ -63,7 +63,7 @@ button:disabled { opacity: 0.6; cursor: default; }
   left: 0;
   right: 0;
   bottom: 0;
-  max-height: 50%;
+  max-height: 25%;
   display: flex;
   flex-direction: column;
   background: #181818;
@@ -87,7 +87,7 @@ button:disabled { opacity: 0.6; cursor: default; }
   overflow-y: auto;
   flex: 1 1 auto;
   min-height: 60px;
-  max-height: calc(50vh - 36px);
+  max-height: calc(25vh - 36px);
   background: #111;
   border: 1px solid #333;
   border-radius: 4px;

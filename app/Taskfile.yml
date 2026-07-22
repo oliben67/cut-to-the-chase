@@ -115,6 +115,16 @@ tasks:
     desc: "Build the Linux AppImage + deploy bundle   [usage: task release:linux]"
     cmd: npm run release:linux -- {{.CLI_ARGS}}
 
+  release:all:
+    desc: "Build all three platforms' installers + deploy bundles   [usage: task release:all]"
+    cmds:
+      - task: release:win
+        vars: { CLI_ARGS: '{{.CLI_ARGS}}' }
+      - task: release:mac
+        vars: { CLI_ARGS: '{{.CLI_ARGS}}' }
+      - task: release:linux
+        vars: { CLI_ARGS: '{{.CLI_ARGS}}' }
+
   # ── Dependencies ──────────────────────────────────────────────────────────
   deps:update:
     desc: Update server packages to their latest allowed versions
