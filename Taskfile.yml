@@ -30,33 +30,40 @@ tasks:
       - task: app:ci
 
   # ── Release ───────────────────────────────────────────────────────────────
-  release:win:
-    desc: "Build the Windows installer + deploy bundle   [usage: task release:win]"
+  build:release:win:
+    desc: "Build the Windows installer + deploy bundle   [usage: task build:release:win]"
     cmds:
-      - task: app:release:win
+      - task: app:build:release:win
         vars: { CLI_ARGS: '{{.CLI_ARGS}}' }
 
-  release:mac:
-    desc: "Build the macOS installer + deploy bundle   [usage: task release:mac]"
+  build:release:mac:
+    desc: "Build the macOS installer + deploy bundle   [usage: task build:release:mac]"
     cmds:
-      - task: app:release:mac
+      - task: app:build:release:mac
         vars: { CLI_ARGS: '{{.CLI_ARGS}}' }
 
-  release:linux:
-    desc: "Build the Linux AppImage + deploy bundle   [usage: task release:linux]"
+  build:release:linux:
+    desc: "Build the Linux AppImage + deploy bundle   [usage: task build:release:linux]"
     cmds:
-      - task: app:release:linux
+      - task: app:build:release:linux
         vars: { CLI_ARGS: '{{.CLI_ARGS}}' }
 
-  release:all:
-    desc: "Build all three platforms' installers + deploy bundles   [usage: task release:all]"
+  build:release:all:
+    desc: "Build all three platforms' installers + deploy bundles   [usage: task build:release:all]"
     cmds:
-      - task: app:release:win
+      - task: app:build:release:win
         vars: { CLI_ARGS: '{{.CLI_ARGS}}' }
-      - task: app:release:mac
+      - task: app:build:release:mac
         vars: { CLI_ARGS: '{{.CLI_ARGS}}' }
-      - task: app:release:linux
+      - task: app:build:release:linux
         vars: { CLI_ARGS: '{{.CLI_ARGS}}' }
+
+  build:all:
+    desc: "Run all tests, then (if they pass) build every release, then stage the release submodule   [usage: task build:all]"
+    cmds:
+      - task: app:test
+      - task: build:release:all
+      - git -C releases add .
 
   # ── Clean ─────────────────────────────────────────────────────────────────
   clean:

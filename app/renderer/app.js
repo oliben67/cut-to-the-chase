@@ -1670,6 +1670,7 @@ class Panel {
           this.selected.clear();
           this.lastClickIdx = dataIdx;
           setCursor(row.ts);
+          recenterOn(row.ts); // same as double-clicking the timeline at this point in time
           this.render();
         }
       };

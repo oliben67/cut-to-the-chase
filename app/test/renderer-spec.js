@@ -391,6 +391,22 @@
     }
   });
 
+  await T("plain-clicking a log entry recenters the chart view on it", async () => {
+    const p = [...panels.values()][0];
+    p.selected.clear();
+    setView(R.min_ts, R.min_ts + 60000); // arbitrary span, away from the row we'll click
+    await p.render();
+    const rows = [...p.body.querySelectorAll(".log-row")];
+    ok(rows.length >= 1, "at least 1 row rendered for the test");
+
+    const span = state.view.t1 - state.view.t0;
+    mouse(rows[0], "click", 5, 20);
+    await until(() => p.selected.size === 0, "click clears any selection");
+    near(state.view.t1 - state.view.t0, span, 1, "span unchanged");
+    ok(state.cursorT != null && Math.abs((state.view.t0 + state.view.t1) / 2 - state.cursorT) < 1,
+      "view recentered on the clicked row's timestamp");
+  });
+
   /* ── snapshots ────────────────────────────────────────────────────────── */
 
   await T("computeSlice returns telemetry and nearby log rows", async () => {
