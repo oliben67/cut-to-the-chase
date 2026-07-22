@@ -420,6 +420,31 @@ async function connectToServer(fileArgs) {
   console.log(`[tunnel] connected to ${cfg.sshTarget} — local port ${serverPort}`);
 }
 
+// Right after the tunnel comes up, check whether the tunnel-host itself has
+// docker -- that's what Add Sources targets by default (an empty Docker
+// host field there resolves to wherever the server process lives, which is
+// now the tunnel-host). Purely informational: failure here doesn't block
+// setup, it just tells the user up front whether they'll need to type an
+// explicit target in Add Sources instead of relying on the default.
+async function checkTunnelHostDocker(localPort, onLog) {
+  onLog?.("$ checking for docker on the tunnel host...");
+  try {
+    const r = await fetch(`http://127.0.0.1:${localPort}/docker/ps`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (r.ok) {
+      onLog?.(`  → docker found (${j.containers.length} container(s), ${j.services.length} service(s))`);
+    } else {
+      onLog?.(`  → no local docker on the tunnel host: ${j.error || r.status}`);
+      onLog?.("  → you'll need to set an explicit target in Add Sources' Docker host field");
+    }
+  } catch (err) {
+    onLog?.(`  → could not check: ${err.message || err}`);
+  }
+}
+
 // Embedded mode with no local Docker has nothing to sample -- offer to set
 // up an ssh-tunnel connection to a Docker-enabled host instead of just
 // starting an empty embedded server. The wizard window itself establishes
@@ -474,6 +499,7 @@ function runSetupWizard() {
         });
         serverPort = tunnel.localPort;
         saveConnectionConfig(cfg);
+        await checkTunnelHostDocker(tunnel.localPort, (line) => wizardWindow?.webContents.send("setup-log", line));
         settled = true;
         ipcMain.removeHandler("setup-wizard-submit");
         wizardWindow.destroy();
@@ -577,7 +603,6 @@ app.whenReady().then(async () => {
   // info` (async; see lib/docker-check.js) and can take a few seconds
   // against a slow/starting daemon or a plain "no docker on PATH" miss. The
   // wizard path closes this itself once its own window is ready to show (see
-  // this itself once its own window is ready to show (see
   // runSetupWizard()'s 'ready-to-show' handler) instead of stacking a
   // second loading window on top of it.
   showSplash();
@@ -590,7 +615,22 @@ app.whenReady().then(async () => {
     const fileArgs = process.argv.slice(app.isPackaged ? 1 : 2).filter((a) => !a.startsWith("-"));
     const cfg = loadConnectionConfig();
     if (cfg.mode === "embedded" && !(await hasLocalDocker())) {
-      await runSetupWizard();
+      try {
+        await runSetupWizard();
+      } catch {
+        // declined (Skip, or just closed the window) -- give local docker a
+        // genuine try (docker compose up) rather than trusting the earlier
+        // quick hasLocalDocker() probe, which can miss a daemon that's still
+        // starting up; only fall back to the bare, docker-less embedded
+        // server if that attempt itself fails.
+        try {
+          const { port } = await ensureLocalContainer({ resourcesDir: resourcesDirForApp() });
+          serverPort = port;
+          console.log(`[docker] server container running locally — port ${serverPort}`);
+        } catch {
+          await startServer(fileArgs);
+        }
+      }
     } else {
       await connectToServer(fileArgs);
     }

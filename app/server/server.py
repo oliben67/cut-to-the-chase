@@ -616,6 +616,17 @@ def docker_ps(host: str | None, ssh_key: str | None = None) -> dict:
         })
         return out
 
+    # Preflight: is docker even installed/reachable at all, wherever `host`
+    # resolved to (the local daemon docker_cmd(None) runs bare, or the
+    # ssh:// target `-H` points at)? Without this, a missing docker install
+    # only ever surfaces buried inside `docker ps`'s own connection-error
+    # wrapping -- this gives that exact case ("docker not installed there")
+    # its own clear, distinguishable message instead.
+    probe = run_logged(base + ["version", "--format", "{{.Server.Version}}"])
+    if probe.returncode != 0:
+        where = host or "the local daemon"
+        raise DockerPsError(f"docker is not installed (or not reachable) on {where}: {probe.stderr.strip()}", log)
+
     out = run_logged(base + ["ps", "--format", "json"])
     if out.returncode != 0:
         raise DockerPsError(out.stderr.strip() or "docker ps failed", log)

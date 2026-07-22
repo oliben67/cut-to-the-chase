@@ -654,13 +654,14 @@ class TestDockerCmdAndPs:
         assert server.docker_cmd(None) == ["/usr/bin/docker"]
 
     def test_ps_normalizes_bare_user_at_host(self, docker_cli, monkeypatch):
-        run = FakeRun([ok(""), ok("")])
+        run = FakeRun([ok(""), ok(""), ok("")])
         monkeypatch.setattr(server.subprocess, "run", run)
         server.docker_ps("u@h")
-        assert run.calls[0][0] == ["/usr/bin/docker", "-H", "ssh://u@h", "ps", "--format", "json"]
+        assert run.calls[1][0] == ["/usr/bin/docker", "-H", "ssh://u@h", "ps", "--format", "json"]
 
     def test_ps_ok_with_services(self, docker_cli, monkeypatch):
         run = FakeRun([
+            ok(""),  # docker version preflight
             ok('{"ID": "1", "Names": "web", "Image": "nginx"}\n'),
             ok('{"ID": "s", "Name": "api", "Replicas": "2/2"}\n'),
         ])
@@ -670,9 +671,14 @@ class TestDockerCmdAndPs:
         assert got["services"] == [{"id": "s", "name": "api", "replicas": "2/2"}]
 
     def test_ps_service_ls_failure_tolerated(self, docker_cli, monkeypatch):
-        run = FakeRun([ok('{"ID": "1", "Names": "web", "Image": "nginx"}\n'), fail()])
+        run = FakeRun([ok(""), ok('{"ID": "1", "Names": "web", "Image": "nginx"}\n'), fail()])
         monkeypatch.setattr(server.subprocess, "run", run)
         assert server.docker_ps(None)["services"] == []
+
+    def test_ps_preflight_reports_missing_docker(self, docker_cli, monkeypatch):
+        monkeypatch.setattr(server.subprocess, "run", FakeRun([fail("command not found: docker")]))
+        with pytest.raises(server.DockerPsError, match="not installed"):
+            server.docker_ps("ssh://u@h")
 
     def test_ps_failure_raises(self, docker_cli, monkeypatch):
         monkeypatch.setattr(server.subprocess, "run", FakeRun([fail("no daemon")]))

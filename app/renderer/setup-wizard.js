@@ -22,6 +22,13 @@ document.getElementById("btn-browse").addEventListener("click", async () => {
   if (paths.length) keyPathEl.value = paths[0];
 });
 
+// Closing this window (however it happens) is what main.js's
+// runSetupWizard() already treats as "cancelled" -- on first launch that
+// falls back to using this machine directly; when reconfiguring from
+// Settings it just leaves the existing connection untouched. window.close()
+// triggers that same path, so this button needs no separate IPC of its own.
+document.getElementById("btn-skip").addEventListener("click", () => window.close());
+
 const activityEl = document.getElementById("activity");
 const activityLogEl = document.getElementById("activity-log");
 const btnActivityToggle = document.getElementById("btn-activity-toggle");

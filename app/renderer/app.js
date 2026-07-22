@@ -2025,7 +2025,14 @@ async function listContainers() {
   renderActivityLog(null);
   const box = $("docker-targets");
   const host = normalizeDockerHost($("docker-host").value);
-  const label = host ? `Connecting to ${host}…` : "Listing local containers…";
+  // spelled out explicitly (rather than just "Connecting to <host>…") since
+  // that phrasing reads as if *this browser page* opens a connection to
+  // <host> -- it never does (fetch() can't even speak ssh://): the CTTC
+  // server at 127.0.0.1 is the only thing this page ever talks to; it's the
+  // server that then runs `docker -H ssh://user@host ...` on <host>'s behalf.
+  const label = host
+    ? `Asking the CTTC server (127.0.0.1:${PORT}) to reach ${host} over ssh…`
+    : `Asking the CTTC server (127.0.0.1:${PORT}) for local containers…`;
   const t0 = Date.now();
   box.textContent = label;
   // ssh connections can take a while (or hang) before the server even
@@ -2034,6 +2041,11 @@ async function listContainers() {
   const tick = setInterval(() => {
     box.textContent = `${label} (${Math.round((Date.now() - t0) / 1000)}s)`;
   }, 1000);
+  // disabled for the whole attempt (not just the button) so the host string
+  // can't be edited out from under an in-flight connect -- re-enabled in
+  // both the success and failure paths below, never left stuck disabled.
+  $("docker-host").disabled = true;
+  $("btn-ps-refresh").disabled = true;
   try {
     const r = await post("/docker/ps", { host });
     clearInterval(tick);
@@ -2076,10 +2088,16 @@ async function listContainers() {
     renderActivityLog(err.log);
     // a bare network-level failure (server unreachable, tunnel down, ...)
     // has no err.log and a browser-generated message that isn't useful on
-    // its own -- say so plainly instead of the raw "Failed to fetch".
+    // its own -- say so plainly instead of the raw "Failed to fetch". When
+    // err.log IS present, the 127.0.0.1 hop succeeded and it was the
+    // server's own ssh/docker call (to <host>) that failed -- spelled out
+    // so it's unambiguous which of the two hops broke.
     $("docker-error").textContent = err.log
-      ? String(err.message || err)
-      : `Could not reach the CTTC server itself (${String(err.message || err)}) — check the connection/tunnel.`;
+      ? `The CTTC server reached out to ${host || "the local daemon"} and failed: ${String(err.message || err)}`
+      : `Could not reach the CTTC server itself at 127.0.0.1:${PORT} (${String(err.message || err)}) — check the connection/tunnel.`;
+  } finally {
+    $("docker-host").disabled = false;
+    $("btn-ps-refresh").disabled = false;
   }
 }
 
