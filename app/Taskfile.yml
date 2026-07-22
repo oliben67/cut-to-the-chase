@@ -82,9 +82,37 @@ tasks:
     desc: Renderer E2E — runs test/renderer-spec.js inside the real app against demo data
     cmd: ./test/run-e2e.sh
 
+  # ── Linting (server/ — the only Python in this app) ──────────────────────
+  lint:
+    desc: Check server/ with ruff
+    dir: '{{.SERVER}}'
+    cmd: "{{.UV}} run ruff check ."
+
+  lint:fix:
+    desc: Check server/ with ruff, auto-fix where possible
+    dir: '{{.SERVER}}'
+    cmd: "{{.UV}} run ruff check --fix ."
+
+  # ── Formatting ────────────────────────────────────────────────────────────
+  format:
+    desc: Format server/ in-place with ruff
+    dir: '{{.SERVER}}'
+    cmd: "{{.UV}} run ruff format ."
+
+  format:check:
+    desc: Check server/ formatting without modifying files (used in CI)
+    dir: '{{.SERVER}}'
+    cmd: "{{.UV}} run ruff format --check ."
+
+  # ── Type checking ─────────────────────────────────────────────────────────
+  typecheck:
+    desc: Run ty (Astral's type checker) on server/'s source (not tests/ -- mostly benign non-null asserts there)
+    dir: '{{.SERVER}}'
+    cmd: "{{.UV}} run ty check server.py files.py"
+
   # ── Quality gates ─────────────────────────────────────────────────────────
   check:
-    desc: Run all quality gates — JS syntax checks and server import (orjson present)
+    desc: Run all quality gates — JS syntax checks, server import, lint, format check, typecheck
     cmds:
       - node --check main.js
       - node --check preload.js
@@ -95,6 +123,15 @@ tasks:
       - node --check lib/docker-check.js
       - node --check lib/ssh-key-file.js
       - "{{.UV}} run --project {{.SERVER}} python -c 'import sys; sys.path.insert(0, \"{{.SERVER}}\"); import server; print(\"server imports ok,\", server.JSON_IMPL)'"
+      - task: lint
+      - task: format:check
+      - task: typecheck
+
+  fix:
+    desc: Auto-fix all server/ lint issues and reformat
+    cmds:
+      - task: lint:fix
+      - task: format
 
   ci:
     desc: Full CI pipeline — install → check

@@ -9,9 +9,11 @@
 # Multi-stage on alpine: curl, the docker CLI tarball, and uv's own install
 # footprint are only needed to *produce* the venv and fetch the docker binary
 # -- none of that belongs in the shipped image, so it all stays in `builder`.
-# alpine (musl) over slim (glibc) roughly halves the base image; orjson and
-# psutil both ship musllinux wheels so no compiler is needed here.
-FROM python:3.12-alpine AS builder
+# alpine (musl) over slim (glibc) roughly halves the base image; every
+# dependency here (orjson, psutil, docker, fastapi, uvicorn[standard] and
+# its uvloop/httptools/watchfiles/websockets extras) ships musllinux wheels,
+# so no compiler is needed either.
+FROM python:3.14-alpine AS builder
 
 ARG DOCKER_CLI_VERSION=27.3.1
 ARG TARGETARCH
@@ -33,11 +35,15 @@ RUN uv sync --no-dev
 COPY server.py files.py ./
 COPY transforms ./transforms
 
-FROM python:3.12-alpine
+FROM python:3.14-alpine
 
 # docker CLI only (not the full engine -- this container never runs its own
-# dockerd, it talks to the host's daemon over the mounted socket) +
-# openssh-client (HostStatsSource can sample a *different* host over ssh,
+# dockerd; listing containers/services and one-shot stats snapshots go
+# through the `docker` Python SDK instead, talking to the host's daemon
+# directly over the mounted socket -- the CLI binary is only still needed
+# for DockerLogSource's `docker logs -f`/`docker service logs -f`, which
+# uses an asyncio subprocess rather than the SDK on purpose: see server.py)
+# + openssh-client (HostStatsSource can sample a *different* host over ssh,
 # independent of what this container itself runs on).
 RUN apk add --no-cache ca-certificates openssh-client
 COPY --from=builder /usr/local/bin/docker /usr/local/bin/docker

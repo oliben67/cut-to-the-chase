@@ -8,28 +8,30 @@ psutil and the HTTP stack are exercised for real. Run:
 
 from __future__ import annotations
 
+import asyncio
 import http.client
 import io
 import json
+import re
 import socket
 import struct
-import subprocess
 import sys
 import threading
 import time
 import types
+import urllib.error
 import urllib.request
 import zipfile
-from datetime import datetime, timedelta, timezone
-from http.server import ThreadingHTTPServer
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+import uvicorn
 
 import server
 
 
-def ms(y, mo, d, h=0, mi=0, s=0, us=0, tz=timezone.utc):
+def ms(y, mo, d, h=0, mi=0, s=0, us=0, tz=UTC):
     return datetime(y, mo, d, h, mi, s, us, tz).timestamp() * 1000.0
 
 
@@ -158,7 +160,7 @@ class TestTransformRegistry:
         p.chmod(0o000)
         try:
             got = server.TransformRegistry(tdir).available()
-            assert got == [{"name": "locked", "doc": ""}]   # listed, doc unreadable
+            assert got == [{"name": "locked", "doc": ""}]  # listed, doc unreadable
         finally:
             p.chmod(0o644)
 
@@ -201,7 +203,9 @@ class TestApplyTransforms:
 
 
 def log_source(transforms=()):
-    return server.LogSource("s1", "svc", Path("/nonexistent"), live=False, transforms=list(transforms))
+    return server.LogSource(
+        "s1", "svc", Path("/nonexistent"), live=False, transforms=list(transforms)
+    )
 
 
 class TestLogSource:
@@ -287,19 +291,19 @@ class TestLogSource:
         nots = ("nots", lambda r: {**r, "ts": None} if "no-ts" in r["text"] else r)
         src = log_source([drop, dup, nots])
         src.ingest_chunk(
-            b"2026-01-02T03:04:05Z keep\n"
-            b"2026-01-02T03:04:06Z drop me\n"
-            b"2026-01-02T03:04:07Z no-ts\n"
+            b"2026-01-02T03:04:05Z keep\n2026-01-02T03:04:06Z drop me\n2026-01-02T03:04:07Z no-ts\n"
         )
         assert src.total() == 2  # "keep" duplicated; "drop me" gone; "no-ts" skipped
         assert src.skipped == 2
 
     def test_index_at(self):
         src = log_source()
-        src.ingest_chunk(b"2026-01-02T03:00:00Z a\n2026-01-02T03:00:10Z b\n2026-01-02T03:00:20Z c\n")
+        src.ingest_chunk(
+            b"2026-01-02T03:00:00Z a\n2026-01-02T03:00:10Z b\n2026-01-02T03:00:20Z c\n"
+        )
         t0 = ms(2026, 1, 2, 3, 0, 0)
         assert src.index_at(t0 - 1000) == 0
-        assert src.index_at(t0 + 4000) == 0   # nearer to a than b
+        assert src.index_at(t0 + 4000) == 0  # nearer to a than b
         assert src.index_at(t0 + 6000) == 1
         assert src.index_at(t0 + 99999999) == 2
 
@@ -308,7 +312,9 @@ class TestLogSource:
 
     def test_ticks(self):
         src = log_source()
-        src.ingest_chunk(b"2026-01-02T03:00:00Z a\n2026-01-02T03:00:00Z b\n2026-01-02T03:00:09Z c\n")
+        src.ingest_chunk(
+            b"2026-01-02T03:00:00Z a\n2026-01-02T03:00:00Z b\n2026-01-02T03:00:09Z c\n"
+        )
         t0 = ms(2026, 1, 2, 3, 0, 0)
         counts = src.ticks(t0, t0 + 10000, 10)
         assert counts[0] == 2 and counts[9] == 1 and sum(counts) == 3
@@ -332,13 +338,13 @@ class TestLogSource:
             b"2026-01-02T03:00:01Z beta ok\n"
             b"2026-01-02T03:00:02Z gamma ERROR two\n"
         )
-        assert src.find("error", 0) == 0                 # case-insensitive
-        assert src.find("error", 1) == 2                 # forward from middle
+        assert src.find("error", 0) == 0  # case-insensitive
+        assert src.find("error", 1) == 2  # forward from middle
         assert src.find("error", 1, forward=False) == 0  # backward from middle
-        assert src.find("ERROR one", 1) == 0             # wraps past the end
-        assert src.find("two", 0, forward=False) == 2    # wraps backward
+        assert src.find("ERROR one", 1) == 0  # wraps past the end
+        assert src.find("two", 0, forward=False) == 2  # wraps backward
         assert src.find("nothing-here", 0) is None
-        assert src.find("   ", 0) is None                # blank query
+        assert src.find("   ", 0) is None  # blank query
         assert src.find("x", 99) is None or src.find("x", 99) >= 0  # start clamped
 
     def test_find_empty_log(self):
@@ -350,8 +356,12 @@ class TestLogSource:
 
 def stats_entry(name, ts, cpu="10%", mem="20%", memuse="100MiB / 1GiB", netio="1kB / 2kB"):
     return {
-        "Name": name, "timestamp": ts, "CPUPerc": cpu, "MemPerc": mem,
-        "MemUsage": memuse, "NetIO": netio,
+        "Name": name,
+        "timestamp": ts,
+        "CPUPerc": cpu,
+        "MemPerc": mem,
+        "MemUsage": memuse,
+        "NetIO": netio,
     }
 
 
@@ -367,31 +377,40 @@ def feed_stats(src, entries):
 class TestStatsSource:
     def test_jsonl_ingest_and_net_rate(self):
         src = stats_source()
-        n = feed_stats(src, [
-            stats_entry("api", "2026-01-02T03:00:00Z", netio="1kB / 2kB"),
-            stats_entry("api", "2026-01-02T03:00:10Z", netio="2kB / 4kB"),
-        ])
+        n = feed_stats(
+            src,
+            [
+                stats_entry("api", "2026-01-02T03:00:00Z", netio="1kB / 2kB"),
+                stats_entry("api", "2026-01-02T03:00:10Z", netio="2kB / 4kB"),
+            ],
+        )
         assert n == 2 and src.count == 2
         rows = src.series["api"]
-        assert rows[0][4] is None                       # first sample: no rate yet
-        assert rows[1][4] == pytest.approx(300.0)       # 3000 B over 10 s
+        assert rows[0][4] is None  # first sample: no rate yet
+        assert rows[1][4] == pytest.approx(300.0)  # 3000 B over 10 s
         assert rows[0][1] == 10.0 and rows[0][2] == 20.0
         assert rows[0][3] == pytest.approx(100 * 1024**2)
 
     def test_net_counter_reset_gives_none(self):
         src = stats_source()
-        feed_stats(src, [
-            stats_entry("api", "2026-01-02T03:00:00Z", netio="9kB / 9kB"),
-            stats_entry("api", "2026-01-02T03:00:10Z", netio="1kB / 1kB"),
-        ])
+        feed_stats(
+            src,
+            [
+                stats_entry("api", "2026-01-02T03:00:00Z", netio="9kB / 9kB"),
+                stats_entry("api", "2026-01-02T03:00:10Z", netio="1kB / 1kB"),
+            ],
+        )
         assert src.series["api"][1][4] is None
 
     def test_net_same_timestamp_gives_none(self):
         src = stats_source()
-        feed_stats(src, [
-            stats_entry("api", "2026-01-02T03:00:00Z"),
-            stats_entry("api", "2026-01-02T03:00:00Z", netio="5kB / 5kB"),
-        ])
+        feed_stats(
+            src,
+            [
+                stats_entry("api", "2026-01-02T03:00:00Z"),
+                stats_entry("api", "2026-01-02T03:00:00Z", netio="5kB / 5kB"),
+            ],
+        )
         assert src.series["api"][1][4] is None
 
     def test_bad_netio_gives_none(self):
@@ -413,11 +432,14 @@ class TestStatsSource:
 
     def test_swarm_grouping_and_detection(self):
         src = stats_source()
-        feed_stats(src, [
-            stats_entry("api.1.abc", "2026-01-02T03:00:00Z"),
-            stats_entry("api.2.def", "2026-01-02T03:00:00Z"),
-            stats_entry("plain", "2026-01-02T03:00:00Z"),
-        ])
+        feed_stats(
+            src,
+            [
+                stats_entry("api.1.abc", "2026-01-02T03:00:00Z"),
+                stats_entry("api.2.def", "2026-01-02T03:00:00Z"),
+                stats_entry("plain", "2026-01-02T03:00:00Z"),
+            ],
+        )
         assert sorted(src.series) == ["api", "plain"]
         assert src._swarm == {"api"}
 
@@ -426,18 +448,20 @@ class TestStatsSource:
         n = src.ingest_chunk(
             b'{"Name": "--", "timestamp": "2026-01-02T03:00:00Z"}\n'
             b'{"Name": "", "timestamp": "2026-01-02T03:00:00Z"}\n'
-            b'{"Name": "x"}\n'                    # no timestamp
-            b'[1, 2]\n'                           # not a dict
-            b'not json at all\n'
+            b'{"Name": "x"}\n'  # no timestamp
+            b"[1, 2]\n"  # not a dict
+            b"not json at all\n"
         )
         assert n == 0 and src.count == 0 and src.skipped == 5
 
     def test_whole_array_mode(self):
         src = stats_source()
-        payload = json.dumps([
-            stats_entry("api", "2026-01-02T03:00:00Z"),
-            stats_entry("api", "2026-01-02T03:00:05Z"),
-        ]).encode()
+        payload = json.dumps(
+            [
+                stats_entry("api", "2026-01-02T03:00:00Z"),
+                stats_entry("api", "2026-01-02T03:00:05Z"),
+            ]
+        ).encode()
         assert src.ingest_chunk(payload) == 2
 
     def test_partial_array_buffered(self):
@@ -448,26 +472,32 @@ class TestStatsSource:
 
     def test_out_of_order_insort(self):
         src = stats_source()
-        feed_stats(src, [
-            stats_entry("api", "2026-01-02T03:00:10Z"),
-            stats_entry("api", "2026-01-02T03:00:00Z"),
-        ])
+        feed_stats(
+            src,
+            [
+                stats_entry("api", "2026-01-02T03:00:10Z"),
+                stats_entry("api", "2026-01-02T03:00:00Z"),
+            ],
+        )
         ts = [r[0] for r in src.series["api"]]
         assert ts == sorted(ts)
 
     def test_services_range_bucketed(self):
         src = stats_source()
-        feed_stats(src, [
-            stats_entry("b", "2026-01-02T03:00:00Z", cpu="10%"),
-            stats_entry("b", "2026-01-02T03:00:01Z", cpu="50%"),
-            stats_entry("a.1.x", "2026-01-02T03:00:05Z", cpu="30%"),
-        ])
+        feed_stats(
+            src,
+            [
+                stats_entry("b", "2026-01-02T03:00:00Z", cpu="10%"),
+                stats_entry("b", "2026-01-02T03:00:01Z", cpu="50%"),
+                stats_entry("a.1.x", "2026-01-02T03:00:05Z", cpu="30%"),
+            ],
+        )
         assert src.services() == ["a", "b"]
         lo, hi = src.range()
         assert lo == ms(2026, 1, 2, 3, 0, 0) and hi == ms(2026, 1, 2, 3, 0, 5)
-        out = src.bucketed(lo, lo + 10000, 5)        # dt = 2 s: both b samples share bucket 0
+        out = src.bucketed(lo, lo + 10000, 5)  # dt = 2 s: both b samples share bucket 0
         by_name = {o["name"]: o for o in out}
-        assert by_name["b"]["cpu"][0] == 50.0        # max-merged in one bucket
+        assert by_name["b"]["cpu"][0] == 50.0  # max-merged in one bucket
         assert by_name["a"]["ttype"] == "service"
         assert by_name["b"]["ttype"] == "container"
         assert all(o["host"] is False for o in out)
@@ -478,7 +508,7 @@ class TestStatsSource:
         feed_stats(src, [stats_entry("api", "2026-01-02T03:00:00Z")])
         t0 = ms(2026, 1, 2, 4, 0, 0)
         out = src.bucketed(t0, t0 + 1000, 5)
-        assert len(out) == 1                          # service listed, but no samples land
+        assert len(out) == 1  # service listed, but no samples land
         assert all(v is None for v in out[0]["cpu"] + out[0]["mem"] + out[0]["net"])
 
     def test_empty_range(self):
@@ -486,17 +516,20 @@ class TestStatsSource:
 
     def test_point_at_nearest(self):
         src = stats_source()
-        feed_stats(src, [
-            stats_entry("api", "2026-01-02T03:00:00Z", cpu="10%"),
-            stats_entry("api", "2026-01-02T03:00:10Z", cpu="90%"),
-        ])
-        src.series["empty"] = []                     # skipped without crashing
+        feed_stats(
+            src,
+            [
+                stats_entry("api", "2026-01-02T03:00:00Z", cpu="10%"),
+                stats_entry("api", "2026-01-02T03:00:10Z", cpu="90%"),
+            ],
+        )
+        src.series["empty"] = []  # skipped without crashing
         t0 = ms(2026, 1, 2, 3, 0, 0)
-        assert src.point_at(t0 + 2000)["api"]["cpu"] == 10.0     # nearest is earlier
-        assert src.point_at(t0 + 8000)["api"]["cpu"] == 90.0     # nearest is later
-        after = src.point_at(t0 + 60000)["api"]                  # past the end
+        assert src.point_at(t0 + 2000)["api"]["cpu"] == 10.0  # nearest is earlier
+        assert src.point_at(t0 + 8000)["api"]["cpu"] == 90.0  # nearest is later
+        after = src.point_at(t0 + 60000)["api"]  # past the end
         assert after["cpu"] == 90.0 and after["ts"] == t0 + 10000
-        before = src.point_at(t0 - 60000)["api"]                 # before the start
+        before = src.point_at(t0 - 60000)["api"]  # before the start
         assert before["cpu"] == 10.0
         assert src.point_at(t0)["api"]["host"] is False
         assert "empty" not in src.point_at(t0)
@@ -520,7 +553,7 @@ class TestSniffAndTail:
         assert server.sniff_kind(jsonl_stats) == "stats"
         assert server.sniff_kind(plain) == "log"
 
-    def test_tail_loop_appends_truncates_and_skips(self, tmp_path):
+    async def test_tail_loop_appends_truncates_and_skips(self, tmp_path):
         f = tmp_path / "t.log"
         f.write_text("2026-01-02T03:00:00Z one\n")
         st = server.State(tmp_path)
@@ -532,22 +565,25 @@ class TestSniffAndTail:
         gsrc = st.open_file(str(gone), "log", None, live=True, transforms=[])
         gone.unlink()
 
-        threading.Thread(target=server.tail_loop, args=(st, 0.03), daemon=True).start()
-        with open(f, "a") as fh:
-            fh.write("2026-01-02T03:00:01Z two\n")
-        deadline = time.time() + 3
-        while src.total() < 2 and time.time() < deadline:
-            time.sleep(0.05)
-        assert src.total() == 2
+        task = asyncio.ensure_future(server.tail_loop(st, 0.03))
+        try:
+            with open(f, "a") as fh:
+                fh.write("2026-01-02T03:00:01Z two\n")
+            deadline = time.time() + 3
+            while src.total() < 2 and time.time() < deadline:
+                await asyncio.sleep(0.05)
+            assert src.total() == 2
 
-        f.write_text("2026-01-02T03:00:02Z rewritten\n")  # truncation -> re-read
-        deadline = time.time() + 3
-        while src.total() < 3 and time.time() < deadline:
-            time.sleep(0.05)
-        assert src.total() == 3
-        assert gsrc.total() == 1  # unchanged, stat() failed quietly
+            f.write_text("2026-01-02T03:00:02Z rewritten\n")  # truncation -> re-read
+            deadline = time.time() + 3
+            while src.total() < 3 and time.time() < deadline:
+                await asyncio.sleep(0.05)
+            assert src.total() == 3
+            assert gsrc.total() == 1  # unchanged, stat() failed quietly
+        finally:
+            task.cancel()
 
-    def test_tail_loop_survives_read_failure(self, tmp_path, monkeypatch):
+    async def test_tail_loop_survives_read_failure(self, tmp_path, monkeypatch):
         f = tmp_path / "r.log"
         f.write_text("2026-01-02T03:00:00Z one\n")
         st = server.State(tmp_path)
@@ -557,31 +593,27 @@ class TestSniffAndTail:
             raise OSError("disk on fire")
 
         monkeypatch.setattr(server, "read_all", broken_read)
-        threading.Thread(target=server.tail_loop, args=(st, 0.03), daemon=True).start()
-        with open(f, "a") as fh:
-            fh.write("2026-01-02T03:00:01Z two\n")
-        time.sleep(0.3)                               # loop hits OSError and keeps running
-        assert src.total() == 1
+        task = asyncio.ensure_future(server.tail_loop(st, 0.03))
+        try:
+            with open(f, "a") as fh:
+                fh.write("2026-01-02T03:00:01Z two\n")
+            await asyncio.sleep(0.3)  # loop hits OSError and keeps running
+            assert src.total() == 1
+        finally:
+            task.cancel()
 
 
 # ── ssh helpers ──────────────────────────────────────────────────────────────
 
 
 class TestSshHelpers:
-    def test_env_none_without_key(self):
-        assert server.ssh_key_env(None) is None
-
-    def test_wrapper_created_and_cached(self):
-        env1 = server.ssh_key_env("/tmp/some-key")
-        env2 = server.ssh_key_env("/tmp/some-key")
-        d1 = env1["PATH"].split(":")[0]
-        assert d1 == env2["PATH"].split(":")[0]
-        body = (Path(d1) / "ssh").read_text()
-        assert '-i "/tmp/some-key"' in body and "IdentitiesOnly=yes" in body
+    def test_ssh_host_and_port(self):
+        assert server.ssh_host_and_port("ssh://user@host") == ([], "user@host")
+        assert server.ssh_host_and_port("ssh://user@host:2222") == (["-p", "2222"], "user@host")
 
     def test_list_ssh_keys(self, tmp_path, monkeypatch):
         monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
-        assert server.list_ssh_keys() == []      # no ~/.ssh at all
+        assert server.list_ssh_keys() == []  # no ~/.ssh at all
         d = tmp_path / ".ssh"
         d.mkdir()
         (d / "id_ed25519").write_text("-----BEGIN OPENSSH PRIVATE KEY-----\n...")
@@ -594,27 +626,12 @@ class TestSshHelpers:
         locked.chmod(0o000)
         try:
             keys = server.list_ssh_keys()
-            assert keys == [str(d / "id_ed25519")]   # unreadable key skipped quietly
+            assert keys == [str(d / "id_ed25519")]  # unreadable key skipped quietly
         finally:
             locked.chmod(0o644)
 
 
-# ── docker CLI (fully mocked) ────────────────────────────────────────────────
-
-
-class FakeRun:
-    """Callable stand-in for subprocess.run with scripted results."""
-
-    def __init__(self, results):
-        self.results = list(results)
-        self.calls = []
-
-    def __call__(self, cmd, **kw):
-        self.calls.append((cmd, kw))
-        r = self.results.pop(0) if len(self.results) > 1 else self.results[0]
-        if isinstance(r, Exception):
-            raise r
-        return r
+# ── docker SDK (fully mocked) ────────────────────────────────────────────────
 
 
 def ok(stdout="", stderr=""):
@@ -626,8 +643,95 @@ def fail(stderr="boom"):
 
 
 @pytest.fixture
-def docker_cli(monkeypatch):
-    monkeypatch.setattr(server.shutil, "which", lambda name: f"/usr/bin/{name}")
+def docker_cli():
+    """No-op placeholder, kept so existing test signatures needn't change --
+    docker-py needs no `docker` binary on PATH the way the old CLI-shelling
+    code did. Tests patch server.docker_client directly instead."""
+    yield
+
+
+class FakeImage:
+    def __init__(self, tag):
+        self.tags = [tag] if tag else []
+        self.short_id = "sha256:deadbeef"
+
+
+class FakeContainer:
+    def __init__(
+        self, name, image="nginx", stats_raw=None, cid="c1", logs_lines=None, log_error=None
+    ):
+        self.name = name
+        self.short_id = cid
+        self.image = FakeImage(image)
+        self.attrs = {"Config": {"Image": image}}
+        self._stats_raw = stats_raw or {}
+        self._logs_lines = logs_lines if logs_lines is not None else []
+        self._log_error = log_error
+
+    def stats(self, stream=False):
+        if isinstance(self._stats_raw, Exception):
+            raise self._stats_raw
+        return self._stats_raw
+
+    def logs(self, **kw):
+        if self._log_error:
+            raise self._log_error
+        return iter(self._logs_lines)
+
+
+class FakeService(FakeContainer):
+    def __init__(self, name, running=2, desired=2, sid="s1", logs_lines=None, log_error=None):
+        super().__init__(name, cid=sid, logs_lines=logs_lines, log_error=log_error)
+        self.attrs = {"ServiceStatus": {"RunningTasks": running, "DesiredTasks": desired}}
+
+
+class FakeCollection:
+    def __init__(self, items=None, error=None):
+        self._items = items or []
+        self._error = error
+
+    def list(self, **kw):
+        if self._error:
+            raise self._error
+        return self._items
+
+    def get(self, name):
+        for it in self._items:
+            if it.name == name:
+                return it
+        raise LookupError(name)
+
+
+class FakeDockerClient:
+    def __init__(self, containers=None, services=None, services_error=None, version_error=None):
+        self.containers = FakeCollection(containers)
+        self.services = FakeCollection(services, services_error)
+        self._version_error = version_error
+
+    def version(self):
+        if self._version_error:
+            raise self._version_error
+        return {"Version": "27.0.0"}
+
+
+def raw_stats(cpu_pct=10.0, mem_bytes=1024 * 1024, mem_limit=4 * 1024 * 1024, net_total=2000):
+    """A minimal docker-py raw stats() dict that _cpu_mem_net_from_raw can
+    compute a plausible cpu_pct/mem_bytes/net_total straight back out of --
+    the exact absolute counter values don't matter, only their deltas and
+    ratios do (see _cpu_mem_net_from_raw's own docstring)."""
+    online = 2
+    sys_delta = 1_000_000_000
+    cpu_delta = int(sys_delta * (cpu_pct / 100.0) / online)
+    return {
+        "cpu_stats": {
+            "cpu_usage": {"total_usage": cpu_delta, "percpu_usage": [1, 1]},
+            "system_cpu_usage": sys_delta,
+            "online_cpus": online,
+        },
+        "precpu_stats": {"cpu_usage": {"total_usage": 0}, "system_cpu_usage": 0},
+        "memory_stats": {"usage": mem_bytes, "limit": mem_limit, "stats": {"cache": 0}},
+        "networks": {"eth0": {"rx_bytes": net_total // 2, "tx_bytes": net_total - net_total // 2}},
+    }
 
 
 class TestNormalizeDockerHost:
@@ -643,70 +747,63 @@ class TestNormalizeDockerHost:
         assert server.normalize_docker_host("tcp://1.2.3.4:2375") == "tcp://1.2.3.4:2375"
 
 
-class TestDockerCmdAndPs:
-    def test_docker_cmd_missing(self, monkeypatch):
-        monkeypatch.setattr(server.shutil, "which", lambda n: None)
-        with pytest.raises(RuntimeError, match="docker CLI not found"):
-            server.docker_cmd(None)
+class TestDockerPs:
+    async def test_normalizes_bare_user_at_host(self, monkeypatch):
+        captured = {}
 
-    def test_docker_cmd_host_flag(self, docker_cli):
-        assert server.docker_cmd("ssh://u@h") == ["/usr/bin/docker", "-H", "ssh://u@h"]
-        assert server.docker_cmd(None) == ["/usr/bin/docker"]
+        def factory(host):
+            captured["host"] = host
+            return FakeDockerClient(containers=[FakeContainer("web", cid="1")])
 
-    def test_ps_normalizes_bare_user_at_host(self, docker_cli, monkeypatch):
-        run = FakeRun([ok(""), ok(""), ok("")])
-        monkeypatch.setattr(server.subprocess, "run", run)
-        server.docker_ps("u@h")
-        assert run.calls[1][0] == ["/usr/bin/docker", "-H", "ssh://u@h", "ps", "--format", "json"]
+        monkeypatch.setattr(server, "docker_client", factory)
+        await server.docker_ps("u@h")
+        assert captured["host"] == "ssh://u@h"
 
-    def test_ps_ok_with_services(self, docker_cli, monkeypatch):
-        run = FakeRun([
-            ok(""),  # docker version preflight
-            ok('{"ID": "1", "Names": "web", "Image": "nginx"}\n'),
-            ok('{"ID": "s", "Name": "api", "Replicas": "2/2"}\n'),
-        ])
-        monkeypatch.setattr(server.subprocess, "run", run)
-        got = server.docker_ps(None)
+    async def test_ok_with_services(self, monkeypatch):
+        client = FakeDockerClient(
+            containers=[FakeContainer("web", image="nginx", cid="1")],
+            services=[FakeService("api", running=2, desired=2, sid="s")],
+        )
+        monkeypatch.setattr(server, "docker_client", lambda host: client)
+        got = await server.docker_ps(None)
         assert got["containers"] == [{"id": "1", "name": "web", "image": "nginx"}]
         assert got["services"] == [{"id": "s", "name": "api", "replicas": "2/2"}]
+        assert got["log"][0]["returncode"] == 0
 
-    def test_ps_service_ls_failure_tolerated(self, docker_cli, monkeypatch):
-        run = FakeRun([ok(""), ok('{"ID": "1", "Names": "web", "Image": "nginx"}\n'), fail()])
-        monkeypatch.setattr(server.subprocess, "run", run)
-        assert server.docker_ps(None)["services"] == []
+    async def test_service_ls_failure_tolerated(self, monkeypatch):
+        from docker.errors import APIError
 
-    def test_ps_preflight_reports_missing_docker(self, docker_cli, monkeypatch):
-        monkeypatch.setattr(server.subprocess, "run", FakeRun([fail("command not found: docker")]))
+        client = FakeDockerClient(
+            containers=[FakeContainer("web", cid="1")],
+            services_error=APIError("not a swarm manager"),
+        )
+        monkeypatch.setattr(server, "docker_client", lambda host: client)
+        assert (await server.docker_ps(None))["services"] == []
+
+    async def test_preflight_reports_missing_docker(self, monkeypatch):
+        client = FakeDockerClient(version_error=Exception("command not found: docker"))
+        monkeypatch.setattr(server, "docker_client", lambda host: client)
         with pytest.raises(server.DockerPsError, match="not installed"):
-            server.docker_ps("ssh://u@h")
+            await server.docker_ps("ssh://u@h")
 
-    def test_ps_failure_raises(self, docker_cli, monkeypatch):
-        monkeypatch.setattr(server.subprocess, "run", FakeRun([fail("no daemon")]))
-        with pytest.raises(RuntimeError, match="no daemon"):
-            server.docker_ps(None)
+    async def test_failure_raises_and_carries_log(self, monkeypatch):
+        client = FakeDockerClient(containers=None)
+        client.containers = FakeCollection(error=RuntimeError("no daemon"))
+        monkeypatch.setattr(server, "docker_client", lambda host: client)
+        with pytest.raises(server.DockerPsError, match="no daemon") as ei:
+            await server.docker_ps(None)
+        assert ei.value.log[-1]["returncode"] != 0
 
-    def test_ps_failure_carries_attempted_log(self, docker_cli, monkeypatch):
-        monkeypatch.setattr(server.subprocess, "run", FakeRun([fail("permission denied")]))
-        with pytest.raises(server.DockerPsError) as ei:
-            server.docker_ps(None)
-        assert ei.value.log[0]["returncode"] != 0
-        assert "permission denied" in ei.value.log[0]["stderr"]
+    async def test_timeout_raises_with_log(self, monkeypatch):
+        monkeypatch.setattr(server, "DOCKER_PS_TIMEOUT", 0.05)
 
-    def test_ps_timeout_raises_with_log(self, docker_cli, monkeypatch):
-        def run(*a, **k):
-            raise server.subprocess.TimeoutExpired(cmd="docker ps", timeout=30)
+        def factory(host):
+            time.sleep(0.3)
+            return FakeDockerClient()
 
-        monkeypatch.setattr(server.subprocess, "run", run)
-        with pytest.raises(server.DockerPsError, match="timed out") as ei:
-            server.docker_ps(None)
-        assert ei.value.log[0]["returncode"] is None
-
-    def test_ps_passes_ssh_key_env(self, docker_cli, monkeypatch):
-        run = FakeRun([ok(""), ok("")])
-        monkeypatch.setattr(server.subprocess, "run", run)
-        server.docker_ps("ssh://u@h", ssh_key="/tmp/k")
-        env = run.calls[0][1]["env"]
-        assert env is not None and "cttc-ssh" in env["PATH"].split(":")[0]
+        monkeypatch.setattr(server, "docker_client", factory)
+        with pytest.raises(server.DockerPsError, match="timed out"):
+            await server.docker_ps(None)
 
 
 class FakeState:
@@ -718,17 +815,22 @@ class FakeState:
 
 
 class TestDockerStatsSource:
-    def test_polls_and_ingests(self, docker_cli, monkeypatch):
-        line = json.dumps({"Name": "api.1.x", "CPUPerc": "10%", "MemPerc": "20%",
-                           "MemUsage": "1MiB / 4MiB", "NetIO": "1kB / 1kB"})
-        run = FakeRun([ok(line + "\nnot-json\n\n")])
-        monkeypatch.setattr(server.subprocess, "run", run)
+    async def test_polls_and_ingests(self, docker_cli, monkeypatch):
+        client = FakeDockerClient(
+            containers=[
+                FakeContainer(
+                    "api.1.x",
+                    stats_raw=raw_stats(cpu_pct=10.0, mem_bytes=1_000_000, mem_limit=4_000_000),
+                ),
+            ]
+        )
+        monkeypatch.setattr(server, "docker_client", lambda host: client)
         st = FakeState()
         src = server.DockerStatsSource("d1", "stats@local", None, 0.05, st)
         try:
             deadline = time.time() + 3
             while not src.series and time.time() < deadline:
-                time.sleep(0.02)
+                await asyncio.sleep(0.02)
             assert "api" in src.series
             assert src.error is None
             assert any(e["type"] == "update" for e in st.events)
@@ -736,99 +838,146 @@ class TestDockerStatsSource:
         finally:
             src.stop()
 
-    def test_error_captured(self, docker_cli, monkeypatch):
-        monkeypatch.setattr(server.subprocess, "run", FakeRun([fail("cannot connect")]))
+    async def test_error_captured(self, docker_cli, monkeypatch):
+        def factory(host):
+            raise RuntimeError("cannot connect")
+
+        monkeypatch.setattr(server, "docker_client", factory)
         src = server.DockerStatsSource("d2", "stats@local", None, 0.05, FakeState())
         try:
             deadline = time.time() + 3
             while src.error is None and time.time() < deadline:
-                time.sleep(0.02)
+                await asyncio.sleep(0.02)
             assert "cannot connect" in src.error
         finally:
             src.stop()
 
-    def test_timeout_captured(self, docker_cli, monkeypatch):
-        exc = subprocess.TimeoutExpired(cmd="docker", timeout=1)
-        monkeypatch.setattr(server.subprocess, "run", FakeRun([exc]))
+    async def test_container_stats_failure_skipped_not_fatal(self, docker_cli, monkeypatch):
+        # one container's stats() call blowing up shouldn't stop the others
+        good = FakeContainer("good", stats_raw=raw_stats())
+        bad = FakeContainer("bad", stats_raw=RuntimeError("boom"))
+        client = FakeDockerClient(containers=[bad, good])
+        monkeypatch.setattr(server, "docker_client", lambda host: client)
         src = server.DockerStatsSource("d3", "stats@local", None, 0.05, FakeState())
         try:
             deadline = time.time() + 3
-            while src.error is None and time.time() < deadline:
-                time.sleep(0.02)
-            assert src.error
+            while "good" not in src.series and time.time() < deadline:
+                await asyncio.sleep(0.02)
+            assert "good" in src.series
+            assert "bad" not in src.series
         finally:
             src.stop()
 
 
-class FakeProc:
-    def __init__(self, chunks, linger_polls=0):
-        self.chunks = list(chunks)
-        self.linger_polls = linger_polls   # poll() returns None this many times after EOF
+class FakeAsyncStdout:
+    def __init__(self, chunks, hang_after=False):
+        self._chunks = list(chunks)
+        self._hang_after = hang_after  # simulate a still-live, merely idle stream
+
+    async def read(self, n):
+        if self._chunks:
+            return self._chunks.pop(0)
+        if self._hang_after:
+            await asyncio.sleep(3600)
+        return b""
+
+
+class FakeAsyncProc:
+    """Stand-in for asyncio.subprocess.Process."""
+
+    def __init__(
+        self,
+        chunks=None,
+        communicate_result=None,
+        communicate_error=None,
+        returncode=0,
+        hang_after=False,
+    ):
+        self.stdout = FakeAsyncStdout(chunks or [], hang_after=hang_after)
+        self.returncode = None  # asyncio only sets this once the process actually exits
         self.terminated = False
-        outer = self
-
-        class Out:
-            def read1(self, n):
-                return outer.chunks.pop(0) if outer.chunks else b""
-
-        self.stdout = Out()
-
-    def poll(self):
-        if self.chunks:
-            return None
-        if self.linger_polls > 0:
-            self.linger_polls -= 1
-            return None
-        return 0
+        self._exit_code = returncode
+        self._communicate_result = communicate_result or (b"", b"")
+        self._communicate_error = communicate_error
 
     def terminate(self):
         self.terminated = True
+        self.returncode = -15
+
+    async def wait(self):
+        return self.returncode
+
+    async def communicate(self):
+        if self._communicate_error:
+            raise self._communicate_error
+        self.returncode = self._exit_code  # real communicate() waits for exit
+        return self._communicate_result
 
 
 class TestDockerLogSource:
-    def test_follows_and_reports_end(self, docker_cli, monkeypatch):
-        # linger_polls > 0 exercises the "no data yet, stream still open" sleep
-        proc = FakeProc([b"2026-01-02T03:04:05Z hello\n2026-01-02T03:04:06Z world\n"],
-                        linger_polls=2)
-        monkeypatch.setattr(server.subprocess, "Popen", lambda *a, **k: proc)
+    async def test_follows_and_reports_end(self, docker_cli, monkeypatch):
+        proc = FakeAsyncProc([b"2026-01-02T03:04:05Z hello\n2026-01-02T03:04:06Z world\n"])
+
+        async def fake_exec(*a, **k):
+            return proc
+
+        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
         st = FakeState()
         src = server.DockerLogSource("l1", "web", None, "container", "web", [], st)
         deadline = time.time() + 3
         while src.error is None and time.time() < deadline:
-            time.sleep(0.02)
+            await asyncio.sleep(0.02)
         assert src.total() == 2
         assert src.error == "log stream ended"
         assert src.path == "docker://local/container/web"
         src.stop()
-        assert proc.terminated
 
-    def test_service_target_uses_service_logs(self, docker_cli, monkeypatch):
+    async def test_service_target_uses_service_logs(self, docker_cli, monkeypatch):
         captured = {}
 
-        def popen(cmd, **kw):
-            captured["cmd"] = cmd
-            return FakeProc([])
+        async def fake_exec(*args, **k):
+            captured["cmd"] = args
+            return FakeAsyncProc([])
 
-        monkeypatch.setattr(server.subprocess, "Popen", popen)
-        src = server.DockerLogSource("l2", "api", "ssh://u@h", "service", "api", [], FakeState(),
-                                     ssh_key="/tmp/k")
+        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+        src = server.DockerLogSource(
+            "l2", "api", "ssh://u@h", "service", "api", [], FakeState(), ssh_key="/tmp/k"
+        )
         deadline = time.time() + 3
         while src.error is None and time.time() < deadline:
-            time.sleep(0.02)
-        assert captured["cmd"][:4] == ["/usr/bin/docker", "-H", "ssh://u@h", "service"]
+            await asyncio.sleep(0.02)
+        assert list(captured["cmd"][:4]) == ["docker", "-H", "ssh://u@h", "service"]
         src.stop()
 
-    def test_spawn_failure_recorded(self, docker_cli, monkeypatch):
-        def popen(*a, **k):
+    async def test_spawn_failure_recorded(self, docker_cli, monkeypatch):
+        async def fake_exec(*a, **k):
             raise OSError("exec failed")
 
-        monkeypatch.setattr(server.subprocess, "Popen", popen)
+        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
         src = server.DockerLogSource("l3", "web", None, "container", "web", [], FakeState())
         deadline = time.time() + 3
         while src.error is None and time.time() < deadline:
-            time.sleep(0.02)
+            await asyncio.sleep(0.02)
         assert "exec failed" in src.error
         src.stop()
+
+    async def test_stop_terminates_the_subprocess(self, docker_cli, monkeypatch):
+        # hang_after=True keeps the fake stream "live but idle" (as a real
+        # tailing `docker logs -f` would be between log lines) so stop()
+        # has to actually terminate it rather than finding it already ended.
+        proc = FakeAsyncProc([b"2026-01-02T03:04:05Z hello\n"], hang_after=True)
+
+        async def fake_exec(*a, **k):
+            return proc
+
+        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+        src = server.DockerLogSource("l4", "web", None, "container", "web", [], FakeState())
+        deadline = time.time() + 3
+        while src.total() < 1 and time.time() < deadline:
+            await asyncio.sleep(0.02)
+        assert src.total() == 1
+        src.stop()
+        assert proc.terminated
 
 
 # ── HostStatsSource ──────────────────────────────────────────────────────────
@@ -851,16 +1000,16 @@ def proc_files(user, system, idle, iowait, rx, tx):
 
 
 class TestHostStatsSource:
-    def test_local_psutil_samples(self):
+    async def test_local_psutil_samples(self):
         src = server.HostStatsSource("h1", "host@local", None, 0.05, FakeState())
         try:
             deadline = time.time() + 5
             while not src.series.get("host@local") and time.time() < deadline:
-                time.sleep(0.05)
+                await asyncio.sleep(0.05)
             rows = src.series["host@local"]
             assert rows, "expected at least one host sample"
             ts, cpu, mem, mem_bytes, rate = rows[0]
-            assert 0 <= cpu <= 100 * 64        # cpu_percent can exceed 100 on multicore? no; be lax
+            assert 0 <= cpu <= 100 * 64  # cpu_percent can exceed 100 on multicore? no; be lax
             assert 0 < mem <= 100
             assert mem_bytes > 0
             assert src.error is None
@@ -868,57 +1017,63 @@ class TestHostStatsSource:
         finally:
             src.stop()
 
-    def test_ssh_sampling_and_interface_filter(self, monkeypatch):
-        samples = [proc_files(100, 100, 700, 100, 1000, 2000),
-                   proc_files(150, 150, 900, 100, 4000, 5000)]
+    async def test_ssh_sampling_and_interface_filter(self, monkeypatch):
+        samples = [
+            proc_files(100, 100, 700, 100, 1000, 2000),
+            proc_files(150, 150, 900, 100, 4000, 5000),
+        ]
         calls = []
 
-        def run(cmd, **kw):
-            calls.append(cmd)
-            return ok(samples[0] if len(calls) == 1 else samples[1])
+        async def fake_exec(*args, **k):
+            calls.append(args)
+            sample = samples[0] if len(calls) == 1 else samples[1]
+            return FakeAsyncProc(communicate_result=(sample.encode(), b""))
 
-        monkeypatch.setattr(server.subprocess, "run", run)
-        src = server.HostStatsSource("h2", "host@h", "ssh://user@h:2222", 0.05, FakeState(),
-                                     ssh_key="/tmp/key")
+        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+        src = server.HostStatsSource(
+            "h2", "host@h", "ssh://user@h:2222", 0.05, FakeState(), ssh_key="/tmp/key"
+        )
         try:
             deadline = time.time() + 5
             while not src.series.get("host@h") and time.time() < deadline:
-                time.sleep(0.05)
+                await asyncio.sleep(0.05)
             assert "-p" in calls[0] and "2222" in calls[0]
-            assert "-i" in calls[0] and "/tmp/key" in calls[0]
-            assert calls[0][-4:] == ["cat", "/proc/stat", "/proc/meminfo", "/proc/net/dev"]
+            assert calls[0][-4:] == ("cat", "/proc/stat", "/proc/meminfo", "/proc/net/dev")
             ts, cpu, mem, mem_bytes, rate = src.series["host@h"][0]
             # busy: 200 -> 300 (delta 100) of total 1000 -> 1300 (delta 300)
             assert cpu == pytest.approx(100 / 300 * 100, rel=1e-3)
             assert mem == pytest.approx(60.0)
             assert mem_bytes == pytest.approx(600000 * 1024)
-            assert rate > 0                     # 6000 bytes over the poll gap; lo/veth/br/docker0 excluded
+            assert rate > 0  # 6000 bytes over the poll gap; lo/veth/br/docker0 excluded
         finally:
             src.stop()
 
-    def test_unsupported_host_scheme(self):
+    async def test_unsupported_host_scheme(self):
         src = server.HostStatsSource("h3", "host@x", "tcp://1.2.3.4:2375", 0.05, FakeState())
         try:
             assert "ssh://" in src.error
-            time.sleep(0.12)                    # loop must idle without sampling
+            await asyncio.sleep(0.12)  # loop must idle without sampling
             assert src.series == {}
         finally:
             src.stop()
 
-    def test_ssh_failure_recorded(self, monkeypatch):
-        monkeypatch.setattr(server.subprocess, "run", FakeRun([fail("Permission denied")]))
+    async def test_ssh_failure_recorded(self, monkeypatch):
+        async def fake_exec(*a, **k):
+            return FakeAsyncProc(communicate_result=(b"", b"Permission denied"), returncode=1)
+
+        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
         src = server.HostStatsSource("h4", "host@h", "ssh://u@h", 0.05, FakeState())
         try:
             deadline = time.time() + 3
             while src.error is None and time.time() < deadline:
-                time.sleep(0.02)
+                await asyncio.sleep(0.02)
             assert "Permission denied" in src.error
         finally:
             src.stop()
 
-    def test_local_without_psutil_reports_error(self, monkeypatch):
+    async def test_local_without_psutil_reports_error(self, monkeypatch):
         src = server.HostStatsSource("h5", "host@x", "tcp://nope", 0.05, FakeState())
-        src.stop()                               # loop idles; call the sampler directly
+        src.stop()  # loop idles; call the sampler directly
         monkeypatch.setitem(sys.modules, "psutil", None)
         with pytest.raises(RuntimeError, match="psutil not installed"):
             src._sample_local()
@@ -933,9 +1088,9 @@ def state(tmp_path):
     tdir.mkdir()
     (tdir / "upper.py").write_text(
         '"""Uppercase text."""\n'
-        'def transform(r):\n'
+        "def transform(r):\n"
         '    r["text"] = r["text"].upper()\n'
-        '    return r\n'
+        "    return r\n"
     )
     return server.State(tdir)
 
@@ -950,8 +1105,25 @@ def log_file(tmp_path):
 @pytest.fixture
 def stats_file(tmp_path):
     f = tmp_path / "stats.jsonl"
-    f.write_text("\n".join(json.dumps(stats_entry("api", f"2026-01-02T03:00:0{i}Z")) for i in range(3)) + "\n")
+    f.write_text(
+        "\n".join(json.dumps(stats_entry("api", f"2026-01-02T03:00:0{i}Z")) for i in range(3))
+        + "\n"
+    )
     return f
+
+
+def _no_op_docker(monkeypatch):
+    """collect_docker's sources spawn background asyncio tasks that
+    immediately try to reach docker/ssh -- give them a harmless no-op
+    target so those tasks don't spam errors during the test (dedup logic,
+    or the /docker/collect endpoint contract, don't depend on any of this
+    actually succeeding)."""
+    monkeypatch.setattr(server, "docker_client", lambda host: FakeDockerClient(containers=[]))
+
+    async def fake_exec(*a, **k):
+        return FakeAsyncProc([])
+
+    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
 
 
 class TestState:
@@ -977,7 +1149,7 @@ class TestState:
         state.close_source(src.id)
         assert stopped == [True]
         assert src.id not in state.sources
-        state.close_source("ghost")            # no-op
+        state.close_source("ghost")  # no-op
 
     def test_describe(self, state, log_file, stats_file):
         state.open_file(str(log_file), "auto", None, live=False, transforms=["upper"])
@@ -990,107 +1162,136 @@ class TestState:
         assert d["stats"]["is_host"] is False
         assert "is_host" not in d["svc"]  # log sources don't carry the flag
 
-    def test_collect_docker_all_sources(self, state, docker_cli, monkeypatch):
-        monkeypatch.setattr(server.subprocess, "run", FakeRun([ok("")]))
-        monkeypatch.setattr(server.subprocess, "Popen", lambda *a, **k: FakeProc([]))
-        opened = state.collect_docker(None, stats=True, logs=[{"name": "web"}],
-                                      transforms=[], interval=0.05, host_stats=True)
+    async def test_collect_docker_all_sources(self, state, docker_cli, monkeypatch):
+        _no_op_docker(monkeypatch)
+        opened = state.collect_docker(
+            None, stats=True, logs=[{"name": "web"}], transforms=[], interval=0.05, host_stats=True
+        )
         assert len(opened) == 3
         kinds = sorted(type(state.sources[sid]).__name__ for sid in opened)
         assert kinds == ["DockerLogSource", "DockerStatsSource", "HostStatsSource"]
         for sid in opened:
             state.close_source(sid)
 
-    def test_collect_docker_flags_off(self, state, docker_cli, monkeypatch):
-        monkeypatch.setattr(server.subprocess, "run", FakeRun([ok("")]))
-        opened = state.collect_docker(None, stats=False, logs=[], transforms=[],
-                                      interval=0.05, host_stats=False)
+    async def test_collect_docker_flags_off(self, state, docker_cli, monkeypatch):
+        _no_op_docker(monkeypatch)
+        opened = state.collect_docker(
+            None, stats=False, logs=[], transforms=[], interval=0.05, host_stats=False
+        )
         assert opened == []
 
-    def test_collect_docker_dedupes_stats_and_host_stats(self, state, docker_cli, monkeypatch):
-        monkeypatch.setattr(server.subprocess, "run", FakeRun([ok("")]))
-        first = state.collect_docker(None, stats=True, logs=[], transforms=[],
-                                     interval=0.05, host_stats=True)
-        second = state.collect_docker(None, stats=True, logs=[], transforms=[],
-                                      interval=0.05, host_stats=True)
+    async def test_collect_docker_dedupes_stats_and_host_stats(
+        self, state, docker_cli, monkeypatch
+    ):
+        _no_op_docker(monkeypatch)
+        first = state.collect_docker(
+            None, stats=True, logs=[], transforms=[], interval=0.05, host_stats=True
+        )
+        second = state.collect_docker(
+            None, stats=True, logs=[], transforms=[], interval=0.05, host_stats=True
+        )
         assert first == second
         assert len(state.sources) == 2  # not 4 -- the second call reused both
         for sid in first:
             state.close_source(sid)
 
-    def test_collect_docker_dedupes_logs(self, state, docker_cli, monkeypatch):
-        monkeypatch.setattr(server.subprocess, "run", FakeRun([ok("")]))
-        monkeypatch.setattr(server.subprocess, "Popen", lambda *a, **k: FakeProc([]))
-        first = state.collect_docker(None, stats=False, host_stats=False,
-                                     logs=[{"name": "web", "type": "container"}],
-                                     transforms=[], interval=0.05)
-        second = state.collect_docker(None, stats=False, host_stats=False,
-                                      logs=[{"name": "web", "type": "container"}],
-                                      transforms=[], interval=0.05)
+    async def test_collect_docker_dedupes_logs(self, state, docker_cli, monkeypatch):
+        _no_op_docker(monkeypatch)
+        first = state.collect_docker(
+            None,
+            stats=False,
+            host_stats=False,
+            logs=[{"name": "web", "type": "container"}],
+            transforms=[],
+            interval=0.05,
+        )
+        second = state.collect_docker(
+            None,
+            stats=False,
+            host_stats=False,
+            logs=[{"name": "web", "type": "container"}],
+            transforms=[],
+            interval=0.05,
+        )
         assert first == second
         assert len(state.sources) == 1
         state.close_source(first[0])
 
-    def test_collect_docker_distinct_targets_not_deduped(self, state, docker_cli, monkeypatch):
-        monkeypatch.setattr(server.subprocess, "run", FakeRun([ok("")]))
-        monkeypatch.setattr(server.subprocess, "Popen", lambda *a, **k: FakeProc([]))
-        by_name = state.collect_docker(None, stats=False, host_stats=False,
-                                       logs=[{"name": "web", "type": "container"}],
-                                       transforms=[], interval=0.05)
-        by_type = state.collect_docker(None, stats=False, host_stats=False,
-                                       logs=[{"name": "web", "type": "service"}],  # same name, different type
-                                       transforms=[], interval=0.05)
-        by_host = state.collect_docker("ssh://u@other", stats=False, host_stats=False,
-                                       logs=[{"name": "web", "type": "container"}],  # same name/type, different host
-                                       transforms=[], interval=0.05)
+    async def test_collect_docker_distinct_targets_not_deduped(
+        self, state, docker_cli, monkeypatch
+    ):
+        _no_op_docker(monkeypatch)
+        by_name = state.collect_docker(
+            None,
+            stats=False,
+            host_stats=False,
+            logs=[{"name": "web", "type": "container"}],
+            transforms=[],
+            interval=0.05,
+        )
+        by_type = state.collect_docker(
+            None,
+            stats=False,
+            host_stats=False,
+            logs=[{"name": "web", "type": "service"}],  # same name, different type
+            transforms=[],
+            interval=0.05,
+        )
+        by_host = state.collect_docker(
+            "ssh://u@other",
+            stats=False,
+            host_stats=False,
+            logs=[{"name": "web", "type": "container"}],  # same name/type, different host
+            transforms=[],
+            interval=0.05,
+        )
         ids = by_name + by_type + by_host
         assert len(set(ids)) == 3  # all distinct -- nothing wrongly collapsed
         for sid in ids:
             state.close_source(sid)
 
-    def test_collect_docker_reuse_ignores_the_second_call_s_settings(self, state, docker_cli, monkeypatch):
-        monkeypatch.setattr(server.subprocess, "run", FakeRun([ok("")]))
-        first = state.collect_docker(None, stats=True, logs=[], transforms=[],
-                                     interval=1.0, host_stats=False)
-        state.collect_docker(None, stats=True, logs=[], transforms=[],
-                             interval=99.0, host_stats=False)  # different interval, same target
+    async def test_collect_docker_reuse_ignores_the_second_call_s_settings(
+        self, state, docker_cli, monkeypatch
+    ):
+        _no_op_docker(monkeypatch)
+        first = state.collect_docker(
+            None, stats=True, logs=[], transforms=[], interval=1.0, host_stats=False
+        )
+        state.collect_docker(
+            None, stats=True, logs=[], transforms=[], interval=99.0, host_stats=False
+        )  # different interval, same target
         src = state.sources[first[0]]
         assert src.interval == 1.0  # untouched by the second, reused call
         state.close_source(first[0])
 
-    def test_collect_docker_concurrent_requests_for_the_same_target_start_only_one(
+    async def test_collect_docker_repeated_calls_for_the_same_target_start_only_one(
         self, state, docker_cli, monkeypatch
     ):
-        """The real point of _open_or_reuse: not just 'sequential calls
-        dedupe' but that a genuine race between simultaneous requests can't
-        both win. N threads all request the identical target at once."""
-        monkeypatch.setattr(server.subprocess, "run", FakeRun([ok("")]))
-        n = 16
-        barrier = threading.Barrier(n)
-        results = [None] * n
-
-        def worker(i):
-            barrier.wait()  # maximize actual overlap
-            results[i] = state.collect_docker(None, stats=True, logs=[], transforms=[],
-                                              interval=0.05, host_stats=False)[0]
-
-        threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=5)
-
-        assert all(r is not None for r in results), "a worker didn't finish"
+        """The real point of _open_or_reuse: N requests for the identical
+        target must all resolve to the same single collector. There's no
+        lock guarding this anymore, by design -- collect_docker is only
+        ever called from request handlers on the single-threaded event
+        loop, and _open_or_reuse has no `await` in it, so each call already
+        runs to completion atomically with respect to every other
+        coroutine before the next one gets a turn (unlike the old
+        threading-based server, real concurrent OS-thread calls into it are
+        not a scenario that can happen anymore)."""
+        _no_op_docker(monkeypatch)
+        results = [
+            state.collect_docker(
+                None, stats=True, logs=[], transforms=[], interval=0.05, host_stats=False
+            )[0]
+            for _ in range(16)
+        ]
         assert len(set(results)) == 1, f"expected one winner id, got {set(results)}"
         assert len(state.sources) == 1
         state.close_source(results[0])
 
     def test_broadcast_full_queue_dropped(self, state):
-        import queue as q
-        full = q.Queue(maxsize=1)
+        full = asyncio.Queue(maxsize=1)
         full.put_nowait({"x": 1})
         state.listeners.append(full)
-        state.broadcast({"type": "sources"})    # must not raise
+        state.broadcast({"type": "sources"})  # must not raise
         state.listeners.remove(full)
 
 
@@ -1098,7 +1299,7 @@ class TestSampleRoundTrip:
     def test_export_and_load(self, state, log_file, stats_file, tmp_path):
         state.open_file(str(log_file), "auto", None, live=False, transforms=[])
         st_src = state.open_file(str(stats_file), "auto", None, live=False, transforms=[])
-        st_src.is_host = True                   # exercise the host flag
+        st_src.is_host = True  # exercise the host flag
         st_src._swarm.add("api")
         t0, t1 = ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 5)
         out = tmp_path / "slice.cttc"
@@ -1112,7 +1313,7 @@ class TestSampleRoundTrip:
         opened = st2.load_sample(str(out))
         assert len(opened) == 2
         d = {s["name"]: s for s in st2.describe()}
-        assert d["svc"]["total"] == 1           # only "alpha" is inside [t0, t1]
+        assert d["svc"]["total"] == 1  # only "alpha" is inside [t0, t1]
         lg = st2.sources[[s for s in opened if st2.sources[s].kind == "log"][0]]
         assert lg.slice(0, 1)[0]["text"] == "alpha"
         stt = st2.sources[[s for s in opened if st2.sources[s].kind == "stats"][0]]
@@ -1124,7 +1325,7 @@ class TestSampleRoundTrip:
         state.open_file(str(log_file), "auto", None, live=False, transforms=[])
         state.open_file(str(stats_file), "auto", None, live=False, transforms=[])
         out = tmp_path / "empty.cttc"
-        r = state.export_sample(str(out), 0.0, 1.0)   # both log and stats out of range
+        r = state.export_sample(str(out), 0.0, 1.0)  # both log and stats out of range
         assert r["sources"] == 0
         assert zipfile.ZipFile(out).namelist() == ["manifest.json"]
 
@@ -1141,31 +1342,66 @@ class TestSampleRoundTrip:
         out = tmp_path / "crafted.cttc"
         with zipfile.ZipFile(out, "w") as z:
             z.writestr("logs/0.jsonl", '{"ts": 1000, "text": "a"}\n\n   \n{"ts": 2000}\n')
-            z.writestr("manifest.json", json.dumps({
-                "version": 1,
-                "sources": [{"type": "log", "name": "crafted", "file": "logs/0.jsonl"}],
-            }))
+            z.writestr(
+                "manifest.json",
+                json.dumps(
+                    {
+                        "version": 1,
+                        "sources": [{"type": "log", "name": "crafted", "file": "logs/0.jsonl"}],
+                    }
+                ),
+            )
         opened = state.load_sample(str(out))
         src = state.sources[opened[0]]
         assert src.total() == 2
-        assert src.slice(1, 1)[0]["text"] == ""       # missing text defaults to empty
+        assert src.slice(1, 1)[0]["text"] == ""  # missing text defaults to empty
 
 
 # ── HTTP API ─────────────────────────────────────────────────────────────────
+
+
+def boot_server(state):
+    """Boots the real FastAPI app (via uvicorn) in a background thread with
+    its own event loop, on an OS-assigned port -- get/post/get_raw/post_raw
+    below hit it over a real TCP socket exactly like main.js's Electron
+    client does, so these tests exercise the actual HTTP contract, not an
+    in-process shortcut. Returns (base_url, srv, thread); caller is
+    responsible for srv.should_exit = True + thread.join()."""
+    server.app.state.cttc = state
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(128)
+    port = sock.getsockname()[1]
+
+    config = uvicorn.Config(server.app, fd=sock.fileno(), log_level="warning", access_log=False)
+    srv = uvicorn.Server(config)
+    server.app.state.uvicorn_server = srv
+
+    loop = asyncio.new_event_loop()
+
+    def run():
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(srv.serve())
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    deadline = time.time() + 5
+    while not srv.started and time.time() < deadline:
+        time.sleep(0.01)
+
+    return f"http://127.0.0.1:{port}", srv, t
 
 
 @pytest.fixture
 def api(state, log_file, stats_file):
     state.open_file(str(log_file), "auto", None, live=False, transforms=[])
     state.open_file(str(stats_file), "auto", None, live=False, transforms=[])
-    server.Handler.state = state
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
-    t = threading.Thread(target=httpd.serve_forever, daemon=True)
-    t.start()
-    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    base, srv, t = boot_server(state)
     yield base, state
-    httpd.shutdown()
-    httpd.server_close()
+    srv.should_exit = True
+    t.join(timeout=5)
 
 
 def get(base, path):
@@ -1187,12 +1423,15 @@ def post(base, path, body=None):
 
 
 def get_raw(base, path):
-    """Like get(), but for binary (non-JSON) responses: /files/download."""
+    """Like get(), but for binary (non-JSON) responses: /files/download.
+    Deliberately doesn't dict()-wrap the headers -- that would lose
+    email.message.Message's case-insensitive lookup, and uvicorn (unlike
+    the old http.server) sends header names lowercased on the wire."""
     try:
         with urllib.request.urlopen(base + path, timeout=5) as r:
-            return r.status, dict(r.headers), r.read()
+            return r.status, r.headers, r.read()
     except urllib.error.HTTPError as e:
-        return e.code, dict(e.headers), e.read()
+        return e.code, e.headers, e.read()
 
 
 def post_raw(base, path, data, headers=None):
@@ -1215,15 +1454,13 @@ class TestHttpApi:
         assert j["max_ts"] == ms(2026, 1, 2, 3, 0, 10)
 
     def test_range_empty(self, tmp_path):
-        server.Handler.state = server.State(tmp_path)
-        httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
-        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        base, srv, t = boot_server(server.State(tmp_path))
         try:
-            _, j = get(f"http://127.0.0.1:{httpd.server_address[1]}", "/range")
+            _, j = get(base, "/range")
             assert j == {"min_ts": None, "max_ts": None}
         finally:
-            httpd.shutdown()
-            httpd.server_close()
+            srv.should_exit = True
+            t.join(timeout=5)
 
     def test_series(self, api):
         base, _ = api
@@ -1244,7 +1481,7 @@ class TestHttpApi:
         sid = next(s.id for s in st.sources.values() if s.kind == "log")
         _, j = get(base, f"/logs?source={sid}&start=0&count=10")
         assert j["total"] == 2 and j["rows"][0]["text"] == "alpha"
-        _, j = get(base, f"/logs?source={sid}")        # defaults
+        _, j = get(base, f"/logs?source={sid}")  # defaults
         assert len(j["rows"]) == 2
         _, j = get(base, f"/index_at?source={sid}&t={ms(2026, 1, 2, 3, 0, 9)}")
         assert j["index"] == 1
@@ -1293,10 +1530,16 @@ class TestHttpApi:
         base, st = api
         extra = tmp_path / "extra.log"
         extra.write_text("2026-01-02T03:00:20Z gamma\n")
-        code, j = post(base, "/open", {"files": [
-            {"path": str(extra), "live": False},
-            {"path": "/no/such/file"},
-        ]})
+        code, j = post(
+            base,
+            "/open",
+            {
+                "files": [
+                    {"path": str(extra), "live": False},
+                    {"path": "/no/such/file"},
+                ]
+            },
+        )
         assert code == 200
         assert len(j["opened"]) == 1
         assert j["errors"][0]["path"] == "/no/such/file"
@@ -1316,9 +1559,11 @@ class TestHttpApi:
 
     def test_docker_ps_endpoint(self, api, monkeypatch):
         base, _ = api
-        monkeypatch.setattr(server, "docker_ps",
-                            lambda host, ssh_key=None: {"containers": [], "services": [],
-                                                        "host": host, "key": ssh_key})
+
+        async def fake_ps(host, ssh_key=None):
+            return {"containers": [], "services": [], "host": host, "key": ssh_key}
+
+        monkeypatch.setattr(server, "docker_ps", fake_ps)
         _, j = post(base, "/docker/ps", {"host": "ssh://u@h", "ssh_key": "/k"})
         assert j["host"] == "ssh://u@h" and j["key"] == "/k"
 
@@ -1340,7 +1585,10 @@ class TestHttpApi:
         base, _ = api
 
         def boom(host, ssh_key=None):
-            raise server.DockerPsError("timed out", [{"cmd": "docker ps", "returncode": None, "ms": 30000, "stderr": "timed out"}])
+            raise server.DockerPsError(
+                "timed out",
+                [{"cmd": "docker ps", "returncode": None, "ms": 30000, "stderr": "timed out"}],
+            )
 
         monkeypatch.setattr(server, "docker_ps", boom)
         code, j = post(base, "/docker/ps", {"host": "ssh://u@h"})
@@ -1364,12 +1612,17 @@ class TestHttpApi:
 
     def test_docker_collect_endpoint(self, api, docker_cli, monkeypatch):
         base, st = api
-        monkeypatch.setattr(server.subprocess, "run", FakeRun([ok("")]))
-        monkeypatch.setattr(server.subprocess, "Popen", lambda *a, **k: FakeProc([]))
-        code, j = post(base, "/docker/collect", {
-            "stats": True, "host_stats": True, "logs": [{"name": "web", "type": "container"}],
-            "interval": 0.05,
-        })
+        _no_op_docker(monkeypatch)
+        code, j = post(
+            base,
+            "/docker/collect",
+            {
+                "stats": True,
+                "host_stats": True,
+                "logs": [{"name": "web", "type": "container"}],
+                "interval": 0.05,
+            },
+        )
         assert code == 200 and len(j["opened"]) == 3
         for sid in j["opened"]:
             st.close_source(sid)
@@ -1381,7 +1634,7 @@ class TestHttpApi:
         assert j["t"] == t
         assert j["services"]["api"]["cpu"] == 10.0
         assert abs(j["services"]["api"]["ts"] - t) < 1500
-        assert get(base, "/point")[0] == 400          # t is required
+        assert get(base, "/point")[0] == 400  # t is required
 
     def test_logs_find_endpoint(self, api):
         base, st = api
@@ -1400,46 +1653,35 @@ class TestHttpApi:
                 s.is_host = True
         out = tmp_path / "nohost-http.cttc"
         t0 = ms(2026, 1, 2, 3, 0, 0)
-        _, j = post(base, "/sample/export",
-                    {"path": str(out), "from": t0, "to": t0 + 60000, "include_host": False})
-        assert j["sources"] == 1                      # only the log made it in
-
-    def test_handle_error_swallows_disconnects_but_not_bugs(self, capsys):
-        inst = server.ThreadingHTTPServer.__new__(server.ThreadingHTTPServer)
-        try:
-            raise ConnectionResetError("peer vanished")
-        except ConnectionResetError:
-            inst.handle_error(None, ("127.0.0.1", 1))   # swallowed
-        assert capsys.readouterr().err == ""
-        try:
-            raise RuntimeError("actual bug")
-        except RuntimeError:
-            inst.handle_error(None, ("127.0.0.1", 1))   # dumped like the default
-        assert "actual bug" in capsys.readouterr().err
+        _, j = post(
+            base,
+            "/sample/export",
+            {"path": str(out), "from": t0, "to": t0 + 60000, "include_host": False},
+        )
+        assert j["sources"] == 1  # only the log made it in
 
     def test_get_broken_pipe_swallowed(self, api, monkeypatch):
+        # BrokenPipeError from business logic is just another exception now
+        # -- the catch-all handler always tries to answer with a real
+        # response (see server.py's _unhandled_error_handler); if the
+        # client really has disconnected, that write harmlessly fails at
+        # the transport layer instead of ever reaching this assertion.
         base, st = api
+
         def explode():
             raise BrokenPipeError()
+
         monkeypatch.setattr(st, "describe", explode)
-        conn = http.client.HTTPConnection(base.split("//")[1], timeout=2)
-        conn.request("GET", "/sources")
-        with pytest.raises(Exception):                  # server sends nothing back
-            conn.getresponse()
-        conn.close()
+        code, j = get(base, "/sources")
+        assert code == 500 and "error" in j
 
     def test_sse_keepalive_comment(self, api, monkeypatch):
         base, st = api
-
-        class FastQueue(server.queue.Queue):
-            def get(self, timeout=None):                # shrink the 15 s keepalive wait
-                return super().get(timeout=0.05)
-
-        monkeypatch.setattr(server.queue, "Queue", FastQueue)
+        monkeypatch.setattr(server, "SSE_KEEPALIVE_INTERVAL", 0.05)  # shrink the 15s wait
         conn = http.client.HTTPConnection(base.split("//")[1], timeout=5)
         conn.request("GET", "/events")
         resp = conn.getresponse()
-        line = resp.fp.readline()
+        line = resp.readline()
         assert line.startswith(b": keepalive")
         resp.close()
         conn.close()
@@ -1449,18 +1691,18 @@ class TestHttpApi:
         host = base.split("//")[1]
         conn = http.client.HTTPConnection(host, timeout=5)
         conn.request("GET", "/events")
-        sock = conn.sock                        # getresponse() may detach conn.sock
+        sock = conn.sock  # getresponse() may detach conn.sock
         resp = conn.getresponse()
         deadline = time.time() + 3
         while not st.listeners and time.time() < deadline:
             time.sleep(0.02)
         st.broadcast({"type": "ping"})
-        line = resp.fp.readline()
+        line = resp.readline()
         assert line.startswith(b"data:") and b"ping" in line
         # force an immediate RST so the handler's next write fails (a plain
         # close is a half-close, which the server can keep writing into)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
-        resp.close()          # the streaming response owns the socket, not conn
+        resp.close()  # the streaming response owns the socket, not conn
         sock.close()
         conn.close()
         deadline = time.time() + 5
@@ -1470,15 +1712,11 @@ class TestHttpApi:
         assert st.listeners == []
 
     def test_shutdown_endpoint(self, tmp_path):
-        server.Handler.state = server.State(tmp_path)
-        httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
-        t = threading.Thread(target=httpd.serve_forever, daemon=True)
-        t.start()
-        code, j = post(f"http://127.0.0.1:{httpd.server_address[1]}", "/shutdown")
+        base, srv, t = boot_server(server.State(tmp_path))
+        code, j = post(base, "/shutdown")
         assert code == 200 and j["ok"] is True
         t.join(timeout=5)
         assert not t.is_alive()
-        httpd.server_close()
 
 
 # ── /files/* (phase 3: upload/download, docs/architecture/remote-server.md) ──
@@ -1500,7 +1738,9 @@ class TestFilesEndpoints:
         base, _ = api
         t0 = ms(2026, 1, 2, 3, 0, 0)
         code, headers, _data = get_raw(base, f"/files/download?from={t0}&to={t0 + 60000}")
-        assert headers["X-CTTC-Source-Count"] == "2"  # the log + stats sources the api fixture opens
+        assert (
+            headers["X-CTTC-Source-Count"] == "2"
+        )  # the log + stats sources the api fixture opens
         exposed = headers["Access-Control-Expose-Headers"]
         assert "X-CTTC-Source-Count" in exposed and "Content-Disposition" in exposed
 
@@ -1518,8 +1758,10 @@ class TestFilesEndpoints:
         code, _h, data = get_raw(base, f"/files/download?from={t0}&to={t0 + 60000}&include_host=0")
         z = zipfile.ZipFile(io.BytesIO(data))
         sources = json.loads(z.read("manifest.json"))["sources"]
-        assert all(s["type"] != "stats" for s in sources)  # the host-marked stats source is excluded
-        assert any(s["type"] == "log" for s in sources)     # the unrelated log source is unaffected
+        assert all(
+            s["type"] != "stats" for s in sources
+        )  # the host-marked stats source is excluded
+        assert any(s["type"] == "log" for s in sources)  # the unrelated log source is unaffected
 
     def test_upload_plain_log(self, api):
         base, st = api
@@ -1537,8 +1779,12 @@ class TestFilesEndpoints:
 
     def test_upload_applies_transforms_header(self, api):
         base, st = api
-        code, j = post_raw(base, "/files/upload", b"2026-01-02T03:00:00Z hi\n",
-                           {"X-CTTC-Filename": "t.log", "X-CTTC-Transforms": "upper"})
+        code, j = post_raw(
+            base,
+            "/files/upload",
+            b"2026-01-02T03:00:00Z hi\n",
+            {"X-CTTC-Filename": "t.log", "X-CTTC-Transforms": "upper"},
+        )
         assert code == 200
         assert st.sources[j["opened"][0]].slice(0, 1)[0]["text"] == "HI"
 
@@ -1559,18 +1805,19 @@ class TestFilesEndpoints:
         assert seen == [{"type": "sources"}]
 
     def test_upload_broken_pipe_swallowed(self, api, monkeypatch):
+        # see TestHttpApi.test_get_broken_pipe_swallowed: any exception from
+        # business logic, including BrokenPipeError, now just gets the
+        # normal catch-all 500 treatment.
         base, st = api
 
         def explode():
             raise BrokenPipeError()
 
         monkeypatch.setattr(st, "describe", explode)
-        conn = http.client.HTTPConnection(base.split("//")[1], timeout=2)
-        conn.request("POST", "/files/upload", body=b"2026-01-02T03:00:00Z a\n",
-                    headers={"X-CTTC-Filename": "x.log"})
-        with pytest.raises(Exception):                  # server sends nothing back
-            conn.getresponse()
-        conn.close()
+        code, j = post_raw(
+            base, "/files/upload", b"2026-01-02T03:00:00Z a\n", headers={"X-CTTC-Filename": "x.log"}
+        )
+        assert code == 500 and "error" in j
 
     def test_options_preflight_allows_upload_headers(self, api):
         base, _ = api
@@ -1591,91 +1838,65 @@ class TestMain:
     def test_main_serves_and_shuts_down(self, tmp_path, monkeypatch, capsys, caplog):
         good = tmp_path / "ok.log"
         good.write_text("2026-01-02T03:00:00Z hi\n")
-        captured = {}
-
-        class CapturingServer(ThreadingHTTPServer):
-            def __init__(self, *a, **k):
-                super().__init__(*a, **k)
-                captured["srv"] = self
-
-        monkeypatch.setattr(server, "ThreadingHTTPServer", CapturingServer)
-        monkeypatch.setattr(sys, "argv", [
-            "server.py", "--port", "0", "--naive-tz", "local",
-            "--transforms-dir", str(tmp_path), "--static",
-            str(good), "/no/such/file.log",
-        ])
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "server.py",
+                "--port",
+                "0",
+                "--naive-tz",
+                "local",
+                "--transforms-dir",
+                str(tmp_path),
+                "--static",
+                str(good),
+                "/no/such/file.log",
+            ],
+        )
         old_tz = server.NAIVE_TZ
         t = threading.Thread(target=server.main, daemon=True)
         t.start()
+
+        # main() prints exactly one {"port": N} json line to stdout once
+        # listening (see _run()) -- poll capsys for it instead of reaching
+        # into server internals for the bound port.
+        out_accum = ""
+        port = None
         deadline = time.time() + 5
-        while "srv" not in captured and time.time() < deadline:
-            time.sleep(0.02)
-        port = captured["srv"].server_address[1]
+        while port is None and time.time() < deadline:
+            out_accum += capsys.readouterr().out
+            m = re.search(r'"port":\s*(\d+)', out_accum)
+            if m:
+                port = int(m.group(1))
+            else:
+                time.sleep(0.02)
+        assert port is not None, f"no port line seen: {out_accum!r}"
+
         _, j = get(f"http://127.0.0.1:{port}", "/sources")
-        assert len(j["sources"]) == 1           # the bad file only warned
+        assert len(j["sources"]) == 1  # the bad file only warned
         post(f"http://127.0.0.1:{port}", "/shutdown")
         t.join(timeout=5)
         assert not t.is_alive()
-        out = capsys.readouterr()
-        assert f'"port":{port}' in out.out.replace(" ", "")
         assert "could not open" in caplog.text
-        assert server.NAIVE_TZ is not None and server.NAIVE_TZ != timezone.utc or old_tz != timezone.utc
-        server.NAIVE_TZ = timezone.utc          # restore module global for other tests
+        assert server.NAIVE_TZ is not None and server.NAIVE_TZ != UTC or old_tz != UTC
+        server.NAIVE_TZ = UTC  # restore module global for other tests
 
     def test_main_keyboard_interrupt_exits_cleanly(self, tmp_path, monkeypatch):
-        class InterruptingServer(ThreadingHTTPServer):
-            def serve_forever(self, *a, **k):
-                raise KeyboardInterrupt
+        async def raise_interrupt(self):
+            raise KeyboardInterrupt
 
-        monkeypatch.setattr(server, "ThreadingHTTPServer", InterruptingServer)
-        monkeypatch.setattr(sys, "argv", ["server.py", "--port", "0",
-                                          "--transforms-dir", str(tmp_path)])
-        server.main()                           # KeyboardInterrupt swallowed
+        monkeypatch.setattr(server.uvicorn.Server, "serve", raise_interrupt)
+        monkeypatch.setattr(
+            sys, "argv", ["server.py", "--port", "0", "--transforms-dir", str(tmp_path)]
+        )
+        server.main()  # KeyboardInterrupt swallowed
 
     def test_dunder_main_via_runpy(self, tmp_path, monkeypatch, capsys):
         import runpy
+
         monkeypatch.setattr(sys, "argv", ["server.py", "--help"])
         with pytest.raises(SystemExit) as exc:
             runpy.run_path(str(Path(server.__file__)), run_name="__main__")
         assert exc.value.code == 0
         assert "--naive-tz" in capsys.readouterr().out
-
-
-# ── stdlib-json fallback (orjson blocked in a subprocess) ────────────────────
-
-
-def test_stdlib_json_fallback():
-    code = (
-        "import sys; sys.modules['orjson'] = None\n"
-        "sys.path.insert(0, %r)\n"
-        "import server\n"
-        "assert server.JSON_IMPL == 'stdlib-json', server.JSON_IMPL\n"
-        "assert server.jloads(server.jdumps({'a': 1})) == {'a': 1}\n"
-        "assert isinstance(server.jdumps({}), bytes)\n"
-        "print('fallback-ok')\n"
-    ) % str(Path(server.__file__).parent)
-    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
-    assert out.returncode == 0, out.stderr
-    assert "fallback-ok" in out.stdout
-
-
-def test_zz_stdlib_json_fallback_reload():
-    """Reload the module with orjson blocked so the fallback lines execute
-    inside this process (and count toward coverage), then restore. Runs last
-    (zz) so no other test observes the reloaded module identity."""
-    import importlib
-
-    saved = sys.modules.get("orjson")
-    sys.modules["orjson"] = None                # forces ImportError on import
-    try:
-        importlib.reload(server)
-        assert server.JSON_IMPL == "stdlib-json"
-        assert server.jloads(server.jdumps({"a": [1, "x"]})) == {"a": [1, "x"]}
-        assert isinstance(server.jdumps({}), bytes)
-    finally:
-        if saved is not None:
-            sys.modules["orjson"] = saved
-        else:
-            sys.modules.pop("orjson", None)
-        importlib.reload(server)
-        assert server.JSON_IMPL == "orjson"

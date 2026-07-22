@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import zipfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from io import BytesIO
 from pathlib import Path
 
@@ -15,14 +15,16 @@ import server
 
 
 def ms(y, mo, d, h=0, mi=0, s=0):
-    return datetime(y, mo, d, h, mi, s, tzinfo=timezone.utc).timestamp() * 1000.0
+    return datetime(y, mo, d, h, mi, s, tzinfo=UTC).timestamp() * 1000.0
 
 
 @pytest.fixture
 def state(tmp_path):
     tdir = tmp_path / "transforms"
     tdir.mkdir()
-    (tdir / "upper.py").write_text('def transform(r):\n    r["text"] = r["text"].upper()\n    return r\n')
+    (tdir / "upper.py").write_text(
+        'def transform(r):\n    r["text"] = r["text"].upper()\n    return r\n'
+    )
     return server.State(tdir)
 
 

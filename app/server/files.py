@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import os
 import tempfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 
@@ -23,7 +23,7 @@ def download_sample(state, t0: float, t1: float, include_host: bool):
     """-> (data, filename, source_count) for the .cttc sample covering
     [t0, t1] -- the byte-returning counterpart to State.export_sample()."""
     data, meta = state.build_sample_bytes(t0, t1, include_host)
-    ts = datetime.fromtimestamp(t0 / 1000, tz=timezone.utc).strftime("%Y-%m-%d-%H-%M-%S")
+    ts = datetime.fromtimestamp(t0 / 1000, tz=UTC).strftime("%Y-%m-%d-%H-%M-%S")
     filename = f"sample-{ts}.cttc"
     return data, filename, len(meta)
 
@@ -57,11 +57,10 @@ def upload_and_open(state, filename: str, data: bytes, transforms: list[str]):
             src = state.open_file(tmp_path, "auto", filename, live=False, transforms=transforms)
             opened = [src.id]
         display_path = f"upload://{filename}"
-        with state.lock:
-            for sid in opened:
-                s = state.sources.get(sid)
-                if s is not None:
-                    s.path = display_path
+        for sid in opened:
+            s = state.sources.get(sid)
+            if s is not None:
+                s.path = display_path
         return opened
     finally:
         try:

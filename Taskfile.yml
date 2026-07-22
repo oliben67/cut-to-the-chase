@@ -29,6 +29,36 @@ tasks:
     cmds:
       - task: app:ci
 
+  lint:
+    desc: Lint every sub-project
+    cmds:
+      - task: app:lint
+
+  lint:fix:
+    desc: Lint every sub-project, auto-fixing where possible
+    cmds:
+      - task: app:lint:fix
+
+  format:
+    desc: Format every sub-project in-place
+    cmds:
+      - task: app:format
+
+  format:check:
+    desc: Check formatting across every sub-project without modifying files
+    cmds:
+      - task: app:format:check
+
+  typecheck:
+    desc: Type-check every sub-project
+    cmds:
+      - task: app:typecheck
+
+  fix:
+    desc: Auto-fix lint issues and reformat every sub-project
+    cmds:
+      - task: app:fix
+
   # ── Release ───────────────────────────────────────────────────────────────
   build:release:win:
     desc: "Build the Windows installer + deploy bundle   [usage: task build:release:win]"
