@@ -2,7 +2,7 @@
 
 **Status:** superseded in part -- see below. Phases 2-3 (collector
 de-duplication; file transfer) are implemented as described. Phase 1 as
-originally designed (**option A: SSH tunnel**, below) was replaced before
+originally designed (**option A: SSH tunnel**, below) was swapped out before
 shipping: the client now connects to the remote server container directly
 over plain HTTP (`http://<host>:<port>`, no ssh tunnel/local port-forward at
 all), a deliberate product decision to keep the ongoing client<->server
@@ -13,6 +13,14 @@ trusted-network-only exposure rather than add auth machinery. `server.py`'s
 `--host` flag (default `127.0.0.1`, `0.0.0.0` in the container) and the
 relaxed `connect-src http://*` CSP are the two changes B's design predicted
 would be needed. Phases 4-5 are still design only.
+
+Neither the SSH tunnel nor auth/TLS is a closed door -- both are explicitly
+**future options**, not permanently abandoned: auth/TLS (see phase 5 below)
+if the network trust model ever changes, and the tunnel transport itself if
+some environment needs it back (e.g. inbound HTTP blocked but SSH egress
+allowed) -- `lib/ssh-tunnel.js`/its tests existed and worked before removal;
+see git history on this file if reviving that path.
+
 See [Using it today](#using-it-today) for how to actually run it.
 
 ## Product context this design has to preserve
@@ -672,9 +680,16 @@ for path B:
    and sample decryption to Electron/Node `crypto`; retire (or gate behind
    embedded-mode-only) the server's `/cttc/keys/*` endpoints and `/open`'s
    `private_key` parameter once the client can decrypt locally.
-5. **Path B (token + TLS + CSP)** only if a real deployment blocks SSH
-   egress — still deferred, still strictly more code/attack-surface than
-   phases 1–4 need.
+5. **Auth + TLS (bearer token, `--bind` safety catch, cert termination) —
+   explicitly deferred, not forgotten.** Phase 1 shipped the direct-HTTP
+   transport *without* this: trusted-network-only exposure was a deliberate
+   near-term call, not an oversight, made when dropping the SSH-tunnel
+   design. This remains the next thing to build once a deployment needs the
+   server reachable somewhere not already trusted end-to-end (untrusted
+   LAN, internet-facing, compliance requirement, ...) — see option B above
+   for the concrete design (token header + `?token=` for SSE, `--bind`
+   defaulting to loopback unless a token is set, TLS terminated in front
+   rather than added to `server.py` itself).
 
 Phases 1–3 are independent of each other and can land in any order; phase 4
 depends on phase 3 (decryption needs the downloaded bytes to decrypt).
