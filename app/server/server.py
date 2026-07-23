@@ -42,7 +42,6 @@ from typing import Literal
 import docker
 import orjson
 import uvicorn
-from docker.errors import DockerException
 from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -627,91 +626,91 @@ class DockerPsError(RuntimeError):
         self.log = log
 
 
-def _docker_ps_sync(host: str | None) -> dict:
-    """Blocking implementation, run off the event loop via asyncio.to_thread
-    (docker-py itself is a synchronous SDK, built on `requests`)."""
-    log = []
+DOCKER_PS_TIMEOUT = 30  # seconds; a module constant so tests can shrink it
 
-    def logged(desc, fn):
-        t0 = time.monotonic()
-        try:
-            result = fn()
-        except Exception as e:
-            log.append(
-                {
-                    "cmd": desc,
-                    "returncode": 1,
-                    "ms": round((time.monotonic() - t0) * 1000),
-                    "stderr": str(e),
-                }
-            )
-            raise
+
+async def _run_docker_cli(desc: str, args: list[str], log: list, timeout: float) -> str:
+    """Run a `docker ...` CLI invocation as a real asyncio subprocess (not
+    docker-py's use_ssh_client transport): docker-py's SSH socket wraps a
+    blocking `proc.stdout.read()` that ignores the timeout it's given (see
+    docker/transport/sshconn.py's SSHSocket.recv) -- a hung ssh connection
+    (bad host, network partition, unexpected prompt) then blocks forever in
+    a worker thread that can never actually be cancelled. An asyncio
+    subprocess can be genuinely killed on timeout instead of leaking."""
+    t0 = time.monotonic()
+    proc = await asyncio.create_subprocess_exec(
+        *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except TimeoutError:
+        proc.kill()
+        await proc.wait()
         log.append(
             {
                 "cmd": desc,
-                "returncode": 0,
+                "returncode": 1,
                 "ms": round((time.monotonic() - t0) * 1000),
-                "stderr": "",
+                "stderr": f"timed out after {timeout:.0f}s (host unreachable, or hung waiting on an ssh prompt)",
             }
         )
-        return result
-
-    where = host or "local"
-    try:
-        client = docker_client(host)
-        logged(f"docker.version() @ {where}", client.version)
-    except Exception as e:
-        raise DockerPsError(
-            f"docker is not installed (or not reachable) on {host or 'the local daemon'}: {e}", log
-        )
-
-    try:
-        containers = logged(f"containers.list() @ {where}", client.containers.list)
-    except Exception as e:
-        raise DockerPsError(str(e) or "docker ps failed", log)
-
-    services = []
-    try:
-        services = logged(f"services.list() @ {where}", client.services.list)
-    except DockerException:
-        pass  # not a swarm manager -- same tolerance the old `docker service ls` had
-
-    def image_tag(c):
-        try:
-            return c.image.tags[0] if c.image.tags else c.image.short_id
-        except DockerException:
-            return c.attrs.get("Config", {}).get("Image", "")
-
-    def replicas(s):
-        st = s.attrs.get("ServiceStatus") or {}
-        return f"{st.get('RunningTasks', 0)}/{st.get('DesiredTasks', 0)}"
-
-    return {
-        "containers": [
-            {"id": c.short_id, "name": c.name, "image": image_tag(c)} for c in containers
-        ],
-        "services": [{"id": s.short_id, "name": s.name, "replicas": replicas(s)} for s in services],
-        "log": log,
-    }
-
-
-DOCKER_PS_TIMEOUT = 30  # seconds; a module constant so tests can shrink it
+        raise DockerPsError(f"{desc} timed out after {timeout:.0f}s", log)
+    ms = round((time.monotonic() - t0) * 1000)
+    err = stderr.decode(errors="replace").strip()
+    log.append({"cmd": desc, "returncode": proc.returncode, "ms": ms, "stderr": err})
+    if proc.returncode != 0:
+        raise DockerPsError(err or f"{desc} failed", log)
+    return stdout.decode(errors="replace")
 
 
 async def docker_ps(host: str | None, ssh_key: str | None = None) -> dict:
     """List containers (and swarm services, when the daemon is a manager)."""
     host = normalize_docker_host(host)
-    logger.info("docker_ps: host=%s", host or "local")
+    where = host or "local"
+    logger.info("docker_ps: host=%s", where)
+    log: list = []
+    base = ["docker"] + (["-H", host] if host else [])
+    t_left = DOCKER_PS_TIMEOUT
+
+    async def run(desc, args):
+        nonlocal t_left
+        t0 = time.monotonic()
+        try:
+            return await _run_docker_cli(desc, args, log, max(0.01, t_left))
+        finally:
+            t_left -= time.monotonic() - t0
+
     try:
-        return await asyncio.wait_for(
-            asyncio.to_thread(_docker_ps_sync, host), timeout=DOCKER_PS_TIMEOUT
+        await run(
+            f"docker version @ {where}", base + ["version", "--format", "{{.Server.Version}}"]
         )
-    except TimeoutError:
+    except DockerPsError as e:
         raise DockerPsError(
-            f"timed out after {DOCKER_PS_TIMEOUT}s reaching {host or 'the local daemon'} "
-            "(host unreachable, or hung waiting on an ssh prompt)",
-            [],
+            f"docker is not installed (or not reachable) on {host or 'the local daemon'}: {e}",
+            log,
         )
+
+    ps_out = await run(f"docker ps @ {where}", base + ["ps", "--format", "{{json .}}"])
+    containers = [
+        {"id": (r := jloads(line))["ID"][:12], "name": r["Names"], "image": r["Image"]}
+        for line in ps_out.splitlines()
+        if line.strip()
+    ]
+
+    services = []
+    try:
+        svc_out = await run(
+            f"docker service ls @ {where}", base + ["service", "ls", "--format", "{{json .}}"]
+        )
+        services = [
+            {"id": (r := jloads(line))["ID"][:12], "name": r["Name"], "replicas": r["Replicas"]}
+            for line in svc_out.splitlines()
+            if line.strip()
+        ]
+    except DockerPsError:
+        pass  # not a swarm manager -- same tolerance the old `docker service ls` had
+
+    return {"containers": containers, "services": services, "log": log}
 
 
 def now_iso() -> str:
@@ -1423,6 +1422,13 @@ def get_log_source(request: Request, source: str) -> LogSource:
     if src is None or src.kind != "log":
         raise bad_request(f"unknown log source: {source}")
     return src
+
+
+@app.get("/health")
+async def route_health():
+    """Cheap liveness probe -- no state/docker/disk access, just confirms the
+    process is up and answering HTTP, for the renderer's status indicator."""
+    return {"ok": True}
 
 
 @app.get("/sources")

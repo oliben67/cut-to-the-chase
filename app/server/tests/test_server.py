@@ -748,48 +748,71 @@ class TestNormalizeDockerHost:
 
 
 class TestDockerPs:
+    """docker_ps shells out to the real `docker` CLI as an asyncio subprocess
+    (not docker-py's use_ssh_client transport, whose SSHSocket.recv() ignores
+    its own configured timeout and can hang a worker thread forever on a bad
+    ssh host) -- so it can genuinely kill a hung invocation on timeout."""
+
     async def test_normalizes_bare_user_at_host(self, monkeypatch):
-        captured = {}
+        captured = []
 
-        def factory(host):
-            captured["host"] = host
-            return FakeDockerClient(containers=[FakeContainer("web", cid="1")])
+        async def fake_exec(*args, **k):
+            captured.append(args)
+            if args[-1] == "{{.Server.Version}}":
+                return FakeAsyncProc(communicate_result=(b"27.0.0\n", b""))
+            return FakeAsyncProc(communicate_result=(b"", b""))
 
-        monkeypatch.setattr(server, "docker_client", factory)
+        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
         await server.docker_ps("u@h")
-        assert captured["host"] == "ssh://u@h"
+        assert list(captured[0][:3]) == ["docker", "-H", "ssh://u@h"]
 
     async def test_ok_with_services(self, monkeypatch):
-        client = FakeDockerClient(
-            containers=[FakeContainer("web", image="nginx", cid="1")],
-            services=[FakeService("api", running=2, desired=2, sid="s")],
-        )
-        monkeypatch.setattr(server, "docker_client", lambda host: client)
+        ps_line = json.dumps({"ID": "1" * 20, "Names": "web", "Image": "nginx"}).encode()
+        svc_line = json.dumps({"ID": "s" * 20, "Name": "api", "Replicas": "2/2"}).encode()
+
+        async def fake_exec(*args, **k):
+            if args[-3] == "version":
+                return FakeAsyncProc(communicate_result=(b"27.0.0\n", b""))
+            if "service" in args:
+                return FakeAsyncProc(communicate_result=(svc_line + b"\n", b""))
+            return FakeAsyncProc(communicate_result=(ps_line + b"\n", b""))
+
+        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
         got = await server.docker_ps(None)
-        assert got["containers"] == [{"id": "1", "name": "web", "image": "nginx"}]
-        assert got["services"] == [{"id": "s", "name": "api", "replicas": "2/2"}]
+        assert got["containers"] == [{"id": "1" * 12, "name": "web", "image": "nginx"}]
+        assert got["services"] == [{"id": "s" * 12, "name": "api", "replicas": "2/2"}]
         assert got["log"][0]["returncode"] == 0
 
     async def test_service_ls_failure_tolerated(self, monkeypatch):
-        from docker.errors import APIError
+        ps_line = json.dumps({"ID": "1" * 20, "Names": "web", "Image": "nginx"}).encode()
 
-        client = FakeDockerClient(
-            containers=[FakeContainer("web", cid="1")],
-            services_error=APIError("not a swarm manager"),
-        )
-        monkeypatch.setattr(server, "docker_client", lambda host: client)
+        async def fake_exec(*args, **k):
+            if args[-3] == "version":
+                return FakeAsyncProc(communicate_result=(b"27.0.0\n", b""))
+            if "service" in args:
+                return FakeAsyncProc(returncode=1, communicate_result=(b"", b"not a swarm manager"))
+            return FakeAsyncProc(communicate_result=(ps_line + b"\n", b""))
+
+        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
         assert (await server.docker_ps(None))["services"] == []
 
     async def test_preflight_reports_missing_docker(self, monkeypatch):
-        client = FakeDockerClient(version_error=Exception("command not found: docker"))
-        monkeypatch.setattr(server, "docker_client", lambda host: client)
+        async def fake_exec(*args, **k):
+            return FakeAsyncProc(
+                returncode=1, communicate_result=(b"", b"command not found: docker")
+            )
+
+        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
         with pytest.raises(server.DockerPsError, match="not installed"):
             await server.docker_ps("ssh://u@h")
 
     async def test_failure_raises_and_carries_log(self, monkeypatch):
-        client = FakeDockerClient(containers=None)
-        client.containers = FakeCollection(error=RuntimeError("no daemon"))
-        monkeypatch.setattr(server, "docker_client", lambda host: client)
+        async def fake_exec(*args, **k):
+            if args[-3] == "version":
+                return FakeAsyncProc(communicate_result=(b"27.0.0\n", b""))
+            return FakeAsyncProc(returncode=1, communicate_result=(b"", b"no daemon"))
+
+        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
         with pytest.raises(server.DockerPsError, match="no daemon") as ei:
             await server.docker_ps(None)
         assert ei.value.log[-1]["returncode"] != 0
@@ -797,11 +820,15 @@ class TestDockerPs:
     async def test_timeout_raises_with_log(self, monkeypatch):
         monkeypatch.setattr(server, "DOCKER_PS_TIMEOUT", 0.05)
 
-        def factory(host):
-            time.sleep(0.3)
-            return FakeDockerClient()
+        class HangingProc(FakeAsyncProc):
+            async def communicate(self):
+                await asyncio.sleep(1)
+                return await super().communicate()
 
-        monkeypatch.setattr(server, "docker_client", factory)
+        async def fake_exec(*args, **k):
+            return HangingProc()
+
+        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
         with pytest.raises(server.DockerPsError, match="timed out"):
             await server.docker_ps(None)
 
@@ -903,6 +930,10 @@ class FakeAsyncProc:
     def terminate(self):
         self.terminated = True
         self.returncode = -15
+
+    def kill(self):
+        self.terminated = True
+        self.returncode = -9
 
     async def wait(self):
         return self.returncode
