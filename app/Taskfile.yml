@@ -8,6 +8,12 @@ vars:
   # VSCode's extension host exports ELECTRON_RUN_AS_NODE, which turns the
   # Electron binary into plain Node — strip it so the app can launch.
   ELECTRON: env -u ELECTRON_RUN_AS_NODE npx electron
+  # releases/ (the cttc-release submodule) keeps each platform's installer
+  # + deploy bundle on its own branch (windows/mac/linux); main only holds
+  # what's shared (the server image build script, the registry-pull compose
+  # variant). `git -C` targets that dir without needing a `cd` to persist
+  # across cmds -- Task runs every `cmds:` entry as its own subprocess, so a
+  # plain `cd releases && ...` in one entry has no effect on the next.
 
 # ── Default ────────────────────────────────────────────────────────────────
 tasks:
@@ -140,17 +146,35 @@ tasks:
       - task: check
 
   # ── Release ───────────────────────────────────────────────────────────────
+  # Each task commits its own branch's result before finishing (rather than
+  # leaving it staged) -- with one branch per platform, an uncommitted build
+  # on e.g. `windows` blocks `git checkout mac` for the next platform in
+  # build:release:all with "local changes would be overwritten". The `diff
+  # --cached --quiet ||` guard skips the commit (instead of failing the
+  # task) on a no-op rebuild, e.g. re-running after nothing changed.
   build:release:win:
     desc: "Build the Windows installer + deploy bundle   [usage: task build:release:win]"
-    cmd: npm run release:win -- {{.CLI_ARGS}}
+    cmds:
+      - git -C ../releases checkout windows
+      - npm run release:win -- {{.CLI_ARGS}}
+      - git -C ../releases add -A
+      - "git -C ../releases diff --cached --quiet || git -C ../releases commit -m 'chore(windows): rebuild deploy bundle'"
 
   build:release:mac:
     desc: "Build the macOS installer + deploy bundle   [usage: task build:release:mac]"
-    cmd: npm run release:mac -- {{.CLI_ARGS}}
+    cmds:
+      - git -C ../releases checkout mac
+      - npm run release:mac -- {{.CLI_ARGS}}
+      - git -C ../releases add -A
+      - "git -C ../releases diff --cached --quiet || git -C ../releases commit -m 'chore(mac): rebuild deploy bundle'"
 
   build:release:linux:
     desc: "Build the Linux AppImage + deploy bundle   [usage: task build:release:linux]"
-    cmd: npm run release:linux -- {{.CLI_ARGS}}
+    cmds:
+      - git -C ../releases checkout linux
+      - npm run release:linux -- {{.CLI_ARGS}}
+      - git -C ../releases add -A
+      - "git -C ../releases diff --cached --quiet || git -C ../releases commit -m 'chore(linux): rebuild deploy bundle'"
 
   build:release:all:
     desc: "Build all three platforms' installers + deploy bundles   [usage: task build:release:all]"
