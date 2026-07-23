@@ -5,7 +5,16 @@ const { spawn } = require("child_process");
 const path = require("path");
 const readline = require("readline");
 const { loadConnectionConfig, saveConnectionConfig, clearConnectionConfig } = require("./lib/connection-config");
-const { hasLocalDocker } = require("./lib/docker-check");
+const { hasLocalDocker, hasLocalSsh } = require("./lib/docker-check");
+
+// Client can only assume the server role locally (skip the setup wizard's
+// remote-tunnel path) if it has both Docker *and* ssh -- the server role
+// requires ssh to reach whatever Docker host(s) it's asked to query, not
+// just a local daemon of its own.
+async function canBeServerLocally() {
+  const [docker, ssh] = await Promise.all([hasLocalDocker(), hasLocalSsh()]);
+  return docker && ssh;
+}
 const { writeKeyFile, copyKeyFile } = require("./lib/ssh-key-file");
 const { ensureLocalContainer, ensureRemoteContainer } = require("./lib/server-provision");
 
@@ -560,7 +569,7 @@ ipcMain.handle("run-setup", async () => {
 
   // "revert to local" only makes sense if there's an ssh-tunnel to revert
   // *from*, and only offered when there's local Docker to fall back *to*.
-  if (cfg.mode === "ssh-tunnel" && (await hasLocalDocker())) {
+  if (cfg.mode === "ssh-tunnel" && (await canBeServerLocally())) {
     const choice = await dialog.showMessageBox({
       type: "question",
       message: "CTTC is connected over an SSH tunnel, and a local Docker was detected.",
@@ -596,7 +605,7 @@ ipcMain.handle("update-image", async (_e, payload) => {
   const source =
     payload.sourceType === "tarball" ? { type: "tarball", path: payload.tarballPath } : { type: "registry", ref: payload.ref };
   try {
-    if (await hasLocalDocker()) {
+    if (await canBeServerLocally()) {
       await ensureLocalContainer({ source, resourcesDir: resourcesDirForApp() });
       await offerRestart("Image updated locally. Restart CTTC to reconnect?");
       return { ok: true };
@@ -621,8 +630,8 @@ ipcMain.handle("update-image", async (_e, payload) => {
 
 app.whenReady().then(async () => {
   // Shown before anything else, including installMenu() and the
-  // hasLocalDocker() check below -- hasLocalDocker() shells out to `docker
-  // info` (async; see lib/docker-check.js) and can take a few seconds
+  // canBeServerLocally() check below -- it shells out to `docker info` and
+  // `ssh -V` (async; see lib/docker-check.js) and can take a few seconds
   // against a slow/starting daemon or a plain "no docker on PATH" miss. The
   // wizard path closes this itself once its own window is ready to show (see
   // runSetupWizard()'s 'ready-to-show' handler) instead of stacking a
@@ -636,15 +645,15 @@ app.whenReady().then(async () => {
     // files passed on the command line open at startup: npm start -- file1 file2
     const fileArgs = process.argv.slice(app.isPackaged ? 1 : 2).filter((a) => !a.startsWith("-"));
     const cfg = loadConnectionConfig();
-    if (cfg.mode === "embedded" && !(await hasLocalDocker())) {
+    if (cfg.mode === "embedded" && !(await canBeServerLocally())) {
       try {
         await runSetupWizard();
       } catch {
         // declined (Skip, or just closed the window) -- give local docker a
         // genuine try (docker compose up) rather than trusting the earlier
-        // quick hasLocalDocker() probe, which can miss a daemon that's still
-        // starting up; only fall back to the bare, docker-less embedded
-        // server if that attempt itself fails.
+        // quick canBeServerLocally() probe, which can miss a daemon that's
+        // still starting up; only fall back to the bare, docker-less
+        // embedded server if that attempt itself fails.
         try {
           const { port } = await ensureLocalContainer({ resourcesDir: resourcesDirForApp() });
           serverPort = port;

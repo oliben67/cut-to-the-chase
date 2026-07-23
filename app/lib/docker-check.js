@@ -43,4 +43,42 @@ function hasLocalDocker() {
   });
 }
 
-module.exports = { hasLocalDocker };
+// Per the client/server/docker-host model: this machine can only collapse
+// the server role into the client (skip the setup wizard/tunnel entirely)
+// if it has both Docker *and* ssh locally -- the server role requires ssh to
+// reach whatever Docker host(s) it's asked to query (see server.py's
+// docker_ps), not just a local daemon to sample.
+function hasLocalSsh() {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (ok) => {
+      if (settled) return;
+      settled = true;
+      resolve(ok);
+    };
+    let proc;
+    try {
+      proc = spawn(process.env.CTTC_SSH_BIN || "ssh", ["-V"], { stdio: "ignore" });
+    } catch {
+      done(false);
+      return;
+    }
+    const timer = setTimeout(() => {
+      proc.kill();
+      done(false);
+    }, 5000);
+    proc.on("error", () => {
+      clearTimeout(timer);
+      done(false);
+    });
+    proc.on("exit", (code) => {
+      clearTimeout(timer);
+      // `ssh -V` prints its version to stderr and exits 0 on OpenSSH: only
+      // treat a clean exit as "ssh is present" (some minimal PATH shims
+      // exit non-zero when they don't understand -V at all).
+      done(code === 0);
+    });
+  });
+}
+
+module.exports = { hasLocalDocker, hasLocalSsh };
