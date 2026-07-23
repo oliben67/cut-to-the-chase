@@ -2146,12 +2146,13 @@ async function listContainers() {
     ? `Asking the CTTC server (127.0.0.1:${PORT}) to reach ${host} over ssh…`
     : `Asking the CTTC server (127.0.0.1:${PORT}) for local containers…`;
   const t0 = Date.now();
-  box.textContent = label;
+  const status = $("docker-status");
+  status.textContent = label;
   // ssh connections can take a while (or hang) before the server even
   // responds -- without this, "Refresh" looks identical whether it's about
   // to succeed, still connecting, or has silently wedged.
   const tick = setInterval(() => {
-    box.textContent = `${label} (${Math.round((Date.now() - t0) / 1000)}s)`;
+    status.textContent = `${label} (${Math.round((Date.now() - t0) / 1000)}s)`;
   }, 1000);
   // disabled for the whole attempt (not just the button) so the host string
   // can't be edited out from under an in-flight connect -- re-enabled in
@@ -2161,6 +2162,7 @@ async function listContainers() {
   try {
     const r = await post("/docker/ps", { host });
     clearInterval(tick);
+    status.textContent = "";
     renderActivityLog(r.log);
     box.innerHTML = "";
     const open = openPaths();
@@ -2196,6 +2198,7 @@ async function listContainers() {
     if (!r.services.length && !r.containers.length) box.textContent = "nothing running";
   } catch (err) {
     clearInterval(tick);
+    status.textContent = "";
     box.innerHTML = "";
     renderActivityLog(err.log);
     // A bare network-level failure (fetch() itself rejected -- server
@@ -2488,3 +2491,30 @@ refreshAll().then(async () => {
   if (state.sources.length === 0) $("btn-add").click(); // still nothing: prompt right away
 });
 connectSSE();
+
+/* ── server status indicator (menu bar, flush right) ──────────────────────
+   Polls /health independently of connectSSE's own stream so it still shows
+   "down" if the SSE connection itself is what's wedged. Only present in the
+   main window's menu bar -- harmless no-op elsewhere since $() returns null. */
+(() => {
+  const el = $("server-status");
+  if (!el) return;
+  const HEALTH_POLL_MS = 5000;
+  const setState = (state, detail) => {
+    el.dataset.state = state;
+    el.title = detail || "";
+  };
+  const check = async () => {
+    // Only flash "checking" when we don't already know the answer -- once
+    // "up", routine re-polls shouldn't flicker the dot on every request.
+    if (el.dataset.state !== "up") setState("checking");
+    try {
+      await get("/health");
+      setState("up");
+    } catch (err) {
+      setState("down", String(err.message || err));
+    }
+  };
+  check();
+  setInterval(check, HEALTH_POLL_MS);
+})();

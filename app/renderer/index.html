@@ -62,6 +62,10 @@
         <button data-action="toggle-devtools">Developer Tools <span class="acc">F12</span></button>
       </div>
     </div>
+    <div id="server-status" class="server-status" title="">
+      <span class="server-status-dot"></span>
+      <span class="server-status-label">cttc server</span>
+    </div>
   </nav>
 
   <header id="toolbar">
@@ -143,6 +147,7 @@
         <button id="btn-ps-refresh" title="Connects from the CTTC server container's host, over ssh, to this target's docker daemon and lists its containers/services">Connect</button>
         <button id="btn-activity-toggle" class="linklike" type="button" hidden>Show activity</button>
       </div>
+      <div id="docker-status" class="muted"></div>
       <div id="docker-error" class="error"></div>
       <pre id="docker-activity" class="activity-log" hidden></pre>
     </div>
