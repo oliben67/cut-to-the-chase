@@ -25,7 +25,7 @@ RUN apk add --no-cache curl \
 
 RUN pip install --no-cache-dir uv
 
-WORKDIR /srv/cttc-server
+WORKDIR /srv/cttc-scout
 # dependency layer first so `uv sync` is only re-run when pyproject.toml
 # actually changes, not on every server.py edit
 COPY pyproject.toml ./
@@ -62,12 +62,12 @@ COPY --from=builder /usr/local/bin/docker /usr/local/bin/docker
 RUN mkdir -p /etc/ssh/ssh_config.d && printf 'Host *\n  StrictHostKeyChecking accept-new\n' \
     > /etc/ssh/ssh_config.d/99-cttc-accept-new.conf
 
-WORKDIR /srv/cttc-server
-COPY --from=builder /srv/cttc-server ./
+WORKDIR /srv/cttc-scout
+COPY --from=builder /srv/cttc-scout ./
 # uv itself (the dependency manager) never needs to run in the final image --
 # it only ever produced the venv in the builder stage, so the final image
 # just execs the venv's own python interpreter directly.
-ENV PATH="/srv/cttc-server/.venv/bin:${PATH}"
+ENV PATH="/srv/cttc-scout/.venv/bin:${PATH}"
 
 EXPOSE 8765
 # 0.0.0.0: the client talks to this container directly over plain HTTP (no

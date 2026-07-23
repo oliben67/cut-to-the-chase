@@ -1,20 +1,20 @@
-# Where cttc-server runs, and what "Docker host" actually targets
+# Where cttc-scout runs, and what "Docker host" actually targets
 
 Three distinct systems come up when talking about Docker connectivity in
 CTTC, and it's easy to conflate them:
 
 - **app-host** — the machine running the Electron client.
 - **tunnel-host** — the machine the setup wizard's ssh tunnel connects to
-  (only exists in ssh-tunnel mode); this is where the `cttc-server`
+  (only exists in ssh-tunnel mode); this is where the `cttc-scout`
   container actually runs in that mode.
 - **docker-host** — whatever's typed into Add Sources' "Docker host" field
   (`ssh://user@host`, or bare `user@host`); may be empty.
 
 The one invariant that holds no matter what: **the browser/renderer only
-ever talks to `http://127.0.0.1:<port>`** — wherever `cttc-server` itself
+ever talks to `http://127.0.0.1:<port>`** — wherever `cttc-scout` itself
 lives (app-host or tunnel-host). The Docker host field is just a string in
 the JSON body of that request; it's `server.py`, running on whichever host
-`cttc-server` is on, that turns it into `docker -H ssh://user@host ...` and
+`cttc-scout` is on, that turns it into `docker -H ssh://user@host ...` and
 does the actual ssh connection to docker-host. The client never opens a
 connection to docker-host itself (`fetch()` can't even speak `ssh://`).
 
@@ -30,7 +30,7 @@ flowchart LR
         S1(["User clicks Connect<br/>in Add Sources"]) --> S2["POST http://127.0.0.1:port<br/>/docker/ps { host }"]
     end
 
-    subgraph L2["⚙️ wherever cttc-server runs<br/>(app-host or tunnel-host)"]
+    subgraph L2["⚙️ wherever cttc-scout runs<br/>(app-host or tunnel-host)"]
         direction TB
         S3{"host field<br/>empty?"}
         S4["docker version / ps<br/>(no -H flag)<br/>📍 queries ITSELF"]
@@ -51,7 +51,7 @@ flowchart LR
     class S4,S5 here
 ```
 
-## Where cttc-server ends up running (startup decision)
+## Where cttc-scout ends up running (startup decision)
 
 This part happens once, at app startup, before any Add Sources request is
 ever made — it decides which system lane 2 above actually is:
@@ -59,14 +59,14 @@ ever made — it decides which system lane 2 above actually is:
 ```mermaid
 flowchart TB
     A1([App starts]) --> A2{Local Docker<br/>on app-host?}
-    A2 -- yes --> A3["ensureLocalContainer()<br/>📍 cttc-server runs on app-host"]
+    A2 -- yes --> A3["ensureLocalContainer()<br/>📍 cttc-scout runs on app-host"]
     A2 -- no --> A4{{Offer Setup Wizard}}
-    A4 -- "user connects" --> T1["ensureRemoteContainer()<br/>docker compose up over ssh<br/>📍 cttc-server runs on tunnel-host"]
+    A4 -- "user connects" --> T1["ensureRemoteContainer()<br/>docker compose up over ssh<br/>📍 cttc-scout runs on tunnel-host"]
     T1 --> T2["Preflight: docker version<br/>on tunnel-host itself (informational)"]
     A4 -- declines --> A5["Try docker compose<br/>locally anyway<br/>(genuine attempt, not<br/>cached probe)"]
     A5 --> A7{Succeeded?}
     A7 -- yes --> A3
-    A7 -- no --> A8["startServer()<br/>bare embedded, no docker<br/>📍 cttc-server runs on app-host"]
+    A7 -- no --> A8["startServer()<br/>bare embedded, no docker<br/>📍 cttc-scout runs on app-host"]
 
     classDef server fill:#2d5,stroke:#164,color:#fff
     class A3,A8,T1 server
@@ -81,11 +81,11 @@ flowchart TB
    (the earlier "no local Docker" probe can be wrong, e.g. a daemon still
    starting up), falling back to a bare, docker-less embedded server only
    if that attempt itself fails.
-3. A successful tunnel connection deploys `cttc-server` onto tunnel-host,
+3. A successful tunnel connection deploys `cttc-scout` onto tunnel-host,
    then immediately probes whether *that* host has Docker (informational —
    doesn't block setup either way).
 4. In Add Sources, an empty "Docker host" field resolves to wherever
-   `cttc-server` actually runs (app-host or tunnel-host, whichever
+   `cttc-scout` actually runs (app-host or tunnel-host, whichever
    applies); a non-empty field overrides that with an explicit docker-host,
    reached via ssh **from the server**, never from the browser.
 

@@ -27,7 +27,7 @@ function defaultRepoDir() {
 }
 
 function bundledTarballPath({ resourcesDir } = {}) {
-  return resourcesDir ? path.join(resourcesDir, "cttc-server.tar.gz") : path.join(defaultSharedDir(), "cttc-server.tar.gz");
+  return resourcesDir ? path.join(resourcesDir, "cttc-scout.tar.gz") : path.join(defaultSharedDir(), "cttc-scout.tar.gz");
 }
 function bundledOfflineComposePath({ resourcesDir } = {}) {
   return resourcesDir
@@ -101,8 +101,8 @@ function scpArgs({ sshKey, sshPort }) {
  * Resolves what image to run and which compose file goes with it. `source`
  * (from Settings > "Update server image", see main.js's "update-image"
  * handler) explicitly overrides the default of "whatever's bundled":
- *   { type: "tarball", path: "C:\\path\\to\\cttc-server.tar.gz" }
- *   { type: "registry", ref: "osteck/cttc-server:0.0.2" }
+ *   { type: "tarball", path: "C:\\path\\to\\cttc-scout.tar.gz" }
+ *   { type: "registry", ref: "osteck/cttc-scout:0.0.2" }
  * With no override: prefers the tarball baked into this install,
  * falling back to image.json's registry ref (a placeholder until a real
  * registry is wired up).
@@ -156,7 +156,7 @@ async function ensureLocalContainer({ spawnFn = spawn, resourcesDir, port = 8765
  * @returns {{host: string, port: number}}
  */
 async function ensureRemoteContainer(cfg, { spawnFn = spawn, sshBin = "ssh", scpBin = "scp", resourcesDir, source, onLog } = {}) {
-  const remoteDir = "cttc-server";
+  const remoteDir = "cttc-scout";
   const ssh = sshExecArgs(cfg);
   const scp = scpArgs(cfg);
   const target = cfg.sshTarget;

@@ -1,12 +1,12 @@
 # Deployment variant of docker-compose.yml: no `build:` context, because
 # this ships alongside a pre-built image (docker load'd from
-# cttc-server.tar.gz) rather than the server sources -- see
+# cttc-scout.tar.gz) rather than the server sources -- see
 # releases/windows/deploy.ps1 and docs/architecture/remote-server.md. Keep
 # the two files' `image`/`pid`/`network_mode`/`volumes` in sync by hand;
 # docker-compose.yml stays the source-build version for local dev.
 services:
-  cttc-server:
-    image: cttc-server:latest
+  cttc-scout:
+    image: cttc-scout:latest
     restart: unless-stopped
     # both required for accurate host telemetry (HostStatsSource uses
     # psutil, which without these only sees this container's own cgroup/
