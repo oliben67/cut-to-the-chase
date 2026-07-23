@@ -155,6 +155,26 @@ body {
 .server-status[data-state="down"] .server-status-dot { background: var(--critical); }
 .server-status[data-state="down"] { color: var(--critical); }
 
+/* Recording menu label's own status dot -- hidden (no dot) when idle,
+   red+pulsing while actively recording, yellow steady while paused. */
+.recording-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-left: 4px;
+  border-radius: 50%;
+  vertical-align: middle;
+}
+.menu[data-menu="recording"][data-state="recording"] .recording-dot {
+  background: var(--critical);
+  animation: recording-pulse 1.5s ease-in-out infinite;
+}
+.menu[data-menu="recording"][data-state="paused"] .recording-dot { background: #f1c40f; }
+@keyframes recording-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
 #toolbar {
   display: flex;
   align-items: center;
@@ -669,6 +689,19 @@ pre.snapshot-body {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+/* multi-segment recording picker (dlg-segment-pick) */
+#segment-pick-list { display: flex; flex-direction: column; gap: 4px; margin: 8px 0; }
+#segment-pick-list button {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 6px 10px;
+  text-align: left;
+}
+#segment-pick-list .seg-range { font-weight: 600; }
+#segment-pick-list .seg-meta { font-size: 11px; color: var(--muted); }
 
 /* settings dialog fieldsets (remote connection, update server image) */
 .keys-box { border: 1px solid var(--border); border-radius: 6px; margin: 8px 0; }

@@ -1986,16 +1986,64 @@ $("btn-clear-sources").onclick = async () => {
 // server.py is this machine's embedded process or a remote one (see
 // docs/architecture/remote-server.md phase 3), unlike sending the path
 // itself, which only means anything when client and server share a
-// filesystem.
-async function uploadFile(localPath) {
+// filesystem. `segment` picks one recording out of a multi-segment .cttc
+// (see the Recording feature below) -- omitted on the first attempt, which
+// is enough for an ordinary single-segment file and only comes back with
+// needs_selection (not opened) when there's more than one to choose from.
+async function uploadFile(localPath, segment) {
   const filename = basename(localPath);
   if (!window.cttc?.readFile) {
     return { opened: [], errors: [{ path: filename, error: "cannot read local files in this environment" }] };
   }
   const bytes = await window.cttc.readFile(localPath);
   const headers = { "X-CTTC-Filename": filename };
+  if (segment != null) headers["X-CTTC-Segment"] = String(segment);
   const res = await fetch(`${API}/files/upload`, { method: "POST", body: bytes, headers });
   return res.json().catch(() => ({ opened: [], errors: [{ path: filename, error: `upload failed: ${res.status}` }] }));
+}
+
+const dlgSegmentPick = $("dlg-segment-pick");
+
+// Shows the multi-segment picker and resolves to the chosen index, or null
+// if cancelled. `segments` is the needs_selection entry's own list:
+// [{index, from, to, created, source_count}].
+function pickSegment(segments) {
+  const box = $("segment-pick-list");
+  box.innerHTML = "";
+  return new Promise((resolve) => {
+    const done = (index) => {
+      dlgSegmentPick.close();
+      $("dlg-segment-pick-cancel").onclick = null;
+      resolve(index);
+    };
+    for (const seg of segments) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      const range = document.createElement("span");
+      range.className = "seg-range";
+      range.textContent = `${fmtIso(seg.from)} — ${fmtIso(seg.to)}`;
+      const meta = document.createElement("span");
+      meta.className = "seg-meta";
+      meta.textContent = `${seg.source_count} source(s)${seg.created ? " · recorded " + fmtIso(new Date(seg.created).getTime() || seg.created) : ""}`;
+      btn.append(range, meta);
+      btn.onclick = () => done(seg.index);
+      box.appendChild(btn);
+    }
+    $("dlg-segment-pick-cancel").onclick = () => done(null);
+    dlgSegmentPick.showModal();
+  });
+}
+
+// Shared by "Load metrics" and "Open Recording": upload once, and if the
+// server comes back asking which segment (a multi-segment recording, see
+// merge_sample_bytes/MultiSegmentSample), show the picker and re-upload
+// with that choice instead of silently picking one or giving up.
+async function uploadAndResolveSegment(path) {
+  const first = await uploadFile(path);
+  if (!first.needs_selection?.length) return first;
+  const index = await pickSegment(first.needs_selection[0].segments);
+  if (index == null) return { opened: [], errors: [] }; // cancelled
+  return uploadFile(path, index);
 }
 
 $("btn-load-sample").onclick = async () => {
@@ -2010,7 +2058,7 @@ $("btn-load-sample").onclick = async () => {
   if (!files.length) return;
   try {
     const errors = [];
-    for (const path of files) errors.push(...((await uploadFile(path)).errors || []));
+    for (const path of files) errors.push(...((await uploadAndResolveSegment(path)).errors || []));
     if (errors.length) alert(errors.map((e) => `${e.path}: ${e.error}`).join("\n"));
     await refreshAll();
     resetZoom(); // show the full timeline, including the newly loaded metrics
@@ -2018,6 +2066,174 @@ $("btn-load-sample").onclick = async () => {
     alert(String(err.message || err));
   }
 };
+
+/* ── Recording (Start/Pause/Stop/Open Recording, Recording menu) ─────────
+   Each Record→Pause span is flushed as one more segment into the same
+   .cttc archive via /sample/record (byte-oriented, mirroring Capture
+   metrics/Load metrics -- no shared-filesystem assumption), rather than
+   each span becoming its own file. A path is chosen once, at Start
+   Recording; every later flush overwrites that same local file. */
+
+const recording = { status: "idle", path: null, segmentStart: null };
+
+function syncRecordingMenu() {
+  const menu = document.querySelector('.menu[data-menu="recording"]');
+  if (menu) menu.dataset.state = recording.status;
+  $("menu-start-recording").disabled = recording.status === "recording";
+  $("menu-pause-recording").disabled = recording.status !== "recording";
+  $("menu-stop-recording").disabled = recording.status === "idle";
+}
+
+// Reassignable wrappers (window.cttc's own properties are read-only --
+// contextBridge.exposeInMainWorld -- so tests substitute these instead;
+// same reasoning as pickRecordingSavePath/readRecordingBytes above).
+async function getRecordingMarkerFromDisk() {
+  return window.cttc?.getRecordingMarker ? window.cttc.getRecordingMarker() : null;
+}
+async function setRecordingMarkerOnDisk(marker) {
+  if (window.cttc?.setRecordingMarker) await window.cttc.setRecordingMarker(marker);
+}
+
+async function persistRecordingMarker() {
+  await setRecordingMarkerOnDisk(
+    recording.status === "idle"
+      ? null
+      : { path: recording.path, status: recording.status, segmentStart: recording.segmentStart }
+  );
+}
+
+function setRecordingState(next) {
+  Object.assign(recording, next);
+  syncRecordingMenu();
+}
+
+// Thin, individually reassignable wrappers around the three native-fs
+// calls Recording needs -- same pattern as saveBinaryFile above, so tests
+// can substitute an in-memory store instead of driving a real native save
+// dialog (which can't run headlessly).
+async function pickRecordingSavePath() {
+  return window.cttc?.pickRecordingPath ? window.cttc.pickRecordingPath() : null;
+}
+async function readRecordingBytes(path) {
+  return window.cttc.readFile(path);
+}
+async function writeRecordingBytes(path, bytes) {
+  return window.cttc.writeBinaryFile(path, bytes);
+}
+
+// Flushes [recording.segmentStart, t1) as one more segment: reads whatever
+// bytes are already at recording.path (none yet, on the very first
+// segment), POSTs them to /sample/record alongside the new range, and
+// writes the merged archive back over the same local file.
+async function flushRecordingSegment(t1) {
+  let existing = new Uint8Array(0);
+  try {
+    existing = await readRecordingBytes(recording.path);
+  } catch {
+    /* first segment -- nothing on disk yet */
+  }
+  const res = await fetch(`${API}/sample/record`, {
+    method: "POST",
+    body: existing,
+    headers: { "X-CTTC-From": String(recording.segmentStart), "X-CTTC-To": String(t1) },
+  });
+  if (!res.ok) {
+    const j = await res.json().catch(() => ({}));
+    throw new Error(j.error || `sample/record failed: ${res.status}`);
+  }
+  const bytes = new Uint8Array(await res.arrayBuffer());
+  await writeRecordingBytes(recording.path, bytes);
+}
+
+async function startRecording() {
+  if (recording.status === "recording") return;
+  if (recording.status === "idle") {
+    const path = await pickRecordingSavePath();
+    if (!path) {
+      if (!window.cttc?.pickRecordingPath) setStatus("Recording needs desktop file access — unavailable here");
+      return; // cancelled, or no native dialog available
+    }
+    setRecordingState({ status: "recording", path, segmentStart: Date.now() });
+    setStatus(`Recording started — saving to ${path}`);
+  } else {
+    // resume from paused: same path, a new segment starts now
+    setRecordingState({ status: "recording", segmentStart: Date.now() });
+    setStatus("Recording resumed");
+  }
+  await persistRecordingMarker();
+}
+
+async function pauseRecording() {
+  if (recording.status !== "recording") return;
+  try {
+    await flushRecordingSegment(Date.now());
+    setRecordingState({ status: "paused", segmentStart: null });
+    setStatus(`Recording paused — ${recording.path}`);
+  } catch (err) {
+    setStatus(`Could not pause recording: ${err.message || err}`);
+    return; // stay "recording" -- the segment wasn't actually flushed
+  }
+  await persistRecordingMarker();
+}
+
+async function stopRecording() {
+  if (recording.status === "idle") return;
+  const path = recording.path;
+  try {
+    if (recording.status === "recording") await flushRecordingSegment(Date.now());
+    setStatus(`Recording stopped — ${path}`);
+  } catch (err) {
+    setStatus(`Could not finalize recording: ${err.message || err}`);
+    return; // keep the in-flight state so the user can retry Stop
+  }
+  setRecordingState({ status: "idle", path: null, segmentStart: null });
+  await persistRecordingMarker();
+}
+
+async function openRecording() {
+  let paths = [];
+  if (window.cttc?.pickFiles) paths = await window.cttc.pickFiles("Open Recording");
+  else {
+    const p = prompt("Path to a recorded .cttc file:");
+    if (p) paths = [p];
+  }
+  const files = paths.filter((p) => p.endsWith(".cttc"));
+  if (!files.length) return;
+  try {
+    const errors = [];
+    for (const path of files) errors.push(...((await uploadAndResolveSegment(path)).errors || []));
+    if (errors.length) alert(errors.map((e) => `${e.path}: ${e.error}`).join("\n"));
+    await refreshAll();
+    resetZoom();
+  } catch (err) {
+    alert(String(err.message || err));
+  }
+}
+
+// Crash recovery: if the app went down mid-recording (crash, force-quit,
+// sleep/shutdown) without Pause/Stop ever running, the marker on disk
+// still says "recording" -- surfacing that as-is would either silently
+// resume timing a segment whose start may be long gone, or just as
+// silently drop it. Instead, treat it exactly like a Pause already
+// happened: no new segment is flushed (the data for it may not even exist
+// anymore if the server itself restarted), just move to "paused" so the
+// user can explicitly Resume or Stop from an honest state. A named
+// function (not an inline IIFE) so it's callable again from tests.
+async function recoverInterruptedRecording() {
+  const marker = await getRecordingMarkerFromDisk();
+  if (!marker) return;
+  const wasInterrupted = marker.status === "recording";
+  setRecordingState({ status: "paused", path: marker.path, segmentStart: null });
+  await persistRecordingMarker();
+  if (wasInterrupted) {
+    setStatus(
+      `A previous recording was interrupted and is now paused: ${marker.path} — Resume to continue, or Stop to finalize.`
+    );
+  }
+}
+recoverInterruptedRecording();
+
+syncRecordingMenu();
 
 const dlgKeys = $("dlg-keys");
 
@@ -2429,6 +2645,10 @@ if (!POPOUT_KIND) {
     "load-metrics": () => $("btn-load-sample").click(),
     "open-theme": () => openThemeDialog(),
     "open-settings": () => openSettingsDialog(),
+    "start-recording": () => startRecording(),
+    "pause-recording": () => pauseRecording(),
+    "stop-recording": () => stopRecording(),
+    "open-recording": () => openRecording(),
     undo: () => document.execCommand("undo"),
     redo: () => document.execCommand("redo"),
     cut: () => document.execCommand("cut"),

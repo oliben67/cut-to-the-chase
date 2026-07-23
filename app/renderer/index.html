@@ -51,6 +51,16 @@
         <button data-action="toggle-fullscreen">Toggle Full Screen <span class="acc">F11</span></button>
       </div>
     </div>
+    <div class="menu" data-menu="recording">
+      <button class="menu-label" type="button">Recording <span id="recording-dot" class="recording-dot"></span></button>
+      <div class="menu-list" role="menu">
+        <button id="menu-start-recording" data-action="start-recording">Start Recording</button>
+        <button id="menu-pause-recording" data-action="pause-recording">Pause Recording</button>
+        <button id="menu-stop-recording" data-action="stop-recording">Stop Recording</button>
+        <div class="menu-sep"></div>
+        <button data-action="open-recording">Open Recording…</button>
+      </div>
+    </div>
     <div class="menu" data-menu="window">
       <button class="menu-label" type="button">Window</button>
       <div class="menu-list" role="menu">
@@ -195,6 +205,15 @@
     <div class="dlg-actions">
       <button id="dlg-export-cancel" title="Close without saving">Cancel</button>
       <button id="dlg-export-ok" class="primary" title="Save the selected range as a .cttc file">Save…</button>
+    </div>
+  </dialog>
+
+  <dialog id="dlg-segment-pick">
+    <h2>Choose a recording to load</h2>
+    <p class="dlg-intro muted">This file holds more than one recorded segment.</p>
+    <div id="segment-pick-list"></div>
+    <div class="dlg-actions">
+      <button id="dlg-segment-pick-cancel" title="Close without loading">Cancel</button>
     </div>
   </dialog>
 

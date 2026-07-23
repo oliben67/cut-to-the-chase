@@ -20,4 +20,8 @@ contextBridge.exposeInMainWorld("cttc", {
   onSetupLog: (cb) => ipcRenderer.on("setup-log", (_e, line) => cb(line)),
   runSetup: () => ipcRenderer.invoke("run-setup"),
   updateImage: (payload) => ipcRenderer.invoke("update-image", payload),
+  pickRecordingPath: () => ipcRenderer.invoke("pick-recording-path"),
+  writeBinaryFile: (filePath, bytes) => ipcRenderer.invoke("write-binary-file", filePath, bytes),
+  getRecordingMarker: () => ipcRenderer.invoke("get-recording-marker"),
+  setRecordingMarker: (marker) => ipcRenderer.invoke("set-recording-marker", marker),
 });

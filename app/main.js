@@ -324,6 +324,56 @@ ipcMain.handle("read-file", async (_e, filePath) => {
   return await require("fs").promises.readFile(filePath);
 });
 
+/* ── Recording (Record/Pause/Stop/Open Recording) ─────────────────────────
+   The renderer owns the actual state machine (when a segment starts/ends,
+   which server call to make) -- this process only ever does two things a
+   renderer can't: show the native save dialog once, and read/write bytes
+   to a path outside the sandbox. See renderer/app.js's recording section. */
+
+// Asked once, when Start Recording is clicked: after this, every
+// Pause/Stop segment flush overwrites the *same* path non-interactively
+// (see write-binary-file below) -- no repeated dialog per segment.
+ipcMain.handle("pick-recording-path", async () => {
+  const r = await dialog.showSaveDialog({
+    title: "Start Recording",
+    defaultPath: `recording-${new Date().toISOString().slice(0, 19).replace(/[T:]/g, "-")}.cttc`,
+    filters: [{ name: "CTTC metrics", extensions: ["cttc"] }],
+  });
+  return r.canceled || !r.filePath ? null : r.filePath;
+});
+
+ipcMain.handle("write-binary-file", async (_e, filePath, bytes) => {
+  await require("fs").promises.writeFile(filePath, Buffer.from(bytes));
+});
+
+// Durable, client-side marker (per the client/server/docker-host model's
+// "client owns its own recovery state" -- see the Recording feature): if
+// the app goes down mid-recording (crash, force-quit, machine sleep/
+// shutdown), the next launch reads this and surfaces the interrupted
+// session as *paused* rather than silently losing track of it or
+// pretending nothing happened. Lives in userData, not next to
+// connection.json, since it's per-install session state, not deployment
+// config.
+const RECORDING_MARKER_PATH = path.join(app.getPath("userData"), "recording.json");
+
+ipcMain.handle("get-recording-marker", async () => {
+  try {
+    return JSON.parse(await require("fs").promises.readFile(RECORDING_MARKER_PATH, "utf8"));
+  } catch {
+    return null; // absent, or corrupt -- either way, nothing to recover
+  }
+});
+
+ipcMain.handle("set-recording-marker", async (_e, marker) => {
+  const fs = require("fs").promises;
+  if (marker == null) {
+    await fs.unlink(RECORDING_MARKER_PATH).catch(() => {});
+    return;
+  }
+  await fs.mkdir(path.dirname(RECORDING_MARKER_PATH), { recursive: true });
+  await fs.writeFile(RECORDING_MARKER_PATH, JSON.stringify(marker, null, 2), "utf8");
+});
+
 // snapshot exports: same dialog + write, only the file type differs
 async function saveSnapshotAs(defaultName, contents, filter) {
   const r = await dialog.showSaveDialog({
