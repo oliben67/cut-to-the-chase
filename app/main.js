@@ -5,16 +5,7 @@ const { spawn } = require("child_process");
 const path = require("path");
 const readline = require("readline");
 const { loadConnectionConfig, saveConnectionConfig, clearConnectionConfig } = require("./lib/connection-config");
-const { hasLocalDocker, hasLocalSsh } = require("./lib/docker-check");
-
-// Client can only assume the server role locally (skip the setup wizard's
-// remote-tunnel path) if it has both Docker *and* ssh -- the server role
-// requires ssh to reach whatever Docker host(s) it's asked to query, not
-// just a local daemon of its own.
-async function canBeServerLocally() {
-  const [docker, ssh] = await Promise.all([hasLocalDocker(), hasLocalSsh()]);
-  return docker && ssh;
-}
+const { hasLocalDocker, canBeServerLocally } = require("./lib/docker-check");
 const { writeKeyFile, copyKeyFile } = require("./lib/ssh-key-file");
 const { ensureLocalContainer, ensureRemoteContainer } = require("./lib/server-provision");
 
