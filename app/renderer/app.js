@@ -20,6 +20,8 @@ window.cttc?.onMainLog?.(({ level, text }) => {
   (level === "error" ? console.error : console.log)(`[main] ${text}`);
 });
 
+// GET path (relative to the CTTC server, never the docker/ssh target -- see
+// normalizeDockerHost below) -> parsed JSON body. Throws on any non-2xx.
 async function get(path) {
   const r = await fetch(API + path);
   if (!r.ok) throw new Error(`${path}: ${r.status}`);
@@ -114,12 +116,18 @@ const STRIPS = [
 const MARGIN_L = 46, MARGIN_R = 8, AXIS_H = 20;
 let stripH = prefs.get("stripH", 96); // strip height; the splitter resizes it
 
+// bytes/sec -> the largest unit (GB/MB/kB/B) that keeps the number >= 1,
+// one decimal place -- used for the NET strip's axis labels and tooltip.
 function fmtBytes(v) {
   if (v >= 1e9) return (v / 1e9).toFixed(1) + " GB/s";
   if (v >= 1e6) return (v / 1e6).toFixed(1) + " MB/s";
   if (v >= 1e3) return (v / 1e3).toFixed(1) + " kB/s";
   return v.toFixed(0) + " B/s";
 }
+// epoch ms -> local wall-clock "HH:MM:SS" (optionally ".mmm"). Deliberately
+// no date part -- every chart/log panel only ever shows one day at a time
+// in practice, and the full ISO timestamp is still available via title/
+// fmtIso() wherever precision actually matters (log row tooltips, snapshots).
 function fmtClock(ms, withMs) {
   const d = new Date(ms);
   const p = (n, w = 2) => String(n).padStart(w, "0");
@@ -131,6 +139,12 @@ function fmtClock(ms, withMs) {
 /* ── categorical colors: fixed slot order, never cycled ─────────────────── */
 
 const slotByName = new Map();
+// One of the theme's 8 fixed --series-N colors, assigned the first time a
+// given series name is seen and never reassigned afterward (see
+// assignColorSlots(), which seeds this map in a stable sort order so colors
+// don't shuffle around as sources come and go). Past 8 concurrent series,
+// everything additional folds to a shared --muted gray rather than cycling
+// back through colors and creating ambiguous duplicates.
 function colorFor(name) {
   if (!slotByName.has(name)) slotByName.set(name, slotByName.size);
   const slot = slotByName.get(name);
@@ -138,6 +152,10 @@ function colorFor(name) {
   if (slot >= 8) return css.getPropertyValue("--muted").trim(); // fold past 8: muted
   return css.getPropertyValue(`--series-${slot + 1}`).trim();
 }
+// Read a CSS custom property (e.g. "--accent") off :root -- the single
+// source of truth for every color used in canvas drawing, so charts follow
+// the active light/dark theme automatically without their own duplicated
+// palette.
 function themeVar(name) {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 }
@@ -157,6 +175,10 @@ function sampleSlot(sid) {
 const SAMPLE_DASH_PATTERNS = [[6, 4], [2, 3], [9, 3, 2, 3], [1, 2.5], [10, 3, 3, 3]];
 const SAMPLE_GRAY_LEVELS = [0.3, 0.45, 0.6, 0.75];
 
+// A source is "live" (still being tailed/polled) unless the server marked
+// it live:false, which only happens for sources restored from a loaded
+// .cttc file (see State.load_sample in server.py) -- everything else
+// (opened files, docker/ssh collectors) stays live.
 function isLiveSid(sid) {
   const src = state.sources.find((s) => s.id === sid);
   return !src || src.live !== false; // source unknown yet -> assume live
@@ -183,13 +205,20 @@ function sampleFileGroups() {
   }
   return [...byPath.values()];
 }
+// true if this source belongs to a loaded .cttc file the user has toggled
+// off via the sample-files switch in the legend (see renderSampleFiles()) --
+// checked everywhere a sample-sourced series/lane/panel might need hiding.
 function isSampleHidden(sid) {
   const src = state.sources.find((s) => s.id === sid);
   return !!(src && src.live === false && state.hiddenSamples.has(src.path));
 }
+// this sample file's dash rhythm for chart lines, keyed by its slot (see
+// sampleSlot() above) so it stays the same across redraws/reorders.
 function dashFor(sid) {
   return SAMPLE_DASH_PATTERNS[sampleSlot(sid) % SAMPLE_DASH_PATTERNS.length];
 }
+// "#rrggbb" -> [r, g, b] ints, or null if the string doesn't match (theme
+// colors always do; this is just defensive against a malformed CSS value).
 function hexToRgb(hex) {
   const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec((hex || "").trim());
   return m ? [parseInt(m[1], 16), parseInt(m[2], 16), parseInt(m[3], 16)] : null;
@@ -307,16 +336,21 @@ if (POPOUT_KIND === "series") $("btn-popback-telemetry").hidden = false;
 
 /* ── time/pixel mapping ─────────────────────────────────────────────────── */
 
+// Plottable width in CSS pixels, i.e. canvas width minus the left axis-label
+// margin and right padding -- every x<->t conversion below goes through
+// this, so it's the one place that'd need to change if the margins did.
 function plotWidth() {
   // svc and host strips share the same geometry; fall back to whichever
   // container is actually visible (a host-only popout hides #charts).
   const el = chartsEl.clientWidth > 0 ? chartsEl : hostChartsEl;
   return Math.max(50, el.clientWidth - MARGIN_L - MARGIN_R);
 }
+// CSS-pixel x (within a strip canvas) -> epoch ms, linear over state.view.
 function xToT(x) {
   const { t0, t1 } = state.view;
   return t0 + ((x - MARGIN_L) / plotWidth()) * (t1 - t0);
 }
+// epoch ms -> CSS-pixel x -- the inverse of xToT(), same linear mapping.
 function tToX(t) {
   const { t0, t1 } = state.view;
   return MARGIN_L + ((t - t0) / (t1 - t0)) * plotWidth();
@@ -345,6 +379,13 @@ function buildStrips() {
   attachChartEvents();
 }
 
+// Sizes a canvas to its parent's current CSS width x the given CSS height,
+// backed by a devicePixelRatio-scaled bitmap so lines/text stay crisp on
+// HiDPI screens, then returns a 2D context pre-scaled back to CSS-pixel
+// coordinates -- every drawStrip()/drawLane() call can then just draw in
+// plain CSS pixels without worrying about the underlying pixel density.
+// Called on every redraw (not cached), since the canvas's CSS size can
+// change (window resize, splitter drag) between draws.
 function sizeCanvas(c, cssH) {
   const dpr = window.devicePixelRatio || 1;
   const w = c.parentElement.clientWidth;
@@ -530,6 +571,9 @@ function drawStrip(c, spec, group, isLast) {
   drawVerticals(ctx, h);
 }
 
+// A small filled circle marking a truly isolated data point (no neighbor
+// within the line-drawing gap limit to connect to) -- appends to the
+// caller's already-open path; caller is responsible for stroke()/fill().
 function dot(ctx, x, y) {
   ctx.moveTo(x + 1.5, y);
   ctx.arc(x, y, 1.5, 0, Math.PI * 2);
@@ -707,6 +751,11 @@ async function startTracking(s) {
 
 /* ── legend ─────────────────────────────────────────────────────────────── */
 
+// One legend entry: a color swatch (colorFor(name), or gray if `cls`
+// includes "disabled") + a text label. `name` drives the swatch color and
+// click/right-click wiring in renderLegend(); `label` is what's actually
+// displayed, which can differ (e.g. appending the originating sample
+// file's name via sampleFileLabel()).
 function legendItem(name, cls, label = name) {
   const item = document.createElement("span");
   item.className = "legend-item" + (cls ? " " + cls : "");
@@ -717,6 +766,8 @@ function legendItem(name, cls, label = name) {
   return item;
 }
 
+// A small pill-shaped, clickable label used for the "others (N)"/"hidden
+// (N)" group headers in the legend -- no swatch, just text.
 function legendChip(text) {
   const chip = document.createElement("span");
   chip.className = "legend-chip";
@@ -851,6 +902,10 @@ let dragX = null;
 let dragIsSample = false;
 let sampleArmed = false;
 
+// Toggles "capture metrics" drag mode: the next chart drag exports a
+// sample instead of zooming (mirrors holding Shift while dragging, see
+// timelineDown() below) -- also flips a body class the CSS uses to change
+// the cursor over charts, as a visible reminder the mode is active.
 function setSampleArmed(v) {
   sampleArmed = v;
   document.body.classList.toggle("sample-armed", v);
@@ -861,6 +916,11 @@ function armSampleCapture() {
   setStatus("Capture metrics armed — drag across a chart to pick a time range (Esc to cancel)");
 }
 
+// mousedown on a chart/lane: records where a possible drag started, and
+// whether this drag would export a sample (Shift held, or "capture
+// metrics" armed) rather than zoom -- decided up front since dragIsSample
+// also determines the selection band's color while dragging (see
+// drawVerticals()).
 function timelineDown(c, e) {
   const rect = c.getBoundingClientRect();
   dragStart = e.clientX - rect.left;
@@ -868,6 +928,9 @@ function timelineDown(c, e) {
   dragX = null;
 }
 
+// mouseup on a chart/lane: a drag past a small pixel threshold zooms (or
+// exports a sample, per dragIsSample) to the dragged range; anything
+// shorter (or a plain click) just moves the cursor to that point in time.
 function timelineUp(c, e) {
   const rect = c.getBoundingClientRect();
   const x = e.clientX - rect.left;
@@ -887,6 +950,9 @@ function timelineUp(c, e) {
   drawAll();
 }
 
+// whether host-level telemetry (CPU/MEM/NET of the docker host itself, as
+// opposed to any individual container) is currently being collected --
+// drives the export dialog's default "include host telemetry" checkbox.
 function hasHostSeries() {
   return (state.series?.services || []).some((s) => s.host);
 }
@@ -987,10 +1053,17 @@ async function exportSample(t0, t1) {
 const dlgSnapshot = $("dlg-snapshot");
 let currentSnapshot = null;
 
+// escapes text (log/container names, which are arbitrary user/docker-
+// controlled strings) before it's interpolated into innerHTML in the
+// snapshot table -- everywhere else builds DOM nodes directly and doesn't
+// need this.
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
+// epoch ms -> full "YYYY-MM-DD HH:MM:SS.sssZ"-style UTC timestamp, used
+// wherever precision (not just clock-face time, see fmtClock()) matters:
+// snapshot metadata, exported file names' timestamp component.
 function fmtIso(t) {
   return new Date(t).toISOString().replace("T", " ").replace("Z", " UTC");
 }
@@ -1468,6 +1541,13 @@ async function setCursor(t, opts = {}) {
 
 const panels = new Map(); // source id -> Panel
 
+// One log source's virtual-scrolled panel: renders only the rows currently
+// in (or just outside) the visible scroll viewport, fetching them from the
+// server a PAGE (200 rows) at a time and caching pages by index for as long
+// as the panel lives (see this.pages). Rows are always stored/fetched
+// oldest-first; `reversed` only affects display order (see dataIndexAt/
+// visualIndexOf) so index-based operations (cursor sync, search) never need
+// to care which way the panel is currently sorted.
 class Panel {
   constructor(src) {
     this.src = src;
@@ -1583,6 +1663,10 @@ class Panel {
     this.update(src);
   }
 
+  // Called on every refreshAll() with this source's latest /sources entry
+  // (row count, error, transforms). Refreshes the header/spacer and, if the
+  // row count grew, invalidates the last cached page so newly-tailed rows
+  // actually get re-fetched instead of serving a stale, now-incomplete copy.
   update(src) {
     this.src = src;
     this.sampleBadge.hidden = src.live !== false;
@@ -1600,6 +1684,10 @@ class Panel {
     this.render();
   }
 
+  // Row page `idx` (data indices [idx*PAGE, idx*PAGE+PAGE)), fetched once
+  // and cached indefinitely (see this.pages) -- concurrent callers awaiting
+  // the same not-yet-resolved page share one in-flight request, since the
+  // Promise itself is what's cached until it resolves to the actual rows.
   async page(idx) {
     if (this.pages.has(idx)) return this.pages.get(idx);
     const pr = get(`/logs?source=${this.src.id}&start=${idx * PAGE}&count=${PAGE}`).then((r) => {
@@ -1769,6 +1857,8 @@ function syncPanels() {
 
 /* ── refresh / SSE ──────────────────────────────────────────────────────── */
 
+// the single status-line message in the toolbar (server connectivity,
+// export/save results, ...) -- always replaces whatever was there before.
 function setStatus(msg) {
   $("status").textContent = msg || "";
 }
@@ -1805,6 +1895,11 @@ async function refreshAll() {
   }
 }
 
+// Opens the server's /events stream (see route_events in server.py): every
+// message just means "something changed, go refetch" -- this deliberately
+// carries no payload of its own, so a debounced refreshAll() (via
+// scheduleRefresh()) is always what actually pulls new data, keeping one
+// single code path for both the SSE-driven and manual-action refresh cases.
 function connectSSE() {
   const es = new EventSource(API + "/events");
   es.onmessage = () => scheduleRefresh();
@@ -1816,6 +1911,8 @@ function connectSSE() {
 
 const dlg = $("dlg-add");
 
+// names of the transform checkboxes ticked in Add Sources, in DOM order --
+// sent as-is to /docker/collect, which loads and applies them server-side.
 function chosenTransforms() {
   return [...dlg.querySelectorAll("#transforms-list input:checked")].map((i) => i.value);
 }
@@ -2181,6 +2278,8 @@ $("btn-popout-host").onclick = () => {
   window.cttc.popout("host", null, popoutView());
 };
 
+// reflects state.chartStyle onto the lines/histogram toggle switch --
+// called on boot and whenever the style changes from elsewhere.
 function syncStyleButton() {
   $("chk-style").checked = state.chartStyle === "bars";
 }
