@@ -4,15 +4,19 @@ const form = document.getElementById("form");
 const keyPathRow = document.getElementById("key-path-row");
 const keyPasteEl = document.getElementById("key-paste");
 const keyPathEl = document.getElementById("key-path");
+const btnBrowseEl = document.getElementById("btn-browse");
 const errorEl = document.getElementById("error");
 const waitEl = document.getElementById("wait");
 const btnConnect = document.getElementById("btn-connect");
 
+// Both control groups stay visible at all times -- only one is ever enabled,
+// so it's clear at a glance which input the connect step will actually use
+// instead of one silently disappearing on radio change.
 for (const radio of document.querySelectorAll('input[name="key-mode"]')) {
   radio.addEventListener("change", () => {
     const paste = radio.value === "paste" && radio.checked;
-    keyPathRow.hidden = paste;
-    keyPasteEl.hidden = !paste;
+    keyPathEl.disabled = paste;
+    btnBrowseEl.disabled = paste;
     keyPasteEl.disabled = !paste;
   });
 }
