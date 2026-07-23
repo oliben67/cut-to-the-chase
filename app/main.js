@@ -612,7 +612,10 @@ ipcMain.handle("update-image", async (_e, payload) => {
     }
     const cfg = loadConnectionConfig();
     if (cfg.mode !== "ssh-tunnel") {
-      return { ok: false, error: "No local Docker and no ssh-tunnel configured -- run Setup first." };
+      return {
+        ok: false,
+        error: "This machine can't run the server locally, and no ssh-tunnel is configured -- run Setup first.",
+      };
     }
     if (tunnel) tunnel.stop();
     tunnel = await ensureRemoteContainer(cfg, {

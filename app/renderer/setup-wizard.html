@@ -11,8 +11,10 @@
   <main id="wizard">
     <h1>Connect CTTC to a remote host</h1>
     <p class="muted">
-      No local Docker was found, so there's nothing for CTTC to sample on this
-      machine. Point it at a Docker-enabled host over SSH instead.
+      This machine can't act as its own CTTC server (either Docker or an ssh
+      client is missing locally). Point CTTC at a separate host that has both
+      installed instead -- it'll run the server there and reach whichever
+      Docker daemon(s) you query over ssh.
     </p>
 
     <form id="form">
