@@ -70,9 +70,10 @@ COPY --from=builder /srv/cttc-server ./
 ENV PATH="/srv/cttc-server/.venv/bin:${PATH}"
 
 EXPOSE 8765
-# server.py hardcodes a 127.0.0.1 bind by design (docs/architecture/
-# remote-server.md's whole point: no code change needed here). With
-# --network=host (see docker-compose.yml) that loopback *is* the host's
-# loopback, so the host's ssh tunnel can reach it exactly as if this were
-# a same-machine embedded server.
-ENTRYPOINT ["python", "server.py", "--port", "8765"]
+# 0.0.0.0: the client talks to this container directly over plain HTTP (no
+# ssh tunnel -- see docs/architecture/remote-server.md), so it must be
+# reachable on the host's real network interfaces, not just loopback.
+# --network=host (see docker-compose.yml) means this *is* the host's own
+# network stack, so binding 0.0.0.0 here exposes it exactly as if the port
+# were opened directly on the host.
+ENTRYPOINT ["python", "server.py", "--host", "0.0.0.0", "--port", "8765"]

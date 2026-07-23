@@ -19,8 +19,8 @@ const HELP_TOPICS = {
   frequency: "#the-cursor-and-the-frequency-window",
 };
 let serverProc = null;
+let serverHost = "127.0.0.1";
 let serverPort = null;
-let tunnel = null; // set instead of serverProc in ssh-tunnel mode (see lib/ssh-tunnel.js)
 
 // Every window's DevTools console (Help > Developer Tools) is the one place
 // a user can see logs regardless of whether the app was launched from a
@@ -158,7 +158,7 @@ ipcMain.handle("menubar-action", (e, action) => {
 
 // Shown from the moment the app starts until the main window has actually
 // painted -- bridges both the potentially-slow connectToServer() call
-// (docker pull/load, ssh tunnel, ...) and the main BrowserWindow's own
+// (docker pull/load, remote provisioning over ssh, ...) and the main BrowserWindow's own
 // load/render time, so there's never a blank Electron window on screen in
 // between. Idempotent: safe to call again if one's already up (e.g. right
 // before createWindow(), after a path that already showed it earlier).
@@ -219,7 +219,7 @@ async function createWindow() {
   });
   attachEditContextMenu(win);
   await win.loadFile(path.join(__dirname, "renderer", "index.html"), {
-    search: `port=${serverPort}`,
+    search: `host=${serverHost}&port=${serverPort}`,
   });
   // e2e mode: CTTC_TEST=<spec.js> runs the spec in the page, reports results
   // + V8 byte coverage of app.js (as exercised by the spec) on stdout, then
@@ -366,7 +366,7 @@ ipcMain.handle("popout", async (e, kind, id, view) => {
   });
   popoutWindows.set(key, win);
   attachEditContextMenu(win);
-  const params = new URLSearchParams({ port: String(serverPort), popout: kind });
+  const params = new URLSearchParams({ host: serverHost, port: String(serverPort), popout: kind });
   if (id) params.set("id", id);
   // hand the opener's current view/cursor over so the new window opens on
   // exactly the same time range instead of blank-then-reset
@@ -400,11 +400,13 @@ ipcMain.on("sync-broadcast", (e, msg) => {
 //   docker-load (or, once a registry is wired up, docker-pull) the server
 //   image and run it as a local container instead of a bare uv/python
 //   process (see app/lib/server-provision.js).
-// - "ssh-tunnel": provisions (load/pull + `docker compose up`) the
-//   container on the configured Docker-enabled host over ssh, then opens
-//   the usual local port-forward to it.
-// Either way the renderer only ever sees http://127.0.0.1:<serverPort> —
-// it can't tell embedded, local-container, and tunneled apart.
+// - "remote": provisions (load/pull + `docker compose up`) the container on
+//   the configured Docker-enabled host over ssh, then talks to it directly
+//   over plain HTTP -- ssh is only used for that one-time provisioning
+//   step, never for the ongoing client<->server traffic (no tunnel, no
+//   local port-forward).
+// Either way the renderer only ever sees http://<serverHost>:<serverPort> —
+// it can't tell embedded, local-container, and remote apart.
 // The image tarball + compose files are electron-builder extraResources
 // (see app/package.json) -- only present under process.resourcesPath once
 // packaged. In an unpackaged dev checkout there's nothing there, so
@@ -419,6 +421,7 @@ async function connectToServer(fileArgs) {
   if (cfg.mode === "embedded") {
     if (app.isPackaged && (await hasLocalDocker())) {
       const { port } = await ensureLocalContainer({ resourcesDir: resourcesDirForApp() });
+      serverHost = "127.0.0.1";
       serverPort = port;
       mainLog(`[docker] server container running locally — port ${serverPort}`);
       return;
@@ -429,29 +432,30 @@ async function connectToServer(fileArgs) {
   if (fileArgs.length) {
     // file paths are local to *this* machine; meaningless against a shared
     // remote server, so they're ignored rather than silently mis-sent
-    mainError(`[tunnel] ignoring command-line files in ssh-tunnel mode: ${fileArgs.join(", ")}`);
+    mainError(`[remote] ignoring command-line files in remote mode: ${fileArgs.join(", ")}`);
   }
   // CTTC_SSH_BIN overrides the ssh binary (verification hook, same idea as
-  // CTTC_TEST/CTTC_EVAL/CTTC_SCREENSHOT below): lets tests point the tunnel
-  // manager at test/fixtures/fake-ssh.js instead of a real ssh + remote host.
-  tunnel = await ensureRemoteContainer(cfg, {
+  // CTTC_TEST/CTTC_EVAL/CTTC_SCREENSHOT below): lets tests point provisioning
+  // at a fake ssh instead of a real ssh + remote host.
+  const remote = await ensureRemoteContainer(cfg, {
     sshBin: process.env.CTTC_SSH_BIN || "ssh",
     resourcesDir: resourcesDirForApp(),
   });
-  serverPort = tunnel.localPort;
-  mainLog(`[tunnel] connected to ${cfg.sshTarget} — local port ${serverPort}`);
+  serverHost = remote.host;
+  serverPort = remote.port;
+  mainLog(`[remote] connected to ${cfg.sshTarget} — http://${serverHost}:${serverPort}`);
 }
 
-// Right after the tunnel comes up, check whether the tunnel-host itself has
-// docker -- that's what Add Sources targets by default (an empty Docker
-// host field there resolves to wherever the server process lives, which is
-// now the tunnel-host). Purely informational: failure here doesn't block
-// setup, it just tells the user up front whether they'll need to type an
-// explicit target in Add Sources instead of relying on the default.
-async function checkTunnelHostDocker(localPort, onLog) {
-  onLog?.("$ checking for docker on the tunnel host...");
+// Right after provisioning, check whether the server host itself has docker
+// -- that's what Add Sources targets by default (an empty Docker host field
+// there resolves to wherever the server process lives). Purely
+// informational: failure here doesn't block setup, it just tells the user
+// up front whether they'll need to type an explicit target in Add Sources
+// instead of relying on the default.
+async function checkServerHostDocker(host, port, onLog) {
+  onLog?.("$ checking for docker on the server host...");
   try {
-    const r = await fetch(`http://127.0.0.1:${localPort}/docker/ps`, {
+    const r = await fetch(`http://${host}:${port}/docker/ps`, {
       method: "POST",
       body: JSON.stringify({}),
     });
@@ -459,7 +463,7 @@ async function checkTunnelHostDocker(localPort, onLog) {
     if (r.ok) {
       onLog?.(`  → docker found (${j.containers.length} container(s), ${j.services.length} service(s))`);
     } else {
-      onLog?.(`  → no local docker on the tunnel host: ${j.error || r.status}`);
+      onLog?.(`  → no local docker on the server host: ${j.error || r.status}`);
       onLog?.("  → you'll need to set an explicit target in Add Sources' Docker host field");
     }
   } catch (err) {
@@ -468,11 +472,12 @@ async function checkTunnelHostDocker(localPort, onLog) {
 }
 
 // Embedded mode with no local Docker has nothing to sample -- offer to set
-// up an ssh-tunnel connection to a Docker-enabled host instead of just
-// starting an empty embedded server. The wizard window itself establishes
-// the tunnel (so it can show its own "please wait" / error state) and sets
-// `tunnel`/`serverPort` directly on success; closing it without succeeding
-// rejects, which the caller treats the same as any other startup failure.
+// up a remote server on a Docker-enabled host instead of just starting an
+// empty embedded server. The wizard window itself provisions the remote
+// container (so it can show its own "please wait" / error state) and sets
+// `serverHost`/`serverPort` directly on success; closing it without
+// succeeding rejects, which the caller treats the same as any other startup
+// failure.
 let wizardWindow = null;
 function runSetupWizard() {
   return new Promise((resolve, reject) => {
@@ -514,14 +519,15 @@ function runSetupWizard() {
           sshPort: payload.sshPort,
           remotePort: 8765, // the CTTC server's fixed container port; see docker-compose.yml
         };
-        tunnel = await ensureRemoteContainer(cfg, {
+        const remote = await ensureRemoteContainer(cfg, {
           sshBin: process.env.CTTC_SSH_BIN || "ssh",
           resourcesDir: resourcesDirForApp(),
           onLog: (line) => wizardWindow?.webContents.send("setup-log", line),
         });
-        serverPort = tunnel.localPort;
+        serverHost = remote.host;
+        serverPort = remote.port;
         saveConnectionConfig(cfg);
-        await checkTunnelHostDocker(tunnel.localPort, (line) => wizardWindow?.webContents.send("setup-log", line));
+        await checkServerHostDocker(remote.host, remote.port, (line) => wizardWindow?.webContents.send("setup-log", line));
         settled = true;
         ipcMain.removeHandler("setup-wizard-submit");
         wizardWindow.destroy();
@@ -535,10 +541,10 @@ function runSetupWizard() {
 }
 
 // Neither Run Setup nor Update Image hot-swap the already-loaded window's
-// server connection (its page was loaded with the *old* serverPort baked
-// into the URL, and a new ssh-tunnel gets a new random local port) --
-// simplest and safest is to save/apply the change, then offer to relaunch
-// the app so it goes through the normal startup path from a clean slate.
+// server connection (its page was loaded with the *old* host/port baked
+// into the URL) -- simplest and safest is to save/apply the change, then
+// offer to relaunch the app so it goes through the normal startup path from
+// a clean slate.
 async function offerRestart(message) {
   const r = await dialog.showMessageBox({
     type: "info",
@@ -558,27 +564,27 @@ async function offerRestart(message) {
 ipcMain.handle("run-setup", async () => {
   const cfg = loadConnectionConfig();
 
-  // "revert to local" only makes sense if there's an ssh-tunnel to revert
+  // "revert to local" only makes sense if there's a remote server to revert
   // *from*, and only offered when there's local Docker to fall back *to*.
-  if (cfg.mode === "ssh-tunnel" && (await canBeServerLocally())) {
+  if (cfg.mode === "remote" && (await canBeServerLocally())) {
     const choice = await dialog.showMessageBox({
       type: "question",
-      message: "CTTC is connected over an SSH tunnel, and a local Docker was detected.",
-      detail: "Reconfigure the SSH tunnel, or revert to sampling this machine directly?",
-      buttons: ["Configure SSH Tunnel…", "Revert to Local", "Cancel"],
+      message: "CTTC is connected to a remote server, and a local Docker was detected.",
+      detail: "Reconfigure the remote server, or revert to sampling this machine directly?",
+      buttons: ["Configure Remote Server…", "Revert to Local", "Cancel"],
       defaultId: 0,
       cancelId: 2,
     });
     if (choice.response === 2) return;
     if (choice.response === 1) {
-      if (tunnel) tunnel.stop();
+      // the remote server is shared infrastructure, not this process's own
+      // child -- nothing local to tear down, just stop pointing at it.
       clearConnectionConfig();
       await offerRestart("Restart CTTC to apply the new connection settings?");
       return;
     }
   }
 
-  if (tunnel) tunnel.stop(); // about to be replaced by the wizard below
   try {
     await runSetupWizard();
   } catch {
@@ -589,9 +595,9 @@ ipcMain.handle("run-setup", async () => {
 
 // Settings > Update server image: pushes a new image (by registry ref or a
 // local tar.gz) to wherever the server currently runs -- locally if Docker
-// is present, otherwise the configured ssh-tunnel host. Unlike Run Setup
-// this doesn't touch connection.json (the *target* doesn't change, only
-// which image runs there).
+// is present, otherwise the configured remote host. Unlike Run Setup this
+// doesn't touch connection.json (the *target* doesn't change, only which
+// image runs there).
 ipcMain.handle("update-image", async (_e, payload) => {
   const source =
     payload.sourceType === "tarball" ? { type: "tarball", path: payload.tarballPath } : { type: "registry", ref: payload.ref };
@@ -602,19 +608,19 @@ ipcMain.handle("update-image", async (_e, payload) => {
       return { ok: true };
     }
     const cfg = loadConnectionConfig();
-    if (cfg.mode !== "ssh-tunnel") {
+    if (cfg.mode !== "remote") {
       return {
         ok: false,
-        error: "This machine can't run the server locally, and no ssh-tunnel is configured -- run Setup first.",
+        error: "This machine can't run the server locally, and no remote server is configured -- run Setup first.",
       };
     }
-    if (tunnel) tunnel.stop();
-    tunnel = await ensureRemoteContainer(cfg, {
+    const remote = await ensureRemoteContainer(cfg, {
       sshBin: process.env.CTTC_SSH_BIN || "ssh",
       source,
       resourcesDir: resourcesDirForApp(),
     });
-    serverPort = tunnel.localPort;
+    serverHost = remote.host;
+    serverPort = remote.port;
     await offerRestart("Image updated on the remote host. Restart CTTC to reconnect?");
     return { ok: true };
   } catch (err) {
@@ -676,16 +682,15 @@ app.whenReady().then(async () => {
 });
 
 function stopServer() {
-  if (tunnel) {
-    // the remote server is shared infrastructure, not this process's child —
-    // never POST /shutdown to it; just tear down our local ssh forward
-    tunnel.stop();
-    return;
-  }
+  // A remote server (or a local Docker container -- see ensureLocalContainer's
+  // `restart: unless-stopped`) is shared/persistent infrastructure, not this
+  // process's own child: there's nothing local to tear down, and this
+  // process must never POST /shutdown to it. Only a bare `uv run server.py`
+  // (serverProc) is actually owned by this process.
   if (serverProc) {
     try {
       // graceful: lets the server stop docker collectors and ssh sessions
-      fetch(`http://127.0.0.1:${serverPort}/shutdown`, { method: "POST" }).catch(() => {});
+      fetch(`http://${serverHost}:${serverPort}/shutdown`, { method: "POST" }).catch(() => {});
       setTimeout(() => serverProc && serverProc.kill(), 1500);
     } catch {
       serverProc.kill();

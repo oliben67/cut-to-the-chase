@@ -3,7 +3,11 @@
 /* ── server connection ──────────────────────────────────────────────────── */
 
 const PORT = new URLSearchParams(location.search).get("port") || "8765";
-const API = `http://127.0.0.1:${PORT}`;
+// 127.0.0.1 covers embedded/local-container mode; main.js passes the actual
+// server host for "remote" mode (client talks directly over HTTP -- no ssh
+// tunnel/port-forward, see docs/architecture/remote-server.md).
+const HOST = new URLSearchParams(location.search).get("host") || "127.0.0.1";
+const API = `http://${HOST}:${PORT}`;
 
 // a window can either be the main window (POPOUT_KIND == null) or a panel
 // popped out into its own window: "telemetry" (the chart area) or "log"
@@ -1026,7 +1030,7 @@ async function exportSample(t0, t1) {
   try {
     // fetch the sample's bytes from the server itself (works identically
     // whether server.py is this same machine's embedded process or a
-    // remote one reached over an ssh tunnel -- see docs/architecture/
+    // remote one reached directly over HTTP -- see docs/architecture/
     // remote-server.md phase 3) rather than asking it to write to a path
     // that might not exist on whichever machine actually ran it
     const params = new URLSearchParams({ from: t0, to: t1, include_host: opts.includeHost ? "1" : "0" });

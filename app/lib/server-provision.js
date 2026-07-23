@@ -3,7 +3,8 @@
 const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
-const { startTunnel, waitForPortOpen } = require("./ssh-tunnel");
+const { hostFromTarget } = require("./connection-config");
+const { waitForPortOpen, waitForHttpOk } = require("./net-wait");
 
 // The server image tarball + both docker-compose variants ship as
 // electron-builder extraResources (see app/package.json's
@@ -147,15 +148,19 @@ async function ensureLocalContainer({ spawnFn = spawn, resourcesDir, port = 8765
  * Gets the server container running on a *remote* Docker-enabled host over
  * ssh: scp's up the tarball+compose (offline path) or just the compose file
  * (registry path), execs the equivalent docker load/pull + compose up
- * there, then opens the usual ssh-tunnel port-forward to it.
- * @param {{sshTarget: string, sshKey: string|null, sshPort?: number, remotePort: number}} cfg
+ * there, then waits for the container's own /health to respond -- ssh is
+ * only used here, for provisioning; the client talks to the running
+ * container directly over plain HTTP afterwards (no tunnel/port-forward).
+ * @param {{sshTarget: string, sshKey: string|null, sshPort?: number, remotePort: number, host?: string}} cfg
  * @param {{source?: {type: "tarball", path: string} | {type: "registry", ref: string}, onLog?: (line: string) => void}} [opts]
+ * @returns {{host: string, port: number}}
  */
 async function ensureRemoteContainer(cfg, { spawnFn = spawn, sshBin = "ssh", scpBin = "scp", resourcesDir, source, onLog } = {}) {
   const remoteDir = "cttc-server";
   const ssh = sshExecArgs(cfg);
   const scp = scpArgs(cfg);
   const target = cfg.sshTarget;
+  const host = cfg.host || hostFromTarget(cfg.sshTarget);
   const resolved = resolveSource(source, { resourcesDir });
 
   await run(spawnFn, sshBin, [...ssh, `mkdir -p ${remoteDir}`], {}, onLog);
@@ -175,8 +180,9 @@ async function ensureRemoteContainer(cfg, { spawnFn = spawn, sshBin = "ssh", scp
     ], {}, onLog);
   }
 
-  onLog?.(`$ ssh -L ${cfg.remotePort}:127.0.0.1:${cfg.remotePort} ${target} (tunnel)`);
-  return startTunnel(cfg, { spawnFn, sshBin });
+  onLog?.(`$ waiting for http://${host}:${cfg.remotePort}/health ...`);
+  await waitForHttpOk(`http://${host}:${cfg.remotePort}/health`, { timeoutMs: 30000 });
+  return { host, port: cfg.remotePort };
 }
 
 module.exports = {

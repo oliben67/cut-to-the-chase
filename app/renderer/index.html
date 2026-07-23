@@ -2,8 +2,12 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
+  <!-- connect-src allows any http:// origin -- "remote" mode talks directly
+       to a user-configured server host:port over plain HTTP (see
+       docs/architecture/remote-server.md), so this can't be pinned to
+       127.0.0.1/localhost the way embedded mode alone could be. -->
   <meta http-equiv="Content-Security-Policy"
-        content="default-src 'self'; connect-src http://127.0.0.1:* http://localhost:*; style-src 'self'; script-src 'self'; img-src 'self' data:" />
+        content="default-src 'self'; connect-src http://*:*; style-src 'self'; script-src 'self'; img-src 'self' data:" />
   <title>CTTC Timeline</title>
   <link rel="stylesheet" href="style.css" />
 </head>
@@ -200,13 +204,13 @@
       <legend>Remote connection</legend>
       <p class="dlg-section-help muted">Point CTTC at a Docker-enabled host over SSH, or revert to sampling this machine directly.</p>
       <div class="ctl">
-        <button id="run-setup-btn" title="Reconfigure (or set up for the first time) the ssh-tunnel connection">Run Setup…</button>
+        <button id="run-setup-btn" title="Reconfigure (or set up for the first time) the remote server connection">Run Setup…</button>
       </div>
     </fieldset>
     <fieldset class="keys-box">
       <legend>Update server image</legend>
       <p class="dlg-section-help muted">Updates wherever the server currently runs — this machine if Docker is
-      present locally, otherwise the configured ssh-tunnel host.</p>
+      present locally, otherwise the configured remote server host.</p>
       <label class="radio-row"><input type="radio" name="image-source" value="registry" checked /> Registry image reference</label>
       <label class="radio-row"><input type="radio" name="image-source" value="tarball" /> Local .tar.gz file</label>
       <div class="ctl" id="image-ref-row">

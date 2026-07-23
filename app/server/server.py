@@ -1686,6 +1686,12 @@ def main():
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=0)
+    ap.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="bind address -- 0.0.0.0 for a container/remote-server deployment "
+        "the client reaches directly over HTTP (see docker-compose.yml)",
+    )
     ap.add_argument("--transforms-dir", default=str(Path(__file__).parent / "transforms"))
     ap.add_argument(
         "--naive-tz",
@@ -1721,7 +1727,7 @@ async def _run(args):
     # exactly one {"port": N} json line from stdout to learn it.
     sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
     sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
-    sock.bind(("127.0.0.1", args.port))
+    sock.bind((args.host, args.port))
     sock.listen(128)
     port = sock.getsockname()[1]
 
@@ -1732,7 +1738,7 @@ async def _run(args):
     logger.info("transforms loaded from %s", args.transforms_dir)
     sys.stdout.write(jdumps({"port": port, "json": JSON_IMPL}).decode() + "\n")
     sys.stdout.flush()
-    logger.info("listening on 127.0.0.1:%d", port)
+    logger.info("listening on %s:%d", args.host, port)
 
     asyncio.ensure_future(tail_loop(state))
     try:

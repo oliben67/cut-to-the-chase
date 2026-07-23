@@ -8,10 +8,24 @@ const path = require("path");
 // behavior, spawn the server locally). Env vars take precedence over the
 // config file so scripted/MDM-pushed deployments don't need to write a file.
 // See docs/architecture/remote-server.md.
+//
+// "remote" mode: the client talks straight over HTTP to the server
+// container running on cfg.host:cfg.remotePort -- no ssh tunnel, no local
+// port-forward. ssh is only ever used to *provision* that container (see
+// lib/server-provision.js's ensureRemoteContainer), not for the ongoing
+// request/response traffic, so sshTarget/sshKey/sshPort are kept around
+// purely for later re-provisioning (Settings > Update server image).
 
 function defaultConfigPath(env) {
   const home = env.HOME || os.homedir();
   return path.join(home, ".cttc", "connection.json");
+}
+
+// "user@host[:ignored]" -> "host" -- the bare address the client uses for
+// direct HTTP, as opposed to sshTarget's full user@host form ssh needs.
+function hostFromTarget(sshTarget) {
+  const at = sshTarget.lastIndexOf("@");
+  return at === -1 ? sshTarget : sshTarget.slice(at + 1);
 }
 
 function readConfigFile(configPath) {
@@ -36,7 +50,7 @@ function readConfigFile(configPath) {
 /**
  * @param {{env?: object, configPath?: string}} opts
  *   configPath overrides the default ~/.cttc/connection.json (mainly for tests).
- * @returns {{mode: "embedded"} | {mode: "ssh-tunnel", sshTarget: string, sshKey: string|null, remotePort: number}}
+ * @returns {{mode: "embedded"} | {mode: "remote", host: string, sshTarget: string, sshKey: string|null, remotePort: number}}
  */
 function loadConnectionConfig({ env = process.env, configPath } = {}) {
   const resolvedPath = configPath || defaultConfigPath(env);
@@ -44,34 +58,42 @@ function loadConnectionConfig({ env = process.env, configPath } = {}) {
 
   const mode = env.CTTC_MODE || fileCfg.mode || "embedded";
   if (mode === "embedded") return { mode: "embedded" };
-  if (mode !== "ssh-tunnel") {
-    throw new Error(`unknown CTTC connection mode: ${JSON.stringify(mode)} (expected "embedded" or "ssh-tunnel")`);
+  if (mode !== "remote") {
+    throw new Error(`unknown CTTC connection mode: ${JSON.stringify(mode)} (expected "embedded" or "remote")`);
   }
 
   const sshTarget = env.CTTC_SSH_TARGET || fileCfg.ssh_target;
   if (!sshTarget) {
-    throw new Error("ssh-tunnel mode requires ssh_target (CTTC_SSH_TARGET env var, or ssh_target in connection.json)");
+    throw new Error("remote mode requires ssh_target (CTTC_SSH_TARGET env var, or ssh_target in connection.json)");
   }
   const sshKey = env.CTTC_SSH_KEY || fileCfg.ssh_key || null;
 
   const remotePortRaw = env.CTTC_REMOTE_PORT || fileCfg.remote_port;
   const remotePort = Number(remotePortRaw);
   if (!remotePortRaw || !Number.isInteger(remotePort) || remotePort <= 0 || remotePort > 65535) {
-    throw new Error(`ssh-tunnel mode requires a valid remote_port between 1-65535 (got ${JSON.stringify(remotePortRaw)})`);
+    throw new Error(`remote mode requires a valid remote_port between 1-65535 (got ${JSON.stringify(remotePortRaw)})`);
   }
 
-  // ssh_port is optional -- absent means ssh's own default (22)
+  // ssh_port is optional -- absent means ssh's own default (22); only used
+  // for (re-)provisioning, never for the client's direct HTTP traffic.
   const sshPortRaw = env.CTTC_SSH_PORT || fileCfg.ssh_port;
   const sshPort = sshPortRaw ? Number(sshPortRaw) : undefined;
   if (sshPortRaw && (!Number.isInteger(sshPort) || sshPort <= 0 || sshPort > 65535)) {
-    throw new Error(`ssh-tunnel mode's ssh_port must be between 1-65535 (got ${JSON.stringify(sshPortRaw)})`);
+    throw new Error(`remote mode's ssh_port must be between 1-65535 (got ${JSON.stringify(sshPortRaw)})`);
   }
 
-  return { mode: "ssh-tunnel", sshTarget, sshKey, remotePort, ...(sshPort ? { sshPort } : {}) };
+  return {
+    mode: "remote",
+    host: hostFromTarget(sshTarget),
+    sshTarget,
+    sshKey,
+    remotePort,
+    ...(sshPort ? { sshPort } : {}),
+  };
 }
 
 /**
- * Writes an ssh-tunnel connection.json (mirrors deploy.ps1's step 4) so the
+ * Writes a "remote" connection.json (mirrors deploy.ps1's step 4) so the
  * setup wizard (see main.js's runSetupWizard) and the PowerShell deploy path
  * produce byte-identical config files.
  * @param {{sshTarget: string, sshKey: string, remotePort: number, sshPort?: number}} cfg
@@ -82,7 +104,7 @@ function saveConnectionConfig(cfg, { configPath } = {}) {
   fs.mkdirSync(path.dirname(resolvedPath), { recursive: true });
   const json = JSON.stringify(
     {
-      mode: "ssh-tunnel",
+      mode: "remote",
       ssh_target: cfg.sshTarget,
       ssh_key: cfg.sshKey,
       remote_port: cfg.remotePort,
@@ -105,4 +127,10 @@ function clearConnectionConfig({ configPath } = {}) {
   if (fs.existsSync(resolvedPath)) fs.unlinkSync(resolvedPath);
 }
 
-module.exports = { loadConnectionConfig, saveConnectionConfig, clearConnectionConfig, defaultConfigPath };
+module.exports = {
+  loadConnectionConfig,
+  saveConnectionConfig,
+  clearConnectionConfig,
+  defaultConfigPath,
+  hostFromTarget,
+};

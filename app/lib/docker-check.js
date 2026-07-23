@@ -10,8 +10,7 @@ const { spawn } = require("child_process");
 // whole multi-second probe. Doing this async lets the splash window's own
 // paint/show events run while the probe is in flight.
 //
-// spawnFn is injectable for testing (see test/unit/docker-check.test.js),
-// same pattern as lib/ssh-tunnel.js's startTunnel.
+// spawnFn is injectable for testing (see test/unit/docker-check.test.js).
 function probe(bin, args, { spawnFn = spawn, timeoutMs = 5000 } = {}) {
   return new Promise((resolve) => {
     let settled = false;
@@ -44,7 +43,7 @@ function probe(bin, args, { spawnFn = spawn, timeoutMs = 5000 } = {}) {
 
 // A local Docker Desktop/Engine means embedded mode has something to sample
 // (host/container telemetry); without one there's nothing for the embedded
-// server to show, so main.js offers the ssh-tunnel setup wizard instead.
+// server to show, so main.js offers the remote-server setup wizard instead.
 function hasLocalDocker(opts) {
   return probe("docker", ["info"], opts);
 }

@@ -1,9 +1,19 @@
 # Running the CTTC server remotely (no local Docker required)
 
-**Status:** phases 1-3 (SSH-tunnel transport + server container; collector
-de-duplication; file transfer) implemented on
-`feature/remote-server-ssh-tunnel`. Phases 4-5 below are still design only.
-See [Using phase 1](#using-phase-1) for how to actually run it.
+**Status:** superseded in part -- see below. Phases 2-3 (collector
+de-duplication; file transfer) are implemented as described. Phase 1 as
+originally designed (**option A: SSH tunnel**, below) was replaced before
+shipping: the client now connects to the remote server container directly
+over plain HTTP (`http://<host>:<port>`, no ssh tunnel/local port-forward at
+all), a deliberate product decision to keep the ongoing client<->server
+traffic path simple, with ssh used only once, to *provision* the container
+(see `lib/server-provision.js`'s `ensureRemoteContainer`). This is option B
+below, minus its token/TLS proposal -- an explicit choice to accept
+trusted-network-only exposure rather than add auth machinery. `server.py`'s
+`--host` flag (default `127.0.0.1`, `0.0.0.0` in the container) and the
+relaxed `connect-src http://*` CSP are the two changes B's design predicted
+would be needed. Phases 4-5 are still design only.
+See [Using it today](#using-it-today) for how to actually run it.
 
 ## Product context this design has to preserve
 
@@ -207,7 +217,7 @@ Things worth calling out because they're easy to get wrong silently:
   [server/.dockerignore](../../app/server/.dockerignore); confirmed it
   drops the transferred context from megabytes to a few hundred bytes.
 
-### Using phase 1
+### Using it today
 
 On the Docker-enabled host:
 
@@ -216,29 +226,35 @@ cd app/server
 docker compose up -d --build
 ```
 
-On the client machine, `~/.cttc/connection.json`:
+On the client machine, `~/.cttc/connection.json` (the setup wizard writes
+this for you; shown here for scripted/MDM deployment):
 
 ```json
 {
-  "mode": "ssh-tunnel",
+  "mode": "remote",
   "ssh_target": "deploy@docker-host.internal",
   "ssh_key": "~/.ssh/cttc_deploy",
   "remote_port": 8765
 }
 ```
 
-Then `npm start` as usual — nothing else changes. (Env vars `CTTC_MODE`,
+`ssh_target`/`ssh_key`/`ssh_port` are only ever used to provision (or
+re-provision, via Settings > Update server image) the container -- the
+client's own ongoing traffic goes straight to
+`http://<host-from-ssh_target>:<remote_port>`, derived by
+`hostFromTarget()` in
+[lib/connection-config.js](../../app/lib/connection-config.js). Then
+`npm start` as usual — nothing else changes. (Env vars `CTTC_MODE`,
 `CTTC_SSH_TARGET`, `CTTC_SSH_KEY`, `CTTC_REMOTE_PORT` override the file, for
-scripted deployment; see
-[lib/connection-config.js](../../app/lib/connection-config.js).)
+scripted deployment.)
 
 **Verified, not just built:** the whole pipeline was validated for real, not
 only unit-tested — a standalone `server.py` instance was started, Electron
-was launched in `ssh-tunnel` mode pointed at it through
-[test/fixtures/fake-ssh.js](../../app/test/fixtures/fake-ssh.js) (a real
-subprocess proxying real sockets, not a mock), and the renderer loaded real
-telemetry and log data over that tunnel with a UI pixel-identical to
-embedded mode. Separately, the container image itself was built and run
+was launched in `ssh-tunnel` mode (the design at the time) pointed at it
+through a fake-ssh test fixture (a real subprocess proxying real sockets,
+not a mock), and the renderer loaded real telemetry and log data over that
+tunnel with a UI pixel-identical to embedded mode. Separately, the container
+image itself was built and run
 against a real Docker daemon: `docker ps` from inside the container
 correctly matched the host's actual container list through the mounted
 socket, the `/docker/ps` and `/sources` HTTP endpoints responded correctly
@@ -531,34 +547,39 @@ currently promises (documented in
 [MANUAL.md](../../MANUAL.md#encryption-keys): *"the private key never
 leaves this machine"* — true today, false under naive shared-server reuse).
 
-## What changes in Electron for the SSH-tunnel path
+## What changes in Electron for the remote path (as shipped)
 
-`main.js` gains a second `startServer`-shaped function alongside the
-existing one, selected by config (see below), not by any new UI:
+`main.js`'s `connectToServer()` handles "remote" mode by calling
+`ensureRemoteContainer()` (see
+[lib/server-provision.js](../../app/lib/server-provision.js)), which
+provisions the container over ssh (mkdir/scp/`docker load`-or-`pull` +
+`docker compose up`) and, once its `/health` endpoint responds, returns
+`{host, port}` directly — no local ssh process, no port-forward:
 
 ```js
-async function startTunnel({ sshTarget, sshKey, remotePort }) {
-  const localPort = await getFreeLocalPort(); // bind :0, read it, close it
-  const args = ["-N", "-L", `127.0.0.1:${localPort}:127.0.0.1:${remotePort}`,
-                ...(sshKey ? ["-i", sshKey, "-o", "IdentitiesOnly=yes"] : []),
-                sshTarget];
-  sshProc = spawn("ssh", args, { stdio: ["ignore", "pipe", "pipe"] });
-  await waitForPortOpen("127.0.0.1", localPort, { timeoutMs: 15000 });
-  serverPort = localPort;
+async function connectToServer(fileArgs) {
+  const cfg = loadConnectionConfig();
+  // ...embedded-mode branches elided...
+  const remote = await ensureRemoteContainer(cfg, { ... });
+  serverHost = remote.host;
+  serverPort = remote.port;
 }
 ```
 
-- `app.whenReady()` picks `startServer(fileArgs)` (today's behavior) or
-  `startTunnel(cfg)` based on config presence — everything downstream
-  (`createWindow`, popout windows, `/events`) is unaware which one ran.
-- **`/shutdown` on quit must not fire in tunnel/remote mode** — that server
-  is shared infrastructure, not this process's child. `stopServer()` needs
-  a mode check; in tunnel mode it should just kill the local `ssh` process
-  and leave the remote container running.
+- `createWindow`/popout windows load `index.html` with both `host` and
+  `port` query params now (`renderer/app.js` builds
+  `API = http://${HOST}:${PORT}` from them) — previously only `port` was
+  passed, since embedded mode was always `127.0.0.1`.
+- **`/shutdown` on quit must not fire in remote mode** — that server is
+  shared infrastructure, not this process's child, and there's no local
+  process (ssh or otherwise) to stop either. `stopServer()` only ever acts
+  on `serverProc` (a bare `uv run server.py`); remote mode and the local-
+  container case are both left running (`restart: unless-stopped`).
 - Startup failure UX reuses the existing `dialog.showErrorBox` path (today:
-  *"could not start server via uv"*); the tunnel path's equivalent failure
-  ("could not reach `docker-host` via ssh") slots into the same dialog with
-  a different message — no new dialog needed.
+  *"could not start server via uv"*); the remote path's equivalent failure
+  ("could not reach `docker-host` via ssh", or the post-provision `/health`
+  wait timing out) slots into the same dialog with a different message —
+  no new dialog needed.
 
 ## Configuration surface (keeps the default flow untouched)
 
@@ -568,7 +589,7 @@ read once at startup, e.g.:
 ```jsonc
 // ~/.cttc/connection.json  (absent = today's embedded/local behavior)
 {
-  "mode": "ssh-tunnel",
+  "mode": "remote",
   "ssh_target": "deploy@docker-host.internal",
   "ssh_key": "~/.ssh/cttc_deploy",
   "remote_port": 8765
@@ -616,10 +637,14 @@ for path B:
 
 ## Suggested phasing
 
-1. **SSH-tunnel transport.** `main.js` gains the tunnel manager and a
-   config loader; `server.py`/`index.html`/`renderer/app.js` untouched.
-   Ship the Dockerfile/compose file for the remote host (`pid: host`,
-   `network_mode: host`, docker socket mount).
+1. **Remote transport — done, shipped as direct HTTP, not a tunnel.**
+   `main.js` gained a config loader and a provisioning path
+   (`ensureRemoteContainer`); unlike the SSH-tunnel design originally
+   sketched here, the client talks straight to the container over HTTP, so
+   `server.py` (a `--host` flag), `index.html` (relaxed CSP), and
+   `renderer/app.js` (host-aware `API` constant) all needed small changes
+   after all. Ships the Dockerfile/compose file for the remote host
+   (`pid: host`, `network_mode: host`, docker socket mount).
 2. **Collector de-duplication — done.** `State._open_or_reuse()` in
    `server.py`: a target already open (matched by its exact
    `docker://{host}/{stats|host|type/name}` path) is returned as-is,
@@ -661,13 +686,13 @@ as a VS Code extension instead of (or alongside) the Electron app — viewing
 correlated telemetry/logs inside the editor.
 
 One thing worth banking now while it's fresh: phase 1's decision to keep
-`lib/connection-config.js` and `lib/ssh-tunnel.js` as plain Node modules
-with zero `electron` dependency (see
-[What changes in Electron for the SSH-tunnel path](#what-changes-in-electron-for-the-ssh-tunnel-path))
+`lib/connection-config.js` and `lib/server-provision.js` as plain Node
+modules with zero `electron` dependency (see
+[What changes in Electron for the remote path](#what-changes-in-electron-for-the-remote-path-as-shipped))
 means they already run unmodified in *any* Node host process — a VS Code
 extension's extension host is exactly that. The remote-server transport
 this phase built isn't Electron-specific despite living in `app/main.js`
 today; a future VS Code extension would reuse both modules as-is rather
-than reimplementing tunnel management. Whether the *rest* of the client
+than reimplementing remote provisioning. Whether the *rest* of the client
 (the canvas-based renderer, IPC-shaped interactions) ports as cleanly is
 the real question for that future exploration — not answered here.
