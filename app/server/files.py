@@ -28,7 +28,9 @@ def download_sample(state, t0: float, t1: float, include_host: bool):
     return data, filename, len(meta)
 
 
-def upload_and_open(state, filename: str, data: bytes, transforms: list[str]):
+def upload_and_open(
+    state, filename: str, data: bytes, transforms: list[str], segment: int | None = None
+):
     """Write the uploaded bytes to a scratch file, open it exactly like a
     local file would be (.cttc -> load_sample, anything else -> open_file,
     always static/non-live since the server has no way to get new bytes
@@ -44,7 +46,9 @@ def upload_and_open(state, filename: str, data: bytes, transforms: list[str]):
 
     Returns the list of opened source ids. Any exception open_file/
     load_sample themselves raise propagates -- callers should catch and
-    report these the same way /open's per-file loop already does.
+    report these the same way /open's per-file loop already does (including
+    MultiSegmentSample, for a multi-segment .cttc with no `segment` chosen
+    yet -- see server.py's route_files_upload).
     """
     suffix = Path(filename).suffix or ".log"
     fd, tmp_path = tempfile.mkstemp(suffix=suffix, prefix="cttc-upload-")
@@ -52,7 +56,7 @@ def upload_and_open(state, filename: str, data: bytes, transforms: list[str]):
         with os.fdopen(fd, "wb") as f:
             f.write(data)
         if filename.endswith(".cttc"):
-            opened = state.load_sample(tmp_path)
+            opened = state.load_sample(tmp_path, segment=segment)
         else:
             src = state.open_file(tmp_path, "auto", filename, live=False, transforms=transforms)
             opened = [src.id]

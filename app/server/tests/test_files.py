@@ -45,14 +45,14 @@ class TestDownloadSample:
         assert filename.endswith(".cttc")
         z = zipfile.ZipFile(BytesIO(data))
         manifest = json.loads(z.read("manifest.json"))
-        assert len(manifest["sources"]) == 1
+        assert len(manifest["segments"][0]["sources"]) == 1
 
     def test_download_empty_range_yields_zero_sources(self, state, log_file):
         state.open_file(str(log_file), "auto", None, live=False, transforms=[])
         data, filename, count = files.download_sample(state, 0.0, 1.0, True)
         assert count == 0
         z = zipfile.ZipFile(BytesIO(data))
-        assert json.loads(z.read("manifest.json"))["sources"] == []
+        assert json.loads(z.read("manifest.json"))["segments"][0]["sources"] == []
 
 
 class TestUploadAndOpen:

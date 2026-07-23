@@ -1033,6 +1033,18 @@ class DockerLogSource(LogSource):
 # ── state, tailing, SSE ──────────────────────────────────────────────────────
 
 
+class MultiSegmentSample(Exception):
+    """Raised by State.load_sample() when a .cttc archive holds more than
+    one recorded segment (see the Recording feature -- multiple Record/
+    Pause spans flushed into the same file) and no segment index was given
+    to pick one. Carries enough per-segment metadata for the client to show
+    a "which recording do you want to load" picker."""
+
+    def __init__(self, segments: list[dict]):
+        super().__init__("multiple recorded segments -- choose one")
+        self.segments = segments
+
+
 class State:
     def __init__(self, transforms_dir: Path):
         self.sources: dict[str, Source] = {}
@@ -1142,56 +1154,115 @@ class State:
             )
         return opened
 
+    def _write_segment(
+        self, z: zipfile.ZipFile, seg_idx: int, t0: float, t1: float, include_host: bool
+    ) -> list[dict]:
+        """Write one segment's per-source log/metric slices in [t0, t1] into
+        the already-open zip `z`, namespaced under seg{seg_idx}/ so multiple
+        segments (recorded across separate Record/Pause spans, possibly
+        merged in from an earlier archive -- see merge_sample_bytes) never
+        collide on filename. Returns that segment's manifest sources list."""
+        meta = []
+        for i, s in enumerate(self.sources.values()):
+            if not include_host and getattr(s, "is_host", False):
+                continue
+            if s.kind == "log":
+                lo = bisect.bisect_left(s.rows, (t0,))
+                hi = bisect.bisect_right(s.rows, (t1 + 1,))
+                rows = s.rows[lo:hi]
+                if not rows:
+                    continue
+                fn = f"seg{seg_idx}/logs/{i}.jsonl"
+                z.writestr(fn, b"\n".join(jdumps({"ts": r[0], "text": r[3]}) for r in rows))
+                meta.append({"type": "log", "name": s.name, "file": fn, "count": len(rows)})
+            else:
+                ser = {}
+                for svc, lst in s.series.items():
+                    lo = bisect.bisect_left(lst, (t0,))
+                    hi = bisect.bisect_right(lst, (t1 + 1,))
+                    if hi > lo:
+                        ser[svc] = lst[lo:hi]
+                swarm = sorted(s._swarm)
+                if not ser:
+                    continue
+                fn = f"seg{seg_idx}/stats/{i}.json"
+                z.writestr(fn, jdumps({"series": ser, "swarm": swarm}))
+                meta.append({"type": "stats", "name": s.name, "file": fn, "is_host": s.is_host})
+        return meta
+
     def build_sample_bytes(
         self, t0: float, t1: float, include_host: bool = True
     ) -> tuple[bytes, list[dict]]:
-        """Build a .cttc sample's bytes: a zip of per-source log/metric
-        slices in [t0, t1] plus a manifest, for every currently open source
-        (unless include_host is False, which excludes host-telemetry
-        sources). Returns (data, meta); meta's length is the "how many
-        sources" count callers report."""
-        items = list(self.sources.values())
-        meta = []
+        """Build a one-segment .cttc sample's bytes (the ordinary Capture
+        Metrics / --static export path -- see merge_sample_bytes for the
+        Recording feature's multi-segment append). Returns (data, meta);
+        meta's length is the "how many sources" count callers report."""
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-            for i, s in enumerate(items):
-                if not include_host and getattr(s, "is_host", False):
-                    continue
-                if s.kind == "log":
-                    lo = bisect.bisect_left(s.rows, (t0,))
-                    hi = bisect.bisect_right(s.rows, (t1 + 1,))
-                    rows = s.rows[lo:hi]
-                    if not rows:
-                        continue
-                    fn = f"logs/{i}.jsonl"
-                    z.writestr(fn, b"\n".join(jdumps({"ts": r[0], "text": r[3]}) for r in rows))
-                    meta.append({"type": "log", "name": s.name, "file": fn, "count": len(rows)})
-                else:
-                    ser = {}
-                    for svc, lst in s.series.items():
-                        lo = bisect.bisect_left(lst, (t0,))
-                        hi = bisect.bisect_right(lst, (t1 + 1,))
-                        if hi > lo:
-                            ser[svc] = lst[lo:hi]
-                    swarm = sorted(s._swarm)
-                    if not ser:
-                        continue
-                    fn = f"stats/{i}.json"
-                    z.writestr(fn, jdumps({"series": ser, "swarm": swarm}))
-                    meta.append({"type": "stats", "name": s.name, "file": fn, "is_host": s.is_host})
-            z.writestr(
-                "manifest.json",
-                jdumps(
-                    {
-                        "version": 1,
-                        "from": t0,
-                        "to": t1,
-                        "created": now_iso(),
-                        "sources": meta,
-                    }
-                ),
-            )
+            meta = self._write_segment(z, 0, t0, t1, include_host)
+            segment = {"from": t0, "to": t1, "created": now_iso(), "sources": meta}
+            z.writestr("manifest.json", jdumps({"version": 2, "segments": [segment]}))
         return buf.getvalue(), meta
+
+    @staticmethod
+    def _read_segments(data: bytes) -> list[dict]:
+        """Normalizes any .cttc archive -- legacy single-segment (no
+        "segments" key, un-prefixed file paths) or the current multi-segment
+        shape alike -- into a list of
+        {"from", "to", "created", "sources", "_members": {relpath: bytes}}.
+        Reading each member's raw bytes here (rather than just the manifest)
+        lets merge_sample_bytes copy prior segments into a new archive
+        byte-for-byte, with zero awareness of whether they were originally
+        legacy or multi-segment."""
+        segments = []
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            man = jloads(z.read("manifest.json"))
+            raw_segments = man.get("segments")
+            if raw_segments is None:
+                raw_segments = [
+                    {
+                        "from": man.get("from"),
+                        "to": man.get("to"),
+                        "created": man.get("created", now_iso()),
+                        "sources": man.get("sources", []),
+                    }
+                ]
+            for seg in raw_segments:
+                members = {src["file"]: z.read(src["file"]) for src in seg["sources"]}
+                segments.append({**seg, "_members": members})
+        return segments
+
+    def merge_sample_bytes(
+        self, existing: bytes | None, t0: float, t1: float, include_host: bool = True
+    ) -> tuple[bytes, list[dict], int]:
+        """Append a new segment covering [t0, t1] to `existing` (raw bytes
+        of a previously recorded/exported .cttc, or None to start fresh),
+        returning the combined archive bytes, the new segment's own sources
+        meta, and its index. Backs /sample/record -- each Record/Pause span
+        of the Recording feature flushes one more segment into the same
+        archive this way, rather than each span becoming its own file."""
+        prior = self._read_segments(existing) if existing else []
+        seg_idx = len(prior)
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            for seg in prior:
+                for relpath, content in seg["_members"].items():
+                    z.writestr(relpath, content)
+            new_meta = self._write_segment(z, seg_idx, t0, t1, include_host)
+            segments_manifest = [
+                {
+                    "from": seg["from"],
+                    "to": seg["to"],
+                    "created": seg["created"],
+                    "sources": seg["sources"],
+                }
+                for seg in prior
+            ]
+            segments_manifest.append(
+                {"from": t0, "to": t1, "created": now_iso(), "sources": new_meta}
+            )
+            z.writestr("manifest.json", jdumps({"version": 2, "segments": segments_manifest}))
+        return buf.getvalue(), new_meta, seg_idx
 
     def export_sample(self, path: str, t0: float, t1: float, include_host: bool = True) -> dict:
         """Write a .cttc sample to a server-side path. See
@@ -1201,14 +1272,42 @@ class State:
         p.write_bytes(data)
         return {"path": str(p), "sources": len(meta)}
 
-    def load_sample(self, path: str) -> list[str]:
-        """Open a .cttc sample as a set of static sources."""
+    def load_sample(self, path: str, segment: int | None = None) -> list[str]:
+        """Open a .cttc sample as a set of static sources. If it holds more
+        than one recorded segment and `segment` isn't given, raises
+        MultiSegmentSample (carrying each segment's from/to/created/source
+        count) so the caller can ask the user which one to load instead of
+        silently picking one."""
         p = Path(path).expanduser()
         opened = []
         raw = p.read_bytes()
         with zipfile.ZipFile(io.BytesIO(raw)) as z:
             man = jloads(z.read("manifest.json"))
-            for meta in man.get("sources", []):
+            raw_segments = man.get("segments")
+            if raw_segments is None:
+                raw_segments = [
+                    {
+                        "from": man.get("from"),
+                        "to": man.get("to"),
+                        "created": man.get("created", now_iso()),
+                        "sources": man.get("sources", []),
+                    }
+                ]
+            if len(raw_segments) > 1 and segment is None:
+                raise MultiSegmentSample(
+                    [
+                        {
+                            "index": i,
+                            "from": seg["from"],
+                            "to": seg["to"],
+                            "created": seg.get("created"),
+                            "source_count": len(seg["sources"]),
+                        }
+                        for i, seg in enumerate(raw_segments)
+                    ]
+                )
+            seg = raw_segments[segment or 0]
+            for meta in seg["sources"]:
                 sid = f"s{self.next_id}"
                 self.next_id += 1
                 if meta["type"] == "log":
@@ -1581,11 +1680,11 @@ async def route_events(request: Request):
 async def route_open(request: Request):
     body = await request.json() if await request.body() else {}
     st = get_state(request)
-    opened, errors = [], []
+    opened, errors, needs_selection = [], [], []
     for f in body.get("files", []):
         try:
             if str(f["path"]).endswith(".cttc"):
-                opened.extend(st.load_sample(f["path"]))
+                opened.extend(st.load_sample(f["path"], segment=f.get("segment")))
                 continue
             src = st.open_file(
                 f["path"],
@@ -1595,10 +1694,17 @@ async def route_open(request: Request):
                 f.get("transforms", []),
             )
             opened.append(src.id)
+        except MultiSegmentSample as e:
+            needs_selection.append({"path": f.get("path"), "segments": e.segments})
         except Exception as e:
             errors.append({"path": f.get("path"), "error": str(e)})
     st.broadcast({"type": "sources"})
-    return {"opened": opened, "errors": errors, "sources": st.describe()}
+    return {
+        "opened": opened,
+        "errors": errors,
+        "needs_selection": needs_selection,
+        "sources": st.describe(),
+    }
 
 
 @app.post("/close")
@@ -1622,6 +1728,34 @@ async def route_sample_export(request: Request):
         float(body["from"]),
         float(body["to"]),
         bool(body.get("include_host", True)),
+    )
+
+
+@app.post("/sample/record")
+async def route_sample_record(request: Request):
+    """Recording feature: flush the current [from, to) span as one more
+    segment into a .cttc archive, byte-oriented like /files/upload|download
+    (no shared-filesystem assumption -- the client already holds the
+    previous archive's bytes locally, from having written them there after
+    the last Record/Pause/Stop). Request body is the *existing* archive's
+    raw bytes (empty body means "first segment, nothing to merge into");
+    response body is the combined archive's raw bytes, for the client to
+    write back over its local copy."""
+    existing = await request.body()
+    t0 = float(request.headers.get("X-CTTC-From", ""))
+    t1 = float(request.headers.get("X-CTTC-To", ""))
+    inc = (request.headers.get("X-CTTC-Include-Host") or "1").lower() not in ("0", "false")
+    st = get_state(request)
+    data, meta, seg_idx = st.merge_sample_bytes(existing or None, t0, t1, inc)
+    return Response(
+        content=data,
+        media_type="application/octet-stream",
+        headers={
+            "X-CTTC-Source-Count": str(len(meta)),
+            "X-CTTC-Segment-Index": str(seg_idx),
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Expose-Headers": "X-CTTC-Source-Count, X-CTTC-Segment-Index",
+        },
     )
 
 
@@ -1653,15 +1787,26 @@ async def route_files_upload(request: Request):
     data = await request.body()
     filename = request.headers.get("X-CTTC-Filename") or "upload"
     transforms = [t for t in (request.headers.get("X-CTTC-Transforms") or "").split(",") if t]
+    segment_raw = request.headers.get("X-CTTC-Segment")
+    segment = int(segment_raw) if segment_raw not in (None, "") else None
     st = get_state(request)
+    needs_selection = []
     try:
-        opened = files.upload_and_open(st, filename, data, transforms)
+        opened = files.upload_and_open(st, filename, data, transforms, segment=segment)
         errors = []
+    except MultiSegmentSample as e:
+        opened, errors = [], []
+        needs_selection.append({"path": filename, "segments": e.segments})
     except Exception as e:
         opened, errors = [], [{"path": filename, "error": str(e)}]
     if opened:
         st.broadcast({"type": "sources"})
-    return {"opened": opened, "errors": errors, "sources": st.describe()}
+    return {
+        "opened": opened,
+        "errors": errors,
+        "needs_selection": needs_selection,
+        "sources": st.describe(),
+    }
 
 
 @app.post("/shutdown")

@@ -1388,6 +1388,83 @@ class TestSampleRoundTrip:
         assert src.slice(1, 1)[0]["text"] == ""  # missing text defaults to empty
 
 
+class TestMultiSegmentSample:
+    """Recording feature: Record/Pause spans get flushed into the same
+    .cttc archive one segment at a time via merge_sample_bytes(), and
+    load_sample() must ask (via MultiSegmentSample) which one to load once
+    there's more than one."""
+
+    def test_merge_from_scratch_is_a_single_segment(self, state, log_file):
+        state.open_file(str(log_file), "auto", None, live=False, transforms=[])
+        t0, t1 = ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 5)
+        data, meta, seg_idx = state.merge_sample_bytes(None, t0, t1)
+        assert seg_idx == 0
+        assert len(meta) == 1
+        man = json.loads(zipfile.ZipFile(io.BytesIO(data)).read("manifest.json"))
+        assert len(man["segments"]) == 1
+        assert man["segments"][0]["from"] == t0 and man["segments"][0]["to"] == t1
+
+    def test_merge_appends_a_second_segment_without_losing_the_first(self, state, log_file):
+        state.open_file(str(log_file), "auto", None, live=False, transforms=[])
+        t0, t1 = ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 5)
+        first, _meta1, idx1 = state.merge_sample_bytes(None, t0, t1)
+        t2, t3 = ms(2026, 1, 2, 3, 0, 5), ms(2026, 1, 2, 3, 0, 10)
+        second, meta2, idx2 = state.merge_sample_bytes(first, t2, t3)
+        assert idx1 == 0 and idx2 == 1
+        assert len(meta2) == 1
+        man = json.loads(zipfile.ZipFile(io.BytesIO(second)).read("manifest.json"))
+        assert len(man["segments"]) == 2
+        assert man["segments"][0]["from"] == t0
+        assert man["segments"][1]["from"] == t2
+        # the first segment's own member bytes must be intact, unchanged
+        z = zipfile.ZipFile(io.BytesIO(second))
+        assert z.read(man["segments"][0]["sources"][0]["file"])
+
+    def test_merge_onto_a_legacy_single_segment_file(self, state, log_file, tmp_path):
+        # a file exported before the Recording feature (build_sample_bytes'
+        # own one-segment shape) must still be a valid base to append onto
+        state.open_file(str(log_file), "auto", None, live=False, transforms=[])
+        t0, t1 = ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 5)
+        legacy, _meta = state.build_sample_bytes(t0, t1)
+        t2, t3 = ms(2026, 1, 2, 3, 0, 5), ms(2026, 1, 2, 3, 0, 10)
+        merged, meta2, idx2 = state.merge_sample_bytes(legacy, t2, t3)
+        assert idx2 == 1 and len(meta2) == 1
+        st2 = server.State(tmp_path)
+        out = tmp_path / "merged.cttc"
+        out.write_bytes(merged)
+        with pytest.raises(server.MultiSegmentSample) as ei:
+            st2.load_sample(str(out))
+        assert [s["index"] for s in ei.value.segments] == [0, 1]
+
+    def test_load_sample_with_explicit_segment_picks_that_one(self, state, log_file, tmp_path):
+        state.open_file(str(log_file), "auto", None, live=False, transforms=[])
+        t0, t1 = ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 5)
+        first, _m1, _i1 = state.merge_sample_bytes(None, t0, t1)
+        t2, t3 = ms(2026, 1, 2, 3, 0, 5), ms(2026, 1, 2, 3, 0, 10)
+        merged, _m2, _i2 = state.merge_sample_bytes(first, t2, t3)
+        out = tmp_path / "two-segments.cttc"
+        out.write_bytes(merged)
+
+        st2 = server.State(tmp_path)
+        opened0 = st2.load_sample(str(out), segment=0)
+        assert len(opened0) == 1
+        assert st2.sources[opened0[0]].slice(0, 1)[0]["text"] == "alpha"
+
+        st3 = server.State(tmp_path)
+        opened1 = st3.load_sample(str(out), segment=1)
+        assert len(opened1) == 1
+        assert st3.sources[opened1[0]].slice(0, 1)[0]["text"] == "beta"
+
+    def test_single_segment_file_loads_without_a_segment_arg(self, state, log_file, tmp_path):
+        state.open_file(str(log_file), "auto", None, live=False, transforms=[])
+        t0, t1 = ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 5)
+        data, _meta, _idx = state.merge_sample_bytes(None, t0, t1)
+        out = tmp_path / "one-segment.cttc"
+        out.write_bytes(data)
+        st2 = server.State(tmp_path)
+        assert len(st2.load_sample(str(out))) == 1  # no MultiSegmentSample raised
+
+
 # ── HTTP API ─────────────────────────────────────────────────────────────────
 
 
@@ -1473,6 +1550,17 @@ def post_raw(base, path, data, headers=None):
             return r.status, json.loads(r.read())
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read())
+
+
+def post_raw_binary(base, path, data, headers=None):
+    """Like post_raw(), but for an endpoint whose *response* body is also
+    raw bytes, not JSON: /sample/record."""
+    req = urllib.request.Request(base + path, data=data, method="POST", headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, r.headers, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers, e.read()
 
 
 class TestHttpApi:
@@ -1587,6 +1675,86 @@ class TestHttpApi:
         assert code == 200 and j["sources"] == 2
         code, j = post(base, "/open", {"files": [{"path": str(out)}]})
         assert code == 200 and len(j["opened"]) == 2 and j["errors"] == []
+
+    def test_sample_record_first_segment_from_empty_body(self, api):
+        base, _ = api
+        t0 = ms(2026, 1, 2, 3, 0, 0)
+        code, headers, data = post_raw_binary(
+            base,
+            "/sample/record",
+            b"",
+            {"X-CTTC-From": str(t0), "X-CTTC-To": str(t0 + 5000)},
+        )
+        assert code == 200
+        assert headers["X-CTTC-Segment-Index"] == "0"
+        man = json.loads(zipfile.ZipFile(io.BytesIO(data)).read("manifest.json"))
+        assert len(man["segments"]) == 1
+
+    def test_sample_record_second_segment_appends(self, api):
+        base, _ = api
+        t0 = ms(2026, 1, 2, 3, 0, 0)
+        _code, _h, first = post_raw_binary(
+            base, "/sample/record", b"", {"X-CTTC-From": str(t0), "X-CTTC-To": str(t0 + 5000)}
+        )
+        code, headers, second = post_raw_binary(
+            base,
+            "/sample/record",
+            first,
+            {"X-CTTC-From": str(t0 + 5000), "X-CTTC-To": str(t0 + 10000)},
+        )
+        assert code == 200
+        assert headers["X-CTTC-Segment-Index"] == "1"
+        man = json.loads(zipfile.ZipFile(io.BytesIO(second)).read("manifest.json"))
+        assert len(man["segments"]) == 2
+
+    def test_sample_record_include_host_false(self, api, state):
+        base, _ = api
+        for s in state.sources.values():
+            if s.kind == "stats":
+                s.is_host = True
+        t0 = ms(2026, 1, 2, 3, 0, 0)
+        code, headers, data = post_raw_binary(
+            base,
+            "/sample/record",
+            b"",
+            {
+                "X-CTTC-From": str(t0),
+                "X-CTTC-To": str(t0 + 20000),
+                "X-CTTC-Include-Host": "0",
+            },
+        )
+        assert code == 200
+        man = json.loads(zipfile.ZipFile(io.BytesIO(data)).read("manifest.json"))
+        assert all(s["type"] != "stats" for s in man["segments"][0]["sources"])
+
+    def test_open_multi_segment_file_returns_needs_selection(self, api, tmp_path):
+        base, _ = api
+        t0 = ms(2026, 1, 2, 3, 0, 0)
+        _code, _h, first = post_raw_binary(
+            base, "/sample/record", b"", {"X-CTTC-From": str(t0), "X-CTTC-To": str(t0 + 5000)}
+        )
+        _code, _h, second = post_raw_binary(
+            base,
+            "/sample/record",
+            first,
+            {"X-CTTC-From": str(t0 + 5000), "X-CTTC-To": str(t0 + 10000)},
+        )
+        out = tmp_path / "recorded.cttc"
+        out.write_bytes(second)
+
+        code, j = post(base, "/open", {"files": [{"path": str(out)}]})
+        assert code == 200
+        assert j["opened"] == []
+        assert j["errors"] == []
+        assert len(j["needs_selection"]) == 1
+        segs = j["needs_selection"][0]["segments"]
+        assert [s["index"] for s in segs] == [0, 1]
+
+        # picking one this time opens it normally
+        code, j = post(base, "/open", {"files": [{"path": str(out), "segment": 1}]})
+        assert code == 200
+        assert len(j["opened"]) == 1
+        assert j["needs_selection"] == []
 
     def test_docker_ps_endpoint(self, api, monkeypatch):
         base, _ = api
@@ -1788,7 +1956,7 @@ class TestFilesEndpoints:
         t0 = ms(2026, 1, 2, 3, 0, 0)
         code, _h, data = get_raw(base, f"/files/download?from={t0}&to={t0 + 60000}&include_host=0")
         z = zipfile.ZipFile(io.BytesIO(data))
-        sources = json.loads(z.read("manifest.json"))["sources"]
+        sources = json.loads(z.read("manifest.json"))["segments"][0]["sources"]
         assert all(
             s["type"] != "stats" for s in sources
         )  # the host-marked stats source is excluded
@@ -1802,6 +1970,31 @@ class TestFilesEndpoints:
         assert len(j["opened"]) == 1 and j["errors"] == []
         src = st.sources[j["opened"][0]]
         assert src.path == "upload://up.log" and src.total() == 2
+
+    def test_upload_multi_segment_cttc_returns_needs_selection(self, api):
+        base, _ = api
+        t0 = ms(2026, 1, 2, 3, 0, 0)
+        _code, _h, first = post_raw_binary(
+            base, "/sample/record", b"", {"X-CTTC-From": str(t0), "X-CTTC-To": str(t0 + 5000)}
+        )
+        _code, _h, second = post_raw_binary(
+            base,
+            "/sample/record",
+            first,
+            {"X-CTTC-From": str(t0 + 5000), "X-CTTC-To": str(t0 + 10000)},
+        )
+        code, j = post_raw(base, "/files/upload", second, {"X-CTTC-Filename": "rec.cttc"})
+        assert code == 200
+        assert j["opened"] == [] and j["errors"] == []
+        assert len(j["needs_selection"]) == 1
+        assert [s["index"] for s in j["needs_selection"][0]["segments"]] == [0, 1]
+
+        code, j = post_raw(
+            base, "/files/upload", second, {"X-CTTC-Filename": "rec.cttc", "X-CTTC-Segment": "0"}
+        )
+        assert code == 200
+        assert len(j["opened"]) >= 1
+        assert j["needs_selection"] == []
 
     def test_upload_no_filename_header_still_works(self, api):
         base, _ = api
