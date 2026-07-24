@@ -354,7 +354,7 @@ to only ever have one client because nothing else could reach it.
 - **The shared, de-duplicated part is exactly what `State.sources` already
   is** — one `DockerStatsSource`/`DockerLogSource`/`HostStatsSource` per
   collected target, visible identically to every client via `/sources` and
-  `/series`. A second client's *"Add sources"* dialog already calls
+  `/series`. A second client's *"Set sources"* dialog already calls
   `/docker/ps` + checks `openPaths()` against the live `/sources` list and
   marks already-open containers *"already added"* ([app.js
   `updateDockerDupes`/`listContainers`](../../app/renderer/app.js)) — so

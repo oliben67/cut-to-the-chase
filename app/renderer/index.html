@@ -16,7 +16,7 @@
     <div class="menu" data-menu="file">
       <button class="menu-label" type="button">File</button>
       <div class="menu-list" role="menu">
-        <button data-action="add-sources">Add Sources… <span class="acc">Ctrl+O</span></button>
+        <button data-action="set-sources">Set Sources… <span class="acc">Ctrl+O</span></button>
         <button data-action="load-metrics">Load Metrics… <span class="acc">Ctrl+L</span></button>
         <div class="menu-sep"></div>
         <span class="menu-sub-label">Preferences</span>
@@ -84,7 +84,7 @@
 
   <header id="toolbar">
     <strong class="app-title">CTTC Timeline</strong>
-    <button id="btn-add" title="Attach to a Docker daemon (local or ssh://) and pick containers/services to follow">＋ Add sources</button>
+    <button id="btn-set" title="Attach to a Docker daemon (local or ssh://) and pick containers/services to follow">＋ Set sources</button>
     <button id="btn-clear-sources" title="Close every open source and start from scratch">🗑 Clear sources</button>
     <button id="btn-load-sample" title="Load a .cttc metrics file (possibly encrypted)">📂 Load metrics</button>
     <label class="ctl" title="Poll interval: size of the ± highlight window around the selected time">poll interval<input id="win-secs" type="number" min="0" step="1" value="5" /> s</label>
@@ -141,7 +141,7 @@
           </div>
         </div>
       </div>
-      <div id="empty-state" class="muted">No sources yet — click “＋ Add sources” to attach to a Docker daemon (local or ssh://), or “📂 Load metrics” to open a .cttc file.</div>
+      <div id="empty-state" class="muted">No sources yet — click “＋ Set sources” to attach to a Docker daemon (local or ssh://), or “📂 Load metrics” to open a .cttc file.</div>
     </section>
     <div id="splitter" title="Drag to resize the logs panel"></div>
     <section id="panels"></section>
@@ -150,8 +150,8 @@
   <div id="tooltip" hidden></div>
   <div id="hint" hidden></div>
 
-  <dialog id="dlg-add">
-    <h2>Add sources — Docker</h2>
+  <dialog id="dlg-set">
+    <h2>Set sources — Docker</h2>
 
     <div>
       <label class="ctl block">Docker host

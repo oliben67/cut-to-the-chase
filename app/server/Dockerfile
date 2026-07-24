@@ -48,7 +48,7 @@ FROM python:3.14-alpine
 RUN apk add --no-cache ca-certificates openssh-client
 COPY --from=builder /usr/local/bin/docker /usr/local/bin/docker
 
-# `docker -H ssh://...` (Add Sources with an ssh:// host, e.g. to reach a
+# `docker -H ssh://...` (Set Sources with an ssh:// host, e.g. to reach a
 # *third* machine from this container) execs plain ssh with no flags of its
 # own, so without this it either hangs on an interactive host-key prompt (no
 # tty, no stdin -- capture_output=True in server.py) or fails outright on

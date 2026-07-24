@@ -430,7 +430,7 @@
     ok(txt.includes("hello") && !txt.includes("world"), "first log line only");
   });
 
-  /* ── add-sources dialog logic ─────────────────────────────────────────── */
+  /* ── set-sources dialog logic ─────────────────────────────────────────── */
 
   await T("updateDockerDupes disables already-collected stats", () => {
     state.sources.push({ id: "__dup", path: "docker://local/stats", kind: "stats", live: true });

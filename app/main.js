@@ -122,7 +122,7 @@ function installMenu() {
 // Electron shows no context menu at all by default (unlike a regular
 // browser) -- text inputs/textareas got no right-click Cut/Copy/Paste/Select
 // All without this. Attach to every window's webContents so it works
-// anywhere text is editable (Add Sources' host field, the setup wizard's
+// anywhere text is editable (Set Sources' host field, the setup wizard's
 // key-paste textarea, ...).
 function attachEditContextMenu(win) {
   win.webContents.on("context-menu", (_e, params) => {
@@ -497,10 +497,10 @@ async function connectToServer(fileArgs) {
 }
 
 // Right after provisioning, check whether the server host itself has docker
-// -- that's what Add Sources targets by default (an empty Docker host field
+// -- that's what Set Sources targets by default (an empty Docker host field
 // there resolves to wherever the server process lives). Purely
 // informational: failure here doesn't block setup, it just tells the user
-// up front whether they'll need to type an explicit target in Add Sources
+// up front whether they'll need to type an explicit target in Set Sources
 // instead of relying on the default.
 async function checkServerHostDocker(host, port, onLog) {
   onLog?.("$ checking for docker on the server host...");
@@ -514,7 +514,7 @@ async function checkServerHostDocker(host, port, onLog) {
       onLog?.(`  → docker found (${j.containers.length} container(s), ${j.services.length} service(s))`);
     } else {
       onLog?.(`  → no local docker on the server host: ${j.error || r.status}`);
-      onLog?.("  → you'll need to set an explicit target in Add Sources' Docker host field");
+      onLog?.("  → you'll need to set an explicit target in Set Sources' Docker host field");
     }
   } catch (err) {
     onLog?.(`  → could not check: ${err.message || err}`);

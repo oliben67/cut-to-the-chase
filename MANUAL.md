@@ -56,7 +56,7 @@ installation, see the [README](README.md).
 ## Getting started
 
 Launch the app (see the [README](README.md) for installation). With nothing
-open, the *Add sources* dialog appears automatically. From there you attach
+open, the *Set sources* dialog appears automatically. From there you attach
 to a Docker daemon; or use **📂 Load metrics** to open a saved `.cttc` file
 instead.
 
@@ -74,7 +74,7 @@ and WARN rows edge-colored](docs/images/app-overview.png)
 
 From top to bottom:
 
-1. **Toolbar** — ＋ Add sources, 🗑 Clear sources, 📂 Load metrics, 🔑 Keys,
+1. **Toolbar** — ＋ Set sources, 🗑 Clear sources, 📂 Load metrics, 🔑 Keys,
    the *frequency* window, the 〜/▤ chart-style switch, and (right) the
    cursor's UTC readout.
 2. **Telemetry** — the container legend, then the CPU % / MEM % / NET metric
@@ -99,10 +99,10 @@ space; the position is remembered.
 
 ### Collecting from Docker
 
-![The Add sources dialog: docker host field, telemetry checkboxes, poll
-interval, and the transforms list](docs/images/dlg-add-sources.png)
+![The Set sources dialog: docker host field, telemetry checkboxes, poll
+interval, and the transforms list](docs/images/dlg-set-sources.png)
 
-**＋ Add sources** attaches to a Docker daemon. Leave the host field empty
+**＋ Set sources** attaches to a Docker daemon. Leave the host field empty
 for the local daemon. Telemetry and logs are two independent kinds of data
 CTTC can collect, so the dialog splits them into two sections — **everything
 in both is ticked by default**; untick whatever you don't want.
@@ -361,7 +361,7 @@ main window on close; series pop-outs are extra views, so nothing moves.
 
 Transforms are user-written Python modules applied to every log record at
 ingest. Drop a `.py` file into `app/server/transforms/` and it appears as a
-checkbox in the *Add sources* dialog. Modules are reloaded every time
+checkbox in the *Set sources* dialog. Modules are reloaded every time
 sources are opened — edit and re-add, no restart needed.
 
 ```python

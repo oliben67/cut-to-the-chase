@@ -17,7 +17,7 @@ services:
       - SSH_AUTH_SOCK=/ssh-agent
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      # Lets `docker -H ssh://...` (Add Sources with an ssh:// host) reach a
+      # Lets `docker -H ssh://...` (Set Sources with an ssh:// host) reach a
       # *third* machine, authenticating as whatever key this host's own
       # ssh-agent already has loaded -- no key ever lives in the container.
       # Falls back to /dev/null (a harmless no-op mount) when this host has

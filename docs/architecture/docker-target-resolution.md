@@ -7,7 +7,7 @@ CTTC, and it's easy to conflate them:
 - **tunnel-host** — the machine the setup wizard's ssh tunnel connects to
   (only exists in ssh-tunnel mode); this is where the `cttc-gateway`
   container actually runs in that mode.
-- **docker-host** — whatever's typed into Add Sources' "Docker host" field
+- **docker-host** — whatever's typed into Set Sources' "Docker host" field
   (`ssh://user@host`, or bare `user@host`); may be empty.
 
 The one invariant that holds no matter what: **the browser/renderer only
@@ -27,7 +27,7 @@ further right; nothing loops backward except the final result:
 flowchart LR
     subgraph L1["🖥️ app-host<br/>(browser / renderer)"]
         direction TB
-        S1(["User clicks Connect<br/>in Add Sources"]) --> S2["POST http://127.0.0.1:port<br/>/docker/ps { host }"]
+        S1(["User clicks Connect<br/>in Set Sources"]) --> S2["POST http://127.0.0.1:port<br/>/docker/ps { host }"]
     end
 
     subgraph L2["⚙️ wherever cttc-gateway runs<br/>(app-host or tunnel-host)"]
@@ -37,7 +37,7 @@ flowchart LR
         S3 -- "yes" --> S4
     end
 
-    subgraph L3["🎯 docker-host<br/>(Add Sources field, if set)"]
+    subgraph L3["🎯 docker-host<br/>(Set Sources field, if set)"]
         direction TB
         S5["docker -H ssh://user@host<br/>version / ps<br/>(ssh subprocess run BY the server)"]
     end
@@ -53,7 +53,7 @@ flowchart LR
 
 ## Where cttc-gateway ends up running (startup decision)
 
-This part happens once, at app startup, before any Add Sources request is
+This part happens once, at app startup, before any Set Sources request is
 ever made — it decides which system lane 2 above actually is:
 
 ```mermaid
@@ -84,7 +84,7 @@ flowchart TB
 3. A successful tunnel connection deploys `cttc-gateway` onto tunnel-host,
    then immediately probes whether *that* host has Docker (informational —
    doesn't block setup either way).
-4. In Add Sources, an empty "Docker host" field resolves to wherever
+4. In Set Sources, an empty "Docker host" field resolves to wherever
    `cttc-gateway` actually runs (app-host or tunnel-host, whichever
    applies); a non-empty field overrides that with an explicit docker-host,
    reached via ssh **from the server**, never from the browser.

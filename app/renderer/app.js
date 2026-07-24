@@ -1911,11 +1911,11 @@ function connectSSE() {
   es.onopen = () => setStatus("");
 }
 
-/* ── add-sources dialog (Docker) ────────────────────────────────────────── */
+/* ── set-sources dialog (Docker) ────────────────────────────────────────── */
 
-const dlg = $("dlg-add");
+const dlg = $("dlg-set");
 
-// names of the transform checkboxes ticked in Add Sources, in DOM order --
+// names of the transform checkboxes ticked in Set Sources, in DOM order --
 // sent as-is to /docker/collect, which loads and applies them server-side.
 function chosenTransforms() {
   return [...dlg.querySelectorAll("#transforms-list input:checked")].map((i) => i.value);
@@ -1941,7 +1941,7 @@ function updateDockerDupes() {
   }
 }
 
-$("btn-add").onclick = async () => {
+$("btn-set").onclick = async () => {
   $("docker-targets").innerHTML = "";
   $("docker-error").textContent = "";
   updateDockerDupes();
@@ -1968,7 +1968,7 @@ $("btn-add").onclick = async () => {
 };
 
 // close every open source and forget the remembered last-session containers,
-// so the next launch starts with nothing and the add-sources dialog opens.
+// so the next launch starts with nothing and the set-sources dialog opens.
 $("btn-clear-sources").onclick = async () => {
   try {
     await Promise.all(state.sources.map((s) => post("/close", { id: s.id })));
@@ -1979,7 +1979,7 @@ $("btn-clear-sources").onclick = async () => {
   }
 };
 
-/* ── load .cttc metrics (separate from the Docker "Add sources" flow) ──── */
+/* ── load .cttc metrics (separate from the Docker "Set sources" flow) ──── */
 
 // reads a local path's bytes (via main.js, which has fs access the renderer
 // doesn't) and POSTs them to /files/upload -- works identically whether
@@ -2595,7 +2595,7 @@ window.cttc?.onPopoutClosed?.(({ kind, id }) => {
 // don't have the matching toolbar/dialogs wired up, so they ignore these).
 if (!POPOUT_KIND) {
   window.cttc?.onMenuAction?.((action) => {
-    if (action === "add-sources") $("btn-add").click();
+    if (action === "set-sources") $("btn-set").click();
     else if (action === "load-metrics") $("btn-load-sample").click();
     else if (action === "open-theme") openThemeDialog();
     else if (action === "open-settings") openSettingsDialog();
@@ -2641,7 +2641,7 @@ if (!POPOUT_KIND) {
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeMenu(); });
 
   const RENDERER_ACTIONS = {
-    "add-sources": () => $("btn-add").click(),
+    "set-sources": () => $("btn-set").click(),
     "load-metrics": () => $("btn-load-sample").click(),
     "open-theme": () => openThemeDialog(),
     "open-settings": () => openSettingsDialog(),
@@ -2673,7 +2673,7 @@ if (!POPOUT_KIND) {
   // like Ctrl+C/V/Z work out of the box in inputs/contenteditable and are
   // deliberately left alone here).
   const ACCELERATORS = {
-    "mod+o": "add-sources",
+    "mod+o": "set-sources",
     "mod+l": "load-metrics",
     "mod+r": "reload",
     f12: "toggle-devtools",
@@ -2700,7 +2700,7 @@ if (!POPOUT_KIND) {
 
 
 refreshAll().then(async () => {
-  if (POPOUT_KIND) return; // popout windows never restore/add sources on their own
+  if (POPOUT_KIND) return; // popout windows never restore/set sources on their own
   if (state.sources.length === 0) {
     // nothing open yet (fresh install, or the last session's sources are all
     // closed): try to reopen the containers/services collected last time.
@@ -2712,7 +2712,7 @@ refreshAll().then(async () => {
       } catch { /* remembered host(s) unreachable; fall through below */ }
     }
   }
-  if (state.sources.length === 0) $("btn-add").click(); // still nothing: prompt right away
+  if (state.sources.length === 0) $("btn-set").click(); // still nothing: prompt right away
 });
 connectSSE();
 
