@@ -573,7 +573,7 @@ function runSetupWizard() {
       // explanatory paragraph (see gateway-setup.html's #new-intro) takes
       // real vertical space that edit mode doesn't have (a single label +
       // dropdown replaces it there -- see openGatewayManager below).
-      height: 780,
+      height: 860,
       minWidth: 480,
       minHeight: 560,
       // Was fixed-size (resizable: false) at a height that clipped the
@@ -755,7 +755,7 @@ function openGatewayManager() {
     // replaced here by a single compact label + dropdown (see
     // gateway-setup.html's #gateway-select-row), so there's less to fit
     // above the (identical) ssh/key/image fields and actions below it.
-    height: 660,
+    height: 800,
     minWidth: 480,
     minHeight: 560,
     icon: APP_ICON,
