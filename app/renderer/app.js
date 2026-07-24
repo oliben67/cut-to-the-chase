@@ -2728,7 +2728,7 @@ connectSSE();
   // whether it's reachable, matters most for "remote" mode (see
   // docs/architecture/remote-server.md), where it's easy to forget which
   // host is actually being talked to.
-  $("server-status-location").textContent = `${HOST}:${PORT}`;
+  $("server-status-location").textContent = `${HOST === "127.0.0.1" ? "localhost" : HOST}:${PORT}`;
   const HEALTH_POLL_MS = 5000;
   const setState = (state, detail) => {
     el.dataset.state = state;
