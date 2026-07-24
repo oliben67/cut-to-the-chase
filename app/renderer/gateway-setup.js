@@ -11,7 +11,6 @@ const MODE = new URLSearchParams(location.search).get("mode") === "edit" ? "edit
 const newIntroEl = document.getElementById("new-intro");
 const gatewaySelectRowEl = document.getElementById("gateway-select-row");
 const selectEl = document.getElementById("gateway-select");
-const emptyEl = document.getElementById("empty");
 const form = document.getElementById("form");
 const sshUserEl = document.getElementById("ssh-user");
 const sshHostEl = document.getElementById("ssh-host");
@@ -19,9 +18,11 @@ const sshPortEl = document.getElementById("ssh-port");
 const keyPathEl = document.getElementById("key-path");
 const keyPasteEl = document.getElementById("key-paste");
 const btnBrowseEl = document.getElementById("btn-browse");
+const imageRadios = [...document.querySelectorAll('input[name="image-source"]')];
 const imageRefRow = document.getElementById("image-ref-row");
 const imageTarballRow = document.getElementById("image-tarball-row");
 const imageRefEl = document.getElementById("image-ref");
+const imageTarballBrowseEl = document.getElementById("image-tarball-browse");
 const imageTarballPathEl = document.getElementById("image-tarball-path");
 const errorEl = document.getElementById("error");
 const waitEl = document.getElementById("wait");
@@ -47,7 +48,7 @@ if (MODE === "edit") {
   gatewaySelectRowEl.hidden = false;
   btnSkip.hidden = true;
   btnUninstall.hidden = false;
-  btnConnect.textContent = "Save changes";
+  btnConnect.textContent = "Save changes"; // overwritten per-gateway once one's picked (fillFormForEdit)
   waitMsgEl.textContent = "Applying changes, please wait…";
 }
 
@@ -63,7 +64,7 @@ for (const radio of document.querySelectorAll('input[name="key-mode"]')) {
   });
 }
 
-for (const radio of document.querySelectorAll('input[name="image-source"]')) {
+for (const radio of imageRadios) {
   radio.addEventListener("change", () => {
     imageRefRow.hidden = radio.value !== "registry" || !radio.checked;
     imageTarballRow.hidden = radio.value !== "tarball" || !radio.checked;
@@ -75,7 +76,7 @@ document.getElementById("btn-browse").addEventListener("click", async () => {
   if (paths.length) keyPathEl.value = paths[0];
 });
 
-document.getElementById("image-tarball-browse").addEventListener("click", async () => {
+imageTarballBrowseEl.addEventListener("click", async () => {
   const paths = await window.cttc.pickFiles("Choose the server image .tar.gz");
   if (paths.length) imageTarballPathEl.value = paths[0];
 });
@@ -97,17 +98,35 @@ window.cttc.onSetupLog((line) => {
   activityLogEl.scrollTop = activityLogEl.scrollHeight;
 });
 
-// Edit mode only: prefill the ssh fields from the picked gateway. "This
-// machine" (embedded) entries have no ssh settings to edit -- those fields
-// are disabled, but Save/Update still applies (just to the image, via
-// ensureLocalContainer -- see main.js's gateway-manage-save). Image settings
-// always start back at "default" -- there's no stored "last image used"
-// per gateway, and defaulting there is the safest no-op choice either way.
+// Edit mode only. Every field this touches (ssh/key + image + Save/
+// Uninstall) is disabled until something is actually picked from the
+// dropdown -- rather than hiding the form outright, so it's obvious at a
+// glance that there's more here once a gateway is chosen, not that the
+// screen is broken/empty. "This machine" (embedded) has no ssh settings to
+// edit -- those fields stay disabled, but Save/Update (still enabled)
+// re-provisions the local container with the chosen image instead. Image
+// settings always start back at "default" -- there's no stored "last image
+// used" per gateway, and defaulting there is the safest no-op either way.
 function fillFormForEdit(g) {
   errorEl.hidden = true;
-  const isRemote = g.mode !== "embedded";
   const sshFields = [sshUserEl, sshHostEl, sshPortEl, keyPathEl, btnBrowseEl, keyPasteEl,
     ...document.querySelectorAll('input[name="key-mode"]')];
+  const imageFields = [...imageRadios, imageRefEl, imageTarballBrowseEl, imageTarballPathEl];
+
+  if (!g) {
+    for (const el of [...sshFields, ...imageFields]) el.disabled = true;
+    btnConnect.disabled = true;
+    btnUninstall.disabled = true;
+    sshUserEl.value = "";
+    sshHostEl.value = "";
+    keyPathEl.value = "";
+    return;
+  }
+
+  btnConnect.disabled = false;
+  btnUninstall.disabled = false;
+  for (const el of imageFields) el.disabled = false;
+  const isRemote = g.mode !== "embedded";
   for (const el of sshFields) el.disabled = !isRemote;
   btnConnect.textContent = isRemote ? "Save changes" : "Update image";
   if (isRemote) {
@@ -132,20 +151,19 @@ async function loadGatewaysForEdit() {
   gateways = await window.cttc.getGateways();
   const prevKey = selectEl.value;
   selectEl.innerHTML = "";
-  if (!gateways.length) {
-    emptyEl.hidden = false;
-    form.hidden = true;
-    return;
-  }
-  emptyEl.hidden = true;
-  form.hidden = false;
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = "— Select a gateway —";
+  selectEl.appendChild(placeholder);
   for (const g of gateways) {
     const opt = document.createElement("option");
     opt.value = keyOf(g);
     opt.textContent = `${g.label || g.host} (${g.host}:${g.port})${g.active ? " — active" : ""}`;
     selectEl.appendChild(opt);
   }
-  selectEl.value = gateways.some((g) => keyOf(g) === prevKey) ? prevKey : keyOf(gateways[0]);
+  // keeps the same gateway selected across a reload (e.g. right after
+  // Save/Uninstall) instead of dropping back to "nothing picked"
+  selectEl.value = gateways.some((g) => keyOf(g) === prevKey) ? prevKey : "";
   fillFormForEdit(selectedGateway());
 }
 
@@ -163,9 +181,9 @@ if (MODE === "edit") {
     waitEl.hidden = false;
     const result = await window.cttc.uninstallGateway(g);
     waitEl.hidden = true;
+    form.hidden = false;
     waitMsgEl.textContent = "Applying changes, please wait…";
     if (!result.ok) {
-      form.hidden = false;
       errorEl.textContent = result.error;
       errorEl.hidden = false;
       return;
@@ -186,7 +204,7 @@ function readImageSource() {
 form.addEventListener("submit", async (e) => {
   e.preventDefault();
   const gw = MODE === "edit" ? selectedGateway() : null;
-  if (MODE === "edit" && !gw) return;
+  if (MODE === "edit" && !gw) return; // nothing picked yet -- button is disabled anyway
   const isEmbeddedEdit = MODE === "edit" && gw.mode === "embedded";
 
   errorEl.hidden = true;
@@ -233,7 +251,7 @@ form.addEventListener("submit", async (e) => {
 
   const result =
     MODE === "edit"
-      ? await window.cttc.saveGatewayEdit({ ...payload, key: keyOf(gw) })
+      ? await window.cttc.saveGatewayEdit({ ...payload, key: keyOf(gw), mode: gw.mode })
       : await window.cttc.submitSetup(payload);
 
   if (!result.ok) {
@@ -249,7 +267,6 @@ form.addEventListener("submit", async (e) => {
     // does) -- refresh so the dropdown/prefill reflect what was just saved
     form.hidden = false;
     waitEl.hidden = true;
-    btnConnect.disabled = false;
     await loadGatewaysForEdit();
   }
   // "new" mode success: main.js closes this window and opens the app itself

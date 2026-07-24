@@ -20,6 +20,12 @@ body {
 h1 { font-size: 18px; }
 .muted { color: #999; font-size: 13px; }
 label { display: block; margin-top: 14px; font-size: 13px; }
+/* label's own `display: block` above is author-origin, which beats the
+   browser's default `[hidden] { display: none }` UA rule regardless of
+   specificity (origin order always wins over specificity in the cascade)
+   -- so toggling .hidden via JS on a <label> (gateway-select-row) silently
+   did nothing without this. Same fix as setup-wizard.css needed once before. */
+label[hidden] { display: none; }
 input[type="text"], input[type="number"], textarea, select {
   display: block;
   width: 100%;

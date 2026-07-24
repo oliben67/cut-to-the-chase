@@ -677,7 +677,17 @@ async function offerRestart(message) {
 // active one flagged so the renderer can highlight it.
 ipcMain.handle("get-gateways", () => {
   const gateways = readGateways();
-  for (const g of gateways) g.active = g.host === serverHost && g.port === serverPort;
+  // "This machine" is always a selectable gateway, even if a local
+  // container has never actually been provisioned here (recordGateway only
+  // ever runs after one succeeds) -- it just won't have a real port yet, so
+  // there's nothing to re-verify/switch to until Edit Gateways' Save
+  // actually provisions one.
+  if (!gateways.some((g) => g.mode === "embedded")) {
+    gateways.unshift({ mode: "embedded", host: "127.0.0.1", port: null, label: "This machine" });
+  }
+  for (const g of gateways) {
+    g.active = g.mode === "embedded" ? serverHost === "127.0.0.1" : g.host === serverHost && g.port === serverPort;
+  }
   return gateways;
 });
 
@@ -687,13 +697,20 @@ ipcMain.handle("get-gateways", () => {
 // into a dead gateway would be a worse experience than an upfront error
 // here. "embedded" means point back at this machine (clears
 // connection.json, same as Run Setup's "Revert to Local"); anything else
-// writes a "remote" connection.json from the saved ssh fields.
+// writes a "remote" connection.json from the saved ssh fields. The
+// never-provisioned "This machine" placeholder (see get-gateways -- no
+// real port yet) has nothing to health-check; switching to it just falls
+// back to the ordinary embedded-mode startup path (with or without local
+// Docker) the same as if no gateway had ever been configured.
 ipcMain.handle("switch-gateway", async (_e, entry) => {
-  try {
-    const r = await fetch(`http://${entry.host}:${entry.port}/health`, { signal: AbortSignal.timeout(5000) });
-    if (!r.ok) throw new Error(`gateway responded ${r.status}`);
-  } catch (err) {
-    return { ok: false, error: `could not reach ${entry.host}:${entry.port}: ${err.message || err}` };
+  const isUnprovisionedLocal = entry.mode === "embedded" && entry.port == null;
+  if (!isUnprovisionedLocal) {
+    try {
+      const r = await fetch(`http://${entry.host}:${entry.port}/health`, { signal: AbortSignal.timeout(5000) });
+      if (!r.ok) throw new Error(`gateway responded ${r.status}`);
+    } catch (err) {
+      return { ok: false, error: `could not reach ${entry.host}:${entry.port}: ${err.message || err}` };
+    }
   }
   if (entry.mode === "embedded") {
     clearConnectionConfig();
@@ -765,24 +782,26 @@ ipcMain.handle("edit-gateways", () => openGatewayManager());
 // hot-swap the main window's already-loaded connection.
 ipcMain.handle("gateway-manage-save", async (_e, payload) => {
   try {
-    const existing = readGateways().find((g) => gatewayKey(g) === payload.key);
-    if (!existing) return { ok: false, error: "That gateway no longer exists -- refresh the list." };
-
     // "This machine" has no ssh settings to change -- Save/Update here only
-    // ever re-provisions the local container with the chosen image.
-    if (existing.mode === "embedded") {
+    // ever (re-)provisions the local container with the chosen image.
+    // Branches on payload.mode (sent by the renderer's own selection)
+    // rather than a registry lookup, since the never-provisioned "This
+    // machine" placeholder (see get-gateways) was never actually recorded.
+    if (payload.mode === "embedded") {
       const { port } = await ensureLocalContainer({
         source: payload.imageSource || undefined,
         resourcesDir: resourcesDirForApp(),
       });
       recordGateway({ mode: "embedded", host: "127.0.0.1", port, label: "This machine" });
-      if (payload.key === `${serverHost}:${serverPort}`) {
-        serverHost = "127.0.0.1";
+      if (serverHost === "127.0.0.1") {
         serverPort = port;
         await offerRestart("Restart CTTC to apply the updated image?");
       }
       return { ok: true };
     }
+
+    const existing = readGateways().find((g) => gatewayKey(g) === payload.key);
+    if (!existing) return { ok: false, error: "That gateway no longer exists -- refresh the list." };
 
     const sshKey =
       payload.keyMode === "paste" ? writeKeyFile(payload.keyContents) : copyKeyFile(payload.keyPath);
@@ -833,7 +852,9 @@ ipcMain.handle("gateway-manage-uninstall", async (_e, entry) => {
       );
     }
     removeGateway(gatewayKey(entry));
-    if (entry.host === serverHost && entry.port === serverPort) {
+    const wasActive =
+      entry.mode === "embedded" ? serverHost === "127.0.0.1" : entry.host === serverHost && entry.port === serverPort;
+    if (wasActive) {
       clearConnectionConfig();
       await offerRestart("This gateway was uninstalled. Restart CTTC to reconnect?");
     }
