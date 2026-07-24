@@ -801,11 +801,15 @@ body:has(#gateway-setup) { overflow-y: auto; }
   font-size: 13px;
   box-sizing: border-box;
 }
-/* stacked label-above-input layout (ssh user/host/port) -- scoped to a
-   direct child of a bare <label> so it doesn't fight the flex-row layouts
-   below (.ctl's own inputs, #key-path-row's), which size themselves. */
+/* stacked label-above-control layout (ssh user/host/port, the gateway
+   picker) -- scoped to a direct child of a bare <label> so it doesn't
+   fight the flex-row layouts below (.ctl's own inputs, #key-path-row's),
+   which size themselves. select needs this too -- without it,
+   #gateway-select-row's dropdown sat inline next to its "CTTC Gateways"
+   label instead of stacked like every other field, with a large gap. */
 #gateway-setup label > input[type="text"],
-#gateway-setup label > input[type="number"] {
+#gateway-setup label > input[type="number"],
+#gateway-setup label > select {
   display: block;
   width: 100%;
   margin-top: 4px;
