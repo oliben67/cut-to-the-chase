@@ -170,7 +170,7 @@ FROM python:3.12-slim
 # docker CLI only (static binary, arch-matched via $TARGETARCH) + openssh-client
 RUN ... curl -fsSL https://download.docker.com/linux/static/stable/${arch}/docker-*.tgz | tar -xz ...
 RUN pip install --no-cache-dir uv
-WORKDIR /srv/cttc-scout
+WORKDIR /srv/cttc-gateway
 COPY pyproject.toml ./
 RUN uv sync --no-dev   # uv treats "dev" as included by default; exclude it explicitly
 COPY server.py transforms ./
@@ -181,7 +181,7 @@ ENTRYPOINT ["uv", "run", "--no-sync", "server.py", "--port", "8765"]
 ```yaml
 # docker-compose.yml (on the Docker-enabled host)
 services:
-  cttc-scout:
+  cttc-gateway:
     build: .
     pid: host          # psutil sees the real host, not the container's cgroup
     network_mode: host  # NET counters match the host's interfaces, not veth0

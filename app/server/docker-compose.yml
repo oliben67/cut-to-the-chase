@@ -2,9 +2,9 @@
 # to 127.0.0.1:8765 on *this* host -- nothing here needs to be exposed to
 # the network; see docs/architecture/remote-server.md.
 services:
-  cttc-scout:
+  cttc-gateway:
     build: .
-    image: cttc-scout:latest
+    image: cttc-gateway:latest
     restart: unless-stopped
     # both required for accurate host telemetry (HostStatsSource uses
     # psutil, which without these only sees this container's own cgroup/

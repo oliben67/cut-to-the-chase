@@ -46,7 +46,7 @@
       "target": ["nsis"],
       "icon": "assets/icon.png",
       "extraResources": [
-        { "from": "../releases/_shared/cttc-scout.tar.gz", "to": "cttc-scout.tar.gz" },
+        { "from": "../releases/_shared/cttc-gateway.tar.gz", "to": "cttc-gateway.tar.gz" },
         { "from": "../releases/_shared/docker-compose.yml", "to": "docker-compose.offline.yml" }
       ]
     },
