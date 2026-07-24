@@ -2723,6 +2723,12 @@ connectSSE();
 (() => {
   const el = $("server-status");
   if (!el) return;
+  // Static for the life of this window (HOST/PORT are set once, from the
+  // URL main.js loaded it with) -- where the gateway actually is, not just
+  // whether it's reachable, matters most for "remote" mode (see
+  // docs/architecture/remote-server.md), where it's easy to forget which
+  // host is actually being talked to.
+  $("server-status-location").textContent = `${HOST}:${PORT}`;
   const HEALTH_POLL_MS = 5000;
   const setState = (state, detail) => {
     el.dataset.state = state;

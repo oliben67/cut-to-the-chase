@@ -154,6 +154,11 @@ body {
 .server-status[data-state="checking"] .server-status-dot { background: #f1c40f; }
 .server-status[data-state="down"] .server-status-dot { background: var(--critical); }
 .server-status[data-state="down"] { color: var(--critical); }
+.server-status-location {
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
 
 /* Recording menu label's own status dot -- hidden (no dot) when idle,
    red+pulsing while actively recording, yellow steady while paused. */
