@@ -122,7 +122,7 @@ function installMenu() {
 // Electron shows no context menu at all by default (unlike a regular
 // browser) -- text inputs/textareas got no right-click Cut/Copy/Paste/Select
 // All without this. Attach to every window's webContents so it works
-// anywhere text is editable (Set Sources' host field, the setup wizard's
+// anywhere text is editable (Set Sources' host field, the gateway setup's
 // key-paste textarea, ...).
 function attachEditContextMenu(win) {
   win.webContents.on("context-menu", (_e, params) => {
@@ -162,7 +162,7 @@ ipcMain.handle("menubar-action", (e, action) => {
 // load/render time, so there's never a blank Electron window on screen in
 // between. Idempotent: safe to call again if one's already up (e.g. right
 // before createWindow(), after a path that already showed it earlier).
-// Skipped only while the setup wizard's own window is up (see
+// Skipped only while the gateway setup's own window is up (see
 // app.whenReady below) -- that's already a fully-drawn "please wait" UI of
 // its own, so stacking a second loading window on top would be redundant.
 let splashWindow = null;
@@ -444,7 +444,7 @@ ipcMain.on("sync-broadcast", (e, msg) => {
 // Connecting to the server has three shapes:
 // - "embedded" + no local Docker (only reachable in an unpackaged dev
 //   checkout -- see app.whenReady below, which routes packaged installs
-//   with no Docker to the setup wizard instead): spawns server.py locally
+//   with no Docker to the gateway setup instead): spawns server.py locally
 //   via uv, same as always.
 // - "embedded" + local Docker present: the packaged app's real default --
 //   docker-load (or, once a registry is wired up, docker-pull) the server
@@ -523,7 +523,7 @@ async function checkServerHostDocker(host, port, onLog) {
 
 // Embedded mode with no local Docker has nothing to sample -- offer to set
 // up a remote server on a Docker-enabled host instead of just starting an
-// empty embedded server. The wizard window itself provisions the remote
+// empty embedded server. The gateway setup window itself provisions the remote
 // container (so it can show its own "please wait" / error state) and sets
 // `serverHost`/`serverPort` directly on success; closing it without
 // succeeding rejects, which the caller treats the same as any other startup
@@ -534,10 +534,16 @@ function runSetupWizard() {
     let settled = false;
     wizardWindow = new BrowserWindow({
       width: 520,
-      height: 640,
-      resizable: false,
+      height: 720,
+      minWidth: 480,
+      minHeight: 560,
+      // Was fixed-size (resizable: false) at a height that clipped the
+      // Connect/Skip buttons once both key-file and paste controls became
+      // permanently visible (rather than toggling) -- resizable + a CSS
+      // scroll fallback (see gateway-setup.css) means a taller form, a
+      // larger OS font scale, or a small display can never hide them again.
       icon: APP_ICON,
-      show: false, // shown on 'ready-to-show' below -- avoids a blank flash before setup-wizard.html renders
+      show: false, // shown on 'ready-to-show' below -- avoids a blank flash before gateway-setup.html renders
       webPreferences: {
         preload: path.join(__dirname, "preload.js"),
         contextIsolation: true,
@@ -550,16 +556,16 @@ function runSetupWizard() {
     });
     wizardWindow.setMenuBarVisibility(false);
     attachEditContextMenu(wizardWindow);
-    wizardWindow.loadFile(path.join(__dirname, "renderer", "setup-wizard.html"));
+    wizardWindow.loadFile(path.join(__dirname, "renderer", "gateway-setup.html"));
     wizardWindow.on("closed", () => {
       wizardWindow = null;
       if (!settled) {
-        ipcMain.removeHandler("setup-wizard-submit");
+        ipcMain.removeHandler("gateway-setup-submit");
         reject(new Error("Setup was cancelled."));
       }
     });
 
-    ipcMain.handle("setup-wizard-submit", async (_e, payload) => {
+    ipcMain.handle("gateway-setup-submit", async (_e, payload) => {
       try {
         const sshKey =
           payload.keyMode === "paste" ? writeKeyFile(payload.keyContents) : copyKeyFile(payload.keyPath);
@@ -579,7 +585,7 @@ function runSetupWizard() {
         saveConnectionConfig(cfg);
         await checkServerHostDocker(remote.host, remote.port, (line) => wizardWindow?.webContents.send("setup-log", line));
         settled = true;
-        ipcMain.removeHandler("setup-wizard-submit");
+        ipcMain.removeHandler("gateway-setup-submit");
         wizardWindow.destroy();
         resolve();
         return { ok: true };
@@ -683,7 +689,7 @@ app.whenReady().then(async () => {
   // canBeServerLocally() check below -- it shells out to `docker info` and
   // `ssh -V` (async; see lib/docker-check.js) and can take a few seconds
   // against a slow/starting daemon or a plain "no docker on PATH" miss. The
-  // wizard path closes this itself once its own window is ready to show (see
+  // gateway setup path closes this itself once its own window is ready to show (see
   // runSetupWizard()'s 'ready-to-show' handler) instead of stacking a
   // second loading window on top of it.
   showSplash();
@@ -721,7 +727,7 @@ app.whenReady().then(async () => {
     app.quit();
     return;
   }
-  // Bridges the gap between the wizard window closing (or the splash
+  // Bridges the gap between the gateway setup window closing (or the splash
   // already up from the branch above) and the main window's first paint --
   // showSplash() is idempotent, so this is a no-op if one's already shown.
   showSplash();

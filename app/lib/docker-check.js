@@ -5,7 +5,7 @@ const { spawn } = require("child_process");
 // Async on purpose: this used to be spawnSync, which blocks Node's event
 // loop for up to its timeout. On Windows that loop is also the UI thread,
 // so a freshly-installed app with no Docker Desktop (the exact case that
-// sends the user to the setup wizard) froze the just-created splash window
+// sends the user to the gateway setup) froze the just-created splash window
 // -- already constructed, but unable to paint its first frame -- for the
 // whole multi-second probe. Doing this async lets the splash window's own
 // paint/show events run while the probe is in flight.
@@ -43,13 +43,13 @@ function probe(bin, args, { spawnFn = spawn, timeoutMs = 5000 } = {}) {
 
 // A local Docker Desktop/Engine means embedded mode has something to sample
 // (host/container telemetry); without one there's nothing for the embedded
-// server to show, so main.js offers the remote-server setup wizard instead.
+// server to show, so main.js offers the remote-server gateway setup instead.
 function hasLocalDocker(opts) {
   return probe("docker", ["info"], opts);
 }
 
 // Per the client/server/docker-host model: this machine can only collapse
-// the server role into the client (skip the setup wizard/tunnel entirely)
+// the server role into the client (skip the gateway setup/tunnel entirely)
 // if it has both Docker *and* ssh locally -- the server role requires ssh to
 // reach whatever Docker host(s) it's asked to query (see server.py's
 // docker_ps), not just a local daemon to sample.

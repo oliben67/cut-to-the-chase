@@ -1,10 +1,18 @@
+html, body {
+  height: 100%;
+}
 body {
   font-family: -apple-system, "Segoe UI", sans-serif;
   background: #1e1e1e;
   color: #ddd;
   margin: 0;
+  /* Safety net, not the primary fix: the window is resizable now (see
+     main.js), but this means a taller form, a larger OS font scale, or a
+     small display can still reach the Connect/Skip buttons via scroll
+     instead of silently clipping them like the old fixed-size window did. */
+  overflow-y: auto;
 }
-#wizard {
+#gateway-setup {
   max-width: 460px;
   margin: 40px auto;
   padding: 0 24px 48px;

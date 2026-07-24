@@ -94,7 +94,7 @@ function loadConnectionConfig({ env = process.env, configPath } = {}) {
 
 /**
  * Writes a "remote" connection.json (mirrors deploy.ps1's step 4) so the
- * setup wizard (see main.js's runSetupWizard) and the PowerShell deploy path
+ * gateway setup (see main.js's runSetupWizard) and the PowerShell deploy path
  * produce byte-identical config files.
  * @param {{sshTarget: string, sshKey: string, remotePort: number, sshPort?: number}} cfg
  * @param {{configPath?: string}} [opts]

@@ -5,7 +5,7 @@ const os = require("os");
 const path = require("path");
 const { spawnSync } = require("child_process");
 
-// Where the setup wizard drops a key file (pasted, or copied in from
+// Where the gateway setup drops a key file (pasted, or copied in from
 // elsewhere -- see copyKeyFile): alongside connection.json in ~/.cttc, not
 // the (often admin-only) Program Files install directory.
 function keysDir() {
@@ -35,7 +35,7 @@ function icacls(args) {
 // ssh refuses a private key that's readable by anyone but its owner. On
 // Windows that's icacls (mirrors deploy.ps1's step 2); elsewhere it's chmod.
 // Grants (R,W), not (R)-only: a read-only grant would lock the *owner* out of
-// ever overwriting the file too, breaking a second run of the wizard with
+// ever overwriting the file too, breaking a second run of the gateway setup with
 // EPERM the moment it tries to rewrite an already-restricted file. Errors
 // are checked: a silently-failed /inheritance:r or /grant:r can leave the
 // file with an emptier ACL than before (nobody, not even the owner, granted
@@ -123,7 +123,7 @@ function decodeKeyFile(sourcePath) {
 }
 
 /**
- * Copies an existing key file (the "browse for a file" wizard path) into
+ * Copies an existing key file (the "browse for a file" gateway setup path) into
  * our managed ~/.cttc/keys/ and locks down the *copy*'s permissions --
  * never reuses the original file/path in place, since we don't own (and
  * shouldn't change) whatever permissions it already has wherever it lives.

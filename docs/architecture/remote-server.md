@@ -234,7 +234,7 @@ cd app/server
 docker compose up -d --build
 ```
 
-On the client machine, `~/.cttc/connection.json` (the setup wizard writes
+On the client machine, `~/.cttc/connection.json` (the gateway setup writes
 this for you; shown here for scripted/MDM deployment):
 
 ```json

@@ -4,7 +4,7 @@ Three distinct systems come up when talking about Docker connectivity in
 CTTC, and it's easy to conflate them:
 
 - **app-host** — the machine running the Electron client.
-- **tunnel-host** — the machine the setup wizard's ssh tunnel connects to
+- **tunnel-host** — the machine the gateway setup's ssh tunnel connects to
   (only exists in ssh-tunnel mode); this is where the `cttc-gateway`
   container actually runs in that mode.
 - **docker-host** — whatever's typed into Set Sources' "Docker host" field
@@ -75,8 +75,8 @@ flowchart TB
 ## Business rules this encodes
 
 1. On first launch, if app-host has no local Docker, CTTC offers the setup
-   wizard (connect to a tunnel-host instead).
-2. Declining the wizard (Skip, or just closing it) doesn't crash the app —
+   gateway setup (connect to a tunnel-host instead).
+2. Declining the gateway setup (Skip, or just closing it) doesn't crash the app —
    it makes a genuine attempt at `docker compose up` on app-host anyway
    (the earlier "no local Docker" probe can be wrong, e.g. a daemon still
    starting up), falling back to a bare, docker-less embedded server only

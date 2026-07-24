@@ -5,10 +5,10 @@
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'self'; style-src 'self'; script-src 'self'" />
   <title>CTTC Setup</title>
-  <link rel="stylesheet" href="setup-wizard.css" />
+  <link rel="stylesheet" href="gateway-setup.css" />
 </head>
 <body>
-  <main id="wizard">
+  <main id="gateway-setup">
     <h1>Connect CTTC to a remote host</h1>
     <p class="muted">
       This machine can't act as its own CTTC server (either Docker or an ssh
@@ -31,12 +31,13 @@
       <fieldset>
         <legend>SSH private key</legend>
         <label class="radio-row"><input type="radio" name="key-mode" value="path" checked /> Use a key file already on this machine</label>
-        <label class="radio-row"><input type="radio" name="key-mode" value="paste" /> Paste the key's contents</label>
 
         <div id="key-path-row">
           <input id="key-path" type="text" readonly placeholder="No file selected" />
           <button type="button" id="btn-browse">Browse…</button>
         </div>
+  
+        <label class="radio-row"><input type="radio" name="key-mode" value="paste" /> Paste the key's contents</label>
         <textarea id="key-paste" rows="6" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----" disabled></textarea>
       </fieldset>
 
@@ -58,6 +59,6 @@
       <pre id="activity-log" class="activity-log" hidden></pre>
     </div>
   </main>
-  <script src="setup-wizard.js"></script>
+  <script src="gateway-setup.js"></script>
 </body>
 </html>

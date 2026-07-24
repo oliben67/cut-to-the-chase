@@ -16,7 +16,7 @@ contextBridge.exposeInMainWorld("cttc", {
   onMenuAction: (cb) => ipcRenderer.on("menu-action", (_e, action) => cb(action)),
   onMainLog: (cb) => ipcRenderer.on("main-log", (_e, entry) => cb(entry)),
   menubarAction: (action) => ipcRenderer.invoke("menubar-action", action),
-  submitSetup: (payload) => ipcRenderer.invoke("setup-wizard-submit", payload),
+  submitSetup: (payload) => ipcRenderer.invoke("gateway-setup-submit", payload),
   onSetupLog: (cb) => ipcRenderer.on("setup-log", (_e, line) => cb(line)),
   runSetup: () => ipcRenderer.invoke("run-setup"),
   updateImage: (payload) => ipcRenderer.invoke("update-image", payload),
