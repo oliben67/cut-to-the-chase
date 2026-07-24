@@ -7,8 +7,13 @@ const readline = require("readline");
 const { loadConnectionConfig, saveConnectionConfig, clearConnectionConfig } = require("./lib/connection-config");
 const { hasLocalDocker, canBeServerLocally } = require("./lib/docker-check");
 const { writeKeyFile, copyKeyFile } = require("./lib/ssh-key-file");
-const { ensureLocalContainer, ensureRemoteContainer } = require("./lib/server-provision");
-const { readGateways, recordGateway } = require("./lib/gateway-registry");
+const {
+  ensureLocalContainer,
+  ensureRemoteContainer,
+  uninstallLocalContainer,
+  uninstallRemoteContainer,
+} = require("./lib/server-provision");
+const { readGateways, recordGateway, removeGateway, gatewayKey } = require("./lib/gateway-registry");
 
 const SERVER_DIR = path.join(__dirname, "server");
 const APP_ICON = path.join(__dirname, "assets", "icon.png");
@@ -672,38 +677,114 @@ ipcMain.handle("switch-gateway", async (_e, entry) => {
   return { ok: true };
 });
 
-// Settings > Run Setup: reachable any time, not just at first launch (see
-// dlg-keys's "Remote connection" section in index.html).
-ipcMain.handle("run-setup", async () => {
-  const cfg = loadConnectionConfig();
-
-  // "revert to local" only makes sense if there's a remote server to revert
-  // *from*, and only offered when there's local Docker to fall back *to*.
-  if (cfg.mode === "remote" && (await canBeServerLocally())) {
-    const choice = await dialog.showMessageBox({
-      type: "question",
-      message: "CTTC is connected to a remote server, and a local Docker was detected.",
-      detail: "Reconfigure the remote server, or revert to sampling this machine directly?",
-      buttons: ["Configure Remote Server…", "Revert to Local", "Cancel"],
-      defaultId: 0,
-      cancelId: 2,
-    });
-    if (choice.response === 2) return;
-    if (choice.response === 1) {
-      // the remote server is shared infrastructure, not this process's own
-      // child -- nothing local to tear down, just stop pointing at it.
-      clearConnectionConfig();
-      await offerRestart("Restart CTTC to apply the new connection settings?");
-      return;
-    }
-  }
-
+// File > Gateways > New Gateway: always just provisions a new one -- picking
+// an existing gateway to revert to (including "This machine") or
+// reconfigure is the status-pill dropdown/Edit Gateways' job now, not this
+// one's, so there's no "already connected, revert or reconfigure?" prompt
+// here anymore.
+ipcMain.handle("new-gateway", async () => {
   try {
     await runSetupWizard();
   } catch {
     return; // cancelled -- nothing changed, no need to restart
   }
   await offerRestart("Restart CTTC to apply the new connection settings?");
+});
+
+// File > Gateways > Edit Gateways: manages the recorded list itself (edit
+// an existing gateway's ssh settings, or uninstall it) -- a separate,
+// non-modal window since (unlike New Gateway) it isn't gating app startup.
+let gatewayManagerWindow = null;
+function openGatewayManager() {
+  if (gatewayManagerWindow && !gatewayManagerWindow.isDestroyed()) {
+    gatewayManagerWindow.focus();
+    return;
+  }
+  gatewayManagerWindow = new BrowserWindow({
+    width: 560,
+    height: 720,
+    minWidth: 480,
+    minHeight: 560,
+    icon: APP_ICON,
+    show: false,
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+  gatewayManagerWindow.once("ready-to-show", () => gatewayManagerWindow.show());
+  gatewayManagerWindow.setMenuBarVisibility(false);
+  attachEditContextMenu(gatewayManagerWindow);
+  gatewayManagerWindow.loadFile(path.join(__dirname, "renderer", "gateway-manage.html"));
+  gatewayManagerWindow.on("closed", () => {
+    gatewayManagerWindow = null;
+  });
+}
+ipcMain.handle("edit-gateways", () => openGatewayManager());
+
+// Re-provisions a gateway at (possibly new) ssh settings and updates its
+// registry entry in place -- editing the *currently active* gateway also
+// updates connection.json and offers a restart, since this window can't
+// hot-swap the main window's already-loaded connection.
+ipcMain.handle("gateway-manage-save", async (_e, payload) => {
+  try {
+    const sshKey =
+      payload.keyMode === "paste" ? writeKeyFile(payload.keyContents) : copyKeyFile(payload.keyPath);
+    const cfg = {
+      sshTarget: `${payload.sshUser}@${payload.sshHost}`,
+      sshKey,
+      sshPort: payload.sshPort,
+      remotePort: 8765,
+    };
+    const remote = await ensureRemoteContainer(cfg, {
+      sshBin: process.env.CTTC_SSH_BIN || "ssh",
+      onLog: (line) => gatewayManagerWindow?.webContents.send("setup-log", line),
+    });
+    const wasActive = payload.key === `${serverHost}:${serverPort}`;
+    recordGateway({
+      mode: "remote",
+      host: remote.host,
+      port: remote.port,
+      label: cfg.sshTarget,
+      sshTarget: cfg.sshTarget,
+      sshKey: cfg.sshKey,
+      ...(cfg.sshPort ? { sshPort: cfg.sshPort } : {}),
+    });
+    if (gatewayKey({ host: remote.host, port: remote.port }) !== payload.key) removeGateway(payload.key);
+    if (wasActive) {
+      saveConnectionConfig(cfg);
+      await offerRestart("Restart CTTC to apply the updated gateway settings?");
+    }
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err.message || String(err) };
+  }
+});
+
+// Stops and removes the gateway's container (locally, or over ssh for a
+// remote one), then drops it from the recorded list. Uninstalling the
+// *currently active* gateway reverts connection.json to embedded mode
+// (nothing else left to point at) and offers a restart.
+ipcMain.handle("gateway-manage-uninstall", async (_e, entry) => {
+  try {
+    if (entry.mode === "embedded") {
+      await uninstallLocalContainer({ resourcesDir: resourcesDirForApp() });
+    } else {
+      await uninstallRemoteContainer(
+        { sshTarget: entry.sshTarget, sshKey: entry.sshKey, sshPort: entry.sshPort },
+        { sshBin: process.env.CTTC_SSH_BIN || "ssh" }
+      );
+    }
+    removeGateway(gatewayKey(entry));
+    if (entry.host === serverHost && entry.port === serverPort) {
+      clearConnectionConfig();
+      await offerRestart("This gateway was uninstalled. Restart CTTC to reconnect?");
+    }
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err.message || String(err) };
+  }
 });
 
 // Settings > Update server image: pushes a new image (by registry ref or a

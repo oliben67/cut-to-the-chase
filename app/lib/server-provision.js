@@ -185,6 +185,35 @@ async function ensureRemoteContainer(cfg, { spawnFn = spawn, sshBin = "ssh", scp
   return { host, port: cfg.remotePort };
 }
 
+/**
+ * Stops and removes the local gateway container (Edit Gateways' Uninstall,
+ * for the "This machine" entry). Leaves the image itself alone -- just the
+ * container/network compose created, matching `docker compose down`'s
+ * default scope.
+ */
+async function uninstallLocalContainer({ spawnFn = spawn, resourcesDir } = {}) {
+  const resolved = resolveSource(undefined, { resourcesDir });
+  await run(spawnFn, "docker", ["compose", "-f", resolved.composeFile, "down"]);
+}
+
+/**
+ * Stops and removes a remote gateway container over ssh, then deletes the
+ * remoteDir ensureRemoteContainer created it in (the tarball/compose file
+ * copied there have no further use once uninstalled).
+ * @param {{sshTarget: string, sshKey: string|null, sshPort?: number}} cfg
+ */
+async function uninstallRemoteContainer(cfg, { spawnFn = spawn, sshBin = "ssh", onLog } = {}) {
+  const remoteDir = "cttc-gateway";
+  const ssh = sshExecArgs(cfg);
+  await run(
+    spawnFn,
+    sshBin,
+    [...ssh, `cd ${remoteDir} && docker compose down; cd "$HOME" && rm -rf ${remoteDir}`],
+    {},
+    onLog
+  );
+}
+
 module.exports = {
   bundledTarballPath,
   bundledOfflineComposePath,
@@ -193,4 +222,6 @@ module.exports = {
   registryComposePath,
   ensureLocalContainer,
   ensureRemoteContainer,
+  uninstallLocalContainer,
+  uninstallRemoteContainer,
 };

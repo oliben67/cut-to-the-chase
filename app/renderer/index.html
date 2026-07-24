@@ -19,6 +19,10 @@
         <button data-action="set-sources">Set Sources… <span class="acc">Ctrl+O</span></button>
         <button data-action="load-metrics">Load Metrics… <span class="acc">Ctrl+L</span></button>
         <div class="menu-sep"></div>
+        <span class="menu-sub-label">Gateways</span>
+        <button data-action="new-gateway" class="menu-indent">New Gateway…</button>
+        <button data-action="edit-gateways" class="menu-indent">Edit Gateways…</button>
+        <div class="menu-sep"></div>
         <span class="menu-sub-label">Preferences</span>
         <button data-action="open-theme" class="menu-indent">Theme…</button>
         <button data-action="open-settings" class="menu-indent">Settings…</button>
@@ -223,13 +227,6 @@
 
   <dialog id="dlg-keys">
     <h2>Settings</h2>
-    <fieldset class="keys-box">
-      <legend>Remote connection</legend>
-      <p class="dlg-section-help muted">Point CTTC at a Docker-enabled host over SSH, or revert to sampling this machine directly.</p>
-      <div class="ctl">
-        <button id="run-setup-btn" title="Reconfigure (or set up for the first time) the remote server connection">Run Setup…</button>
-      </div>
-    </fieldset>
     <fieldset class="keys-box">
       <legend>Update server image</legend>
       <p class="dlg-section-help muted">Updates wherever the server currently runs — this machine if Docker is

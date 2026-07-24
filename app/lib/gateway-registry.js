@@ -57,4 +57,19 @@ function recordGateway(entry, { configPath } = {}) {
   return next;
 }
 
-module.exports = { defaultGatewaysPath, gatewayKey, readGateways, recordGateway };
+/**
+ * Drops one gateway entry (matched by "host:port", see gatewayKey) and
+ * returns the remaining list. Used when a gateway is uninstalled, or when
+ * editing one changes its host:port (the old key no longer applies).
+ * @param {string} key
+ */
+function removeGateway(key, { configPath } = {}) {
+  const resolvedPath = configPath || defaultGatewaysPath(process.env);
+  const list = readGateways({ configPath: resolvedPath });
+  const next = list.filter((g) => gatewayKey(g) !== key);
+  fs.mkdirSync(path.dirname(resolvedPath), { recursive: true });
+  fs.writeFileSync(resolvedPath, JSON.stringify(next, null, 2), "utf8");
+  return next;
+}
+
+module.exports = { defaultGatewaysPath, gatewayKey, readGateways, recordGateway, removeGateway };

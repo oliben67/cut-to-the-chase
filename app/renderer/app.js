@@ -2243,10 +2243,6 @@ function openSettingsDialog() {
 }
 $("dlg-keys-close").onclick = () => dlgKeys.close();
 
-// hands off to main.js -- setup involves native windows/dialogs and a
-// restart, none of which belongs in this dialog's own DOM
-$("run-setup-btn").onclick = () => window.cttc.runSetup();
-
 /* ── update server image (dlg-keys's "Update server image" section) ────── */
 const imageRefRow = $("image-ref-row");
 const imageTarballRow = $("image-tarball-row");
@@ -2643,6 +2639,8 @@ if (!POPOUT_KIND) {
   const RENDERER_ACTIONS = {
     "set-sources": () => $("btn-set").click(),
     "load-metrics": () => $("btn-load-sample").click(),
+    "new-gateway": () => window.cttc.newGateway(),
+    "edit-gateways": () => window.cttc.editGateways(),
     "open-theme": () => openThemeDialog(),
     "open-settings": () => openSettingsDialog(),
     "start-recording": () => startRecording(),
