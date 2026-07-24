@@ -33,6 +33,13 @@ let serverProc = null;
 let serverHost = "127.0.0.1";
 let serverPort = null;
 
+// Shared by get-gateways (flagging the active one for the dropdown) and
+// gateway-manage-uninstall (deciding whether the uninstalled gateway was the
+// one currently in use).
+function isActiveGateway(g) {
+  return g.mode === "embedded" ? serverHost === "127.0.0.1" : g.host === serverHost && g.port === serverPort;
+}
+
 // Every window's DevTools console (Help > Developer Tools) is the one place
 // a user can see logs regardless of whether the app was launched from a
 // terminal or double-clicked -- so main-process logging (including the
@@ -709,7 +716,7 @@ ipcMain.handle("get-gateways", () => {
     gateways.unshift({ mode: "embedded", host: "127.0.0.1", port: null, label: "This machine" });
   }
   for (const g of gateways) {
-    g.active = g.mode === "embedded" ? serverHost === "127.0.0.1" : g.host === serverHost && g.port === serverPort;
+    g.active = isActiveGateway(g);
   }
   return gateways;
 });
@@ -771,7 +778,7 @@ ipcMain.handle("new-gateway", async () => {
   } catch {
     return; // cancelled -- nothing changed, no need to restart
   }
-  await offerRestart("Restart CTTC to apply the new connection settings?");
+  await offerRestart("Reconnect CTTC to apply the new connection settings?");
 });
 
 // File > Gateways > Edit Gateways: manages the recorded list itself (edit
@@ -893,8 +900,7 @@ ipcMain.handle("gateway-manage-uninstall", async (_e, entry) => {
       );
     }
     removeGateway(gatewayKey(entry));
-    const wasActive =
-      entry.mode === "embedded" ? serverHost === "127.0.0.1" : entry.host === serverHost && entry.port === serverPort;
+    const wasActive = isActiveGateway(entry);
     if (wasActive) {
       clearConnectionConfig();
       // reverts to embedded mode, same as switch-gateway's isUnprovisionedLocal

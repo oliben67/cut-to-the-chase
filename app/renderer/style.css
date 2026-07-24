@@ -521,7 +521,9 @@ body.sample-armed .strip { cursor: cell; }
 }
 #splitter:hover, #splitter.dragging { background: color-mix(in srgb, var(--accent) 35%, transparent); }
 
-/* windows for a panel popped out on its own: show only the relevant part */
+/* windows for a panel popped out on its own: show only the relevant part.
+   popout-telemetry and popout-series hide the exact same set -- a single
+   series popout is just telemetry-style layout with one series only. */
 body.popout-telemetry #panels,
 body.popout-telemetry #splitter,
 body.popout-telemetry #btn-set,
@@ -530,15 +532,12 @@ body.popout-telemetry #btn-clear-sources,
 body.popout-telemetry #recording-transport,
 body.popout-telemetry #btn-open-recording,
 body.popout-telemetry #style-switch,
-body.popout-telemetry #host-block {
-  display: none;
-}
-/* a single series popped out: telemetry-style layout, one series only */
+body.popout-telemetry #host-block,
 body.popout-series #panels,
 body.popout-series #splitter,
 body.popout-series #btn-set,
-body.popout-series #btn-clear-sources,
 body.popout-series #btn-load-sample,
+body.popout-series #btn-clear-sources,
 body.popout-series #recording-transport,
 body.popout-series #btn-open-recording,
 body.popout-series #style-switch,
