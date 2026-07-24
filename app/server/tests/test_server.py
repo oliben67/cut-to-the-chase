@@ -783,6 +783,28 @@ class TestDockerPs:
         assert got["services"] == [{"id": "s" * 12, "name": "api", "replicas": "2/2"}]
         assert got["log"][0]["returncode"] == 0
 
+    async def test_excludes_the_gateway_container_itself(self, monkeypatch):
+        web_line = json.dumps({"ID": "1" * 20, "Names": "web", "Image": "nginx"}).encode()
+        gw_line = json.dumps(
+            {"ID": "2" * 20, "Names": "cttc-gateway-cttc-gateway-1", "Image": "cttc-gateway:latest"}
+        ).encode()
+        gw_line_tagless = json.dumps(
+            {"ID": "3" * 20, "Names": "some-other-gw", "Image": "myrepo/cttc-gateway"}
+        ).encode()
+
+        async def fake_exec(*args, **k):
+            if args[-3] == "version":
+                return FakeAsyncProc(communicate_result=(b"27.0.0\n", b""))
+            if "service" in args:
+                return FakeAsyncProc(returncode=1, communicate_result=(b"", b"not a swarm manager"))
+            return FakeAsyncProc(
+                communicate_result=(web_line + b"\n" + gw_line + b"\n" + gw_line_tagless + b"\n", b"")
+            )
+
+        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+        got = await server.docker_ps(None)
+        assert got["containers"] == [{"id": "1" * 12, "name": "web", "image": "nginx"}]
+
     async def test_service_ls_failure_tolerated(self, monkeypatch):
         ps_line = json.dumps({"ID": "1" * 20, "Names": "web", "Image": "nginx"}).encode()
 

@@ -579,14 +579,14 @@
       await startRecording();
       eq(recording.status, "recording");
       eq(recording.path, "/fake/e2e-recording.cttc");
-      eq($("menu-start-recording").disabled, true);
-      eq($("menu-pause-recording").disabled, false);
-      eq($("menu-stop-recording").disabled, false);
+      eq($("btn-start-recording").disabled, true);
+      eq($("btn-pause-recording").disabled, false);
+      eq($("btn-stop-recording").disabled, false);
 
       await pauseRecording();
       eq(recording.status, "paused");
-      eq($("menu-start-recording").disabled, false);
-      eq($("menu-pause-recording").disabled, true);
+      eq($("btn-start-recording").disabled, false);
+      eq($("btn-pause-recording").disabled, true);
       ok(store["/fake/e2e-recording.cttc"], "first segment flushed to the in-memory store");
       const afterFirst = store["/fake/e2e-recording.cttc"];
       eq(afterFirst[0], 0x50, "PK zip magic byte 1");
@@ -596,7 +596,7 @@
       await stopRecording();
       eq(recording.status, "idle");
       eq(recording.path, null);
-      eq($("menu-stop-recording").disabled, true);
+      eq($("btn-stop-recording").disabled, true);
       const afterSecond = store["/fake/e2e-recording.cttc"];
       ok(afterSecond.length >= afterFirst.length, "second segment appended, archive grew (or stayed same size)");
 

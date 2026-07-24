@@ -74,6 +74,12 @@ function startServer(extraArgs) {
       clearTimeout(timer);
       try {
         const info = JSON.parse(line);
+        // This is the bare dev/no-Docker embedded fallback -- always local,
+        // but serverHost can be stale from a previous remote connection
+        // (switch-gateway/uninstall reconnecting to "This machine" doesn't
+        // relaunch the process anymore, so the module-level "127.0.0.1"
+        // default only applies once, at first launch).
+        serverHost = "127.0.0.1";
         serverPort = info.port;
         mainLog(`[server] listening on ${info.port} (json: ${info.json})`);
         resolve(info.port);
@@ -254,6 +260,11 @@ async function createWindow() {
   if (testFile) {
     setTimeout(() => {
       console.error("[test] global timeout — spec never resolved");
+      // app.exit() (unlike app.quit()) skips 'before-quit', so stopServer()
+      // never runs on its own here -- without this, every e2e run leaks its
+      // spawned `uv run server.py` process (confirmed: dozens accumulated
+      // across this session's test runs before this fix).
+      serverProc?.kill();
       app.exit(3);
     }, 120000);
     setTimeout(async () => {
@@ -286,6 +297,7 @@ async function createWindow() {
       } catch (err) {
         console.error(`[test] ${err.stack || err}`);
       }
+      serverProc?.kill();
       app.exit(code);
     }, 1500);
     return;
@@ -653,22 +665,33 @@ function runSetupWizard() {
   });
 }
 
-// Neither Run Setup nor Update Image hot-swap the already-loaded window's
-// server connection (its page was loaded with the *old* host/port baked
-// into the URL) -- simplest and safest is to save/apply the change, then
-// offer to relaunch the app so it goes through the normal startup path from
-// a clean slate.
+// Run Setup / Update Image / switch-gateway don't hot-swap the already-loaded
+// window's server connection on their own (its page was loaded with the
+// *old* host/port baked into the URL) -- but a full app.relaunch() threw away
+// the whole process (every popout, the splash-free startup already done)
+// just to change a query string. Reloading only the main window with the
+// now-updated serverHost/serverPort gets the same fresh-connection result
+// without restarting CTTC itself. Popouts hold their own stale connection
+// the same way, so they're closed rather than left pointing at the old
+// gateway; the main window's own panels re-fetch from the new one on load.
 async function offerRestart(message) {
   const r = await dialog.showMessageBox({
     type: "info",
     message,
-    buttons: ["Restart Now", "Later"],
+    buttons: ["Reconnect Now", "Later"],
     defaultId: 0,
     cancelId: 1,
   });
-  if (r.response === 0) {
-    app.relaunch();
-    app.exit(0);
+  if (r.response !== 0) return;
+  for (const popout of popoutWindows.values()) {
+    if (!popout.isDestroyed()) popout.close();
+  }
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    await mainWindow.loadFile(path.join(__dirname, "renderer", "index.html"), {
+      search: `host=${serverHost}&port=${serverPort}`,
+    });
+  } else {
+    await createWindow();
   }
 }
 
@@ -714,6 +737,15 @@ ipcMain.handle("switch-gateway", async (_e, entry) => {
   }
   if (entry.mode === "embedded") {
     clearConnectionConfig();
+    if (isUnprovisionedLocal) {
+      // never actually provisioned -- same startup path a fresh launch
+      // would take (re-provision or start local), which sets
+      // serverHost/serverPort itself once it's done.
+      await connectToServer([]);
+    } else {
+      serverHost = "127.0.0.1";
+      serverPort = entry.port;
+    }
   } else {
     saveConnectionConfig({
       sshTarget: entry.sshTarget,
@@ -721,8 +753,10 @@ ipcMain.handle("switch-gateway", async (_e, entry) => {
       remotePort: entry.port,
       ...(entry.sshPort ? { sshPort: entry.sshPort } : {}),
     });
+    serverHost = entry.host;
+    serverPort = entry.port;
   }
-  await offerRestart(`Restart CTTC to switch to ${entry.label}?`);
+  await offerRestart(`Reconnect CTTC to switch to ${entry.label}?`);
   return { ok: true };
 });
 
@@ -750,12 +784,17 @@ function openGatewayManager() {
     return;
   }
   gatewayManagerWindow = new BrowserWindow({
-    width: 560,
-    // Shorter than New Gateway's window: the intro heading + paragraph is
-    // replaced here by a single compact label + dropdown (see
-    // gateway-setup.html's #gateway-select-row), so there's less to fit
-    // above the (identical) ssh/key/image fields and actions below it.
-    height: 800,
+    // Same width as New Gateway -- both render the identical #gateway-setup
+    // layout, so a different window width just left the two screens with
+    // mismatched side margins for no reason.
+    width: 520,
+    // Shorter than New Gateway's window: edit mode has less content above
+    // the shared ssh/key/image fields (a compact label + dropdown vs. New
+    // Gateway's intro heading + paragraph) -- 57px less, measured via each
+    // mode's #gateway-setup scrollHeight at the same window size -- so a
+    // matching height here left extra empty space below the Save/Uninstall
+    // buttons that New Gateway's Connect/Skip row doesn't have.
+    height: 803,
     minWidth: 480,
     minHeight: 560,
     icon: APP_ICON,
@@ -795,7 +834,7 @@ ipcMain.handle("gateway-manage-save", async (_e, payload) => {
       recordGateway({ mode: "embedded", host: "127.0.0.1", port, label: "This machine" });
       if (serverHost === "127.0.0.1") {
         serverPort = port;
-        await offerRestart("Restart CTTC to apply the updated image?");
+        await offerRestart("Reconnect CTTC to apply the updated image?");
       }
       return { ok: true };
     }
@@ -829,7 +868,9 @@ ipcMain.handle("gateway-manage-save", async (_e, payload) => {
     if (gatewayKey({ host: remote.host, port: remote.port }) !== payload.key) removeGateway(payload.key);
     if (wasActive) {
       saveConnectionConfig(cfg);
-      await offerRestart("Restart CTTC to apply the updated gateway settings?");
+      serverHost = remote.host;
+      serverPort = remote.port;
+      await offerRestart("Reconnect CTTC to apply the updated gateway settings?");
     }
     return { ok: true };
   } catch (err) {
@@ -856,7 +897,12 @@ ipcMain.handle("gateway-manage-uninstall", async (_e, entry) => {
       entry.mode === "embedded" ? serverHost === "127.0.0.1" : entry.host === serverHost && entry.port === serverPort;
     if (wasActive) {
       clearConnectionConfig();
-      await offerRestart("This gateway was uninstalled. Restart CTTC to reconnect?");
+      // reverts to embedded mode, same as switch-gateway's isUnprovisionedLocal
+      // path -- there's nothing left running locally to just point at, so
+      // this goes through the ordinary embedded startup (re-provision or
+      // start local) rather than assuming a stale host/port still works.
+      await connectToServer([]);
+      await offerRestart("This gateway was uninstalled. Reconnect CTTC to switch back to this machine?");
     }
     return { ok: true };
   } catch (err) {

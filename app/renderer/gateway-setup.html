@@ -51,10 +51,12 @@
         <legend>Server image</legend>
         <label class="radio-row"><input type="radio" name="image-source" value="default" checked /> Use the bundled image (recommended)</label>
         <label class="radio-row"><input type="radio" name="image-source" value="registry" /> Registry image reference</label>
-        <label class="radio-row"><input type="radio" name="image-source" value="tarball" /> Local .tar.gz file</label>
         <div class="ctl" id="image-ref-row" hidden>
-          <input id="image-ref" type="text" placeholder="osteck/cttc-gateway:0.0.2" />
+          <!-- keep this tag in sync with releases/_repo/image.json -- a stale
+               placeholder tag reads as a real, pullable default and isn't -->
+          <input id="image-ref" type="text" placeholder="osteck/cttc-gateway:0.0.1" />
         </div>
+        <label class="radio-row"><input type="radio" name="image-source" value="tarball" /> Local .tar.gz file</label>
         <div class="ctl" id="image-tarball-row" hidden>
           <input id="image-tarball-path" type="text" readonly disabled placeholder="No file selected" />
           <button type="button" id="image-tarball-browse">Browse…</button>

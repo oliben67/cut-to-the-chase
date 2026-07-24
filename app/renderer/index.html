@@ -54,16 +54,6 @@
         <button data-action="toggle-fullscreen">Toggle Full Screen <span class="acc">F11</span></button>
       </div>
     </div>
-    <div class="menu" data-menu="recording">
-      <button class="menu-label" type="button">Recording <span id="recording-dot" class="recording-dot"></span></button>
-      <div class="menu-list" role="menu">
-        <button id="menu-start-recording" data-action="start-recording">Start Recording</button>
-        <button id="menu-pause-recording" data-action="pause-recording">Pause Recording</button>
-        <button id="menu-stop-recording" data-action="stop-recording">Stop Recording</button>
-        <div class="menu-sep"></div>
-        <button data-action="open-recording">Open Recording…</button>
-      </div>
-    </div>
     <div class="menu" data-menu="window">
       <button class="menu-label" type="button">Window</button>
       <div class="menu-list" role="menu">
@@ -82,7 +72,7 @@
     <div id="server-status" class="server-status" title="">
       <button id="server-status-btn" type="button" class="server-status-btn" title="Switch gateway…">
         <span class="server-status-dot"></span>
-        <span class="server-status-label">cttc gateway</span>
+        <span class="server-status-label">gateway:</span>
         <span id="server-status-location" class="server-status-location"></span>
       </button>
       <div id="gateway-dropdown" class="gateway-dropdown" role="menu" hidden></div>
@@ -94,6 +84,15 @@
     <button id="btn-set" title="Attach to a Docker daemon (local or ssh://) and pick containers/services to follow">＋ Set sources</button>
     <button id="btn-clear-sources" title="Close every open source and start from scratch">🗑 Clear sources</button>
     <button id="btn-load-sample" title="Load a .cttc metrics file (possibly encrypted)">📂 Load metrics</button>
+    <!-- transport controls, tape-recorder style: record/pause/stop grouped
+         together (like the three buttons on a physical deck), eject (open a
+         saved recording) standalone since it isn't part of that transport -->
+    <span class="btn-group" id="recording-transport">
+      <button id="btn-start-recording" title="Start Recording"><span id="recording-glyph">⏺</span><span id="recording-dot" class="recording-dot"></span></button>
+      <button id="btn-pause-recording" title="Pause Recording" disabled>⏸</button>
+      <button id="btn-stop-recording" title="Stop Recording" disabled>⏹</button>
+    </span>
+    <button id="btn-open-recording" title="Open Recording…">⏏</button>
     <label class="ctl" title="Poll interval: size of the ± highlight window around the selected time">poll interval<input id="win-secs" type="number" min="0" step="1" value="5" /> s</label>
     <button id="btn-freq-help" class="icon-btn" title="Learn more about the poll interval">?</button>
     <label class="ctl switch-row" id="style-switch" title="Switch between line plot and histogram">

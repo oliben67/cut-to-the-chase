@@ -158,7 +158,8 @@ async function loadGatewaysForEdit() {
   for (const g of gateways) {
     const opt = document.createElement("option");
     opt.value = keyOf(g);
-    opt.textContent = `${g.label || g.host} (${g.host}:${g.port})${g.active ? " — active" : ""}`;
+    const loc = g.port == null ? g.host : `${g.host}:${g.port}`;
+    opt.textContent = `${g.label || g.host} (${loc})${g.active ? " — active" : ""}`;
     selectEl.appendChild(opt);
   }
   // keeps the same gateway selected across a reload (e.g. right after

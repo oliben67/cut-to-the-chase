@@ -2,13 +2,16 @@
 :root {
   color-scheme: light dark;
   --surface-1: #fcfcfb;
+  --surface-2: #f1f0ec;
+  --surface-3: #e7e6e0;
   --page: #f9f9f7;
   --text-primary: #0b0b0b;
   --text-secondary: #52514e;
   --muted: #898781;
   --grid: #e1e0d9;
   --baseline: #c3c2b7;
-  --border: rgba(11, 11, 11, 0.10);
+  --border: rgba(11, 11, 11, 0.13);
+  --border-strong: rgba(11, 11, 11, 0.22);
   --accent: #2a78d6;
   /* user-configurable via File > Preferences > Theme (see app.js prefs.hlColor) */
   --hl-color: #eaff00;
@@ -23,21 +26,29 @@
   --series-6: #eb6834;
   --series-7: #4a3aa7;
   --series-8: #e34948;
+  --radius-sm: 5px;
+  --radius-md: 7px;
+  --radius-lg: 10px;
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.12);
+  --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.16);
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --surface-1: #1a1a19;
-    --page: #0d0d0d;
-    --text-primary: #ffffff;
+    --surface-1: #18181a;
+    --surface-2: #212123;
+    --surface-3: #2b2b2d;
+    --page: #0b0b0c;
+    --text-primary: #f4f4f4;
     --text-secondary: #c3c2b7;
-    --muted: #898781;
+    --muted: #8f8d87;
     --grid: #2c2c2a;
     --baseline: #383835;
-    --border: rgba(255, 255, 255, 0.10);
-    --accent: #3987e5;
+    --border: rgba(255, 255, 255, 0.11);
+    --border-strong: rgba(255, 255, 255, 0.18);
+    --accent: #4a90f0;
     --hl-color: #eaff00;
     --hl: color-mix(in srgb, var(--hl-color) 40%, transparent);
-    --critical: #d03b3b;
+    --critical: #e35454;
     --warning: #fab219;
     --series-1: #3987e5;
     --series-2: #008300;
@@ -47,6 +58,8 @@
     --series-6: #d95926;
     --series-7: #9085e9;
     --series-8: #e66767;
+    --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.4);
+    --shadow-md: 0 8px 28px rgba(0, 0, 0, 0.5);
   }
 }
 
@@ -64,7 +77,8 @@
 html, body { height: 100%; }
 body {
   margin: 0;
-  font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  font: 13px/1.45 -apple-system, "Segoe UI", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
   background: var(--page);
   color: var(--text-primary);
   display: flex;
@@ -90,24 +104,25 @@ body {
   background: none;
   border: none;
   color: var(--text-primary);
-  padding: 3px 8px;
+  padding: 4px 9px;
   line-height: 1.2;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   cursor: pointer;
+  transition: background 0.1s ease;
 }
 #menubar .menu-label:hover,
-#menubar .menu.open .menu-label { background: var(--surface-2, #0002); }
+#menubar .menu.open .menu-label { background: var(--surface-2); }
 #menubar .menu-list {
   display: none;
   position: absolute;
   top: 100%;
   left: 0;
   min-width: 220px;
-  background: var(--surface-1);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
-  padding: 2px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+  padding: 4px;
   z-index: 50;
   flex-direction: column;
 }
@@ -121,13 +136,14 @@ body {
   border: none;
   color: var(--text-primary);
   text-align: left;
-  padding: 3px 8px;
+  padding: 5px 9px;
   line-height: 1.3;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   cursor: pointer;
   font-size: 12px;
 }
 #menubar .menu-list button:hover { background: var(--accent); color: #fff; }
+#menubar .menu-list button:disabled:hover { background: none; color: var(--text-primary); }
 #menubar .menu-list button.menu-indent { padding-left: 20px; }
 #menubar .menu-sub-label {
   padding: 3px 8px 1px;
@@ -152,16 +168,17 @@ body {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 3px 8px;
+  padding: 4px 9px;
   color: var(--muted);
   background: none;
   border: none;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   font: inherit;
   cursor: pointer;
+  transition: background 0.1s ease;
 }
 .server-status-btn:hover,
-.server-status.open .server-status-btn { background: var(--surface-2, #0002); }
+.server-status.open .server-status-btn { background: var(--surface-2); }
 .server-status-dot {
   width: 8px;
   height: 8px;
@@ -185,11 +202,11 @@ body {
   top: 100%;
   right: 0;
   min-width: 260px;
-  background: var(--surface-1);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
-  padding: 2px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+  padding: 4px;
   z-index: 50;
 }
 .gateway-dropdown .gateway-item {
@@ -197,11 +214,11 @@ body {
   flex-direction: column;
   align-items: flex-start;
   gap: 1px;
-  padding: 5px 8px;
+  padding: 6px 9px;
   width: 100%;
   background: none;
   border: none;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   color: var(--text-primary);
   text-align: left;
   cursor: pointer;
@@ -220,7 +237,7 @@ body {
 }
 .gateway-dropdown .gateway-empty { padding: 6px 8px; font-size: 12px; color: var(--muted); }
 
-/* Recording menu label's own status dot -- hidden (no dot) when idle,
+/* Record toolbar button's own status dot -- hidden (no dot) when idle,
    red+pulsing while actively recording, yellow steady while paused. */
 .recording-dot {
   display: inline-block;
@@ -230,11 +247,19 @@ body {
   border-radius: 50%;
   vertical-align: middle;
 }
-.menu[data-menu="recording"][data-state="recording"] .recording-dot {
+#btn-start-recording[data-state="recording"] .recording-dot {
   background: var(--critical);
   animation: recording-pulse 1.5s ease-in-out infinite;
 }
-.menu[data-menu="recording"][data-state="paused"] .recording-dot { background: #f1c40f; }
+#btn-start-recording[data-state="paused"] .recording-dot { background: #f1c40f; }
+/* the button's own ⏺ glyph (white/light in dark mode, since it's plain
+   button text) would otherwise sit right next to the red/yellow dot,
+   reading as two dots at once -- hide it whenever the dot itself is
+   showing a real state so only one is ever visible. */
+#btn-start-recording[data-state="recording"] #recording-glyph,
+#btn-start-recording[data-state="paused"] #recording-glyph {
+  display: none;
+}
 @keyframes recording-pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.35; }
@@ -266,9 +291,9 @@ body {
   padding: 6px 8px;
   max-height: 160px;
   overflow-y: auto;
-  background: var(--surface-2, #0002);
+  background: var(--surface-2);
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--radius-md);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 11px;
   white-space: pre-wrap;
@@ -306,16 +331,19 @@ body {
 button {
   font: inherit;
   color: var(--text-primary);
-  background: var(--surface-1);
-  border: 1px solid var(--baseline);
-  border-radius: 6px;
-  padding: 3px 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 4px 11px;
   cursor: pointer;
+  transition: background 0.1s ease, border-color 0.1s ease;
 }
-button:hover { border-color: var(--accent); }
-button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button:hover { background: var(--surface-3); border-color: var(--border-strong); }
+button:active { background: var(--surface-3); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 500; }
+button.primary:hover { filter: brightness(1.08); background: var(--accent); }
 button:disabled, input:disabled { opacity: 0.5; cursor: default; }
-button:disabled:hover { border-color: var(--baseline); }
+button:disabled:hover { background: var(--surface-2); border-color: var(--border-strong); }
 body.sample-armed .strip { cursor: cell; }
 
 #layout { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
@@ -386,17 +414,17 @@ body.sample-armed .strip { cursor: cell; }
   flex-direction: column;
   min-width: 180px;
   padding: 4px;
-  background: var(--surface-1);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.22);
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
 }
 #ctxmenu button {
   border: none;
   background: none;
   text-align: left;
   padding: 5px 10px;
-  border-radius: 5px;
+  border-radius: var(--radius-sm);
 }
 #ctxmenu button:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
 
@@ -499,6 +527,8 @@ body.popout-telemetry #splitter,
 body.popout-telemetry #btn-set,
 body.popout-telemetry #btn-load-sample,
 body.popout-telemetry #btn-clear-sources,
+body.popout-telemetry #recording-transport,
+body.popout-telemetry #btn-open-recording,
 body.popout-telemetry #style-switch,
 body.popout-telemetry #host-block {
   display: none;
@@ -509,6 +539,8 @@ body.popout-series #splitter,
 body.popout-series #btn-set,
 body.popout-series #btn-clear-sources,
 body.popout-series #btn-load-sample,
+body.popout-series #recording-transport,
+body.popout-series #btn-open-recording,
 body.popout-series #style-switch,
 body.popout-series #host-block {
   display: none;
@@ -531,6 +563,8 @@ body.popout-host #splitter,
 body.popout-host #btn-set,
 body.popout-host #btn-load-sample,
 body.popout-host #btn-clear-sources,
+body.popout-host #recording-transport,
+body.popout-host #btn-open-recording,
 body.popout-host #style-switch,
 body.popout-host #btn-popout-telemetry {
   display: none;
@@ -538,8 +572,8 @@ body.popout-host #btn-popout-telemetry {
 
 .btn-group { display: inline-flex; }
 .btn-group button { border-radius: 0; margin-left: -1px; }
-.btn-group button:first-child { border-radius: 6px 0 0 6px; margin-left: 0; }
-.btn-group button:last-child { border-radius: 0 6px 6px 0; }
+.btn-group button:first-child { border-radius: var(--radius-sm) 0 0 var(--radius-sm); margin-left: 0; }
+.btn-group button:last-child { border-radius: 0 var(--radius-sm) var(--radius-sm) 0; }
 .lane-canvas { flex: 1 1 auto; display: block; cursor: crosshair; }
 
 #panels {
@@ -556,8 +590,9 @@ body.popout-host #btn-popout-telemetry {
   display: flex;
   flex-direction: column;
   background: var(--surface-1);
-  border: 1px solid var(--border);
-  border-radius: 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
   min-height: 0;
 }
 .panel-head {
@@ -653,10 +688,10 @@ button.popback { font-size: 14px; }
   position: fixed;
   z-index: 10;
   pointer-events: none;
-  background: var(--surface-1);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.18);
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-sm);
   padding: 6px 9px;
   font-size: 11px;
   max-width: 340px;
@@ -670,10 +705,10 @@ button.popback { font-size: 14px; }
   position: fixed;
   z-index: 200;
   pointer-events: none;
-  background: var(--surface-1);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.18);
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-sm);
   padding: 4px 8px;
   font-size: 11px;
   max-width: 280px;
@@ -683,8 +718,9 @@ button.popback { font-size: 14px; }
 dialog {
   background: var(--surface-1);
   color: var(--text-primary);
-  border: 1px solid var(--border);
-  border-radius: 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-md);
   min-width: 460px;
   max-width: 620px;
 }
@@ -695,10 +731,10 @@ dialog h2 { margin: 0 0 10px; font-size: 15px; }
 #docker-targets label.added { opacity: 0.55; }
 .tdoc { color: var(--muted); }
 #docker-targets .group { font-weight: 600; margin-top: 6px; color: var(--text-secondary); }
-#transforms-box { border: 1px solid var(--border); border-radius: 6px; margin: 8px 0; }
+#transforms-box { border: 1px solid var(--border); border-radius: var(--radius-md); margin: 8px 0; }
 #transforms-box legend { font-size: 12px; color: var(--text-secondary); padding: 0 4px; }
 .dlg-intro { margin: 10px 0 6px; font-size: 12px; }
-.dlg-section { border: 1px solid var(--border); border-radius: 6px; margin: 10px 0; padding-bottom: 2px; }
+.dlg-section { border: 1px solid var(--border); border-radius: var(--radius-md); margin: 10px 0; padding-bottom: 2px; }
 .dlg-section legend { font-size: 12.5px; font-weight: 600; color: var(--text-primary); padding: 0 4px; }
 .dlg-section-help { margin: 0 0 8px; font-size: 11.5px; }
 #transforms-list label { display: block; padding: 1px 0; color: var(--text-primary); }
@@ -711,7 +747,7 @@ dialog h2 { margin: 0 0 10px; font-size: 15px; }
   max-height: 360px;
   overflow-y: auto;
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--radius-md);
   padding: 6px 8px;
   font-size: 12px;
 }
@@ -756,7 +792,7 @@ pre.snapshot-body {
 #segment-pick-list .seg-meta { font-size: 11px; color: var(--muted); }
 
 /* settings dialog fieldsets (remote connection, update server image) */
-.keys-box { border: 1px solid var(--border); border-radius: 6px; margin: 8px 0; }
+.keys-box { border: 1px solid var(--border); border-radius: var(--radius-md); margin: 8px 0; }
 .keys-box .radio-row { display: flex; align-items: center; gap: 6px; font-size: 13px; margin: 4px 0; }
 .keys-box .radio-row input { width: auto; }
 .keys-box legend { font-size: 12px; color: var(--text-secondary); padding: 0 4px; }
@@ -780,26 +816,34 @@ pre.snapshot-body {
    form, a larger OS font scale, or a small display can still reach content
    via scroll instead of silently clipping it. */
 body:has(#gateway-setup) { overflow-y: auto; }
-#gateway-setup { max-width: 460px; margin: 40px auto; padding: 0 12px 48px; }
+#gateway-setup { margin: 22px 0; padding: 0 20px 48px; }
 /* .keys-box has no explicit padding elsewhere -- the browser's UA default
    fieldset padding (~0.75em sides) narrows its controls more than the
    surrounding page padding does; tightened here so gateway-setup's inputs
    use closer to the same width as the plain (non-fieldset) ones above them,
    without changing #gateway-setup's own max-width. */
 #gateway-setup .keys-box { padding: 4px 10px 10px; }
-#gateway-setup h1 { font-size: 18px; }
-#gateway-setup label { display: block; margin-top: 14px; font-size: 13px; }
+#gateway-setup h1 { font-size: 19px; font-weight: 600; letter-spacing: -0.01em; }
+#gateway-setup label { display: block; margin-top: 14px; font-size: 13px; color: var(--text-secondary); }
 #gateway-setup input[type="text"],
 #gateway-setup input[type="number"],
 #gateway-setup textarea,
 #gateway-setup select {
-  background: var(--surface-2, #0002);
-  border: 1px solid var(--border);
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
   color: var(--text-primary);
-  border-radius: 4px;
-  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  padding: 6px 9px;
   font-size: 13px;
   box-sizing: border-box;
+  transition: border-color 0.1s ease;
+}
+#gateway-setup input[type="text"]:focus,
+#gateway-setup input[type="number"]:focus,
+#gateway-setup textarea:focus,
+#gateway-setup select:focus {
+  outline: none;
+  border-color: var(--accent);
 }
 /* stacked label-above-control layout (ssh user/host/port, the gateway
    picker) -- scoped to a direct child of a bare <label> so it doesn't
@@ -813,6 +857,12 @@ body:has(#gateway-setup) { overflow-y: auto; }
   display: block;
   width: 100%;
   margin-top: 4px;
+}
+/* the port number is at most 5 digits -- stretching it to the same width
+   as the hostname/username fields above it left a wide mostly-empty box
+   that read as an unfinished layout rather than a small numeric field */
+#gateway-setup label > input[type="number"]#ssh-port {
+  width: 100px;
 }
 /* indented to line up under the radio option's text (not the radio dot),
    so these read as that option's own sub-fields rather than a separate row */

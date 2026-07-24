@@ -691,10 +691,14 @@ async def docker_ps(host: str | None, ssh_key: str | None = None) -> dict:
         )
 
     ps_out = await run(f"docker ps @ {where}", base + ["ps", "--format", "{{json .}}"])
+    ps_rows = [jloads(line) for line in ps_out.splitlines() if line.strip()]
     containers = [
-        {"id": (r := jloads(line))["ID"][:12], "name": r["Names"], "image": r["Image"]}
-        for line in ps_out.splitlines()
-        if line.strip()
+        {"id": r["ID"][:12], "name": r["Names"], "image": r["Image"]}
+        for r in ps_rows
+        # the gateway's own container (image "cttc-gateway[:tag]", see
+        # docker-compose.yml) is infrastructure CTTC runs itself, not
+        # something to offer up as a monitorable target
+        if r["Image"].split(":")[0].rsplit("/", 1)[-1] != "cttc-gateway"
     ]
 
     services = []

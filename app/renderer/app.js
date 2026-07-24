@@ -2077,11 +2077,10 @@ $("btn-load-sample").onclick = async () => {
 const recording = { status: "idle", path: null, segmentStart: null };
 
 function syncRecordingMenu() {
-  const menu = document.querySelector('.menu[data-menu="recording"]');
-  if (menu) menu.dataset.state = recording.status;
-  $("menu-start-recording").disabled = recording.status === "recording";
-  $("menu-pause-recording").disabled = recording.status !== "recording";
-  $("menu-stop-recording").disabled = recording.status === "idle";
+  $("btn-start-recording").dataset.state = recording.status;
+  $("btn-start-recording").disabled = recording.status === "recording";
+  $("btn-pause-recording").disabled = recording.status !== "recording";
+  $("btn-stop-recording").disabled = recording.status === "idle";
 }
 
 // Reassignable wrappers (window.cttc's own properties are read-only --
@@ -2234,6 +2233,11 @@ async function recoverInterruptedRecording() {
 recoverInterruptedRecording();
 
 syncRecordingMenu();
+
+$("btn-start-recording").onclick = () => startRecording();
+$("btn-pause-recording").onclick = () => pauseRecording();
+$("btn-stop-recording").onclick = () => stopRecording();
+$("btn-open-recording").onclick = () => openRecording();
 
 /* ── theme preferences (dlg-theme) ───────────────────────────────────────
    Reached via File > Preferences > Theme. Currently just the log-highlight
@@ -2586,10 +2590,6 @@ if (!POPOUT_KIND) {
     "new-gateway": () => window.cttc.newGateway(),
     "edit-gateways": () => window.cttc.editGateways(),
     "open-theme": () => openThemeDialog(),
-    "start-recording": () => startRecording(),
-    "pause-recording": () => pauseRecording(),
-    "stop-recording": () => stopRecording(),
-    "open-recording": () => openRecording(),
     undo: () => document.execCommand("undo"),
     redo: () => document.execCommand("redo"),
     cut: () => document.execCommand("cut"),
@@ -2669,7 +2669,8 @@ connectSSE();
   // whether it's reachable, matters most for "remote" mode (see
   // docs/architecture/remote-server.md), where it's easy to forget which
   // host is actually being talked to.
-  $("server-status-location").textContent = `${HOST === "127.0.0.1" ? "localhost" : HOST}:${PORT}`;
+  const statusHost = HOST === "127.0.0.1" ? "localhost" : HOST;
+  $("server-status-location").textContent = PORT == null || PORT === "null" ? statusHost : `${statusHost}:${PORT}`;
   const HEALTH_POLL_MS = 5000;
   const btn = $("server-status-btn");
   const setState = (state, detail) => {
@@ -2728,7 +2729,8 @@ connectSSE();
       label.textContent = g.label || g.host;
       const loc = document.createElement("span");
       loc.className = "gateway-item-loc";
-      loc.textContent = `${g.host === "127.0.0.1" ? "localhost" : g.host}:${g.port}`;
+      const locHost = g.host === "127.0.0.1" ? "localhost" : g.host;
+      loc.textContent = g.port == null ? locHost : `${locHost}:${g.port}`;
       item.append(label, loc);
       if (!g.active) {
         item.onclick = async () => {
