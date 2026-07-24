@@ -721,6 +721,29 @@
     ok(typeof window.cttc?.openHelp === "function", "openHelp exposed via preload");
   });
 
+  /* ── gateway dropdown ──────────────────────────────────────────────────── */
+
+  await T("gateway dropdown opens/closes, listing real (possibly empty) recorded gateways", async () => {
+    ok(typeof window.cttc?.getGateways === "function", "getGateways exposed via preload");
+    ok(typeof window.cttc?.switchGateway === "function", "switchGateway exposed via preload");
+    eq($("gateway-dropdown").hidden, true, "starts closed");
+    $("server-status-btn").click();
+    await sleep(50); // dropdown render is async (awaits getGateways())
+    eq($("gateway-dropdown").hidden, false, "opens on click");
+    ok($("server-status").classList.contains("open"), "wrapper marked open");
+    // real IPC round-trip against the actual (embedded, bare uv) test server
+    // -- this dev/test launch path never calls recordGateway, so an empty
+    // list is the expected, valid real-world response here, not a mock.
+    const gateways = await window.cttc.getGateways();
+    ok(Array.isArray(gateways), "getGateways returns an array");
+    if (!gateways.length) {
+      ok($("gateway-dropdown").querySelector(".gateway-empty"), "empty-state shown");
+    }
+    document.body.click(); // outside click
+    eq($("gateway-dropdown").hidden, true, "closes on outside click");
+    ok(!$("server-status").classList.contains("open"), "wrapper no longer marked open");
+  });
+
   await T("host block shows the loading state before first host sample", () => {
     state.sources.push({ id: "__hload", kind: "stats", is_host: true,
                          path: "docker://local/host", live: true, name: "host@local" });

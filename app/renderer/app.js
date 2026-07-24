@@ -2730,9 +2730,10 @@ connectSSE();
   // host is actually being talked to.
   $("server-status-location").textContent = `${HOST === "127.0.0.1" ? "localhost" : HOST}:${PORT}`;
   const HEALTH_POLL_MS = 5000;
+  const btn = $("server-status-btn");
   const setState = (state, detail) => {
     el.dataset.state = state;
-    el.title = detail || "";
+    btn.title = detail ? `${detail}` : "Switch gateway…";
   };
   const check = async () => {
     // Only flash "checking" when we don't already know the answer -- once
@@ -2747,4 +2748,73 @@ connectSSE();
   };
   check();
   setInterval(check, HEALTH_POLL_MS);
+})();
+
+/* ── gateway dropdown (click the status pill) ─────────────────────────────
+   Lists every gateway this client has ever actually connected to (see
+   lib/gateway-registry.js, recorded server-side in main.js right after a
+   connect succeeds) so switching back to one doesn't mean re-typing an ssh
+   target from scratch. Picking a non-active one re-verifies it's still up
+   (main.js's switch-gateway) before writing connection.json and offering a
+   restart -- never blind-trusts a stale entry. */
+(() => {
+  const wrap = $("server-status");
+  const btn = $("server-status-btn");
+  const dropdown = $("gateway-dropdown");
+  if (!wrap || !window.cttc?.getGateways) return;
+
+  const close = () => {
+    wrap.classList.remove("open");
+    dropdown.hidden = true;
+  };
+
+  const render = (gateways) => {
+    dropdown.innerHTML = "";
+    if (!gateways.length) {
+      const empty = document.createElement("div");
+      empty.className = "gateway-empty";
+      empty.textContent = "No other gateways yet — Run Setup to add one.";
+      dropdown.appendChild(empty);
+      return;
+    }
+    for (const g of gateways) {
+      const item = document.createElement("button");
+      item.type = "button";
+      item.className = "gateway-item";
+      item.dataset.active = String(!!g.active);
+      const label = document.createElement("span");
+      label.className = "gateway-item-label";
+      label.textContent = g.label || g.host;
+      const loc = document.createElement("span");
+      loc.className = "gateway-item-loc";
+      loc.textContent = `${g.host === "127.0.0.1" ? "localhost" : g.host}:${g.port}`;
+      item.append(label, loc);
+      if (!g.active) {
+        item.onclick = async () => {
+          close();
+          setStatus(`Switching to ${g.label || g.host}…`);
+          const r = await window.cttc.switchGateway(g);
+          if (!r.ok) setStatus(`Could not switch gateway: ${r.error}`);
+        };
+      }
+      dropdown.appendChild(item);
+    }
+  };
+
+  btn.onclick = async (e) => {
+    e.stopPropagation();
+    if (wrap.classList.contains("open")) {
+      close();
+      return;
+    }
+    wrap.classList.add("open");
+    dropdown.hidden = false;
+    render(await window.cttc.getGateways());
+  };
+  document.addEventListener("click", (e) => {
+    if (!wrap.contains(e.target)) close();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") close();
+  });
 })();

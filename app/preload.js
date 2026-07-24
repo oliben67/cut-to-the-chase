@@ -24,4 +24,6 @@ contextBridge.exposeInMainWorld("cttc", {
   writeBinaryFile: (filePath, bytes) => ipcRenderer.invoke("write-binary-file", filePath, bytes),
   getRecordingMarker: () => ipcRenderer.invoke("get-recording-marker"),
   setRecordingMarker: (marker) => ipcRenderer.invoke("set-recording-marker", marker),
+  getGateways: () => ipcRenderer.invoke("get-gateways"),
+  switchGateway: (entry) => ipcRenderer.invoke("switch-gateway", entry),
 });

@@ -8,6 +8,7 @@ const { loadConnectionConfig, saveConnectionConfig, clearConnectionConfig } = re
 const { hasLocalDocker, canBeServerLocally } = require("./lib/docker-check");
 const { writeKeyFile, copyKeyFile } = require("./lib/ssh-key-file");
 const { ensureLocalContainer, ensureRemoteContainer } = require("./lib/server-provision");
+const { readGateways, recordGateway } = require("./lib/gateway-registry");
 
 const SERVER_DIR = path.join(__dirname, "server");
 const APP_ICON = path.join(__dirname, "assets", "icon.png");
@@ -474,6 +475,7 @@ async function connectToServer(fileArgs) {
       serverHost = "127.0.0.1";
       serverPort = port;
       mainLog(`[docker] server container running locally — port ${serverPort}`);
+      recordGateway({ mode: "embedded", host: serverHost, port: serverPort, label: "This machine" });
       return;
     }
     await startServer(fileArgs);
@@ -494,6 +496,15 @@ async function connectToServer(fileArgs) {
   serverHost = remote.host;
   serverPort = remote.port;
   mainLog(`[remote] connected to ${cfg.sshTarget} — http://${serverHost}:${serverPort}`);
+  recordGateway({
+    mode: "remote",
+    host: serverHost,
+    port: serverPort,
+    label: cfg.sshTarget,
+    sshTarget: cfg.sshTarget,
+    sshKey: cfg.sshKey,
+    ...(cfg.sshPort ? { sshPort: cfg.sshPort } : {}),
+  });
 }
 
 // Right after provisioning, check whether the server host itself has docker
@@ -583,6 +594,15 @@ function runSetupWizard() {
         serverHost = remote.host;
         serverPort = remote.port;
         saveConnectionConfig(cfg);
+        recordGateway({
+          mode: "remote",
+          host: remote.host,
+          port: remote.port,
+          label: cfg.sshTarget,
+          sshTarget: cfg.sshTarget,
+          sshKey: cfg.sshKey,
+          ...(cfg.sshPort ? { sshPort: cfg.sshPort } : {}),
+        });
         await checkServerHostDocker(remote.host, remote.port, (line) => wizardWindow?.webContents.send("setup-log", line));
         settled = true;
         ipcMain.removeHandler("gateway-setup-submit");
@@ -614,6 +634,43 @@ async function offerRestart(message) {
     app.exit(0);
   }
 }
+
+// Backs the status-pill dropdown in the main window: every gateway this
+// client has ever actually connected to, newest first, with the currently
+// active one flagged so the renderer can highlight it.
+ipcMain.handle("get-gateways", () => {
+  const gateways = readGateways();
+  for (const g of gateways) g.active = g.host === serverHost && g.port === serverPort;
+  return gateways;
+});
+
+// Switching gateways doesn't re-provision anything -- these are all
+// gateways already confirmed running at some point; a quick /health check
+// just confirms it's still up before committing to it, since restarting
+// into a dead gateway would be a worse experience than an upfront error
+// here. "embedded" means point back at this machine (clears
+// connection.json, same as Run Setup's "Revert to Local"); anything else
+// writes a "remote" connection.json from the saved ssh fields.
+ipcMain.handle("switch-gateway", async (_e, entry) => {
+  try {
+    const r = await fetch(`http://${entry.host}:${entry.port}/health`, { signal: AbortSignal.timeout(5000) });
+    if (!r.ok) throw new Error(`gateway responded ${r.status}`);
+  } catch (err) {
+    return { ok: false, error: `could not reach ${entry.host}:${entry.port}: ${err.message || err}` };
+  }
+  if (entry.mode === "embedded") {
+    clearConnectionConfig();
+  } else {
+    saveConnectionConfig({
+      sshTarget: entry.sshTarget,
+      sshKey: entry.sshKey,
+      remotePort: entry.port,
+      ...(entry.sshPort ? { sshPort: entry.sshPort } : {}),
+    });
+  }
+  await offerRestart(`Restart CTTC to switch to ${entry.label}?`);
+  return { ok: true };
+});
 
 // Settings > Run Setup: reachable any time, not just at first launch (see
 // dlg-keys's "Remote connection" section in index.html).
@@ -659,7 +716,8 @@ ipcMain.handle("update-image", async (_e, payload) => {
     payload.sourceType === "tarball" ? { type: "tarball", path: payload.tarballPath } : { type: "registry", ref: payload.ref };
   try {
     if (await canBeServerLocally()) {
-      await ensureLocalContainer({ source, resourcesDir: resourcesDirForApp() });
+      const { port } = await ensureLocalContainer({ source, resourcesDir: resourcesDirForApp() });
+      recordGateway({ mode: "embedded", host: "127.0.0.1", port, label: "This machine" });
       await offerRestart("Image updated locally. Restart CTTC to reconnect?");
       return { ok: true };
     }
@@ -677,6 +735,15 @@ ipcMain.handle("update-image", async (_e, payload) => {
     });
     serverHost = remote.host;
     serverPort = remote.port;
+    recordGateway({
+      mode: "remote",
+      host: remote.host,
+      port: remote.port,
+      label: cfg.sshTarget,
+      sshTarget: cfg.sshTarget,
+      sshKey: cfg.sshKey,
+      ...(cfg.sshPort ? { sshPort: cfg.sshPort } : {}),
+    });
     await offerRestart("Image updated on the remote host. Restart CTTC to reconnect?");
     return { ok: true };
   } catch (err) {

@@ -135,14 +135,23 @@ body {
 #menubar .menu-list button:hover .acc { color: #fff; }
 
 .server-status {
+  position: relative;
   margin-left: auto;
+}
+.server-status-btn {
   display: flex;
   align-items: center;
   gap: 6px;
   padding: 3px 8px;
   color: var(--muted);
-  cursor: default;
+  background: none;
+  border: none;
+  border-radius: 4px;
+  font: inherit;
+  cursor: pointer;
 }
+.server-status-btn:hover,
+.server-status.open .server-status-btn { background: var(--surface-2, #0002); }
 .server-status-dot {
   width: 8px;
   height: 8px;
@@ -153,12 +162,54 @@ body {
 .server-status[data-state="up"] .server-status-dot { background: #2ecc71; }
 .server-status[data-state="checking"] .server-status-dot { background: #f1c40f; }
 .server-status[data-state="down"] .server-status-dot { background: var(--critical); }
-.server-status[data-state="down"] { color: var(--critical); }
+.server-status[data-state="down"] .server-status-btn { color: var(--critical); }
 .server-status-location {
   font-size: 11px;
   color: var(--muted);
   font-variant-numeric: tabular-nums;
 }
+.gateway-dropdown {
+  display: flex;
+  flex-direction: column;
+  position: absolute;
+  top: 100%;
+  right: 0;
+  min-width: 260px;
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+  padding: 2px;
+  z-index: 50;
+}
+.gateway-dropdown[hidden] { display: none; }
+.gateway-dropdown .gateway-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  padding: 5px 8px;
+  width: 100%;
+  background: none;
+  border: none;
+  border-radius: 4px;
+  color: var(--text-primary);
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+}
+.gateway-dropdown .gateway-item:hover { background: var(--accent); color: #fff; }
+.gateway-dropdown .gateway-item[data-active="true"] { cursor: default; }
+.gateway-dropdown .gateway-item-label { display: flex; align-items: center; gap: 6px; font-weight: 600; }
+.gateway-dropdown .gateway-item-loc { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.gateway-dropdown .gateway-item:hover .gateway-item-loc { color: inherit; }
+.gateway-dropdown .gateway-item[data-active="true"] .gateway-item-label::after {
+  content: "● active";
+  font-weight: 400;
+  font-size: 10px;
+  color: #2ecc71;
+}
+.gateway-dropdown .gateway-empty { padding: 6px 8px; font-size: 12px; color: var(--muted); }
 
 /* Recording menu label's own status dot -- hidden (no dot) when idle,
    red+pulsing while actively recording, yellow steady while paused. */
