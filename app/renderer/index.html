@@ -25,7 +25,6 @@
         <div class="menu-sep"></div>
         <span class="menu-sub-label">Preferences</span>
         <button data-action="open-theme" class="menu-indent">Theme…</button>
-        <button data-action="open-settings" class="menu-indent">Settings…</button>
         <div class="menu-sep"></div>
         <button data-action="quit">Quit <span class="acc">Ctrl+Q</span></button>
       </div>
@@ -222,31 +221,6 @@
     <div id="segment-pick-list"></div>
     <div class="dlg-actions">
       <button id="dlg-segment-pick-cancel" title="Close without loading">Cancel</button>
-    </div>
-  </dialog>
-
-  <dialog id="dlg-keys">
-    <h2>Settings</h2>
-    <fieldset class="keys-box">
-      <legend>Update server image</legend>
-      <p class="dlg-section-help muted">Updates wherever the server currently runs — this machine if Docker is
-      present locally, otherwise the configured remote server host.</p>
-      <label class="radio-row"><input type="radio" name="image-source" value="registry" checked /> Registry image reference</label>
-      <label class="radio-row"><input type="radio" name="image-source" value="tarball" /> Local .tar.gz file</label>
-      <div class="ctl" id="image-ref-row">
-        <input id="image-ref" type="text" placeholder="osteck/cttc-gateway:0.0.2" />
-      </div>
-      <div class="ctl" id="image-tarball-row" hidden>
-        <input id="image-tarball-path" type="text" readonly disabled placeholder="No file selected" />
-        <button type="button" id="image-tarball-browse">Browse…</button>
-      </div>
-      <div id="image-update-error" class="error"></div>
-      <div class="ctl">
-        <button id="update-image-btn" title="Load/pull this image and restart the server container">Update Image</button>
-      </div>
-    </fieldset>
-    <div class="dlg-actions">
-      <button id="dlg-keys-close">Close</button>
     </div>
   </dialog>
 

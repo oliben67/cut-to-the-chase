@@ -2235,61 +2235,6 @@ recoverInterruptedRecording();
 
 syncRecordingMenu();
 
-const dlgKeys = $("dlg-keys");
-
-// reached via File > Preferences > Settings (formerly a "🔑 Keys" toolbar button)
-function openSettingsDialog() {
-  dlgKeys.showModal();
-}
-$("dlg-keys-close").onclick = () => dlgKeys.close();
-
-/* ── update server image (dlg-keys's "Update server image" section) ────── */
-const imageRefRow = $("image-ref-row");
-const imageTarballRow = $("image-tarball-row");
-const imageTarballPathEl = $("image-tarball-path");
-const imageRefEl = $("image-ref");
-const imageUpdateError = $("image-update-error");
-
-for (const radio of document.querySelectorAll('input[name="image-source"]')) {
-  radio.addEventListener("change", () => {
-    const tarball = radio.value === "tarball" && radio.checked;
-    imageRefRow.hidden = tarball;
-    imageTarballRow.hidden = !tarball;
-    imageTarballPathEl.disabled = !tarball;
-  });
-}
-
-$("image-tarball-browse").onclick = async () => {
-  const paths = await window.cttc.pickFiles("Choose the server image .tar.gz");
-  if (paths.length) imageTarballPathEl.value = paths[0];
-};
-
-$("update-image-btn").onclick = async () => {
-  imageUpdateError.textContent = "";
-  const tarballMode = document.querySelector('input[name="image-source"]:checked').value === "tarball";
-  const payload = tarballMode
-    ? { sourceType: "tarball", tarballPath: imageTarballPathEl.value }
-    : { sourceType: "registry", ref: imageRefEl.value.trim() };
-  if (tarballMode && !payload.tarballPath) {
-    imageUpdateError.textContent = "Choose a .tar.gz file first.";
-    return;
-  }
-  if (!tarballMode && !payload.ref) {
-    imageUpdateError.textContent = "Enter an image reference (repo:tag) first.";
-    return;
-  }
-  const btn = $("update-image-btn");
-  btn.disabled = true;
-  btn.textContent = "Updating…";
-  try {
-    const result = await window.cttc.updateImage(payload);
-    if (!result.ok) imageUpdateError.textContent = result.error;
-  } finally {
-    btn.disabled = false;
-    btn.textContent = "Update Image";
-  }
-};
-
 /* ── theme preferences (dlg-theme) ───────────────────────────────────────
    Reached via File > Preferences > Theme. Currently just the log-highlight
    color (the background + dotted top/bottom border painted on log rows
@@ -2594,7 +2539,6 @@ if (!POPOUT_KIND) {
     if (action === "set-sources") $("btn-set").click();
     else if (action === "load-metrics") $("btn-load-sample").click();
     else if (action === "open-theme") openThemeDialog();
-    else if (action === "open-settings") openSettingsDialog();
   });
 }
 
@@ -2642,7 +2586,6 @@ if (!POPOUT_KIND) {
     "new-gateway": () => window.cttc.newGateway(),
     "edit-gateways": () => window.cttc.editGateways(),
     "open-theme": () => openThemeDialog(),
-    "open-settings": () => openSettingsDialog(),
     "start-recording": () => startRecording(),
     "pause-recording": () => pauseRecording(),
     "stop-recording": () => stopRecording(),

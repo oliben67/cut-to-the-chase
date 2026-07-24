@@ -4,7 +4,12 @@ const { app, BrowserWindow, dialog, ipcMain, Menu, shell } = require("electron")
 const { spawn } = require("child_process");
 const path = require("path");
 const readline = require("readline");
-const { loadConnectionConfig, saveConnectionConfig, clearConnectionConfig } = require("./lib/connection-config");
+const {
+  loadConnectionConfig,
+  saveConnectionConfig,
+  clearConnectionConfig,
+  hostFromTarget,
+} = require("./lib/connection-config");
 const { hasLocalDocker, canBeServerLocally } = require("./lib/docker-check");
 const { writeKeyFile, copyKeyFile } = require("./lib/ssh-key-file");
 const {
@@ -199,6 +204,7 @@ function closeSplash() {
   splashWindow = null;
 }
 
+let mainWindow = null;
 async function createWindow() {
   const win = new BrowserWindow({
     width: 1440,
@@ -215,6 +221,19 @@ async function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
     },
+  });
+  mainWindow = win;
+  // Auxiliary windows (popouts, Edit Gateways) have no reason to keep
+  // running once the main window they belong to is gone -- without this,
+  // closing just the main window while Edit Gateways is open leaves it as
+  // an orphaned window with nothing behind it, and window-all-closed never
+  // fires to actually quit the app.
+  win.on("closed", () => {
+    if (mainWindow === win) mainWindow = null;
+    if (gatewayManagerWindow && !gatewayManagerWindow.isDestroyed()) gatewayManagerWindow.close();
+    for (const popout of popoutWindows.values()) {
+      if (!popout.isDestroyed()) popout.close();
+    }
   });
   win.once("ready-to-show", () => {
     win.show();
@@ -572,7 +591,7 @@ function runSetupWizard() {
     });
     wizardWindow.setMenuBarVisibility(false);
     attachEditContextMenu(wizardWindow);
-    wizardWindow.loadFile(path.join(__dirname, "renderer", "gateway-setup.html"));
+    wizardWindow.loadFile(path.join(__dirname, "renderer", "gateway-setup.html"), { search: "mode=new" });
     wizardWindow.on("closed", () => {
       wizardWindow = null;
       if (!settled) {
@@ -583,6 +602,14 @@ function runSetupWizard() {
 
     ipcMain.handle("gateway-setup-submit", async (_e, payload) => {
       try {
+        const host = hostFromTarget(`${payload.sshUser}@${payload.sshHost}`);
+        const existing = readGateways().find((g) => g.host === host);
+        if (existing) {
+          return {
+            ok: false,
+            error: `A gateway already exists at ${host} (${existing.label}) -- use File > Gateways > Edit Gateways to modify it instead.`,
+          };
+        }
         const sshKey =
           payload.keyMode === "paste" ? writeKeyFile(payload.keyContents) : copyKeyFile(payload.keyPath);
         const cfg = {
@@ -594,6 +621,7 @@ function runSetupWizard() {
         const remote = await ensureRemoteContainer(cfg, {
           sshBin: process.env.CTTC_SSH_BIN || "ssh",
           resourcesDir: resourcesDirForApp(),
+          source: payload.imageSource || undefined,
           onLog: (line) => wizardWindow?.webContents.send("setup-log", line),
         });
         serverHost = remote.host;
@@ -716,7 +744,7 @@ function openGatewayManager() {
   gatewayManagerWindow.once("ready-to-show", () => gatewayManagerWindow.show());
   gatewayManagerWindow.setMenuBarVisibility(false);
   attachEditContextMenu(gatewayManagerWindow);
-  gatewayManagerWindow.loadFile(path.join(__dirname, "renderer", "gateway-manage.html"));
+  gatewayManagerWindow.loadFile(path.join(__dirname, "renderer", "gateway-setup.html"), { search: "mode=edit" });
   gatewayManagerWindow.on("closed", () => {
     gatewayManagerWindow = null;
   });
@@ -729,6 +757,25 @@ ipcMain.handle("edit-gateways", () => openGatewayManager());
 // hot-swap the main window's already-loaded connection.
 ipcMain.handle("gateway-manage-save", async (_e, payload) => {
   try {
+    const existing = readGateways().find((g) => gatewayKey(g) === payload.key);
+    if (!existing) return { ok: false, error: "That gateway no longer exists -- refresh the list." };
+
+    // "This machine" has no ssh settings to change -- Save/Update here only
+    // ever re-provisions the local container with the chosen image.
+    if (existing.mode === "embedded") {
+      const { port } = await ensureLocalContainer({
+        source: payload.imageSource || undefined,
+        resourcesDir: resourcesDirForApp(),
+      });
+      recordGateway({ mode: "embedded", host: "127.0.0.1", port, label: "This machine" });
+      if (payload.key === `${serverHost}:${serverPort}`) {
+        serverHost = "127.0.0.1";
+        serverPort = port;
+        await offerRestart("Restart CTTC to apply the updated image?");
+      }
+      return { ok: true };
+    }
+
     const sshKey =
       payload.keyMode === "paste" ? writeKeyFile(payload.keyContents) : copyKeyFile(payload.keyPath);
     const cfg = {
@@ -739,6 +786,7 @@ ipcMain.handle("gateway-manage-save", async (_e, payload) => {
     };
     const remote = await ensureRemoteContainer(cfg, {
       sshBin: process.env.CTTC_SSH_BIN || "ssh",
+      source: payload.imageSource || undefined,
       onLog: (line) => gatewayManagerWindow?.webContents.send("setup-log", line),
     });
     const wasActive = payload.key === `${serverHost}:${serverPort}`;
@@ -781,51 +829,6 @@ ipcMain.handle("gateway-manage-uninstall", async (_e, entry) => {
       clearConnectionConfig();
       await offerRestart("This gateway was uninstalled. Restart CTTC to reconnect?");
     }
-    return { ok: true };
-  } catch (err) {
-    return { ok: false, error: err.message || String(err) };
-  }
-});
-
-// Settings > Update server image: pushes a new image (by registry ref or a
-// local tar.gz) to wherever the server currently runs -- locally if Docker
-// is present, otherwise the configured remote host. Unlike Run Setup this
-// doesn't touch connection.json (the *target* doesn't change, only which
-// image runs there).
-ipcMain.handle("update-image", async (_e, payload) => {
-  const source =
-    payload.sourceType === "tarball" ? { type: "tarball", path: payload.tarballPath } : { type: "registry", ref: payload.ref };
-  try {
-    if (await canBeServerLocally()) {
-      const { port } = await ensureLocalContainer({ source, resourcesDir: resourcesDirForApp() });
-      recordGateway({ mode: "embedded", host: "127.0.0.1", port, label: "This machine" });
-      await offerRestart("Image updated locally. Restart CTTC to reconnect?");
-      return { ok: true };
-    }
-    const cfg = loadConnectionConfig();
-    if (cfg.mode !== "remote") {
-      return {
-        ok: false,
-        error: "This machine can't run the server locally, and no remote server is configured -- run Setup first.",
-      };
-    }
-    const remote = await ensureRemoteContainer(cfg, {
-      sshBin: process.env.CTTC_SSH_BIN || "ssh",
-      source,
-      resourcesDir: resourcesDirForApp(),
-    });
-    serverHost = remote.host;
-    serverPort = remote.port;
-    recordGateway({
-      mode: "remote",
-      host: remote.host,
-      port: remote.port,
-      label: cfg.sshTarget,
-      sshTarget: cfg.sshTarget,
-      sshKey: cfg.sshKey,
-      ...(cfg.sshPort ? { sshPort: cfg.sshPort } : {}),
-    });
-    await offerRestart("Image updated on the remote host. Restart CTTC to reconnect?");
     return { ok: true };
   } catch (err) {
     return { ok: false, error: err.message || String(err) };

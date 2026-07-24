@@ -22,7 +22,6 @@ contextBridge.exposeInMainWorld("cttc", {
   editGateways: () => ipcRenderer.invoke("edit-gateways"),
   saveGatewayEdit: (payload) => ipcRenderer.invoke("gateway-manage-save", payload),
   uninstallGateway: (entry) => ipcRenderer.invoke("gateway-manage-uninstall", entry),
-  updateImage: (payload) => ipcRenderer.invoke("update-image", payload),
   pickRecordingPath: () => ipcRenderer.invoke("pick-recording-path"),
   writeBinaryFile: (filePath, bytes) => ipcRenderer.invoke("write-binary-file", filePath, bytes),
   getRecordingMarker: () => ipcRenderer.invoke("get-recording-marker"),

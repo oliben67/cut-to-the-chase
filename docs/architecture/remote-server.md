@@ -247,7 +247,7 @@ this for you; shown here for scripted/MDM deployment):
 ```
 
 `ssh_target`/`ssh_key`/`ssh_port` are only ever used to provision (or
-re-provision, via Settings > Update server image) the container -- the
+re-provision, via File > Gateways > Edit Gateways) the container -- the
 client's own ongoing traffic goes straight to
 `http://<host-from-ssh_target>:<remote_port>`, derived by
 `hostFromTarget()` in
