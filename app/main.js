@@ -569,7 +569,11 @@ function runSetupWizard() {
     let settled = false;
     wizardWindow = new BrowserWindow({
       width: 520,
-      height: 720,
+      // Taller than Edit Gateways' window: New Gateway's intro heading +
+      // explanatory paragraph (see gateway-setup.html's #new-intro) takes
+      // real vertical space that edit mode doesn't have (a single label +
+      // dropdown replaces it there -- see openGatewayManager below).
+      height: 780,
       minWidth: 480,
       minHeight: 560,
       // Was fixed-size (resizable: false) at a height that clipped the
@@ -730,7 +734,11 @@ function openGatewayManager() {
   }
   gatewayManagerWindow = new BrowserWindow({
     width: 560,
-    height: 720,
+    // Shorter than New Gateway's window: the intro heading + paragraph is
+    // replaced here by a single compact label + dropdown (see
+    // gateway-setup.html's #gateway-select-row), so there's less to fit
+    // above the (identical) ssh/key/image fields and actions below it.
+    height: 660,
     minWidth: 480,
     minHeight: 560,
     icon: APP_ICON,
