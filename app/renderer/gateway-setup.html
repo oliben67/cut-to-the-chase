@@ -5,7 +5,7 @@
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'self'; style-src 'self'; script-src 'self'" />
   <title>CTTC Gateways</title>
-  <link rel="stylesheet" href="gateway-setup.css" />
+  <link rel="stylesheet" href="style.css" />
 </head>
 <body>
   <main id="gateway-setup">
@@ -34,7 +34,7 @@
         <input id="ssh-port" type="number" min="1" max="65535" value="22" required />
       </label>
 
-      <fieldset>
+      <fieldset class="keys-box">
         <legend>SSH private key</legend>
         <label class="radio-row"><input type="radio" name="key-mode" value="path" checked /> Use a key file already on this machine</label>
 
@@ -47,7 +47,7 @@
         <textarea id="key-paste" rows="6" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----" disabled></textarea>
       </fieldset>
 
-      <fieldset>
+      <fieldset class="keys-box">
         <legend>Server image</legend>
         <label class="radio-row"><input type="radio" name="image-source" value="default" checked /> Use the bundled image (recommended)</label>
         <label class="radio-row"><input type="radio" name="image-source" value="registry" /> Registry image reference</label>
@@ -63,10 +63,10 @@
 
       <div id="error" class="error" hidden></div>
 
-      <div class="actions">
-        <button type="button" id="btn-skip" class="secondary" title="Use this machine's own Docker (or none) instead of a remote server">Skip — use this machine</button>
-        <button type="button" id="btn-uninstall" class="secondary" hidden title="Stop and remove this gateway's container">Uninstall…</button>
-        <button type="submit" id="btn-connect">Connect</button>
+      <div class="dlg-actions">
+        <button type="button" id="btn-skip" title="Use this machine's own Docker (or none) instead of a remote server">Skip — use this machine</button>
+        <button type="button" id="btn-uninstall" hidden title="Stop and remove this gateway's container">Uninstall…</button>
+        <button type="submit" id="btn-connect" class="primary">Connect</button>
       </div>
     </form>
 
