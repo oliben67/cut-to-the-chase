@@ -2,15 +2,20 @@
 :root {
   color-scheme: light dark;
   --surface-1: #fcfcfb;
+  --surface-2: #f1f0ec;
+  --surface-3: #e7e6e0;
   --page: #f9f9f7;
   --text-primary: #0b0b0b;
   --text-secondary: #52514e;
   --muted: #898781;
   --grid: #e1e0d9;
   --baseline: #c3c2b7;
-  --border: rgba(11, 11, 11, 0.10);
+  --border: rgba(11, 11, 11, 0.13);
+  --border-strong: rgba(11, 11, 11, 0.22);
   --accent: #2a78d6;
-  --hl: rgba(42, 120, 214, 0.14);
+  /* user-configurable via File > Preferences > Theme (see app.js prefs.hlColor) */
+  --hl-color: #eaff00;
+  --hl: color-mix(in srgb, var(--hl-color) 30%, transparent);
   --critical: #d03b3b;
   --warning: #fab219;
   --series-1: #2a78d6;
@@ -21,20 +26,29 @@
   --series-6: #eb6834;
   --series-7: #4a3aa7;
   --series-8: #e34948;
+  --radius-sm: 5px;
+  --radius-md: 7px;
+  --radius-lg: 10px;
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.12);
+  --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.16);
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --surface-1: #1a1a19;
-    --page: #0d0d0d;
-    --text-primary: #ffffff;
+    --surface-1: #18181a;
+    --surface-2: #212123;
+    --surface-3: #2b2b2d;
+    --page: #0b0b0c;
+    --text-primary: #f4f4f4;
     --text-secondary: #c3c2b7;
-    --muted: #898781;
+    --muted: #8f8d87;
     --grid: #2c2c2a;
     --baseline: #383835;
-    --border: rgba(255, 255, 255, 0.10);
-    --accent: #3987e5;
-    --hl: rgba(57, 135, 229, 0.22);
-    --critical: #d03b3b;
+    --border: rgba(255, 255, 255, 0.11);
+    --border-strong: rgba(255, 255, 255, 0.18);
+    --accent: #4a90f0;
+    --hl-color: #eaff00;
+    --hl: color-mix(in srgb, var(--hl-color) 40%, transparent);
+    --critical: #e35454;
     --warning: #fab219;
     --series-1: #3987e5;
     --series-2: #008300;
@@ -44,18 +58,211 @@
     --series-6: #d95926;
     --series-7: #9085e9;
     --series-8: #e66767;
+    --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.4);
+    --shadow-md: 0 8px 28px rgba(0, 0, 0, 0.5);
   }
 }
 
 * { box-sizing: border-box; }
+/* Any author-origin rule setting `display` on an element (e.g. `.ctl {
+   display: inline-flex }`, `label { display: block }`) beats the browser's
+   default `[hidden] { display: none }` UA-stylesheet rule regardless of
+   selector specificity -- origin order always wins over specificity in the
+   cascade. Toggling .hidden via JS then silently does nothing. This was
+   patched piecemeal per-selector over a dozen times across this file
+   (#chart-block[hidden], .panel[hidden], .gateway-dropdown[hidden], ...);
+   one !important rule here replaces all of them and closes the whole bug
+   class instead of relying on remembering it per new element. */
+[hidden] { display: none !important; }
 html, body { height: 100%; }
 body {
   margin: 0;
-  font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  font: 13px/1.45 -apple-system, "Segoe UI", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
   background: var(--page);
   color: var(--text-primary);
   display: flex;
   flex-direction: column;
+}
+
+/* custom menu bar — replaces the native OS menu so the vertical spacing
+   between items can actually be tuned (impossible for the native menu on
+   either macOS or Windows) */
+#menubar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 4px;
+  background: var(--surface-1);
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+  font-size: 12px;
+  user-select: none;
+}
+#menubar .menu { position: relative; }
+#menubar .menu-label {
+  background: none;
+  border: none;
+  color: var(--text-primary);
+  padding: 4px 9px;
+  line-height: 1.2;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background 0.1s ease;
+}
+#menubar .menu-label:hover,
+#menubar .menu.open .menu-label { background: var(--surface-2); }
+#menubar .menu-list {
+  display: none;
+  position: absolute;
+  top: 100%;
+  left: 0;
+  min-width: 220px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+  padding: 4px;
+  z-index: 50;
+  flex-direction: column;
+}
+#menubar .menu.open .menu-list { display: flex; }
+#menubar .menu-list button {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  background: none;
+  border: none;
+  color: var(--text-primary);
+  text-align: left;
+  padding: 5px 9px;
+  line-height: 1.3;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 12px;
+}
+#menubar .menu-list button:hover { background: var(--accent); color: #fff; }
+#menubar .menu-list button:disabled:hover { background: none; color: var(--text-primary); }
+#menubar .menu-list button.menu-indent { padding-left: 20px; }
+#menubar .menu-sub-label {
+  padding: 3px 8px 1px;
+  font-size: 10px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+#menubar .menu-sep {
+  height: 1px;
+  margin: 3px 4px;
+  background: var(--border);
+}
+#menubar .acc { color: var(--muted); font-size: 11px; margin-left: 12px; }
+#menubar .menu-list button:hover .acc { color: #fff; }
+
+.server-status {
+  position: relative;
+  margin-left: auto;
+}
+.server-status-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 9px;
+  color: var(--muted);
+  background: none;
+  border: none;
+  border-radius: var(--radius-sm);
+  font: inherit;
+  cursor: pointer;
+  transition: background 0.1s ease;
+}
+.server-status-btn:hover,
+.server-status.open .server-status-btn { background: var(--surface-2); }
+.server-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex: 0 0 auto;
+}
+.server-status[data-state="up"] .server-status-dot { background: #2ecc71; }
+.server-status[data-state="checking"] .server-status-dot { background: #f1c40f; }
+.server-status[data-state="down"] .server-status-dot { background: var(--critical); }
+.server-status[data-state="down"] .server-status-btn { color: var(--critical); }
+.server-status-location {
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.gateway-dropdown {
+  display: flex;
+  flex-direction: column;
+  position: absolute;
+  top: 100%;
+  right: 0;
+  min-width: 260px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+  padding: 4px;
+  z-index: 50;
+}
+.gateway-dropdown .gateway-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  padding: 6px 9px;
+  width: 100%;
+  background: none;
+  border: none;
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+}
+.gateway-dropdown .gateway-item:hover { background: var(--accent); color: #fff; }
+.gateway-dropdown .gateway-item[data-active="true"] { cursor: default; }
+.gateway-dropdown .gateway-item-label { display: flex; align-items: center; gap: 6px; font-weight: 600; }
+.gateway-dropdown .gateway-item-loc { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.gateway-dropdown .gateway-item:hover .gateway-item-loc { color: inherit; }
+.gateway-dropdown .gateway-item[data-active="true"] .gateway-item-label::after {
+  content: "● active";
+  font-weight: 400;
+  font-size: 10px;
+  color: #2ecc71;
+}
+.gateway-dropdown .gateway-empty { padding: 6px 8px; font-size: 12px; color: var(--muted); }
+
+/* Record toolbar button's own status dot -- hidden (no dot) when idle,
+   red+pulsing while actively recording, yellow steady while paused. */
+.recording-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-left: 4px;
+  border-radius: 50%;
+  vertical-align: middle;
+}
+#btn-start-recording[data-state="recording"] .recording-dot {
+  background: var(--critical);
+  animation: recording-pulse 1.5s ease-in-out infinite;
+}
+#btn-start-recording[data-state="paused"] .recording-dot { background: #f1c40f; }
+/* the button's own ⏺ glyph (white/light in dark mode, since it's plain
+   button text) would otherwise sit right next to the red/yellow dot,
+   reading as two dots at once -- hide it whenever the dot itself is
+   showing a real state so only one is ever visible. */
+#btn-start-recording[data-state="recording"] #recording-glyph,
+#btn-start-recording[data-state="paused"] #recording-glyph {
+  display: none;
+}
+@keyframes recording-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
 }
 
 #toolbar {
@@ -70,6 +277,27 @@ body {
 .app-title { margin-right: 4px; }
 .muted { color: var(--muted); }
 .error { color: var(--critical); }
+.linklike {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent);
+  text-decoration: underline;
+  cursor: pointer;
+  font-size: 12px;
+}
+.activity-log {
+  margin: 6px 0 0;
+  padding: 6px 8px;
+  max-height: 160px;
+  overflow-y: auto;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  white-space: pre-wrap;
+}
 .ctl { display: inline-flex; align-items: center; gap: 5px; color: var(--text-secondary); }
 .ctl.block { display: flex; margin: 6px 0; }
 .ctl input[type="number"] { width: 56px; }
@@ -103,14 +331,19 @@ body {
 button {
   font: inherit;
   color: var(--text-primary);
-  background: var(--surface-1);
-  border: 1px solid var(--baseline);
-  border-radius: 6px;
-  padding: 3px 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 4px 11px;
   cursor: pointer;
+  transition: background 0.1s ease, border-color 0.1s ease;
 }
-button:hover { border-color: var(--accent); }
-button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button:hover { background: var(--surface-3); border-color: var(--border-strong); }
+button:active { background: var(--surface-3); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 500; }
+button.primary:hover { filter: brightness(1.08); background: var(--accent); }
+button:disabled, input:disabled { opacity: 0.5; cursor: default; }
+button:disabled:hover { background: var(--surface-2); border-color: var(--border-strong); }
 body.sample-armed .strip { cursor: cell; }
 
 #layout { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
@@ -121,9 +354,7 @@ body.sample-armed .strip { cursor: cell; }
   border-bottom: 1px solid var(--border);
   padding: 4px 0 2px;
 }
-#chart-block[hidden] { display: none; }
 #empty-state { padding: 28px 16px; text-align: center; }
-#empty-state[hidden] { display: none; }
 
 #chart-head {
   display: flex;
@@ -183,17 +414,17 @@ body.sample-armed .strip { cursor: cell; }
   flex-direction: column;
   min-width: 180px;
   padding: 4px;
-  background: var(--surface-1);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.22);
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
 }
 #ctxmenu button {
   border: none;
   background: none;
   text-align: left;
   padding: 5px 10px;
-  border-radius: 5px;
+  border-radius: var(--radius-sm);
 }
 #ctxmenu button:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
 
@@ -239,6 +470,17 @@ body.sample-armed .strip { cursor: cell; }
   pointer-events: auto;
 }
 
+#lanes-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 12px 2px;
+  border-top: 1px solid var(--border);
+  margin-top: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
 #lanes { padding-top: 2px; }
 
 #host-head {
@@ -252,11 +494,7 @@ body.sample-armed .strip { cursor: cell; }
   font-weight: 600;
   color: var(--text-secondary);
 }
-#host-charts[hidden] { display: none; }
-#host-block[hidden] { display: none; }
-#host-nav[hidden] { display: none; }
 #host-loading { padding: 20px 16px; text-align: center; }
-#host-loading[hidden] { display: none; }
 .hourglass {
   display: inline-block;
   animation: hourglass-flip 1.4s ease-in-out infinite;
@@ -283,24 +521,25 @@ body.sample-armed .strip { cursor: cell; }
 }
 #splitter:hover, #splitter.dragging { background: color-mix(in srgb, var(--accent) 35%, transparent); }
 
-/* windows for a panel popped out on its own: show only the relevant part */
+/* windows for a panel popped out on its own: show only the relevant part.
+   popout-telemetry and popout-series hide the exact same set -- a single
+   series popout is just telemetry-style layout with one series only. */
 body.popout-telemetry #panels,
 body.popout-telemetry #splitter,
-body.popout-telemetry #btn-add,
+body.popout-telemetry #btn-set,
 body.popout-telemetry #btn-load-sample,
 body.popout-telemetry #btn-clear-sources,
-body.popout-telemetry #btn-keys,
+body.popout-telemetry #recording-transport,
+body.popout-telemetry #btn-open-recording,
 body.popout-telemetry #style-switch,
-body.popout-telemetry #host-block {
-  display: none;
-}
-/* a single series popped out: telemetry-style layout, one series only */
+body.popout-telemetry #host-block,
 body.popout-series #panels,
 body.popout-series #splitter,
-body.popout-series #btn-add,
-body.popout-series #btn-clear-sources,
-body.popout-series #btn-keys,
+body.popout-series #btn-set,
 body.popout-series #btn-load-sample,
+body.popout-series #btn-clear-sources,
+body.popout-series #recording-transport,
+body.popout-series #btn-open-recording,
 body.popout-series #style-switch,
 body.popout-series #host-block {
   display: none;
@@ -315,14 +554,16 @@ body.popout-log #panels { flex: 1 1 auto; }
 body.popout-host #legend,
 body.popout-host #charts,
 body.popout-host #chart-nav,
+body.popout-host #lanes-head,
 body.popout-host #lanes,
 body.popout-host #empty-state,
 body.popout-host #panels,
 body.popout-host #splitter,
-body.popout-host #btn-add,
+body.popout-host #btn-set,
 body.popout-host #btn-load-sample,
 body.popout-host #btn-clear-sources,
-body.popout-host #btn-keys,
+body.popout-host #recording-transport,
+body.popout-host #btn-open-recording,
 body.popout-host #style-switch,
 body.popout-host #btn-popout-telemetry {
   display: none;
@@ -330,8 +571,8 @@ body.popout-host #btn-popout-telemetry {
 
 .btn-group { display: inline-flex; }
 .btn-group button { border-radius: 0; margin-left: -1px; }
-.btn-group button:first-child { border-radius: 6px 0 0 6px; margin-left: 0; }
-.btn-group button:last-child { border-radius: 0 6px 6px 0; }
+.btn-group button:first-child { border-radius: var(--radius-sm) 0 0 var(--radius-sm); margin-left: 0; }
+.btn-group button:last-child { border-radius: 0 var(--radius-sm) var(--radius-sm) 0; }
 .lane-canvas { flex: 1 1 auto; display: block; cursor: crosshair; }
 
 #panels {
@@ -348,11 +589,11 @@ body.popout-host #btn-popout-telemetry {
   display: flex;
   flex-direction: column;
   background: var(--surface-1);
-  border: 1px solid var(--border);
-  border-radius: 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
   min-height: 0;
 }
-.panel[hidden] { display: none; }
 .panel-head {
   display: flex;
   align-items: baseline;
@@ -368,7 +609,6 @@ body.popout-host #btn-popout-telemetry {
   border-radius: 8px;
   color: var(--muted);
 }
-.sample-badge[hidden] { display: none; }
 .icon-btn,
 .panel-head .close {
   border: none;
@@ -391,9 +631,7 @@ body.popout-host #btn-popout-telemetry {
   background: color-mix(in srgb, var(--accent) 12%, transparent);
   border-color: transparent;
 }
-.icon-btn[hidden] { display: none; }
 button.popback { font-size: 14px; }
-button.popback[hidden] { display: none; }
 .panel-search {
   display: flex;
   align-items: center;
@@ -401,7 +639,6 @@ button.popback[hidden] { display: none; }
   padding: 4px 10px;
   border-bottom: 1px solid var(--border);
 }
-.panel-search[hidden] { display: none; }
 .panel-search input {
   flex: 1 1 auto;
   min-width: 0;
@@ -436,6 +673,10 @@ button.popback[hidden] { display: none; }
 }
 .log-row:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
 .log-row.hl { background: var(--hl); }
+/* dotted boundary marking the top/bottom edge of a contiguous run of
+   highlighted log entries (see the .hl-top/.hl-bottom logic in app.js) */
+.log-row.hl-top { border-top: 2px dashed var(--hl-color); }
+.log-row.hl-bottom { border-bottom: 2px dashed var(--hl-color); }
 .log-row.cursor-row { border-left-color: var(--accent); }
 .log-row.selected { outline: 1px solid var(--accent); outline-offset: -1px; background: color-mix(in srgb, var(--accent) 14%, transparent); }
 .log-row .ts { color: var(--muted); margin-right: 6px; }
@@ -446,10 +687,10 @@ button.popback[hidden] { display: none; }
   position: fixed;
   z-index: 10;
   pointer-events: none;
-  background: var(--surface-1);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.18);
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-sm);
   padding: 6px 9px;
   font-size: 11px;
   max-width: 340px;
@@ -463,22 +704,22 @@ button.popback[hidden] { display: none; }
   position: fixed;
   z-index: 200;
   pointer-events: none;
-  background: var(--surface-1);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.18);
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-sm);
   padding: 4px 8px;
   font-size: 11px;
   max-width: 280px;
   color: var(--text-primary);
 }
-#hint[hidden] { display: none; }
 
 dialog {
   background: var(--surface-1);
   color: var(--text-primary);
-  border: 1px solid var(--border);
-  border-radius: 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-md);
   min-width: 460px;
   max-width: 620px;
 }
@@ -489,10 +730,10 @@ dialog h2 { margin: 0 0 10px; font-size: 15px; }
 #docker-targets label.added { opacity: 0.55; }
 .tdoc { color: var(--muted); }
 #docker-targets .group { font-weight: 600; margin-top: 6px; color: var(--text-secondary); }
-#transforms-box { border: 1px solid var(--border); border-radius: 6px; margin: 8px 0; }
+#transforms-box { border: 1px solid var(--border); border-radius: var(--radius-md); margin: 8px 0; }
 #transforms-box legend { font-size: 12px; color: var(--text-secondary); padding: 0 4px; }
 .dlg-intro { margin: 10px 0 6px; font-size: 12px; }
-.dlg-section { border: 1px solid var(--border); border-radius: 6px; margin: 10px 0; padding-bottom: 2px; }
+.dlg-section { border: 1px solid var(--border); border-radius: var(--radius-md); margin: 10px 0; padding-bottom: 2px; }
 .dlg-section legend { font-size: 12.5px; font-weight: 600; color: var(--text-primary); padding: 0 4px; }
 .dlg-section-help { margin: 0 0 8px; font-size: 11.5px; }
 #transforms-list label { display: block; padding: 1px 0; color: var(--text-primary); }
@@ -505,7 +746,7 @@ dialog h2 { margin: 0 0 10px; font-size: 15px; }
   max-height: 360px;
   overflow-y: auto;
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--radius-md);
   padding: 6px 8px;
   font-size: 12px;
 }
@@ -536,27 +777,23 @@ pre.snapshot-body {
   text-overflow: ellipsis;
 }
 
-/* keys-management dialog */
-.keys-list { display: flex; flex-direction: column; gap: 2px; margin: 8px 0; }
-.key-row {
+/* multi-segment recording picker (dlg-segment-pick) */
+#segment-pick-list { display: flex; flex-direction: column; gap: 4px; margin: 8px 0; }
+#segment-pick-list button {
   display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 4px 8px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 6px 10px;
+  text-align: left;
 }
-.key-row .name { font-weight: 600; }
-.key-badge {
-  font-size: 10px;
-  padding: 1px 6px;
-  border-radius: 8px;
-  border: 1px solid var(--border);
-  color: var(--muted);
-}
-.key-badge.private { border-color: var(--accent); color: var(--accent); }
-.key-row .spacer { margin-left: auto; }
-.keys-box { border: 1px solid var(--border); border-radius: 6px; margin: 8px 0; }
+#segment-pick-list .seg-range { font-weight: 600; }
+#segment-pick-list .seg-meta { font-size: 11px; color: var(--muted); }
+
+/* settings dialog fieldsets (remote connection, update server image) */
+.keys-box { border: 1px solid var(--border); border-radius: var(--radius-md); margin: 8px 0; }
+.keys-box .radio-row { display: flex; align-items: center; gap: 6px; font-size: 13px; margin: 4px 0; }
+.keys-box .radio-row input { width: auto; }
 .keys-box legend { font-size: 12px; color: var(--text-secondary); padding: 0 4px; }
 .keys-box input[type="text"] { flex: 1; min-width: 200px; }
 .keys-box textarea {
@@ -565,3 +802,92 @@ pre.snapshot-body {
   font-size: 11px;
   margin: 6px 0;
 }
+
+/* gateway-setup.html (New Gateway / Edit Gateways -- a standalone page, not
+   a <dialog>, so it needs its own top-level layout) -- everything else
+   (buttons, .keys-box fieldsets, .radio-row, .muted/.error/.linklike/
+   .activity-log, .dlg-actions) reuses the same rules as the main window's
+   dialogs above rather than duplicating them with hardcoded colors, so
+   this page respects the same light/dark theme instead of always being
+   dark regardless of it. */
+/* Scroll safety net, scoped to only this page (never the main window,
+   which manages its own internal scroll regions) via :has() -- a taller
+   form, a larger OS font scale, or a small display can still reach content
+   via scroll instead of silently clipping it. */
+body:has(#gateway-setup) { overflow-y: auto; }
+#gateway-setup { margin: 22px 0; padding: 0 20px 48px; }
+/* .keys-box has no explicit padding elsewhere -- the browser's UA default
+   fieldset padding (~0.75em sides) narrows its controls more than the
+   surrounding page padding does; tightened here so gateway-setup's inputs
+   use closer to the same width as the plain (non-fieldset) ones above them,
+   without changing #gateway-setup's own max-width. */
+#gateway-setup .keys-box { padding: 4px 10px 10px; }
+#gateway-setup h1 { font-size: 19px; font-weight: 600; letter-spacing: -0.01em; }
+#gateway-setup label { display: block; margin-top: 14px; font-size: 13px; color: var(--text-secondary); }
+#gateway-setup input[type="text"],
+#gateway-setup input[type="number"],
+#gateway-setup textarea,
+#gateway-setup select {
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  color: var(--text-primary);
+  border-radius: var(--radius-sm);
+  padding: 6px 9px;
+  font-size: 13px;
+  box-sizing: border-box;
+  transition: border-color 0.1s ease;
+}
+#gateway-setup input[type="text"]:focus,
+#gateway-setup input[type="number"]:focus,
+#gateway-setup textarea:focus,
+#gateway-setup select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+/* stacked label-above-control layout (ssh user/host/port, the gateway
+   picker) -- scoped to a direct child of a bare <label> so it doesn't
+   fight the flex-row layouts below (.ctl's own inputs, #key-path-row's),
+   which size themselves. select needs this too -- without it,
+   #gateway-select-row's dropdown sat inline next to its "CTTC Gateways"
+   label instead of stacked like every other field, with a large gap. */
+#gateway-setup label > input[type="text"],
+#gateway-setup label > input[type="number"],
+#gateway-setup label > select {
+  display: block;
+  width: 100%;
+  margin-top: 4px;
+}
+/* the port number is at most 5 digits -- stretching it to the same width
+   as the hostname/username fields above it left a wide mostly-empty box
+   that read as an unfinished layout rather than a small numeric field */
+#gateway-setup label > input[type="number"]#ssh-port {
+  width: 100px;
+}
+/* indented to line up under the radio option's text (not the radio dot),
+   so these read as that option's own sub-fields rather than a separate row */
+#key-path-row { display: flex; gap: 8px; align-items: center; margin-left: 22px; }
+#key-path-row input { flex: 1; }
+#key-paste { margin-left: 22px; width: calc(100% - 22px); }
+.wait { text-align: center; margin-top: 40px; }
+.spinner {
+  width: 32px; height: 32px; margin: 0 auto 12px;
+  border: 3px solid var(--border); border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+#activity {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  max-height: 25%;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface-1);
+  border-top: 1px solid var(--border);
+  padding: 6px 16px;
+  box-sizing: border-box;
+}
+#activity .linklike { padding: 4px 0; align-self: flex-start; }
+#activity .activity-log { max-height: calc(25vh - 36px); min-height: 60px; }

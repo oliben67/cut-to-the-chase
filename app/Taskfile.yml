@@ -8,6 +8,12 @@ vars:
   # VSCode's extension host exports ELECTRON_RUN_AS_NODE, which turns the
   # Electron binary into plain Node — strip it so the app can launch.
   ELECTRON: env -u ELECTRON_RUN_AS_NODE npx electron
+  # releases/ (the cttc-release submodule) keeps each platform's installer
+  # + deploy bundle on its own branch (windows/mac/linux); main only holds
+  # what's shared (the server image build script, the registry-pull compose
+  # variant). `git -C` targets that dir without needing a `cd` to persist
+  # across cmds -- Task runs every `cmds:` entry as its own subprocess, so a
+  # plain `cd releases && ...` in one entry has no effect on the next.
 
 # ── Default ────────────────────────────────────────────────────────────────
 tasks:
@@ -63,9 +69,10 @@ tasks:
 
   # ── Tests ─────────────────────────────────────────────────────────────────
   test:
-    desc: Run everything — server unit tests (with coverage) then renderer E2E
+    desc: Run everything — server unit tests (with coverage), main-process unit tests, then renderer E2E
     cmds:
       - task: test:server
+      - task: test:unit
       - task: test:e2e
 
   test:server:
@@ -73,24 +80,111 @@ tasks:
     dir: '{{.SERVER}}'
     cmd: "{{.UV}} run --group dev pytest tests/ -q --cov=server --cov-report=term-missing"
 
+  test:unit:
+    desc: Main-process unit tests (lib/*.js) — Node's built-in test runner, no Electron needed
+    cmd: node --test test/unit/*.test.js
+
   test:e2e:
     desc: Renderer E2E — runs test/renderer-spec.js inside the real app against demo data
     cmd: ./test/run-e2e.sh
 
+  # ── Linting (server/ — the only Python in this app) ──────────────────────
+  lint:
+    desc: Check server/ with ruff
+    dir: '{{.SERVER}}'
+    cmd: "{{.UV}} run ruff check ."
+
+  lint:fix:
+    desc: Check server/ with ruff, auto-fix where possible
+    dir: '{{.SERVER}}'
+    cmd: "{{.UV}} run ruff check --fix ."
+
+  # ── Formatting ────────────────────────────────────────────────────────────
+  format:
+    desc: Format server/ in-place with ruff
+    dir: '{{.SERVER}}'
+    cmd: "{{.UV}} run ruff format ."
+
+  format:check:
+    desc: Check server/ formatting without modifying files (used in CI)
+    dir: '{{.SERVER}}'
+    cmd: "{{.UV}} run ruff format --check ."
+
+  # ── Type checking ─────────────────────────────────────────────────────────
+  typecheck:
+    desc: Run ty (Astral's type checker) on server/'s source (not tests/ -- mostly benign non-null asserts there)
+    dir: '{{.SERVER}}'
+    cmd: "{{.UV}} run ty check server.py files.py"
+
   # ── Quality gates ─────────────────────────────────────────────────────────
   check:
-    desc: Run all quality gates — JS syntax checks and server import (orjson present)
+    desc: Run all quality gates — JS syntax checks, server import, lint, format check, typecheck
     cmds:
       - node --check main.js
       - node --check preload.js
       - node --check renderer/app.js
+      - node --check lib/connection-config.js
+      - node --check lib/ssh-tunnel.js
+      - node --check lib/server-provision.js
+      - node --check lib/docker-check.js
+      - node --check lib/ssh-key-file.js
       - "{{.UV}} run --project {{.SERVER}} python -c 'import sys; sys.path.insert(0, \"{{.SERVER}}\"); import server; print(\"server imports ok,\", server.JSON_IMPL)'"
+      - task: lint
+      - task: format:check
+      - task: typecheck
+
+  fix:
+    desc: Auto-fix all server/ lint issues and reformat
+    cmds:
+      - task: lint:fix
+      - task: format
 
   ci:
     desc: Full CI pipeline — install → check
     cmds:
       - task: install
       - task: check
+
+  # ── Release ───────────────────────────────────────────────────────────────
+  # Each task commits its own branch's result before finishing (rather than
+  # leaving it staged) -- with one branch per platform, an uncommitted build
+  # on e.g. `windows` blocks `git checkout mac` for the next platform in
+  # build:release:all with "local changes would be overwritten". The `diff
+  # --cached --quiet ||` guard skips the commit (instead of failing the
+  # task) on a no-op rebuild, e.g. re-running after nothing changed.
+  build:release:win:
+    desc: "Build the Windows installer + deploy bundle   [usage: task build:release:win]"
+    cmds:
+      - git -C ../releases checkout windows
+      - npm run release:win -- {{.CLI_ARGS}}
+      - git -C ../releases add -A
+      - "git -C ../releases diff --cached --quiet || git -C ../releases commit -m 'chore(windows): rebuild deploy bundle'"
+
+  build:release:mac:
+    desc: "Build the macOS installer + deploy bundle   [usage: task build:release:mac]"
+    cmds:
+      - git -C ../releases checkout mac
+      - npm run release:mac -- {{.CLI_ARGS}}
+      - git -C ../releases add -A
+      - "git -C ../releases diff --cached --quiet || git -C ../releases commit -m 'chore(mac): rebuild deploy bundle'"
+
+  build:release:linux:
+    desc: "Build the Linux AppImage + deploy bundle   [usage: task build:release:linux]"
+    cmds:
+      - git -C ../releases checkout linux
+      - npm run release:linux -- {{.CLI_ARGS}}
+      - git -C ../releases add -A
+      - "git -C ../releases diff --cached --quiet || git -C ../releases commit -m 'chore(linux): rebuild deploy bundle'"
+
+  build:release:all:
+    desc: "Build all three platforms' installers + deploy bundles   [usage: task build:release:all]"
+    cmds:
+      - task: build:release:win
+        vars: { CLI_ARGS: '{{.CLI_ARGS}}' }
+      - task: build:release:mac
+        vars: { CLI_ARGS: '{{.CLI_ARGS}}' }
+      - task: build:release:linux
+        vars: { CLI_ARGS: '{{.CLI_ARGS}}' }
 
   # ── Dependencies ──────────────────────────────────────────────────────────
   deps:update:

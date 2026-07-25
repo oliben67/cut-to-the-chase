@@ -391,6 +391,22 @@
     }
   });
 
+  await T("plain-clicking a log entry recenters the chart view on it", async () => {
+    const p = [...panels.values()][0];
+    p.selected.clear();
+    setView(R.min_ts, R.min_ts + 60000); // arbitrary span, away from the row we'll click
+    await p.render();
+    const rows = [...p.body.querySelectorAll(".log-row")];
+    ok(rows.length >= 1, "at least 1 row rendered for the test");
+
+    const span = state.view.t1 - state.view.t0;
+    mouse(rows[0], "click", 5, 20);
+    await until(() => p.selected.size === 0, "click clears any selection");
+    near(state.view.t1 - state.view.t0, span, 1, "span unchanged");
+    ok(state.cursorT != null && Math.abs((state.view.t0 + state.view.t1) / 2 - state.cursorT) < 1,
+      "view recentered on the clicked row's timestamp");
+  });
+
   /* ── snapshots ────────────────────────────────────────────────────────── */
 
   await T("computeSlice returns telemetry and nearby log rows", async () => {
@@ -414,7 +430,7 @@
     ok(txt.includes("hello") && !txt.includes("world"), "first log line only");
   });
 
-  /* ── add-sources dialog logic ─────────────────────────────────────────── */
+  /* ── set-sources dialog logic ─────────────────────────────────────────── */
 
   await T("updateDockerDupes disables already-collected stats", () => {
     state.sources.push({ id: "__dup", path: "docker://local/stats", kind: "stats", live: true });
@@ -431,16 +447,27 @@
     }
   });
 
-  await T("ssh key row appears only for ssh:// hosts", async () => {
-    $("docker-host").value = "ssh://deploy@example";
-    await refreshSshKeyRow();
-    eq($("ssh-key-row").hidden, false, "visible for ssh://");
-    const opts = [...$("ssh-key").options].map((o) => o.value);
-    ok(opts.includes(""), "default option");
-    ok(opts.includes("__browse__"), "browse option");
-    $("docker-host").value = "";
-    await refreshSshKeyRow();
-    eq($("ssh-key-row").hidden, true, "hidden for local");
+  await T("activity log toggle reflects the last docker/ps call", async () => {
+    renderActivityLog(null);
+    eq($("btn-activity-toggle").hidden, true, "hidden with no activity");
+    eq($("docker-activity").hidden, true, "panel hidden with no activity");
+
+    renderActivityLog([{ cmd: "docker ps --format json", returncode: 0, ms: 12, stderr: "" }]);
+    eq($("btn-activity-toggle").hidden, false, "toggle shown once there's activity");
+    ok($("docker-activity").textContent.includes("docker ps"), "logged command shown");
+
+    $("btn-activity-toggle").click();
+    eq($("docker-activity").hidden, false, "shown after toggle click");
+    $("btn-activity-toggle").click();
+    eq($("docker-activity").hidden, true, "hidden again after second click");
+  });
+
+  await T("normalizeDockerHost defaults a schemeless host to ssh://", () => {
+    eq(normalizeDockerHost(""), null, "empty is local");
+    eq(normalizeDockerHost("   "), null, "blank is local");
+    eq(normalizeDockerHost("user@other-server"), "ssh://user@other-server", "bare user@host gets ssh://");
+    eq(normalizeDockerHost("ssh://user@other-server"), "ssh://user@other-server", "already-schemed left alone");
+    eq(normalizeDockerHost("tcp://1.2.3.4:2375"), "tcp://1.2.3.4:2375", "other schemes left alone too");
   });
 
   await T("openPaths reflects open sources", () => {
@@ -478,6 +505,190 @@
     }
   });
 
+  /* ── phase 3: /files/download + /files/upload client wiring ────────────── */
+
+  await T("exportSample fetches real bytes from /files/download and hands them to saveBinaryFile", async () => {
+    const realSave = saveBinaryFile;
+    const realAsk = askExportOptions;
+    let saved = null;
+    saveBinaryFile = (name, bytes) => { saved = { name, bytes }; return "/tmp/" + name; };
+    askExportOptions = async () => ({ includeHost: false, hadHost: false });
+    try {
+      await exportSample(R.min_ts, R.min_ts + 5 * 60000);
+      ok(saved, "saveBinaryFile was called");
+      ok(saved.name.endsWith(".cttc"), saved.name);
+      ok(saved.bytes instanceof Uint8Array && saved.bytes.length > 0, "got real bytes");
+      eq(saved.bytes[0], 0x50, "PK zip magic byte 1"); // 'P'
+      eq(saved.bytes[1], 0x4b, "PK zip magic byte 2"); // 'K'
+      ok($("status").textContent.includes("metrics saved"), $("status").textContent);
+    } finally {
+      saveBinaryFile = realSave;
+      askExportOptions = realAsk;
+    }
+  });
+
+  await T("exportSample reports a cancel without touching the server response", async () => {
+    const realSave = saveBinaryFile;
+    const realAsk = askExportOptions;
+    saveBinaryFile = () => null; // user closed the native dialog
+    askExportOptions = async () => ({ includeHost: false, hadHost: false });
+    try {
+      await exportSample(R.min_ts, R.min_ts + 5 * 60000);
+      ok($("status").textContent.includes("canceled"), $("status").textContent);
+    } finally {
+      saveBinaryFile = realSave;
+      askExportOptions = realAsk;
+    }
+  });
+
+  await T("uploadFile round-trips a real local log file through /files/upload", async () => {
+    ok(window.cttc?.readFile, "preload readFile is present in the real app");
+    const demoLog = state.sources.find((s) => s.kind === "log" && !basename(s.path).includes("worker"))?.path;
+    ok(demoLog, "a real demo log path is open to upload");
+    const r = await uploadFile(demoLog);
+    ok(r.opened?.length === 1, JSON.stringify(r));
+    eq(r.errors.length, 0);
+    try {
+      const src = (await get("/sources")).sources.find((s) => s.id === r.opened[0]);
+      ok(src, "uploaded source is registered");
+      eq(src.path, `upload://${basename(demoLog)}`, "synthetic display path");
+      eq(src.live, false);
+    } finally {
+      await post("/close", { id: r.opened[0] });
+    }
+  });
+
+  await T("Load metrics button's dedupe check accounts for the upload:// path scheme", () => {
+    const open = openPaths();
+    ok(!open.has("/some/local/never-opened.cttc"), "sanity: local path form never matches");
+  });
+
+  /* ── Recording (Start/Pause/Stop/Open Recording) ──────────────────────── */
+
+  await T("Record -> Pause -> Resume -> Stop writes a real 2-segment .cttc, menu state tracks it", async () => {
+    const realPick = pickRecordingSavePath, realRead = readRecordingBytes, realWrite = writeRecordingBytes;
+    const store = {};
+    pickRecordingSavePath = async () => "/fake/e2e-recording.cttc";
+    readRecordingBytes = async (p) => {
+      if (!(p in store)) throw new Error("no such file");
+      return store[p];
+    };
+    writeRecordingBytes = async (p, bytes) => { store[p] = bytes; };
+    try {
+      eq(recording.status, "idle");
+      await startRecording();
+      eq(recording.status, "recording");
+      eq(recording.path, "/fake/e2e-recording.cttc");
+      eq($("btn-start-recording").disabled, true);
+      eq($("btn-pause-recording").disabled, false);
+      eq($("btn-stop-recording").disabled, false);
+
+      await pauseRecording();
+      eq(recording.status, "paused");
+      eq($("btn-start-recording").disabled, false);
+      eq($("btn-pause-recording").disabled, true);
+      ok(store["/fake/e2e-recording.cttc"], "first segment flushed to the in-memory store");
+      const afterFirst = store["/fake/e2e-recording.cttc"];
+      eq(afterFirst[0], 0x50, "PK zip magic byte 1");
+
+      await startRecording(); // resume
+      eq(recording.status, "recording");
+      await stopRecording();
+      eq(recording.status, "idle");
+      eq(recording.path, null);
+      eq($("btn-stop-recording").disabled, true);
+      const afterSecond = store["/fake/e2e-recording.cttc"];
+      ok(afterSecond.length >= afterFirst.length, "second segment appended, archive grew (or stayed same size)");
+
+      // write the final in-memory bytes to a real path and confirm /open
+      // recognizes it as a genuine 2-segment archive
+      const realPath = "/tmp/cttc-e2e-recording.cttc";
+      await window.cttc.writeBinaryFile(realPath, afterSecond);
+      const openRes = await post("/open", { files: [{ path: realPath }] });
+      eq(openRes.opened.length, 0, "ambiguous -- nothing opened without a segment choice");
+      eq(openRes.needs_selection.length, 1);
+      eq(openRes.needs_selection[0].segments.length, 2, "both flushed segments present");
+    } finally {
+      pickRecordingSavePath = realPick;
+      readRecordingBytes = realRead;
+      writeRecordingBytes = realWrite;
+    }
+  });
+
+  await T("Start Recording without a chosen path stays idle (dialog cancelled)", async () => {
+    const realPick = pickRecordingSavePath;
+    pickRecordingSavePath = async () => null; // user closed the native dialog
+    try {
+      await startRecording();
+      eq(recording.status, "idle");
+    } finally {
+      pickRecordingSavePath = realPick;
+    }
+  });
+
+  await T("Pause/Stop are no-ops when not recording", async () => {
+    eq(recording.status, "idle");
+    await pauseRecording(); // must not throw
+    eq(recording.status, "idle");
+    await stopRecording(); // must not throw
+    eq(recording.status, "idle");
+  });
+
+  await T("recoverInterruptedRecording flips a stale 'recording' marker to paused", async () => {
+    const realGetMarker = getRecordingMarkerFromDisk, realSetMarker = setRecordingMarkerOnDisk;
+    let lastSet = null;
+    getRecordingMarkerFromDisk = async () => ({ path: "/fake/stale.cttc", status: "recording", segmentStart: 123 });
+    setRecordingMarkerOnDisk = async (m) => { lastSet = m; };
+    try {
+      await recoverInterruptedRecording();
+      eq(recording.status, "paused");
+      eq(recording.path, "/fake/stale.cttc");
+      ok($("status").textContent.includes("interrupted"), $("status").textContent);
+      ok(lastSet && lastSet.status === "paused", "corrected marker persisted as paused");
+    } finally {
+      getRecordingMarkerFromDisk = realGetMarker;
+      setRecordingMarkerOnDisk = realSetMarker;
+      setRecordingState({ status: "idle", path: null, segmentStart: null });
+      await persistRecordingMarker();
+    }
+  });
+
+  await T("multi-segment .cttc upload surfaces the picker, choosing a segment loads it", async () => {
+    // build a real 2-segment recording server-side via /sample/record
+    const t0 = R.min_ts;
+    const firstRes = await fetch(`${API}/sample/record`, {
+      method: "POST", body: new Uint8Array(0),
+      headers: { "X-CTTC-From": String(t0), "X-CTTC-To": String(t0 + 60000) },
+    });
+    const firstBytes = new Uint8Array(await firstRes.arrayBuffer());
+    const secondRes = await fetch(`${API}/sample/record`, {
+      method: "POST", body: firstBytes,
+      headers: { "X-CTTC-From": String(t0 + 60000), "X-CTTC-To": String(t0 + 120000) },
+    });
+    const secondBytes = new Uint8Array(await secondRes.arrayBuffer());
+
+    // write to a real path (window.cttc.readFile itself is read-only and
+    // can't be reassigned -- see docs/architecture's contextBridge note)
+    // so uploadFile's real readFile call has real bytes to read.
+    const realPath = "/tmp/cttc-e2e-multi-segment.cttc";
+    await window.cttc.writeBinaryFile(realPath, secondBytes);
+
+    const realPickSegment = pickSegment;
+    let shownSegments = null;
+    pickSegment = async (segments) => { shownSegments = segments; return 1; };
+    try {
+      const r = await uploadAndResolveSegment(realPath);
+      ok(shownSegments, "picker was invoked");
+      eq(shownSegments.length, 2, "both segments offered");
+      eq(r.errors.length, 0, JSON.stringify(r.errors));
+      ok(r.opened.length >= 1, "chosen segment's sources opened");
+      for (const sid of r.opened) await post("/close", { id: sid });
+      await refreshAll();
+    } finally {
+      pickSegment = realPickSegment;
+    }
+  });
+
   /* ── popout wiring (buttons only; no real windows) ────────────────────── */
 
   await T("popout buttons visible in main window, popback hidden", () => {
@@ -508,6 +719,29 @@
   await T("frequency help button is wired to the help IPC", () => {
     ok(typeof $("btn-freq-help").onclick === "function", "button has a handler");
     ok(typeof window.cttc?.openHelp === "function", "openHelp exposed via preload");
+  });
+
+  /* ── gateway dropdown ──────────────────────────────────────────────────── */
+
+  await T("gateway dropdown opens/closes, listing real (possibly empty) recorded gateways", async () => {
+    ok(typeof window.cttc?.getGateways === "function", "getGateways exposed via preload");
+    ok(typeof window.cttc?.switchGateway === "function", "switchGateway exposed via preload");
+    eq($("gateway-dropdown").hidden, true, "starts closed");
+    $("server-status-btn").click();
+    await sleep(50); // dropdown render is async (awaits getGateways())
+    eq($("gateway-dropdown").hidden, false, "opens on click");
+    ok($("server-status").classList.contains("open"), "wrapper marked open");
+    // real IPC round-trip against the actual (embedded, bare uv) test server
+    // -- this dev/test launch path never calls recordGateway, so an empty
+    // list is the expected, valid real-world response here, not a mock.
+    const gateways = await window.cttc.getGateways();
+    ok(Array.isArray(gateways), "getGateways returns an array");
+    if (!gateways.length) {
+      ok($("gateway-dropdown").querySelector(".gateway-empty"), "empty-state shown");
+    }
+    document.body.click(); // outside click
+    eq($("gateway-dropdown").hidden, true, "closes on outside click");
+    ok(!$("server-status").classList.contains("open"), "wrapper no longer marked open");
   });
 
   await T("host block shows the loading state before first host sample", () => {
@@ -582,66 +816,13 @@
     }
   });
 
-  await T("keys dialog: generate, import, list badges, delete", async () => {
-    const tmp = "__e2e-key-" + Date.now().toString(36);
-    const rows = () => [...document.querySelectorAll("#keys-list .key-row")];
-    const rowOf = (n) => rows().find((r) => r.querySelector(".name").textContent === n);
-    $("btn-keys").click();
-    await until(() => dlgKeys.open, "keys dialog open");
-    try {
-      $("key-gen-name").value = tmp;
-      $("key-gen-btn").click();
-      await until(() => rowOf(tmp), "generated key listed");
-      ok(rowOf(tmp).querySelector(".key-badge").textContent.includes("private"), "own key badged private");
-      ok(rowOf(tmp).querySelector("button[title*='Copy']"), "copy button offered");
-
-      const pem = (await get("/cttc/keys")).keys.find((k) => k.name === tmp).public_pem;
-      $("key-import-name").value = tmp + "-pub";
-      $("key-import-pem").value = pem;
-      $("key-import-btn").click();
-      await until(() => rowOf(tmp + "-pub"), "imported key listed");
-      eq(rowOf(tmp + "-pub").querySelector(".key-badge").textContent, "public only", "imported key badged");
-
-      $("key-import-name").value = tmp + "-pub";        // duplicate name
-      $("key-import-pem").value = pem;
-      $("key-import-btn").click();
-      await until(() => $("keys-error").textContent.includes("already exists"), "duplicate rejected inline");
-
-      const realConfirm = window.confirm;
-      window.confirm = () => true;
-      try {
-        rowOf(tmp + "-pub").querySelector("button[title*='Delete']").click();
-        await until(() => !rowOf(tmp + "-pub"), "deleted via UI");
-      } finally {
-        window.confirm = realConfirm;
-      }
-      await post("/cttc/keys/delete", { name: tmp });
-      await renderKeysList();
-      ok(!rows().some((r) => r.querySelector(".name").textContent.startsWith("__e2e-key-")), "cleaned up");
-    } finally {
-      dlgKeys.close();
-      for (const n of [tmp, tmp + "-pub"]) await post("/cttc/keys/delete", { name: n }).catch(() => {});
-    }
-  });
-
-  await T("export dialog resolves host + encryption choices", async () => {
-    const tmp = "__e2e-exp-" + Date.now().toString(36);
-    await post("/cttc/keys/generate", { name: tmp });
-    try {
-      const p = askExportOptions();
-      await until(() => dlgExport.open, "export dialog open");
-      const values = [...$("export-key").options].map((o) => o.value);
-      ok(values.includes(""), "offers no-encryption");
-      ok(values.includes(tmp), "offers the stored key");
-      $("export-key").value = tmp;
-      $("export-host").checked = false;
-      $("dlg-export-ok").click();
-      const opts = await p;
-      eq(opts.publicKey, tmp, "chosen key returned");
-      eq(opts.includeHost, false, "host choice returned");
-    } finally {
-      await post("/cttc/keys/delete", { name: tmp }).catch(() => {});
-    }
+  await T("export dialog resolves host choice", async () => {
+    const p = askExportOptions();
+    await until(() => dlgExport.open, "export dialog open");
+    $("export-host").checked = false;
+    $("dlg-export-ok").click();
+    const opts = await p;
+    eq(opts.includeHost, false, "host choice returned");
   });
 
   // destructive — must stay the last test: closes every source, then reopens

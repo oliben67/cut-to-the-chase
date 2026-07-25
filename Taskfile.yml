@@ -29,6 +29,72 @@ tasks:
     cmds:
       - task: app:ci
 
+  lint:
+    desc: Lint every sub-project
+    cmds:
+      - task: app:lint
+
+  lint:fix:
+    desc: Lint every sub-project, auto-fixing where possible
+    cmds:
+      - task: app:lint:fix
+
+  format:
+    desc: Format every sub-project in-place
+    cmds:
+      - task: app:format
+
+  format:check:
+    desc: Check formatting across every sub-project without modifying files
+    cmds:
+      - task: app:format:check
+
+  typecheck:
+    desc: Type-check every sub-project
+    cmds:
+      - task: app:typecheck
+
+  fix:
+    desc: Auto-fix lint issues and reformat every sub-project
+    cmds:
+      - task: app:fix
+
+  # ── Release ───────────────────────────────────────────────────────────────
+  build:release:win:
+    desc: "Build the Windows installer + deploy bundle   [usage: task build:release:win]"
+    cmds:
+      - task: app:build:release:win
+        vars: { CLI_ARGS: '{{.CLI_ARGS}}' }
+
+  build:release:mac:
+    desc: "Build the macOS installer + deploy bundle   [usage: task build:release:mac]"
+    cmds:
+      - task: app:build:release:mac
+        vars: { CLI_ARGS: '{{.CLI_ARGS}}' }
+
+  build:release:linux:
+    desc: "Build the Linux AppImage + deploy bundle   [usage: task build:release:linux]"
+    cmds:
+      - task: app:build:release:linux
+        vars: { CLI_ARGS: '{{.CLI_ARGS}}' }
+
+  build:release:all:
+    desc: "Build all three platforms' installers + deploy bundles   [usage: task build:release:all]"
+    cmds:
+      - task: app:build:release:win
+        vars: { CLI_ARGS: '{{.CLI_ARGS}}' }
+      - task: app:build:release:mac
+        vars: { CLI_ARGS: '{{.CLI_ARGS}}' }
+      - task: app:build:release:linux
+        vars: { CLI_ARGS: '{{.CLI_ARGS}}' }
+
+  build:all:
+    desc: "Run all tests, then (if they pass) build every release, then stage the release submodule   [usage: task build:all]"
+    cmds:
+      - task: app:test
+      - task: build:release:all
+      - git -C releases add .
+
   # ── Clean ─────────────────────────────────────────────────────────────────
   clean:
     desc: Remove build artefacts and caches across all sub-projects

@@ -3,7 +3,11 @@
 /* ── server connection ──────────────────────────────────────────────────── */
 
 const PORT = new URLSearchParams(location.search).get("port") || "8765";
-const API = `http://127.0.0.1:${PORT}`;
+// 127.0.0.1 covers embedded/local-container mode; main.js passes the actual
+// server host for "remote" mode (client talks directly over HTTP -- no ssh
+// tunnel/port-forward, see docs/architecture/remote-server.md).
+const HOST = new URLSearchParams(location.search).get("host") || "127.0.0.1";
+const API = `http://${HOST}:${PORT}`;
 
 // a window can either be the main window (POPOUT_KIND == null) or a panel
 // popped out into its own window: "telemetry" (the chart area) or "log"
@@ -11,6 +15,17 @@ const API = `http://127.0.0.1:${PORT}`;
 const POPOUT_KIND = new URLSearchParams(location.search).get("popout") || null;
 const POPOUT_ID = new URLSearchParams(location.search).get("id") || null;
 
+// Mirrors main-process logging (including the server subprocess's own
+// stdout/stderr, piped through main.js) into this window's own DevTools
+// console (Help > Developer Tools) -- the one place logs are visible
+// regardless of how the app was launched (double-clicked, no terminal
+// attached, ...). See main.js's mainLog/mainError/broadcastLog.
+window.cttc?.onMainLog?.(({ level, text }) => {
+  (level === "error" ? console.error : console.log)(`[main] ${text}`);
+});
+
+// GET path (relative to the CTTC server, never the docker/ssh target -- see
+// normalizeDockerHost below) -> parsed JSON body. Throws on any non-2xx.
 async function get(path) {
   const r = await fetch(API + path);
   if (!r.ok) throw new Error(`${path}: ${r.status}`);
@@ -19,8 +34,30 @@ async function get(path) {
 async function post(path, body) {
   const r = await fetch(API + path, { method: "POST", body: JSON.stringify(body || {}) });
   const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(j.error || `${path}: ${r.status}`);
+  if (!r.ok) {
+    const e = new Error(j.error || `${path}: ${r.status}`);
+    e.log = j.log; // docker/ps failures carry the attempted commands (see renderActivityLog)
+    // true iff the CTTC server itself sent this response (any non-2xx with
+    // a body) -- distinct from fetch() rejecting outright (server
+    // unreachable/reset/no response at all), which never reaches this line
+    // and so never sets this flag. Needed because a real server-side error
+    // can still have no .log (e.g. a plain 500, not a DockerPsError).
+    e.serverResponded = true;
+    throw e;
+  }
   return j;
+}
+
+// ssh is the only remote transport CTTC supports, so a Docker host string
+// with no scheme (e.g. "user@other-server", exactly what you'd type after
+// `ssh `) is unambiguous shorthand for ssh://user@other-server -- without
+// this, that shorthand silently fell through to the local daemon instead
+// (docker -H user@host isn't a valid endpoint, and HostStatsSource/etc all
+// gate their ssh handling on an explicit "ssh://" prefix).
+function normalizeDockerHost(raw) {
+  const host = (raw || "").trim();
+  if (!host) return null;
+  return /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(host) ? host : `ssh://${host}`;
 }
 
 /* ── persisted UI preferences ───────────────────────────────────────────── */
@@ -52,6 +89,7 @@ const state = {
   hoverGroup: "svc",      // strip group under the pointer: "svc" | "host"
   chartStyle: prefs.get("chartStyle", "lines"), // "lines" | "bars"
   showHost: prefs.get("showHost", true),
+  showLanes: prefs.get("showLanes", false), // per-log-source "entry occurred here" bars, between telemetry and host
   track: prefs.get("track", {}),           // series name -> "sel" | "mut" | "hid"
   showOthers: prefs.get("showOthers", true), // list not-selected containers in legend
   poppedOut: new Set(),   // "telemetry" and/or log source ids moved to their own window
@@ -82,12 +120,18 @@ const STRIPS = [
 const MARGIN_L = 46, MARGIN_R = 8, AXIS_H = 20;
 let stripH = prefs.get("stripH", 96); // strip height; the splitter resizes it
 
+// bytes/sec -> the largest unit (GB/MB/kB/B) that keeps the number >= 1,
+// one decimal place -- used for the NET strip's axis labels and tooltip.
 function fmtBytes(v) {
   if (v >= 1e9) return (v / 1e9).toFixed(1) + " GB/s";
   if (v >= 1e6) return (v / 1e6).toFixed(1) + " MB/s";
   if (v >= 1e3) return (v / 1e3).toFixed(1) + " kB/s";
   return v.toFixed(0) + " B/s";
 }
+// epoch ms -> local wall-clock "HH:MM:SS" (optionally ".mmm"). Deliberately
+// no date part -- every chart/log panel only ever shows one day at a time
+// in practice, and the full ISO timestamp is still available via title/
+// fmtIso() wherever precision actually matters (log row tooltips, snapshots).
 function fmtClock(ms, withMs) {
   const d = new Date(ms);
   const p = (n, w = 2) => String(n).padStart(w, "0");
@@ -99,6 +143,12 @@ function fmtClock(ms, withMs) {
 /* ── categorical colors: fixed slot order, never cycled ─────────────────── */
 
 const slotByName = new Map();
+// One of the theme's 8 fixed --series-N colors, assigned the first time a
+// given series name is seen and never reassigned afterward (see
+// assignColorSlots(), which seeds this map in a stable sort order so colors
+// don't shuffle around as sources come and go). Past 8 concurrent series,
+// everything additional folds to a shared --muted gray rather than cycling
+// back through colors and creating ambiguous duplicates.
 function colorFor(name) {
   if (!slotByName.has(name)) slotByName.set(name, slotByName.size);
   const slot = slotByName.get(name);
@@ -106,6 +156,10 @@ function colorFor(name) {
   if (slot >= 8) return css.getPropertyValue("--muted").trim(); // fold past 8: muted
   return css.getPropertyValue(`--series-${slot + 1}`).trim();
 }
+// Read a CSS custom property (e.g. "--accent") off :root -- the single
+// source of truth for every color used in canvas drawing, so charts follow
+// the active light/dark theme automatically without their own duplicated
+// palette.
 function themeVar(name) {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 }
@@ -125,6 +179,10 @@ function sampleSlot(sid) {
 const SAMPLE_DASH_PATTERNS = [[6, 4], [2, 3], [9, 3, 2, 3], [1, 2.5], [10, 3, 3, 3]];
 const SAMPLE_GRAY_LEVELS = [0.3, 0.45, 0.6, 0.75];
 
+// A source is "live" (still being tailed/polled) unless the server marked
+// it live:false, which only happens for sources restored from a loaded
+// .cttc file (see State.load_sample in server.py) -- everything else
+// (opened files, docker/ssh collectors) stays live.
 function isLiveSid(sid) {
   const src = state.sources.find((s) => s.id === sid);
   return !src || src.live !== false; // source unknown yet -> assume live
@@ -151,13 +209,20 @@ function sampleFileGroups() {
   }
   return [...byPath.values()];
 }
+// true if this source belongs to a loaded .cttc file the user has toggled
+// off via the sample-files switch in the legend (see renderSampleFiles()) --
+// checked everywhere a sample-sourced series/lane/panel might need hiding.
 function isSampleHidden(sid) {
   const src = state.sources.find((s) => s.id === sid);
   return !!(src && src.live === false && state.hiddenSamples.has(src.path));
 }
+// this sample file's dash rhythm for chart lines, keyed by its slot (see
+// sampleSlot() above) so it stays the same across redraws/reorders.
 function dashFor(sid) {
   return SAMPLE_DASH_PATTERNS[sampleSlot(sid) % SAMPLE_DASH_PATTERNS.length];
 }
+// "#rrggbb" -> [r, g, b] ints, or null if the string doesn't match (theme
+// colors always do; this is just defensive against a malformed CSS value).
 function hexToRgb(hex) {
   const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec((hex || "").trim());
   return m ? [parseInt(m[1], 16), parseInt(m[2], 16), parseInt(m[3], 16)] : null;
@@ -275,16 +340,21 @@ if (POPOUT_KIND === "series") $("btn-popback-telemetry").hidden = false;
 
 /* ── time/pixel mapping ─────────────────────────────────────────────────── */
 
+// Plottable width in CSS pixels, i.e. canvas width minus the left axis-label
+// margin and right padding -- every x<->t conversion below goes through
+// this, so it's the one place that'd need to change if the margins did.
 function plotWidth() {
   // svc and host strips share the same geometry; fall back to whichever
   // container is actually visible (a host-only popout hides #charts).
   const el = chartsEl.clientWidth > 0 ? chartsEl : hostChartsEl;
   return Math.max(50, el.clientWidth - MARGIN_L - MARGIN_R);
 }
+// CSS-pixel x (within a strip canvas) -> epoch ms, linear over state.view.
 function xToT(x) {
   const { t0, t1 } = state.view;
   return t0 + ((x - MARGIN_L) / plotWidth()) * (t1 - t0);
 }
+// epoch ms -> CSS-pixel x -- the inverse of xToT(), same linear mapping.
 function tToX(t) {
   const { t0, t1 } = state.view;
   return MARGIN_L + ((t - t0) / (t1 - t0)) * plotWidth();
@@ -313,6 +383,13 @@ function buildStrips() {
   attachChartEvents();
 }
 
+// Sizes a canvas to its parent's current CSS width x the given CSS height,
+// backed by a devicePixelRatio-scaled bitmap so lines/text stay crisp on
+// HiDPI screens, then returns a 2D context pre-scaled back to CSS-pixel
+// coordinates -- every drawStrip()/drawLane() call can then just draw in
+// plain CSS pixels without worrying about the underlying pixel density.
+// Called on every redraw (not cached), since the canvas's CSS size can
+// change (window resize, splitter drag) between draws.
 function sizeCanvas(c, cssH) {
   const dpr = window.devicePixelRatio || 1;
   const w = c.parentElement.clientWidth;
@@ -356,10 +433,13 @@ function drawAll() {
   $("host-nav").hidden = !showingHostArea || hostLoading;
   $("btn-host-toggle").textContent = state.showHost ? "\u25be" : "\u25b8";
   $("btn-host-toggle").title = state.showHost ? "Hide host telemetry" : "Show host telemetry";
+  lanesEl.hidden = !state.showLanes;
+  $("btn-lanes-toggle").textContent = state.showLanes ? "\u25be" : "\u25b8";
+  $("btn-lanes-toggle").title = state.showLanes ? "Hide log entry markers" : "Show log entry markers";
   STRIPS.forEach((spec, i) => drawStrip(stripCanvases[i], spec, "svc", i === STRIPS.length - 1));
   if (hasHost && state.showHost && !hostBlockEl.hidden)
     STRIPS.forEach((spec, i) => drawStrip(hostCanvases[i], spec, "host", i === STRIPS.length - 1));
-  drawLanes();
+  if (state.showLanes) drawLanes();
   updateTimelineNav(chartNav);
   updateTimelineNav(hostNav);
 }
@@ -495,6 +575,9 @@ function drawStrip(c, spec, group, isLast) {
   drawVerticals(ctx, h);
 }
 
+// A small filled circle marking a truly isolated data point (no neighbor
+// within the line-drawing gap limit to connect to) -- appends to the
+// caller's already-open path; caller is responsible for stroke()/fill().
 function dot(ctx, x, y) {
   ctx.moveTo(x + 1.5, y);
   ctx.arc(x, y, 1.5, 0, Math.PI * 2);
@@ -554,7 +637,7 @@ function drawLanes() {
   for (const c of lanesEl.querySelectorAll("canvas")) drawLane(c);
 }
 
-const LANE_H = 18;
+const LANE_H = 8; // was 18 -- these are just "an entry happened here" tick marks, not worth the same weight as the strips
 
 function drawLane(c) {
   const sid = c.dataset.sid;
@@ -574,7 +657,7 @@ function drawLane(c) {
       if (!counts[b]) continue;
       ctx.globalAlpha = live ? 0.35 + 0.65 * (counts[b] / maxC) : 0.85;
       const x = MARGIN_L + (b / n) * pw;
-      ctx.fillRect(x, 3, Math.max(1, pw / n - 0.5), LANE_H - 6);
+      ctx.fillRect(x, 1, Math.max(1, pw / n - 0.5), LANE_H - 2);
     }
     ctx.globalAlpha = 1;
   }
@@ -659,7 +742,7 @@ async function startTracking(s) {
           host: host === "local" ? null : host,
           stats: false, host_stats: false, transforms: [],
           logs: [{ name: s.name, type: ttype }],
-          ssh_key: prefs.get("sshKeys", {})[host] || null,
+          ssh_key: null,
           interval: 5,
         });
       } catch (err) {
@@ -672,6 +755,11 @@ async function startTracking(s) {
 
 /* ── legend ─────────────────────────────────────────────────────────────── */
 
+// One legend entry: a color swatch (colorFor(name), or gray if `cls`
+// includes "disabled") + a text label. `name` drives the swatch color and
+// click/right-click wiring in renderLegend(); `label` is what's actually
+// displayed, which can differ (e.g. appending the originating sample
+// file's name via sampleFileLabel()).
 function legendItem(name, cls, label = name) {
   const item = document.createElement("span");
   item.className = "legend-item" + (cls ? " " + cls : "");
@@ -682,6 +770,8 @@ function legendItem(name, cls, label = name) {
   return item;
 }
 
+// A small pill-shaped, clickable label used for the "others (N)"/"hidden
+// (N)" group headers in the legend -- no swatch, just text.
 function legendChip(text) {
   const chip = document.createElement("span");
   chip.className = "legend-chip";
@@ -816,6 +906,10 @@ let dragX = null;
 let dragIsSample = false;
 let sampleArmed = false;
 
+// Toggles "capture metrics" drag mode: the next chart drag exports a
+// sample instead of zooming (mirrors holding Shift while dragging, see
+// timelineDown() below) -- also flips a body class the CSS uses to change
+// the cursor over charts, as a visible reminder the mode is active.
 function setSampleArmed(v) {
   sampleArmed = v;
   document.body.classList.toggle("sample-armed", v);
@@ -826,6 +920,11 @@ function armSampleCapture() {
   setStatus("Capture metrics armed — drag across a chart to pick a time range (Esc to cancel)");
 }
 
+// mousedown on a chart/lane: records where a possible drag started, and
+// whether this drag would export a sample (Shift held, or "capture
+// metrics" armed) rather than zoom -- decided up front since dragIsSample
+// also determines the selection band's color while dragging (see
+// drawVerticals()).
 function timelineDown(c, e) {
   const rect = c.getBoundingClientRect();
   dragStart = e.clientX - rect.left;
@@ -833,6 +932,9 @@ function timelineDown(c, e) {
   dragX = null;
 }
 
+// mouseup on a chart/lane: a drag past a small pixel threshold zooms (or
+// exports a sample, per dragIsSample) to the dragged range; anything
+// shorter (or a plain click) just moves the cursor to that point in time.
 function timelineUp(c, e) {
   const rect = c.getBoundingClientRect();
   const x = e.clientX - rect.left;
@@ -852,6 +954,9 @@ function timelineUp(c, e) {
   drawAll();
 }
 
+// whether host-level telemetry (CPU/MEM/NET of the docker host itself, as
+// opposed to any individual container) is currently being collected --
+// drives the export dialog's default "include host telemetry" checkbox.
 function hasHostSeries() {
   return (state.series?.services || []).some((s) => s.host);
 }
@@ -868,25 +973,6 @@ function currentDockerHost() {
 
 const dlgExport = $("dlg-export");
 
-// fill a <select> with the stored public keys (value = key name); the first
-// option means "no encryption" / "pick one"
-async function fillKeySelect(sel, emptyLabel) {
-  sel.innerHTML = "";
-  const none = document.createElement("option");
-  none.value = "";
-  none.textContent = emptyLabel;
-  sel.appendChild(none);
-  try {
-    for (const k of (await get("/cttc/keys")).keys) {
-      if (!k.has_public) continue;
-      const o = document.createElement("option");
-      o.value = k.name;
-      o.textContent = k.name + (k.has_private ? " (yours)" : "");
-      sel.appendChild(o);
-    }
-  } catch { /* server down: only "no encryption" is offered */ }
-}
-
 async function askExportOptions() {
   const hasHost = hasHostSeries();
   const cb = $("export-host");
@@ -894,22 +980,35 @@ async function askExportOptions() {
   $("export-host-note").textContent = hasHost
     ? "Currently being collected — included automatically unless you uncheck this."
     : "Not currently collected — checking this starts collecting it now (this past range won't have host data yet, but later saved metrics will).";
-  await fillKeySelect($("export-key"), "no encryption");
   return new Promise((resolve) => {
     const done = (ok) => {
       dlgExport.close();
       $("dlg-export-ok").onclick = null;
       $("dlg-export-cancel").onclick = null;
-      resolve(ok ? {
-        includeHost: cb.checked,
-        hadHost: hasHost,
-        publicKey: $("export-key").value || null,
-      } : null);
+      resolve(ok ? { includeHost: cb.checked, hadHost: hasHost } : null);
     };
     $("dlg-export-ok").onclick = () => done(true);
     $("dlg-export-cancel").onclick = () => done(false);
     dlgExport.showModal();
   });
+}
+
+// write bytes to a local file: Electron's native save dialog when available
+// (window.cttc.saveBinary, via main.js), else a plain-browser download --
+// works the same whether the bytes came from a same-machine embedded server
+// or a remote one, since the fetch that produced them already happened.
+async function saveBinaryFile(name, bytes) {
+  if (window.cttc?.saveBinary) return window.cttc.saveBinary(name, bytes);
+  const blob = new Blob([bytes], { type: "application/octet-stream" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  return name; // no real filesystem path in this fallback; used for the status line only
 }
 
 async function exportSample(t0, t1) {
@@ -920,7 +1019,7 @@ async function exportSample(t0, t1) {
       const host = currentDockerHost();
       await post("/docker/collect", {
         host, stats: false, host_stats: true, logs: [], transforms: [],
-        ssh_key: prefs.get("sshKeys", {})[host] || null,
+        ssh_key: null,
         interval: 5,
       });
     } catch (err) {
@@ -928,19 +1027,21 @@ async function exportSample(t0, t1) {
     }
   }
   const name = `metrics-${new Date(t0).toISOString().slice(0, 19).replace(/[T:]/g, "-")}.cttc`;
-  let path = window.cttc?.saveFile ? await window.cttc.saveFile(name)
-                                   : prompt("Save metrics as (.cttc):", name);
-  if (!path) return;
-  if (!path.endsWith(".cttc")) path += ".cttc";
   try {
-    const r = await post("/sample/export", {
-      path, from: t0, to: t1,
-      include_host: opts.includeHost,
-      public_key: opts.publicKey,
-    });
-    const enc = r.encrypted ? `, encrypted for “${opts.publicKey}”` : "";
-    setStatus(r.sources ? `metrics saved: ${r.path} (${r.sources} sources${enc})`
-                        : "metrics saved, but no data in the selected range");
+    // fetch the sample's bytes from the server itself (works identically
+    // whether server.py is this same machine's embedded process or a
+    // remote one reached directly over HTTP -- see docs/architecture/
+    // remote-server.md phase 3) rather than asking it to write to a path
+    // that might not exist on whichever machine actually ran it
+    const params = new URLSearchParams({ from: t0, to: t1, include_host: opts.includeHost ? "1" : "0" });
+    const res = await fetch(`${API}/files/download?${params}`);
+    if (!res.ok) throw new Error((await res.json().catch(() => null))?.error || `download failed: ${res.status}`);
+    const sourceCount = Number(res.headers.get("X-CTTC-Source-Count") || 0);
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const path = await saveBinaryFile(name, bytes);
+    if (!path) { setStatus("metrics export canceled"); return; }
+    setStatus(sourceCount ? `metrics saved: ${path} (${sourceCount} sources)`
+                          : "metrics saved, but no data in the selected range");
   } catch (err) {
     setStatus("metrics export failed: " + (err.message || err));
   }
@@ -956,10 +1057,17 @@ async function exportSample(t0, t1) {
 const dlgSnapshot = $("dlg-snapshot");
 let currentSnapshot = null;
 
+// escapes text (log/container names, which are arbitrary user/docker-
+// controlled strings) before it's interpolated into innerHTML in the
+// snapshot table -- everywhere else builds DOM nodes directly and doesn't
+// need this.
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
+// epoch ms -> full "YYYY-MM-DD HH:MM:SS.sssZ"-style UTC timestamp, used
+// wherever precision (not just clock-face time, see fmtClock()) matters:
+// snapshot metadata, exported file names' timestamp component.
 function fmtIso(t) {
   return new Date(t).toISOString().replace("T", " ").replace("Z", " UTC");
 }
@@ -1437,6 +1545,13 @@ async function setCursor(t, opts = {}) {
 
 const panels = new Map(); // source id -> Panel
 
+// One log source's virtual-scrolled panel: renders only the rows currently
+// in (or just outside) the visible scroll viewport, fetching them from the
+// server a PAGE (200 rows) at a time and caching pages by index for as long
+// as the panel lives (see this.pages). Rows are always stored/fetched
+// oldest-first; `reversed` only affects display order (see dataIndexAt/
+// visualIndexOf) so index-based operations (cursor sync, search) never need
+// to care which way the panel is currently sorted.
 class Panel {
   constructor(src) {
     this.src = src;
@@ -1552,6 +1667,10 @@ class Panel {
     this.update(src);
   }
 
+  // Called on every refreshAll() with this source's latest /sources entry
+  // (row count, error, transforms). Refreshes the header/spacer and, if the
+  // row count grew, invalidates the last cached page so newly-tailed rows
+  // actually get re-fetched instead of serving a stale, now-incomplete copy.
   update(src) {
     this.src = src;
     this.sampleBadge.hidden = src.live !== false;
@@ -1569,6 +1688,10 @@ class Panel {
     this.render();
   }
 
+  // Row page `idx` (data indices [idx*PAGE, idx*PAGE+PAGE)), fetched once
+  // and cached indefinitely (see this.pages) -- concurrent callers awaiting
+  // the same not-yet-resolved page share one in-flight request, since the
+  // Promise itself is what's cached until it resolves to the actual rows.
   async page(idx) {
     if (this.pages.has(idx)) return this.pages.get(idx);
     const pr = get(`/logs?source=${this.src.id}&start=${idx * PAGE}&count=${PAGE}`).then((r) => {
@@ -1605,6 +1728,10 @@ class Panel {
 
     for (const r of this.body.querySelectorAll(".log-row")) r.remove();
     const frag = document.createDocumentFragment();
+    // dotted top/bottom border marks the edges of a contiguous run of
+    // highlighted rows (not every row), so track the previous row's state
+    // across loop iterations.
+    let prevHl = false, prevDiv = null;
     for (let i = i0; i <= i1; i++) {
       const dataIdx = this.dataIndexAt(i);
       const row = pages[Math.floor(dataIdx / PAGE)]?.[dataIdx % PAGE];
@@ -1612,8 +1739,15 @@ class Panel {
       const div = document.createElement("div");
       div.className = "log-row";
       div.style.top = i * ROWH + "px";
-      if (state.cursorT != null && Math.abs(row.ts - state.cursorT) <= state.windowMs)
+      const isHl = state.cursorT != null && Math.abs(row.ts - state.cursorT) <= state.windowMs;
+      if (isHl) {
         div.classList.add("hl");
+        if (!prevHl) div.classList.add("hl-top");
+      } else if (prevHl) {
+        prevDiv.classList.add("hl-bottom");
+      }
+      prevHl = isHl;
+      prevDiv = div;
       if (dataIdx === this.cursorIdx) div.classList.add("cursor-row");
       if (this.selected.has(dataIdx)) div.classList.add("selected");
       if (/\b(ERROR|FATAL|CRIT)/i.test(row.text)) div.classList.add("lvl-error");
@@ -1643,6 +1777,7 @@ class Panel {
           this.selected.clear();
           this.lastClickIdx = dataIdx;
           setCursor(row.ts);
+          recenterOn(row.ts); // same as double-clicking the timeline at this point in time
           this.render();
         }
       };
@@ -1659,6 +1794,7 @@ class Panel {
       };
       frag.appendChild(div);
     }
+    if (prevHl && prevDiv) prevDiv.classList.add("hl-bottom"); // last rendered row ends a run
     this.body.appendChild(frag);
   }
 
@@ -1725,6 +1861,8 @@ function syncPanels() {
 
 /* ── refresh / SSE ──────────────────────────────────────────────────────── */
 
+// the single status-line message in the toolbar (server connectivity,
+// export/save results, ...) -- always replaces whatever was there before.
 function setStatus(msg) {
   $("status").textContent = msg || "";
 }
@@ -1761,6 +1899,11 @@ async function refreshAll() {
   }
 }
 
+// Opens the server's /events stream (see route_events in server.py): every
+// message just means "something changed, go refetch" -- this deliberately
+// carries no payload of its own, so a debounced refreshAll() (via
+// scheduleRefresh()) is always what actually pulls new data, keeping one
+// single code path for both the SSE-driven and manual-action refresh cases.
 function connectSSE() {
   const es = new EventSource(API + "/events");
   es.onmessage = () => scheduleRefresh();
@@ -1768,10 +1911,12 @@ function connectSSE() {
   es.onopen = () => setStatus("");
 }
 
-/* ── add-sources dialog (Docker) ────────────────────────────────────────── */
+/* ── set-sources dialog (Docker) ────────────────────────────────────────── */
 
-const dlg = $("dlg-add");
+const dlg = $("dlg-set");
 
+// names of the transform checkboxes ticked in Set Sources, in DOM order --
+// sent as-is to /docker/collect, which loads and applies them server-side.
 function chosenTransforms() {
   return [...dlg.querySelectorAll("#transforms-list input:checked")].map((i) => i.value);
 }
@@ -1783,7 +1928,7 @@ function openPaths() {
 }
 
 function updateDockerDupes() {
-  const hostKey = $("docker-host").value.trim() || "local";
+  const hostKey = normalizeDockerHost($("docker-host").value) || "local";
   const paths = openPaths();
   for (const [cbId, noteId, path] of [
     ["docker-stats", "docker-stats-note", `docker://${hostKey}/stats`],
@@ -1796,11 +1941,11 @@ function updateDockerDupes() {
   }
 }
 
-$("btn-add").onclick = async () => {
+$("btn-set").onclick = async () => {
   $("docker-targets").innerHTML = "";
   $("docker-error").textContent = "";
   updateDockerDupes();
-  refreshSshKeyRow();
+  renderActivityLog(null);
   listContainers();
   try {
     const t = await get("/transforms");
@@ -1823,7 +1968,7 @@ $("btn-add").onclick = async () => {
 };
 
 // close every open source and forget the remembered last-session containers,
-// so the next launch starts with nothing and the add-sources dialog opens.
+// so the next launch starts with nothing and the set-sources dialog opens.
 $("btn-clear-sources").onclick = async () => {
   try {
     await Promise.all(state.sources.map((s) => post("/close", { id: s.id })));
@@ -1834,7 +1979,72 @@ $("btn-clear-sources").onclick = async () => {
   }
 };
 
-/* ── load .cttc metrics (separate from the Docker "Add sources" flow) ──── */
+/* ── load .cttc metrics (separate from the Docker "Set sources" flow) ──── */
+
+// reads a local path's bytes (via main.js, which has fs access the renderer
+// doesn't) and POSTs them to /files/upload -- works identically whether
+// server.py is this machine's embedded process or a remote one (see
+// docs/architecture/remote-server.md phase 3), unlike sending the path
+// itself, which only means anything when client and server share a
+// filesystem. `segment` picks one recording out of a multi-segment .cttc
+// (see the Recording feature below) -- omitted on the first attempt, which
+// is enough for an ordinary single-segment file and only comes back with
+// needs_selection (not opened) when there's more than one to choose from.
+async function uploadFile(localPath, segment) {
+  const filename = basename(localPath);
+  if (!window.cttc?.readFile) {
+    return { opened: [], errors: [{ path: filename, error: "cannot read local files in this environment" }] };
+  }
+  const bytes = await window.cttc.readFile(localPath);
+  const headers = { "X-CTTC-Filename": filename };
+  if (segment != null) headers["X-CTTC-Segment"] = String(segment);
+  const res = await fetch(`${API}/files/upload`, { method: "POST", body: bytes, headers });
+  return res.json().catch(() => ({ opened: [], errors: [{ path: filename, error: `upload failed: ${res.status}` }] }));
+}
+
+const dlgSegmentPick = $("dlg-segment-pick");
+
+// Shows the multi-segment picker and resolves to the chosen index, or null
+// if cancelled. `segments` is the needs_selection entry's own list:
+// [{index, from, to, created, source_count}].
+function pickSegment(segments) {
+  const box = $("segment-pick-list");
+  box.innerHTML = "";
+  return new Promise((resolve) => {
+    const done = (index) => {
+      dlgSegmentPick.close();
+      $("dlg-segment-pick-cancel").onclick = null;
+      resolve(index);
+    };
+    for (const seg of segments) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      const range = document.createElement("span");
+      range.className = "seg-range";
+      range.textContent = `${fmtIso(seg.from)} — ${fmtIso(seg.to)}`;
+      const meta = document.createElement("span");
+      meta.className = "seg-meta";
+      meta.textContent = `${seg.source_count} source(s)${seg.created ? " · recorded " + fmtIso(new Date(seg.created).getTime() || seg.created) : ""}`;
+      btn.append(range, meta);
+      btn.onclick = () => done(seg.index);
+      box.appendChild(btn);
+    }
+    $("dlg-segment-pick-cancel").onclick = () => done(null);
+    dlgSegmentPick.showModal();
+  });
+}
+
+// Shared by "Load metrics" and "Open Recording": upload once, and if the
+// server comes back asking which segment (a multi-segment recording, see
+// merge_sample_bytes/MultiSegmentSample), show the picker and re-upload
+// with that choice instead of silently picking one or giving up.
+async function uploadAndResolveSegment(path) {
+  const first = await uploadFile(path);
+  if (!first.needs_selection?.length) return first;
+  const index = await pickSegment(first.needs_selection[0].segments);
+  if (index == null) return { opened: [], errors: [] }; // cancelled
+  return uploadFile(path, index);
+}
 
 $("btn-load-sample").onclick = async () => {
   let paths = [];
@@ -1844,24 +2054,11 @@ $("btn-load-sample").onclick = async () => {
     if (p) paths = [p];
   }
   const open = openPaths();
-  const files = paths.filter((p) => p.endsWith(".cttc") && !open.has(p));
+  const files = paths.filter((p) => p.endsWith(".cttc") && !open.has(`upload://${basename(p)}`));
   if (!files.length) return;
   try {
-    let errors = (await post("/open", { files: files.map((path) => ({ path, live: false })) })).errors || [];
-    // encrypted files: the server flags them so we can ask for the key and retry
-    const locked = errors.filter((e) => e.encrypted);
-    if (locked.length) {
-      errors = errors.filter((e) => !e.encrypted);
-      const key = prompt(
-        `${locked.map((e) => basename(e.path)).join(", ")} is encrypted.\n` +
-        "Private key (a name from ~/.cttc/keys, or a full PEM):");
-      if (key) {
-        const retry = await post("/open", {
-          files: locked.map((e) => ({ path: e.path, live: false, private_key: key })),
-        });
-        errors.push(...(retry.errors || []));
-      }
-    }
+    const errors = [];
+    for (const path of files) errors.push(...((await uploadAndResolveSegment(path)).errors || []));
     if (errors.length) alert(errors.map((e) => `${e.path}: ${e.error}`).join("\n"));
     await refreshAll();
     resetZoom(); // show the full timeline, including the newly loaded metrics
@@ -1870,177 +2067,268 @@ $("btn-load-sample").onclick = async () => {
   }
 };
 
-/* ── encryption keys management (dlg-keys) ──────────────────────────────── */
+/* ── Recording (Start/Pause/Stop/Open Recording, Recording menu) ─────────
+   Each Record→Pause span is flushed as one more segment into the same
+   .cttc archive via /sample/record (byte-oriented, mirroring Capture
+   metrics/Load metrics -- no shared-filesystem assumption), rather than
+   each span becoming its own file. A path is chosen once, at Start
+   Recording; every later flush overwrites that same local file. */
 
-const dlgKeys = $("dlg-keys");
+const recording = { status: "idle", path: null, segmentStart: null };
 
-async function renderKeysList() {
-  const box = $("keys-list");
-  $("keys-error").textContent = "";
-  let keys = [];
+function syncRecordingMenu() {
+  $("btn-start-recording").dataset.state = recording.status;
+  $("btn-start-recording").disabled = recording.status === "recording";
+  $("btn-pause-recording").disabled = recording.status !== "recording";
+  $("btn-stop-recording").disabled = recording.status === "idle";
+}
+
+// Reassignable wrappers (window.cttc's own properties are read-only --
+// contextBridge.exposeInMainWorld -- so tests substitute these instead;
+// same reasoning as pickRecordingSavePath/readRecordingBytes above).
+async function getRecordingMarkerFromDisk() {
+  return window.cttc?.getRecordingMarker ? window.cttc.getRecordingMarker() : null;
+}
+async function setRecordingMarkerOnDisk(marker) {
+  if (window.cttc?.setRecordingMarker) await window.cttc.setRecordingMarker(marker);
+}
+
+async function persistRecordingMarker() {
+  await setRecordingMarkerOnDisk(
+    recording.status === "idle"
+      ? null
+      : { path: recording.path, status: recording.status, segmentStart: recording.segmentStart }
+  );
+}
+
+function setRecordingState(next) {
+  Object.assign(recording, next);
+  syncRecordingMenu();
+}
+
+// Thin, individually reassignable wrappers around the three native-fs
+// calls Recording needs -- same pattern as saveBinaryFile above, so tests
+// can substitute an in-memory store instead of driving a real native save
+// dialog (which can't run headlessly).
+async function pickRecordingSavePath() {
+  return window.cttc?.pickRecordingPath ? window.cttc.pickRecordingPath() : null;
+}
+async function readRecordingBytes(path) {
+  return window.cttc.readFile(path);
+}
+async function writeRecordingBytes(path, bytes) {
+  return window.cttc.writeBinaryFile(path, bytes);
+}
+
+// Flushes [recording.segmentStart, t1) as one more segment: reads whatever
+// bytes are already at recording.path (none yet, on the very first
+// segment), POSTs them to /sample/record alongside the new range, and
+// writes the merged archive back over the same local file.
+async function flushRecordingSegment(t1) {
+  let existing = new Uint8Array(0);
   try {
-    keys = (await get("/cttc/keys")).keys;
+    existing = await readRecordingBytes(recording.path);
+  } catch {
+    /* first segment -- nothing on disk yet */
+  }
+  const res = await fetch(`${API}/sample/record`, {
+    method: "POST",
+    body: existing,
+    headers: { "X-CTTC-From": String(recording.segmentStart), "X-CTTC-To": String(t1) },
+  });
+  if (!res.ok) {
+    const j = await res.json().catch(() => ({}));
+    throw new Error(j.error || `sample/record failed: ${res.status}`);
+  }
+  const bytes = new Uint8Array(await res.arrayBuffer());
+  await writeRecordingBytes(recording.path, bytes);
+}
+
+async function startRecording() {
+  if (recording.status === "recording") return;
+  if (recording.status === "idle") {
+    const path = await pickRecordingSavePath();
+    if (!path) {
+      if (!window.cttc?.pickRecordingPath) setStatus("Recording needs desktop file access — unavailable here");
+      return; // cancelled, or no native dialog available
+    }
+    setRecordingState({ status: "recording", path, segmentStart: Date.now() });
+    setStatus(`Recording started — saving to ${path}`);
+  } else {
+    // resume from paused: same path, a new segment starts now
+    setRecordingState({ status: "recording", segmentStart: Date.now() });
+    setStatus("Recording resumed");
+  }
+  await persistRecordingMarker();
+}
+
+async function pauseRecording() {
+  if (recording.status !== "recording") return;
+  try {
+    await flushRecordingSegment(Date.now());
+    setRecordingState({ status: "paused", segmentStart: null });
+    setStatus(`Recording paused — ${recording.path}`);
   } catch (err) {
-    $("keys-error").textContent = String(err.message || err);
+    setStatus(`Could not pause recording: ${err.message || err}`);
+    return; // stay "recording" -- the segment wasn't actually flushed
+  }
+  await persistRecordingMarker();
+}
+
+async function stopRecording() {
+  if (recording.status === "idle") return;
+  const path = recording.path;
+  try {
+    if (recording.status === "recording") await flushRecordingSegment(Date.now());
+    setStatus(`Recording stopped — ${path}`);
+  } catch (err) {
+    setStatus(`Could not finalize recording: ${err.message || err}`);
+    return; // keep the in-flight state so the user can retry Stop
+  }
+  setRecordingState({ status: "idle", path: null, segmentStart: null });
+  await persistRecordingMarker();
+}
+
+async function openRecording() {
+  let paths = [];
+  if (window.cttc?.pickFiles) paths = await window.cttc.pickFiles("Open Recording");
+  else {
+    const p = prompt("Path to a recorded .cttc file:");
+    if (p) paths = [p];
+  }
+  const files = paths.filter((p) => p.endsWith(".cttc"));
+  if (!files.length) return;
+  try {
+    const errors = [];
+    for (const path of files) errors.push(...((await uploadAndResolveSegment(path)).errors || []));
+    if (errors.length) alert(errors.map((e) => `${e.path}: ${e.error}`).join("\n"));
+    await refreshAll();
+    resetZoom();
+  } catch (err) {
+    alert(String(err.message || err));
+  }
+}
+
+// Crash recovery: if the app went down mid-recording (crash, force-quit,
+// sleep/shutdown) without Pause/Stop ever running, the marker on disk
+// still says "recording" -- surfacing that as-is would either silently
+// resume timing a segment whose start may be long gone, or just as
+// silently drop it. Instead, treat it exactly like a Pause already
+// happened: no new segment is flushed (the data for it may not even exist
+// anymore if the server itself restarted), just move to "paused" so the
+// user can explicitly Resume or Stop from an honest state. A named
+// function (not an inline IIFE) so it's callable again from tests.
+async function recoverInterruptedRecording() {
+  const marker = await getRecordingMarkerFromDisk();
+  if (!marker) return;
+  const wasInterrupted = marker.status === "recording";
+  setRecordingState({ status: "paused", path: marker.path, segmentStart: null });
+  await persistRecordingMarker();
+  if (wasInterrupted) {
+    setStatus(
+      `A previous recording was interrupted and is now paused: ${marker.path} — Resume to continue, or Stop to finalize.`
+    );
+  }
+}
+recoverInterruptedRecording();
+
+syncRecordingMenu();
+
+$("btn-start-recording").onclick = () => startRecording();
+$("btn-pause-recording").onclick = () => pauseRecording();
+$("btn-stop-recording").onclick = () => stopRecording();
+$("btn-open-recording").onclick = () => openRecording();
+
+/* ── theme preferences (dlg-theme) ───────────────────────────────────────
+   Reached via File > Preferences > Theme. Currently just the log-highlight
+   color (the background + dotted top/bottom border painted on log rows
+   within the sampling frequency window around the selected time — see
+   Panel.render()'s "hl"/"hl-top"/"hl-bottom" classes). */
+
+const DEFAULT_HL_COLOR = "#eaff00"; // light neon yellow
+const dlgTheme = $("dlg-theme");
+
+function applyHlColor(color) {
+  document.documentElement.style.setProperty("--hl-color", color);
+}
+applyHlColor(prefs.get("hlColor", DEFAULT_HL_COLOR));
+
+function openThemeDialog() {
+  $("theme-hl-color").value = prefs.get("hlColor", DEFAULT_HL_COLOR);
+  dlgTheme.showModal();
+}
+$("theme-hl-color").oninput = (e) => applyHlColor(e.target.value); // live preview
+$("dlg-theme-reset").onclick = () => {
+  $("theme-hl-color").value = DEFAULT_HL_COLOR;
+  applyHlColor(DEFAULT_HL_COLOR);
+};
+$("dlg-theme-save").onclick = () => {
+  const color = $("theme-hl-color").value;
+  prefs.set("hlColor", color);
+  applyHlColor(color);
+  dlgTheme.close();
+};
+$("dlg-theme-close").onclick = () => {
+  applyHlColor(prefs.get("hlColor", DEFAULT_HL_COLOR)); // discard live preview
+  dlgTheme.close();
+};
+
+/* ── docker host activity log (ssh:// connections) ──────────────────────── */
+
+function renderActivityLog(entries) {
+  const toggle = $("btn-activity-toggle");
+  const pre = $("docker-activity");
+  if (!entries || !entries.length) {
+    toggle.hidden = true;
+    pre.hidden = true;
+    pre.textContent = "";
     return;
   }
-  box.innerHTML = "";
-  if (!keys.length) {
-    box.innerHTML = '<div class="muted">no keys yet</div>';
-    return;
-  }
-  for (const k of keys) {
-    const row = document.createElement("div");
-    row.className = "key-row";
-    const name = document.createElement("span");
-    name.className = "name";
-    name.textContent = k.name;
-    row.appendChild(name);
-    const badge = document.createElement("span");
-    badge.className = "key-badge" + (k.has_private ? " private" : "");
-    badge.textContent = k.has_private ? "public + private" : "public only";
-    badge.title = k.has_private
-      ? "You hold the private key: you can open metrics encrypted for this key."
-      : "Imported public key: you can encrypt metrics for its owner, not open them.";
-    row.appendChild(badge);
-    const spacer = document.createElement("span");
-    spacer.className = "spacer";
-    row.appendChild(spacer);
-    if (k.has_public) {
-      const copy = document.createElement("button");
-      copy.className = "icon-btn";
-      copy.textContent = "📋";
-      copy.title = "Copy the public key (share it so others can encrypt metrics for you)";
-      copy.onclick = async () => {
-        await navigator.clipboard.writeText(k.public_pem);
-        setStatus(`public key “${k.name}” copied to clipboard`);
-      };
-      row.appendChild(copy);
-    }
-    const del = document.createElement("button");
-    del.className = "icon-btn";
-    del.textContent = "🗑";
-    del.title = k.has_private
-      ? "Delete this keypair — metrics encrypted for it become unreadable!"
-      : "Delete this imported public key";
-    del.onclick = async () => {
-      const warn = k.has_private
-        ? `Delete keypair “${k.name}”?\n\nThe private key is destroyed: any metrics encrypted for it can never be opened again.`
-        : `Delete imported public key “${k.name}”?`;
-      if (!confirm(warn)) return;
-      try {
-        await post("/cttc/keys/delete", { name: k.name });
-        renderKeysList();
-      } catch (err) {
-        $("keys-error").textContent = String(err.message || err);
-      }
-    };
-    row.appendChild(del);
-    box.appendChild(row);
-  }
+  toggle.hidden = false;
+  pre.textContent = entries
+    .map((e) => `$ ${e.cmd}\n  → exit ${e.returncode} (${e.ms}ms)${e.stderr ? `\n  ${e.stderr}` : ""}`)
+    .join("\n\n");
 }
 
-$("btn-keys").onclick = () => {
-  renderKeysList();
-  dlgKeys.showModal();
-};
-$("dlg-keys-close").onclick = () => dlgKeys.close();
-
-$("key-gen-btn").onclick = async () => {
-  const name = $("key-gen-name").value.trim();
-  try {
-    const r = await post("/cttc/keys/generate", { name });
-    $("key-gen-name").value = "";
-    setStatus(`keypair “${r.name}” generated`);
-    renderKeysList();
-  } catch (err) {
-    $("keys-error").textContent = String(err.message || err);
-  }
-};
-
-$("key-import-btn").onclick = async () => {
-  const name = $("key-import-name").value.trim();
-  const pem = $("key-import-pem").value.trim();
-  try {
-    const r = await post("/cttc/keys/import", { name, public_pem: pem });
-    $("key-import-name").value = "";
-    $("key-import-pem").value = "";
-    setStatus(`public key “${r.name}” imported`);
-    renderKeysList();
-  } catch (err) {
-    $("keys-error").textContent = String(err.message || err);
-  }
-};
-
-/* ── ssh key selection (ssh:// docker hosts) ────────────────────────────── */
-
-const BROWSE = "__browse__";
-
-function currentSshKey() {
-  const v = $("ssh-key").value;
-  return $("ssh-key-row").hidden || !v || v === BROWSE ? null : v;
-}
-
-function rememberSshKey() {
-  const host = $("docker-host").value.trim();
-  if (!host) return;
-  const map = prefs.get("sshKeys", {});
-  map[host] = currentSshKey();
-  prefs.set("sshKeys", map);
-}
-
-async function refreshSshKeyRow() {
-  const host = $("docker-host").value.trim();
-  const row = $("ssh-key-row");
-  row.hidden = !host.startsWith("ssh://");
-  if (row.hidden) return;
-  const sel = $("ssh-key");
-  const remembered = prefs.get("sshKeys", {})[host] ?? null;
-  const chosen = sel.dataset.filled ? currentSshKey() : null;
-  let keys = [];
-  try {
-    keys = (await get("/ssh/keys")).keys;
-  } catch { /* server down; the default option still works */ }
-  sel.innerHTML = "";
-  const add = (value, label) => {
-    const o = document.createElement("option");
-    o.value = value;
-    o.textContent = label;
-    sel.appendChild(o);
-  };
-  add("", "default (ssh config / agent)");
-  for (const k of keys) add(k, k.replace(/^.*\/\.ssh\//, "~/.ssh/"));
-  add(BROWSE, "browse…");
-  const want = chosen || remembered;
-  if (want && ![...sel.options].some((o) => o.value === want)) add(want, want);
-  sel.value = want || "";
-  sel.dataset.filled = "1";
-}
-
-$("ssh-key").onchange = async () => {
-  const sel = $("ssh-key");
-  if (sel.value === BROWSE) {
-    const paths = window.cttc?.pickFiles ? await window.cttc.pickFiles() : [];
-    if (paths.length) {
-      const o = document.createElement("option");
-      o.value = paths[0];
-      o.textContent = paths[0];
-      sel.insertBefore(o, sel.querySelector(`option[value="${BROWSE}"]`));
-      sel.value = paths[0];
-    } else {
-      sel.value = "";
-    }
-  }
-  rememberSshKey();
+$("btn-activity-toggle").onclick = () => {
+  const pre = $("docker-activity");
+  const toggle = $("btn-activity-toggle");
+  pre.hidden = !pre.hidden;
+  toggle.textContent = pre.hidden ? "Show activity" : "Hide activity";
 };
 
 async function listContainers() {
   $("docker-error").textContent = "";
+  renderActivityLog(null);
   const box = $("docker-targets");
-  const host = $("docker-host").value.trim() || null;
-  box.textContent = "listing…";
+  const host = normalizeDockerHost($("docker-host").value);
+  // spelled out explicitly (rather than just "Connecting to <host>…") since
+  // that phrasing reads as if *this browser page* opens a connection to
+  // <host> -- it never does (fetch() can't even speak ssh://): the CTTC
+  // server at 127.0.0.1 is the only thing this page ever talks to; it's the
+  // server that then runs `docker -H ssh://user@host ...` on <host>'s behalf.
+  const label = host
+    ? `Asking the CTTC server (127.0.0.1:${PORT}) to reach ${host} over ssh…`
+    : `Asking the CTTC server (127.0.0.1:${PORT}) for local containers…`;
+  const t0 = Date.now();
+  const status = $("docker-status");
+  status.textContent = label;
+  // ssh connections can take a while (or hang) before the server even
+  // responds -- without this, "Refresh" looks identical whether it's about
+  // to succeed, still connecting, or has silently wedged.
+  const tick = setInterval(() => {
+    status.textContent = `${label} (${Math.round((Date.now() - t0) / 1000)}s)`;
+  }, 1000);
+  // disabled for the whole attempt (not just the button) so the host string
+  // can't be edited out from under an in-flight connect -- re-enabled in
+  // both the success and failure paths below, never left stuck disabled.
+  $("docker-host").disabled = true;
+  $("btn-ps-refresh").disabled = true;
   try {
-    const r = await post("/docker/ps", { host, ssh_key: currentSshKey() });
+    const r = await post("/docker/ps", { host });
+    clearInterval(tick);
+    status.textContent = "";
+    renderActivityLog(r.log);
     box.innerHTML = "";
     const open = openPaths();
     const hostKey = host || "local";
@@ -2074,23 +2362,44 @@ async function listContainers() {
     addGroup("Containers (docker logs)", r.containers, "container");
     if (!r.services.length && !r.containers.length) box.textContent = "nothing running";
   } catch (err) {
+    clearInterval(tick);
+    status.textContent = "";
     box.innerHTML = "";
-    $("docker-error").textContent = String(err.message || err);
+    renderActivityLog(err.log);
+    // A bare network-level failure (fetch() itself rejected -- server
+    // unreachable, tunnel down, connection reset with zero bytes sent) has
+    // no err.serverResponded and a browser-generated message that isn't
+    // useful on its own. Anything the CTTC server actually responded to
+    // (err.serverResponded) means the 127.0.0.1 hop succeeded and it was
+    // the server's own ssh/docker call (or an unexpected server-side bug)
+    // that failed -- spelled out so it's unambiguous which of the two hops
+    // broke. Deliberately NOT keyed on err.log: a plain 500 (an unhandled
+    // exception, not a DockerPsError) has no log either, but the server did
+    // respond.
+    $("docker-error").textContent = err.serverResponded
+      ? `The CTTC server reached out to ${host || "the local daemon"} and failed: ${String(err.message || err)}`
+      : `Could not reach the CTTC server itself at 127.0.0.1:${PORT} (${String(err.message || err)}) — check the connection/tunnel.`;
+  } finally {
+    $("docker-host").disabled = false;
+    $("btn-ps-refresh").disabled = false;
   }
 }
 
 $("btn-ps-refresh").onclick = () => listContainers();
-$("docker-host").oninput = () => {
-  updateDockerDupes();
-  refreshSshKeyRow();
-};
+$("docker-host").oninput = () => updateDockerDupes();
+$("docker-host").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    listContainers();
+  }
+});
 
 $("dlg-cancel").onclick = () => dlg.close();
 
 $("dlg-ok").onclick = async () => {
   const transforms = chosenTransforms();
   try {
-    const host = $("docker-host").value.trim() || null;
+    const host = normalizeDockerHost($("docker-host").value);
     const logs = [...$("docker-targets").querySelectorAll("input:checked:not(:disabled)")].map((cb) => ({
       name: cb.value,
       type: cb.dataset.type,
@@ -2101,7 +2410,7 @@ $("dlg-ok").onclick = async () => {
       const collectReq = {
         host, stats, logs, transforms,
         host_stats: hostStats,
-        ssh_key: currentSshKey(),
+        ssh_key: null,
         interval: Number($("docker-interval").value) || 5,
       };
       await post("/docker/collect", collectReq);
@@ -2137,6 +2446,8 @@ $("btn-popout-host").onclick = () => {
   window.cttc.popout("host", null, popoutView());
 };
 
+// reflects state.chartStyle onto the lines/histogram toggle switch --
+// called on boot and whenever the style changes from elsewhere.
 function syncStyleButton() {
   $("chk-style").checked = state.chartStyle === "bars";
 }
@@ -2150,6 +2461,12 @@ $("chk-style").onchange = (e) => {
 $("btn-host-toggle").onclick = () => {
   state.showHost = !state.showHost;
   prefs.set("showHost", state.showHost);
+  drawAll();
+};
+
+$("btn-lanes-toggle").onclick = () => {
+  state.showLanes = !state.showLanes;
+  prefs.set("showLanes", state.showLanes);
   drawAll();
 };
 
@@ -2219,8 +2536,112 @@ window.cttc?.onPopoutClosed?.(({ kind, id }) => {
   syncPanels();
 });
 
+// File menu actions (main.js's application menu; popped-out panel windows
+// don't have the matching toolbar/dialogs wired up, so they ignore these).
+if (!POPOUT_KIND) {
+  window.cttc?.onMenuAction?.((action) => {
+    if (action === "set-sources") $("btn-set").click();
+    else if (action === "load-metrics") $("btn-load-sample").click();
+    else if (action === "open-theme") openThemeDialog();
+  });
+}
+
+/* ── custom menu bar (replaces the native OS menu — its row spacing can't
+   be styled via CSS on either macOS or Windows) ─────────────────────────── */
+{
+  const menubar = $("menubar");
+  const isMac = navigator.platform.toUpperCase().includes("MAC");
+  if (isMac) {
+    for (const acc of menubar.querySelectorAll(".acc")) {
+      acc.textContent = acc.textContent
+        .replace(/Ctrl\+Shift\+/, "⇧⌘")
+        .replace(/Ctrl\+/, "⌘");
+    }
+  }
+
+  let openMenu = null;
+  function closeMenu() {
+    if (!openMenu) return;
+    openMenu.classList.remove("open");
+    openMenu = null;
+  }
+  for (const menu of menubar.querySelectorAll(".menu")) {
+    const label = menu.querySelector(".menu-label");
+    label.onclick = () => {
+      if (openMenu === menu) { closeMenu(); return; }
+      closeMenu();
+      menu.classList.add("open");
+      openMenu = menu;
+    };
+    label.onmouseenter = () => {
+      if (openMenu && openMenu !== menu) {
+        closeMenu();
+        menu.classList.add("open");
+        openMenu = menu;
+      }
+    };
+  }
+  document.addEventListener("click", (e) => { if (!menubar.contains(e.target)) closeMenu(); });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeMenu(); });
+
+  const RENDERER_ACTIONS = {
+    "set-sources": () => $("btn-set").click(),
+    "load-metrics": () => $("btn-load-sample").click(),
+    "new-gateway": () => window.cttc.newGateway(),
+    "edit-gateways": () => window.cttc.editGateways(),
+    "open-theme": () => openThemeDialog(),
+    undo: () => document.execCommand("undo"),
+    redo: () => document.execCommand("redo"),
+    cut: () => document.execCommand("cut"),
+    copy: () => document.execCommand("copy"),
+    paste: () => document.execCommand("paste"),
+    "select-all": () => document.execCommand("selectAll"),
+  };
+
+  function runMenuAction(action) {
+    closeMenu();
+    const fn = RENDERER_ACTIONS[action];
+    if (fn) fn();
+    else window.cttc?.menubarAction?.(action); // about/reload/devtools/zoom/fullscreen/minimize/close/quit
+  }
+
+  menubar.addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-action]");
+    if (btn) runMenuAction(btn.dataset.action);
+  });
+
+  // Accelerators for actions with no native browser default (edit shortcuts
+  // like Ctrl+C/V/Z work out of the box in inputs/contenteditable and are
+  // deliberately left alone here).
+  const ACCELERATORS = {
+    "mod+o": "set-sources",
+    "mod+l": "load-metrics",
+    "mod+r": "reload",
+    f12: "toggle-devtools",
+    "mod+=": "zoom-in",
+    "mod+-": "zoom-out",
+    "mod+0": "zoom-reset",
+    f11: "toggle-fullscreen",
+    "mod+m": "minimize",
+    "mod+w": "close",
+    "mod+q": "quit",
+  };
+  window.addEventListener("keydown", (e) => {
+    const mod = isMac ? e.metaKey : e.ctrlKey;
+    const key = e.key.toLowerCase();
+    if (["control", "meta", "shift", "alt"].includes(key)) return;
+    const combo = mod ? `mod+${key}` : key;
+    const action = ACCELERATORS[combo];
+    if (action) {
+      e.preventDefault();
+      runMenuAction(action);
+    }
+  });
+}
+
+
 refreshAll().then(async () => {
-  if (POPOUT_KIND) return; // popout windows never restore/add sources on their own
+  if (POPOUT_KIND) return; // popout windows never restore/set sources on their own
   if (state.sources.length === 0) {
     // nothing open yet (fresh install, or the last session's sources are all
     // closed): try to reopen the containers/services collected last time.
@@ -2232,6 +2653,111 @@ refreshAll().then(async () => {
       } catch { /* remembered host(s) unreachable; fall through below */ }
     }
   }
-  if (state.sources.length === 0) $("btn-add").click(); // still nothing: prompt right away
+  if (state.sources.length === 0) $("btn-set").click(); // still nothing: prompt right away
 });
 connectSSE();
+
+/* ── server status indicator (menu bar, flush right) ──────────────────────
+   Polls /health independently of connectSSE's own stream so it still shows
+   "down" if the SSE connection itself is what's wedged. Only present in the
+   main window's menu bar -- harmless no-op elsewhere since $() returns null. */
+(() => {
+  const el = $("server-status");
+  if (!el) return;
+  // Static for the life of this window (HOST/PORT are set once, from the
+  // URL main.js loaded it with) -- where the gateway actually is, not just
+  // whether it's reachable, matters most for "remote" mode (see
+  // docs/architecture/remote-server.md), where it's easy to forget which
+  // host is actually being talked to.
+  const statusHost = HOST === "127.0.0.1" ? "localhost" : HOST;
+  $("server-status-location").textContent = PORT == null || PORT === "null" ? statusHost : `${statusHost}:${PORT}`;
+  const HEALTH_POLL_MS = 5000;
+  const btn = $("server-status-btn");
+  const setState = (state, detail) => {
+    el.dataset.state = state;
+    btn.title = detail ? `${detail}` : "Switch gateway…";
+  };
+  const check = async () => {
+    // Only flash "checking" when we don't already know the answer -- once
+    // "up", routine re-polls shouldn't flicker the dot on every request.
+    if (el.dataset.state !== "up") setState("checking");
+    try {
+      await get("/health");
+      setState("up");
+    } catch (err) {
+      setState("down", String(err.message || err));
+    }
+  };
+  check();
+  setInterval(check, HEALTH_POLL_MS);
+})();
+
+/* ── gateway dropdown (click the status pill) ─────────────────────────────
+   Lists every gateway this client has ever actually connected to (see
+   lib/gateway-registry.js, recorded server-side in main.js right after a
+   connect succeeds) so switching back to one doesn't mean re-typing an ssh
+   target from scratch. Picking a non-active one re-verifies it's still up
+   (main.js's switch-gateway) before writing connection.json and offering a
+   restart -- never blind-trusts a stale entry. */
+(() => {
+  const wrap = $("server-status");
+  const btn = $("server-status-btn");
+  const dropdown = $("gateway-dropdown");
+  if (!wrap || !window.cttc?.getGateways) return;
+
+  const close = () => {
+    wrap.classList.remove("open");
+    dropdown.hidden = true;
+  };
+
+  const render = (gateways) => {
+    dropdown.innerHTML = "";
+    if (!gateways.length) {
+      const empty = document.createElement("div");
+      empty.className = "gateway-empty";
+      empty.textContent = "No other gateways yet — Run Setup to add one.";
+      dropdown.appendChild(empty);
+      return;
+    }
+    for (const g of gateways) {
+      const item = document.createElement("button");
+      item.type = "button";
+      item.className = "gateway-item";
+      item.dataset.active = String(!!g.active);
+      const label = document.createElement("span");
+      label.className = "gateway-item-label";
+      label.textContent = g.label || g.host;
+      const loc = document.createElement("span");
+      loc.className = "gateway-item-loc";
+      const locHost = g.host === "127.0.0.1" ? "localhost" : g.host;
+      loc.textContent = g.port == null ? locHost : `${locHost}:${g.port}`;
+      item.append(label, loc);
+      if (!g.active) {
+        item.onclick = async () => {
+          close();
+          setStatus(`Switching to ${g.label || g.host}…`);
+          const r = await window.cttc.switchGateway(g);
+          if (!r.ok) setStatus(`Could not switch gateway: ${r.error}`);
+        };
+      }
+      dropdown.appendChild(item);
+    }
+  };
+
+  btn.onclick = async (e) => {
+    e.stopPropagation();
+    if (wrap.classList.contains("open")) {
+      close();
+      return;
+    }
+    wrap.classList.add("open");
+    dropdown.hidden = false;
+    render(await window.cttc.getGateways());
+  };
+  document.addEventListener("click", (e) => {
+    if (!wrap.contains(e.target)) close();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") close();
+  });
+})();

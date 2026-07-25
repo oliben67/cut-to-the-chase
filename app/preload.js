@@ -3,8 +3,9 @@
 const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("cttc", {
-  pickFiles: () => ipcRenderer.invoke("pick-files"),
-  saveFile: (defaultName) => ipcRenderer.invoke("save-file", defaultName),
+  pickFiles: (title) => ipcRenderer.invoke("pick-files", title),
+  saveBinary: (defaultName, bytes) => ipcRenderer.invoke("save-binary", defaultName, bytes),
+  readFile: (filePath) => ipcRenderer.invoke("read-file", filePath),
   saveJson: (defaultName, jsonText) => ipcRenderer.invoke("save-json", defaultName, jsonText),
   saveText: (defaultName, text) => ipcRenderer.invoke("save-text", defaultName, text),
   popout: (kind, id, view) => ipcRenderer.invoke("popout", kind, id, view),
@@ -12,4 +13,19 @@ contextBridge.exposeInMainWorld("cttc", {
   onPopoutClosed: (cb) => ipcRenderer.on("popout-closed", (_e, msg) => cb(msg)),
   broadcastSync: (msg) => ipcRenderer.send("sync-broadcast", msg),
   onSync: (cb) => ipcRenderer.on("sync-broadcast", (_e, msg) => cb(msg)),
+  onMenuAction: (cb) => ipcRenderer.on("menu-action", (_e, action) => cb(action)),
+  onMainLog: (cb) => ipcRenderer.on("main-log", (_e, entry) => cb(entry)),
+  menubarAction: (action) => ipcRenderer.invoke("menubar-action", action),
+  submitSetup: (payload) => ipcRenderer.invoke("gateway-setup-submit", payload),
+  onSetupLog: (cb) => ipcRenderer.on("setup-log", (_e, line) => cb(line)),
+  newGateway: () => ipcRenderer.invoke("new-gateway"),
+  editGateways: () => ipcRenderer.invoke("edit-gateways"),
+  saveGatewayEdit: (payload) => ipcRenderer.invoke("gateway-manage-save", payload),
+  uninstallGateway: (entry) => ipcRenderer.invoke("gateway-manage-uninstall", entry),
+  pickRecordingPath: () => ipcRenderer.invoke("pick-recording-path"),
+  writeBinaryFile: (filePath, bytes) => ipcRenderer.invoke("write-binary-file", filePath, bytes),
+  getRecordingMarker: () => ipcRenderer.invoke("get-recording-marker"),
+  setRecordingMarker: (marker) => ipcRenderer.invoke("set-recording-marker", marker),
+  getGateways: () => ipcRenderer.invoke("get-gateways"),
+  switchGateway: (entry) => ipcRenderer.invoke("switch-gateway", entry),
 });

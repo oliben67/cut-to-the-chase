@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; style-src 'self'; script-src 'self'" />
+  <title>CTTC Gateways</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main id="gateway-setup">
+    <div id="new-intro">
+      <h1>Create a new CTTC Gateway</h1>
+      <p class="muted">
+        This machine can't act as its own CTTC server (either Docker or an ssh
+        client is missing locally). Point CTTC at a separate host that has both
+        installed instead -- it'll run the server there and reach whichever
+        Docker daemon(s) you query over ssh.
+      </p>
+    </div>
+
+    <label id="gateway-select-row" hidden>CTTC Gateways
+      <select id="gateway-select"></select>
+    </label>
+
+    <form id="form">
+      <label>SSH username
+        <input id="ssh-user" type="text" required autocomplete="off" />
+      </label>
+      <label>Remote SSH host
+        <input id="ssh-host" type="text" required autocomplete="off" placeholder="docker-host.example.com" />
+      </label>
+      <label>SSH port
+        <input id="ssh-port" type="number" min="1" max="65535" value="22" required />
+      </label>
+
+      <fieldset class="keys-box">
+        <legend>SSH private key</legend>
+        <label class="radio-row"><input type="radio" name="key-mode" value="path" checked /> Use a key file already on this machine</label>
+
+        <div id="key-path-row">
+          <input id="key-path" type="text" readonly placeholder="No file selected" />
+          <button type="button" id="btn-browse">Browse…</button>
+        </div>
+
+        <label class="radio-row"><input type="radio" name="key-mode" value="paste" /> Paste the key's contents</label>
+        <textarea id="key-paste" rows="6" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----" disabled></textarea>
+      </fieldset>
+
+      <fieldset class="keys-box">
+        <legend>Server image</legend>
+        <label class="radio-row"><input type="radio" name="image-source" value="default" checked /> Use the bundled image (recommended)</label>
+        <label class="radio-row"><input type="radio" name="image-source" value="registry" /> Registry image reference</label>
+        <div class="ctl" id="image-ref-row" hidden>
+          <!-- keep this tag in sync with releases/_repo/image.json -- a stale
+               placeholder tag reads as a real, pullable default and isn't -->
+          <input id="image-ref" type="text" placeholder="osteck/cttc-gateway:0.0.1" />
+        </div>
+        <label class="radio-row"><input type="radio" name="image-source" value="tarball" /> Local .tar.gz file</label>
+        <div class="ctl" id="image-tarball-row" hidden>
+          <input id="image-tarball-path" type="text" readonly disabled placeholder="No file selected" />
+          <button type="button" id="image-tarball-browse">Browse…</button>
+        </div>
+      </fieldset>
+
+      <div id="error" class="error" hidden></div>
+
+      <div class="dlg-actions">
+        <button type="button" id="btn-skip" title="Use this machine's own Docker (or none) instead of a remote server">Skip — use this machine</button>
+        <button type="button" id="btn-uninstall" hidden title="Stop and remove this gateway's container">Uninstall…</button>
+        <button type="submit" id="btn-connect" class="primary">Connect</button>
+      </div>
+    </form>
+
+    <div id="wait" class="wait" hidden>
+      <div class="spinner"></div>
+      <p id="wait-msg">Connecting, please wait…</p>
+    </div>
+
+    <div id="activity" hidden>
+      <button type="button" id="btn-activity-toggle" class="linklike">Show activity</button>
+      <pre id="activity-log" class="activity-log" hidden></pre>
+    </div>
+  </main>
+  <script src="gateway-setup.js"></script>
+</body>
+</html>
