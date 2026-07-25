@@ -508,7 +508,21 @@ body {
 }
 .ab-group button:active .ab-icon,
 .ab-group button:active .ab-group-icon svg,
-.ab-group button:active .ab-chevron {
+.ab-group button:active .ab-chevron,
+.ab-group button:active .ab-group-title {
+  color: var(--page);
+}
+/* An open section's header stays reversed for as long as it's expanded
+   (not just the momentary :active flash above) -- same fg/bg swap, same
+   child-color overrides, so an open dropdown reads as "open" at a glance. */
+.ab-group[data-expanded="true"] .ab-group-header {
+  background: var(--text-primary);
+  color: var(--page);
+}
+.ab-group[data-expanded="true"] .ab-group-header .ab-icon,
+.ab-group[data-expanded="true"] .ab-group-header .ab-group-icon svg,
+.ab-group[data-expanded="true"] .ab-group-header .ab-chevron,
+.ab-group[data-expanded="true"] .ab-group-header .ab-group-title {
   color: var(--page);
 }
 .ab-icon {
