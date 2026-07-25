@@ -29,7 +29,7 @@ installation, see the [README](README.md).
   - [The timeline navigator](#the-timeline-navigator)
 - [Working with logs](#working-with-logs)
 - [Snapshots](#snapshots)
-- [Capturing and sharing metrics (.cttc)](#capturing-and-sharing-metrics-cttc)
+- [Capturing and sharing metrics (.cttc-metric)](#capturing-and-sharing-metrics-cttc-metric)
 - [Encryption keys](#encryption-keys)
 - [Pop-out windows](#pop-out-windows)
 - [Transforms](#transforms)
@@ -48,7 +48,7 @@ installation, see the [README](README.md).
   chart or density lane at time *t* and **every log panel jumps to its
   entries at *t***, highlighting the ± frequency window around it.
 - **Live vs. sample data** — live sources keep updating; data loaded from a
-  `.cttc` metrics file is static and drawn grayed + dashed/hatched so it is
+  `.cttc-metric` file is static and drawn grayed + dashed/hatched so it is
   always distinguishable from live series.
 - **View** — the visible time window. All charts, lanes, and the host panel
   share one view; popped-out windows stay in sync with it.
@@ -57,7 +57,7 @@ installation, see the [README](README.md).
 
 Launch the app (see the [README](README.md) for installation). With nothing
 open, the *Set sources* dialog appears automatically. From there you attach
-to a Docker daemon; or use **📂 Load metrics** to open a saved `.cttc` file
+to a Docker daemon; or use **📂 Load metrics** to open a saved `.cttc-metric` file
 instead.
 
 If you collected from Docker before, the app **restores those collections on
@@ -139,8 +139,8 @@ telemetry is read from the remote's `/proc` over the same ssh credentials.
 
 ### Loading metrics files
 
-**📂 Load metrics** opens one or more `.cttc` files previously captured with
-the app (see [Capturing and sharing metrics](#capturing-and-sharing-metrics-cttc)).
+**📂 Load metrics** opens one or more `.cttc-metric` files previously captured with
+the app (see [Capturing and sharing metrics](#capturing-and-sharing-metrics-cttc-metric)).
 They open as **static** sources: their series draw grayed and dashed, their
 log panels carry a *sample* badge, and the legend gains one switch per loaded
 file to show/hide everything from that file at once.
@@ -158,7 +158,7 @@ or paste a full PEM.
 - logs from `docker logs -t` / `docker service logs -t` (RFC3339 prefix);
 - JSONL logs (timestamp read from `timestamp`/`ts`/`time`/`@timestamp`/
   `datetime`/`date` — strings or epoch numbers);
-- `.cttc` metrics files.
+- `.cttc-metric` metrics files.
 
 Lines without their own timestamp (stack traces, wrapped output) attach to
 the previous entry. Files are tailed for new lines; rotation and truncation
@@ -183,7 +183,7 @@ changes the rendering style everywhere (bars are translucent so overlapping
 series stay readable). Hover a strip for a tooltip listing each visible
 series' value at that instant, sorted descending.
 
-Series from loaded `.cttc` files draw **grayed and dashed** (hatched in
+Series from loaded `.cttc-metric` files draw **grayed and dashed** (hatched in
 histogram mode), with a distinct gray level + dash rhythm per file, so live
 and sampled data never look alike.
 
@@ -210,7 +210,7 @@ Right-click a legend entry for actions:
 The `others (N)` chip itself expands/collapses the grayed list. All states
 persist across launches.
 
-When `.cttc` files are loaded, the legend also shows one **switch per file**
+When `.cttc-metric` files are loaded, the legend also shows one **switch per file**
 (labelled with the file name) that shows/hides all of that file's data at
 once.
 
@@ -240,10 +240,13 @@ Clicking a log row moves the cursor to that row's time instead.
 ### Zooming and panning
 
 - **Drag** across a chart or lane to zoom into the selection (blue band).
+- **Mouse wheel / trackpad scroll** over a chart or lane zooms in/out,
+  anchored on the point under the cursor (ctrl/cmd+wheel is left alone for
+  the OS's own page-zoom gesture).
 - **Double-click** to re-center the view on that time, keeping the span.
 - **Right-click** a chart for `🔍+ Zoom in here`, `🔍− Zoom out here`,
-  `↺ Reset zoom` (fits the whole data range and re-centers the cursor on the
-  middle, like a double-click), `📸 Take snapshot`, and `✂ Capture metrics`.
+  `↺ Reset zoom` (fits the whole data range and places the cursor on now),
+  `📸 Take snapshot`, and `✂ Capture metrics`.
 
 ### The timeline navigator
 
@@ -292,7 +295,7 @@ Options in the snapshot dialog:
 View the result as a **Raw** table or as **JSON**, and save it with
 **💾 Save as TXT…** / **💾 Save as JSON…**.
 
-## Capturing and sharing metrics (.cttc)
+## Capturing and sharing metrics (.cttc-metric)
 
 To save a time range for later analysis or to share it:
 
@@ -301,21 +304,21 @@ To save a time range for later analysis or to share it:
 2. In the **Save metrics** dialog choose whether to include host telemetry
    (if it isn't being collected yet, ticking the box starts it for future
    captures) and, optionally, an **Encrypt for** key.
-3. Pick a destination — you get a single **`.cttc`** file containing the
+3. Pick a destination — you get a single **`.cttc-metric`** file containing the
    logs *and* metrics of every open source, sliced to the selected range.
 
-A `.cttc` file is a zip: a manifest, one JSONL file per log source, and the
+A `.cttc-metric` file is a zip: a manifest, one JSONL file per log source, and the
 per-service metric series (host flag and swarm info preserved). If encrypted,
 the zip is wrapped in AES-256-GCM under a one-time key that only the chosen
 recipient's RSA private key can unwrap.
 
-Load a `.cttc` back with **📂 Load metrics** — see
+Load a `.cttc-metric` back with **📂 Load metrics** — see
 [Loading metrics files](#loading-metrics-files) for how sampled data is
 displayed.
 
 ## Encryption keys
 
-**🔑 Keys** manages the keys used to encrypt/decrypt `.cttc` files. They are
+**🔑 Keys** manages the keys used to encrypt/decrypt `.cttc-metric` files. They are
 plain PEM files in `~/.cttc/keys/` (private keys are created owner-only,
 mode 600 — the same trust model as `~/.ssh`).
 
@@ -334,7 +337,7 @@ copy/delete actions, plus the generate and import forms](docs/images/dlg-keys.pn
 
 Typical exchange: your teammate clicks *Generate*, then *Copy*, and sends
 you the PEM. You *Import* it under their name, capture metrics with
-*Encrypt for → their name*, and send them the `.cttc`. Only they can open it.
+*Encrypt for → their name*, and send them the `.cttc-metric`. Only they can open it.
 
 ## Pop-out windows
 
@@ -385,7 +388,8 @@ ingestion — the error is recorded on the affected record instead.
 | shift-click log row | select the range from the last-clicked row |
 | right-click log selection | snapshot / capture metrics centered on the selected entries |
 | drag on chart / lane | zoom to selection (blue band) |
-| shift+drag (or right-click → ✂ Capture metrics, then drag) | export the range as `.cttc` (orange band) |
+| mouse wheel / trackpad scroll over chart / lane | zoom in/out anchored on the cursor |
+| shift+drag (or right-click → ✂ Capture metrics, then drag) | export the range as `.cttc-metric` (orange band) |
 | double-click chart / lane | re-center on that point in time |
 | right-click chart / lane | zoom in / zoom out / reset zoom / snapshot / capture metrics |
 | drag timeline-nav thumb | pan the view |
@@ -398,7 +402,7 @@ ingestion — the error is recorded on the affected record instead.
 | legend entry right-click | track / unselect / hide a container, or open it in its own window |
 | `others (N)` chip | expand/collapse not-selected containers |
 | `hidden (N)` chip | restore hidden containers |
-| sample-file switch in the legend | show/hide everything from that `.cttc` file |
+| sample-file switch in the legend | show/hide everything from that `.cttc-metric` file |
 | ▾/▸ on Host telemetry | collapse/expand the host strip group |
 | ⬆/⬇ in a log panel | newest-first / oldest-first ordering |
 | 🔍 in a log panel | search that log |
@@ -441,13 +445,13 @@ Highlights:
   [uv](https://docs.astral.sh/uv/); it provisions the server's Python
   environment on first run.
 - **"docker CLI not found on PATH"** — install the docker CLI, or use the
-  app on files / `.cttc` metrics only.
+  app on files / `.cttc-metric` metrics only.
 - **The app opens as a plain terminal process / nothing appears** (VS Code
   terminals) — the extension host exports `ELECTRON_RUN_AS_NODE`, which
   turns Electron into plain Node. Unset it (`task start` already does).
 - **Timestamps look shifted** — files with naive local timestamps need the
   server started with `--naive-tz local`.
-- **An encrypted `.cttc` won't open** — you need the *private* key of the
+- **An encrypted `.cttc-metric` won't open** — you need the *private* key of the
   keypair it was encrypted for; a name from `~/.cttc/keys/` or a pasted PEM
   both work at the prompt. If that private key was deleted, the file cannot
   be recovered.

@@ -492,7 +492,7 @@ Proposed change: give sample export/import the same shape.
   existing endpoint handlers. That's what makes "spin it off into its own
   container later" a refactor instead of a rewrite — the day file traffic
   needs to scale independently of the telemetry/log collectors (large
-  `.cttc` files, many concurrent uploads), it lifts out behind the same
+  `.cttc-metric`/`.cttc-record` files, many concurrent uploads), it lifts out behind the same
   route prefix on a different port/container without the collector code
   ever noticing.
 - **Uploaded sources stay first-class, not a side view.** Once opened, a
