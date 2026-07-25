@@ -10,3 +10,4 @@ stay-the-course/
 .coverage
 releases/windows/cttc-windows-deploy.zip
 releases/windows/cttc-windows-deploy/
+.vscode/settings.json
