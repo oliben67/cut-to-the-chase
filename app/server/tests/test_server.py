@@ -1691,7 +1691,7 @@ class TestHttpApi:
 
     def test_sample_export_and_reload_via_open(self, api, tmp_path):
         base, _ = api
-        out = tmp_path / "range.cttc"
+        out = tmp_path / "range.cttc-metric"
         t0 = ms(2026, 1, 2, 3, 0, 0)
         code, j = post(base, "/sample/export", {"path": str(out), "from": t0, "to": t0 + 11000})
         assert code == 200 and j["sources"] == 2
@@ -1761,7 +1761,7 @@ class TestHttpApi:
             first,
             {"X-CTTC-From": str(t0 + 5000), "X-CTTC-To": str(t0 + 10000)},
         )
-        out = tmp_path / "recorded.cttc"
+        out = tmp_path / "recorded.cttc-record"
         out.write_bytes(second)
 
         code, j = post(base, "/open", {"files": [{"path": str(out)}]})
@@ -1940,6 +1940,131 @@ class TestHttpApi:
         assert not t.is_alive()
 
 
+class TestEventsEndpoints:
+    """HTTP-level coverage for /events/* -- these previously only had
+    EventManager unit tests (test_events.py), which missed a real routing
+    bug: GET /events/list used to be plainly GET /events, which collides
+    with the pre-existing GET /events SSE stream (see route_events above
+    the /docker/ps routes) -- FastAPI matched the SSE route first, so a
+    plain fetch() from the renderer never resolved .json() (an SSE
+    response's body never ends). urllib.request.urlopen(timeout=5) below
+    would have caught that immediately as a clear timeout instead of a
+    silent hang, which is exactly why this class exists now."""
+
+    def test_create_list_and_status(self, api):
+        base, _ = api
+        code, j = post(
+            base,
+            "/events/create",
+            {
+                "name": "cpu high",
+                "source_ids": [],
+                "conditions": [{"type": "metric", "metric": "cpu", "op": ">", "threshold": 80}],
+                "action": {"kind": "snapshot", "minutes": 5},
+            },
+        )
+        assert code == 200 and j["event_id"]
+        event_id = j["event_id"]
+
+        code, j = get(base, "/events/list")
+        assert code == 200 and event_id in j["event_ids"]
+
+        code, j = get(base, f"/events/{event_id}")
+        assert code == 200
+        assert j["name"] == "cpu high"
+        assert j["conditions"] == [{"type": "metric", "metric": "cpu", "op": ">", "threshold": 80}]
+        assert j["status"] == "armed"
+
+    def test_events_list_is_not_shadowed_by_the_sse_stream(self, api):
+        """The actual regression: GET /events (the SSE stream) must keep
+        working, and GET /events/list must be its own, independent route."""
+        base, _ = api
+        code, j = get(base, "/events/list")
+        assert code == 200 and j["event_ids"] == []
+
+    def test_enable_disable_reset_cancel(self, api):
+        base, _ = api
+        _code, j = post(
+            base,
+            "/events/create",
+            {
+                "name": "x",
+                "conditions": [{"type": "log", "pattern": "ERROR"}],
+                "action": {"kind": "recording", "duration_minutes": 1},
+            },
+        )
+        event_id = j["event_id"]
+
+        code, _ = post(base, f"/events/{event_id}/disable")
+        assert code == 200
+        assert get(base, f"/events/{event_id}")[1]["enabled"] is False
+
+        code, _ = post(base, f"/events/{event_id}/enable")
+        assert code == 200
+        assert get(base, f"/events/{event_id}")[1]["enabled"] is True
+
+        code, _ = post(base, f"/events/{event_id}/reset")
+        assert code == 200
+
+        code, _ = post(base, f"/events/{event_id}/cancel")
+        assert code == 200
+        assert get(base, f"/events/{event_id}")[0] == 404
+
+    def test_create_with_invalid_condition_is_a_400(self, api):
+        base, _ = api
+        code, j = post(
+            base,
+            "/events/create",
+            {"name": "x", "conditions": [{"type": "bogus"}], "action": {"kind": "snapshot", "minutes": 5}},
+        )
+        assert code == 400 and "error" in j
+
+    def test_unknown_event_operations_are_404(self, api):
+        base, _ = api
+        assert get(base, "/events/nope")[0] == 404
+        assert post(base, "/events/nope/enable")[0] == 404
+        assert post(base, "/events/nope/disable")[0] == 404
+        assert post(base, "/events/nope/reset")[0] == 404
+        assert post(base, "/events/nope/cancel")[0] == 404
+        assert post(base, "/events/nope/update", {"name": "x"})[0] == 404
+
+    def test_update_changes_only_given_fields(self, api):
+        base, _ = api
+        _code, j = post(
+            base,
+            "/events/create",
+            {
+                "name": "old",
+                "conditions": [{"type": "metric", "metric": "cpu", "op": ">", "threshold": 80}],
+                "action": {"kind": "recording", "duration_minutes": 5},
+            },
+        )
+        event_id = j["event_id"]
+
+        code, j = post(base, f"/events/{event_id}/update", {"name": "new"})
+        assert code == 200 and j["ok"] is True
+
+        code, st = get(base, f"/events/{event_id}")
+        assert code == 200
+        assert st["name"] == "new"
+        assert st["action"]["duration_minutes"] == 5  # unchanged
+
+    def test_update_with_invalid_conditions_is_a_400(self, api):
+        base, _ = api
+        _code, j = post(
+            base,
+            "/events/create",
+            {
+                "name": "x",
+                "conditions": [{"type": "log", "pattern": "ERROR"}],
+                "action": {"kind": "recording", "duration_minutes": 5},
+            },
+        )
+        event_id = j["event_id"]
+        code, j = post(base, f"/events/{event_id}/update", {"conditions": [{"type": "bogus"}]})
+        assert code == 400 and "error" in j
+
+
 # ── /files/* (phase 3: upload/download, docs/architecture/remote-server.md) ──
 
 
@@ -1951,7 +2076,7 @@ class TestFilesEndpoints:
         assert code == 200
         assert headers["Content-Type"] == "application/octet-stream"
         assert 'filename="sample-' in headers["Content-Disposition"]
-        assert headers["Content-Disposition"].endswith('.cttc"')
+        assert headers["Content-Disposition"].endswith('.cttc-metric"')
         z = zipfile.ZipFile(io.BytesIO(data))
         assert "manifest.json" in z.namelist()
 
@@ -2005,14 +2130,14 @@ class TestFilesEndpoints:
             first,
             {"X-CTTC-From": str(t0 + 5000), "X-CTTC-To": str(t0 + 10000)},
         )
-        code, j = post_raw(base, "/files/upload", second, {"X-CTTC-Filename": "rec.cttc"})
+        code, j = post_raw(base, "/files/upload", second, {"X-CTTC-Filename": "rec.cttc-record"})
         assert code == 200
         assert j["opened"] == [] and j["errors"] == []
         assert len(j["needs_selection"]) == 1
         assert [s["index"] for s in j["needs_selection"][0]["segments"]] == [0, 1]
 
         code, j = post_raw(
-            base, "/files/upload", second, {"X-CTTC-Filename": "rec.cttc", "X-CTTC-Segment": "0"}
+            base, "/files/upload", second, {"X-CTTC-Filename": "rec.cttc-record", "X-CTTC-Segment": "0"}
         )
         assert code == 200
         assert len(j["opened"]) >= 1
@@ -2036,16 +2161,16 @@ class TestFilesEndpoints:
 
     def test_upload_bad_data_reports_error_not_500(self, api):
         base, _ = api
-        code, j = post_raw(base, "/files/upload", b"not a zip", {"X-CTTC-Filename": "bad.cttc"})
+        code, j = post_raw(base, "/files/upload", b"not a zip", {"X-CTTC-Filename": "bad.cttc-metric"})
         assert code == 200  # request itself succeeded; the failure is reported in errors
         assert j["opened"] == [] and len(j["errors"]) == 1
-        assert "bad.cttc" == j["errors"][0]["path"]
+        assert "bad.cttc-metric" == j["errors"][0]["path"]
 
     def test_upload_broadcasts_sources_event_only_on_success(self, api):
         base, st = api
         seen = []
         st.broadcast = lambda ev: seen.append(ev)
-        post_raw(base, "/files/upload", b"not a zip", {"X-CTTC-Filename": "bad.cttc"})
+        post_raw(base, "/files/upload", b"not a zip", {"X-CTTC-Filename": "bad.cttc-metric"})
         assert seen == []  # nothing opened -> no broadcast
         post_raw(base, "/files/upload", b"2026-01-02T03:00:00Z a\n", {"X-CTTC-Filename": "ok.log"})
         assert seen == [{"type": "sources"}]

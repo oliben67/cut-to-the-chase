@@ -2,8 +2,9 @@
 
 Two of CTTC's flows assume the Electron client and server.py share a
 filesystem (true when the server runs on the same machine, false once it
-runs on a remote docker-enabled host): loading a picked .cttc/log file, and
-saving an exported .cttc sample. This module gives both a byte-oriented
+runs on a remote docker-enabled host): loading a picked .cttc-metric/
+.cttc-record/log file, and saving an exported .cttc-metric sample. This
+module gives both a byte-oriented
 alternative -- upload a file's bytes so it can be opened, download an
 exported sample's bytes directly -- with a deliberately narrow interface
 into State (hand it bytes, get back opened source ids / a zip blob) and its
@@ -18,13 +19,15 @@ import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
+from cttc_format import METRIC_EXT, is_cttc_archive
+
 
 def download_sample(state, t0: float, t1: float, include_host: bool):
-    """-> (data, filename, source_count) for the .cttc sample covering
+    """-> (data, filename, source_count) for the .cttc-metric sample covering
     [t0, t1] -- the byte-returning counterpart to State.export_sample()."""
     data, meta = state.build_sample_bytes(t0, t1, include_host)
     ts = datetime.fromtimestamp(t0 / 1000, tz=UTC).strftime("%Y-%m-%d-%H-%M-%S")
-    filename = f"sample-{ts}.cttc"
+    filename = f"sample-{ts}{METRIC_EXT}"
     return data, filename, len(meta)
 
 
@@ -32,7 +35,8 @@ def upload_and_open(
     state, filename: str, data: bytes, transforms: list[str], segment: int | None = None
 ):
     """Write the uploaded bytes to a scratch file, open it exactly like a
-    local file would be (.cttc -> load_sample, anything else -> open_file,
+    local file would be (.cttc-metric/.cttc-record -> load_sample, anything
+    else -> open_file,
     always static/non-live since the server has no way to get new bytes
     without another upload), then point the resulting source(s) at a
     synthetic upload://<filename> display path.
@@ -55,7 +59,7 @@ def upload_and_open(
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
-        if filename.endswith(".cttc"):
+        if is_cttc_archive(filename):
             opened = state.load_sample(tmp_path, segment=segment)
         else:
             src = state.open_file(tmp_path, "auto", filename, live=False, transforms=transforms)

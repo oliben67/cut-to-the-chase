@@ -41,8 +41,8 @@ class TestDownloadSample:
         t0, t1 = ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 20)
         data, filename, count = files.download_sample(state, t0, t1, True)
         assert count == 1
-        assert filename == "sample-2026-01-02-03-00-00.cttc"
-        assert filename.endswith(".cttc")
+        assert filename == "sample-2026-01-02-03-00-00.cttc-metric"
+        assert filename.endswith(".cttc-metric")
         z = zipfile.ZipFile(BytesIO(data))
         manifest = json.loads(z.read("manifest.json"))
         assert len(manifest["segments"][0]["sources"]) == 1
@@ -90,15 +90,15 @@ class TestUploadAndOpen:
         data, _filename, _count = files.download_sample(state, t0, t1, True)
 
         state2 = server.State(Path("/tmp"))
-        opened = files.upload_and_open(state2, "reload.cttc", data, [])
+        opened = files.upload_and_open(state2, "reload.cttc-metric", data, [])
         assert len(opened) == 1
         src = state2.sources[opened[0]]
-        assert src.path == "upload://reload.cttc"
+        assert src.path == "upload://reload.cttc-metric"
         assert src.slice(0, 1)[0]["text"] == "alpha"
 
     def test_upload_bad_data_propagates_error(self, state):
         with pytest.raises(Exception):
-            files.upload_and_open(state, "broken.cttc", b"not a zip file", [])
+            files.upload_and_open(state, "broken.cttc-metric", b"not a zip file", [])
 
     def test_upload_no_extension_defaults_to_log_suffix(self, state):
         # mainly asserts this doesn't blow up picking a temp-file suffix
