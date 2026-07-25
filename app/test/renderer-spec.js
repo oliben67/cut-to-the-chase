@@ -66,7 +66,7 @@
   });
 
   await T("basename / escapeHtml / fmtIso", () => {
-    eq(basename("/a/b/c.cttc"), "c.cttc");
+    eq(basename("/a/b/c.cttc-metric"), "c.cttc-metric");
     eq(basename(null), "");
     eq(escapeHtml('<a b="c">&\''), "&lt;a b=&quot;c&quot;&gt;&amp;&#39;");
     ok(fmtIso(0).endsWith(" UTC"));
@@ -101,6 +101,45 @@
     near((state.view.t0 + state.view.t1) / 2, MID, 1, "still centered");
   });
 
+  await T("zoomAtAnchored keeps the anchor point fixed, unlike zoomAt", () => {
+    setView(MID - 30000, MID + 30000);
+    const anchor = MID + 10000; // off-center, so recentering would move it
+    zoomAtAnchored(anchor, 0.5);
+    near(state.view.t1 - state.view.t0, 30000, 1, "halved");
+    near(anchor, state.view.t0 + (anchor - (MID - 30000)) * 0.5, 1, "anchor stayed put");
+    // the anchor's position within the view (as a fraction of the span) is unchanged
+    const before = { t0: MID - 30000, t1: MID + 30000 };
+    const fracBefore = (anchor - before.t0) / (before.t1 - before.t0);
+    const fracAfter = (anchor - state.view.t0) / (state.view.t1 - state.view.t0);
+    near(fracBefore, fracAfter, 0.001, "anchor's relative position preserved");
+  });
+
+  await T("wheel over a chart zooms anchored on the cursor, not the view center", () => {
+    setView(MID - 30000, MID + 30000);
+    const canvas = document.querySelector("canvas[data-strip]");
+    ok(canvas, "a strip canvas exists");
+    const rect = canvas.getBoundingClientRect();
+    const x = rect.left + rect.width * 0.75; // off-center, right side
+    const before = { ...state.view };
+    canvas.dispatchEvent(new WheelEvent("wheel", { deltaY: -100, clientX: x, clientY: rect.top + 5, bubbles: true, cancelable: true }));
+    ok(state.view.t1 - state.view.t0 < before.t1 - before.t0, "scrolling up (deltaY<0) zoomed in");
+
+    setView(MID - 30000, MID + 30000);
+    const before2 = { ...state.view };
+    canvas.dispatchEvent(new WheelEvent("wheel", { deltaY: 100, clientX: x, clientY: rect.top + 5, bubbles: true, cancelable: true }));
+    ok(state.view.t1 - state.view.t0 > before2.t1 - before2.t0, "scrolling down (deltaY>0) zoomed out");
+  });
+
+  await T("ctrl/meta+wheel over a chart is left alone (reserved for page zoom)", () => {
+    setView(MID - 30000, MID + 30000);
+    const canvas = document.querySelector("canvas[data-strip]");
+    const rect = canvas.getBoundingClientRect();
+    const before = { ...state.view };
+    canvas.dispatchEvent(new WheelEvent("wheel", { deltaY: -100, clientX: rect.left + 10, clientY: rect.top + 5, ctrlKey: true, bubbles: true, cancelable: true }));
+    eq(state.view.t0, before.t0);
+    eq(state.view.t1, before.t1);
+  });
+
   await T("recenterOn keeps span, moves center", () => {
     setView(MID - 30000, MID + 30000);
     recenterOn(R.min_ts);
@@ -114,11 +153,11 @@
     near((state.view.t0 + state.view.t1) / 2, Date.now(), 2000);
   });
 
-  await T("resetZoom fits the data and centers the cursor mid-range", () => {
+  await T("resetZoom fits the data and places the cursor on now", () => {
     state.cursorT = null;
     resetZoom();
     ok(state.view.t0 < R.min_ts && state.view.t1 > R.max_ts, "view covers data + pad");
-    near(state.cursorT, MID, 1, "cursor centered like a double-click");
+    near(state.cursorT, Date.now(), 2000, "cursor placed on now");
   });
 
   /* ── toolbar controls ─────────────────────────────────────────────────── */
@@ -480,7 +519,7 @@
   /* ── sample round trip through the UI data model ──────────────────────── */
 
   await T("sample export + load shows grayed sample sources", async () => {
-    const out = "/tmp/cttc-e2e-sample.cttc";
+    const out = "/tmp/cttc-e2e-sample.cttc-metric";
     const r = await post("/sample/export", { path: out, from: R.min_ts, to: R.min_ts + 5 * 60000 });
     ok(r.sources >= 2, "exported sources");
     const opened = (await post("/open", { files: [{ path: out }] })).opened;
@@ -490,7 +529,7 @@
       const sample = state.sources.find((s) => s.live === false);
       ok(sample, "sample source present and static");
       eq(isLiveSid(sample.id), false);
-      ok(sampleFileLabel(sample.id).includes("cttc-e2e-sample.cttc"), "labeled with file");
+      ok(sampleFileLabel(sample.id).includes("cttc-e2e-sample.cttc-metric"), "labeled with file");
       const groups = sampleFileGroups();
       eq(groups.length, 1, "one sample file group");
       ok(groups[0].ids.size >= 2, "group covers its sources");
@@ -518,7 +557,7 @@
     try {
       await exportSample(R.min_ts, R.min_ts + 5 * 60000);
       ok(saved, "saveBinaryFile was called");
-      ok(saved.name.endsWith(".cttc"), saved.name);
+      ok(saved.name.endsWith(".cttc-metric"), saved.name);
       ok(saved.bytes instanceof Uint8Array && saved.bytes.length > 0, "got real bytes");
       eq(saved.bytes[0], 0x50, "PK zip magic byte 1"); // 'P'
       eq(saved.bytes[1], 0x4b, "PK zip magic byte 2"); // 'K'
@@ -562,15 +601,15 @@
 
   await T("Load metrics button's dedupe check accounts for the upload:// path scheme", () => {
     const open = openPaths();
-    ok(!open.has("/some/local/never-opened.cttc"), "sanity: local path form never matches");
+    ok(!open.has("/some/local/never-opened.cttc-metric"), "sanity: local path form never matches");
   });
 
   /* ── Recording (Start/Pause/Stop/Open Recording) ──────────────────────── */
 
-  await T("Record -> Pause -> Resume -> Stop writes a real 2-segment .cttc, menu state tracks it", async () => {
+  await T("Record -> Pause -> Resume -> Stop writes a real 2-segment .cttc-record, menu state tracks it", async () => {
     const realPick = pickRecordingSavePath, realRead = readRecordingBytes, realWrite = writeRecordingBytes;
     const store = {};
-    pickRecordingSavePath = async () => "/fake/e2e-recording.cttc";
+    pickRecordingSavePath = async () => "/fake/e2e-recording.cttc-record";
     readRecordingBytes = async (p) => {
       if (!(p in store)) throw new Error("no such file");
       return store[p];
@@ -580,7 +619,7 @@
       eq(recording.status, "idle");
       await startRecording();
       eq(recording.status, "recording");
-      eq(recording.path, "/fake/e2e-recording.cttc");
+      eq(recording.path, "/fake/e2e-recording.cttc-record");
       eq($("btn-start-recording").disabled, true);
       eq($("btn-pause-recording").disabled, false);
       eq($("btn-stop-recording").disabled, false);
@@ -589,8 +628,8 @@
       eq(recording.status, "paused");
       eq($("btn-start-recording").disabled, false);
       eq($("btn-pause-recording").disabled, true);
-      ok(store["/fake/e2e-recording.cttc"], "first segment flushed to the in-memory store");
-      const afterFirst = store["/fake/e2e-recording.cttc"];
+      ok(store["/fake/e2e-recording.cttc-record"], "first segment flushed to the in-memory store");
+      const afterFirst = store["/fake/e2e-recording.cttc-record"];
       eq(afterFirst[0], 0x50, "PK zip magic byte 1");
 
       await startRecording(); // resume
@@ -599,12 +638,12 @@
       eq(recording.status, "idle");
       eq(recording.path, null);
       eq($("btn-stop-recording").disabled, true);
-      const afterSecond = store["/fake/e2e-recording.cttc"];
+      const afterSecond = store["/fake/e2e-recording.cttc-record"];
       ok(afterSecond.length >= afterFirst.length, "second segment appended, archive grew (or stayed same size)");
 
       // write the final in-memory bytes to a real path and confirm /open
       // recognizes it as a genuine 2-segment archive
-      const realPath = "/tmp/cttc-e2e-recording.cttc";
+      const realPath = "/tmp/cttc-e2e-recording.cttc-record";
       await window.cttc.writeBinaryFile(realPath, afterSecond);
       const openRes = await post("/open", { files: [{ path: realPath }] });
       eq(openRes.opened.length, 0, "ambiguous -- nothing opened without a segment choice");
@@ -639,12 +678,12 @@
   await T("recoverInterruptedRecording flips a stale 'recording' marker to paused", async () => {
     const realGetMarker = getRecordingMarkerFromDisk, realSetMarker = setRecordingMarkerOnDisk;
     let lastSet = null;
-    getRecordingMarkerFromDisk = async () => ({ path: "/fake/stale.cttc", status: "recording", segmentStart: 123 });
+    getRecordingMarkerFromDisk = async () => ({ path: "/fake/stale.cttc-record", status: "recording", segmentStart: 123 });
     setRecordingMarkerOnDisk = async (m) => { lastSet = m; };
     try {
       await recoverInterruptedRecording();
       eq(recording.status, "paused");
-      eq(recording.path, "/fake/stale.cttc");
+      eq(recording.path, "/fake/stale.cttc-record");
       ok($("status").textContent.includes("interrupted"), $("status").textContent);
       ok(lastSet && lastSet.status === "paused", "corrected marker persisted as paused");
     } finally {
@@ -655,7 +694,7 @@
     }
   });
 
-  await T("multi-segment .cttc upload surfaces the picker, choosing a segment loads it", async () => {
+  await T("multi-segment .cttc-record upload surfaces the picker, choosing a segment loads it", async () => {
     // build a real 2-segment recording server-side via /sample/record
     const t0 = R.min_ts;
     const firstRes = await fetch(`${API}/sample/record`, {
@@ -672,7 +711,7 @@
     // write to a real path (window.cttc.readFile itself is read-only and
     // can't be reassigned -- see docs/architecture's contextBridge note)
     // so uploadFile's real readFile call has real bytes to read.
-    const realPath = "/tmp/cttc-e2e-multi-segment.cttc";
+    const realPath = "/tmp/cttc-e2e-multi-segment.cttc-record";
     await window.cttc.writeBinaryFile(realPath, secondBytes);
 
     const realPickSegment = pickSegment;
@@ -688,6 +727,321 @@
       await refreshAll();
     } finally {
       pickSegment = realPickSegment;
+    }
+  });
+
+  /* ── sidebar / appearance ──────────────────────────────────────────────── */
+
+  await T("sidebar groups have no separator borders between them", () => {
+    for (const g of document.querySelectorAll(".ab-group")) {
+      eq(getComputedStyle(g).borderTopWidth, "0px", `${g.querySelector(".ab-group-title")?.textContent} group`);
+    }
+  });
+
+  await T("Create Event/Edit Events buttons live inside the Metrics sidebar section", () => {
+    const metricsGroup = document.querySelector('.ab-group[data-section="metrics"]');
+    ok(metricsGroup, "Metrics section exists");
+    ok(metricsGroup.contains($("btn-event-create")), "btn-event-create is inside the Metrics section");
+    ok(metricsGroup.contains($("btn-event-edit")), "btn-event-edit is inside the Metrics section");
+  });
+
+  await T("sidebar sections start collapsed and expand on header click", () => {
+    const metricsGroup = document.querySelector('.ab-group[data-section="metrics"]');
+    const header = metricsGroup.querySelector(".ab-group-header");
+    const body = metricsGroup.querySelector(".ab-group-body");
+    eq(body.hidden, true, "starts collapsed");
+    header.click();
+    eq(body.hidden, false, "expands on click");
+    eq(metricsGroup.dataset.expanded, "true");
+    header.click();
+    eq(body.hidden, true, "collapses again on a second click");
+  });
+
+  /* ── status bar (event notifications) ─────────────────────────────────── */
+
+  await T("status bar is shown by default and toggled from Appearance", () => {
+    eq($("app-status-bar").hidden, false, "visible by default");
+    openThemeDialog();
+    try {
+      eq($("theme-status-bar-toggle").checked, true);
+      $("theme-status-bar-toggle").checked = false;
+      $("theme-status-bar-toggle").dispatchEvent(new Event("change"));
+      eq($("app-status-bar").hidden, true, "hidden once toggled off");
+      eq(prefs.get("statusBarVisible"), false);
+    } finally {
+      $("theme-status-bar-toggle").checked = true;
+      $("theme-status-bar-toggle").dispatchEvent(new Event("change"));
+      dlgTheme.close();
+    }
+    eq($("app-status-bar").hidden, false, "restored visible for later tests");
+  });
+
+  await T("notifyEvent updates the status bar text with a timestamp", () => {
+    notifyEvent("something happened");
+    ok($("app-status-bar-text").textContent.includes("something happened"));
+  });
+
+  await T("creating an event notifies the status bar", async () => {
+    openEventCreateDialog();
+    try {
+      $("event-name").value = "e2e status bar event";
+      $("event-hosted").value = "ui";
+      await $("dlg-event-create").onclick();
+    } finally {
+      dlgEventForm.close();
+    }
+    ok($("app-status-bar-text").textContent.includes("e2e status bar event"));
+    const list = loadUiEvents();
+    saveUiEvents(list.filter((e) => e.name !== "e2e status bar event")); // clean up
+  });
+
+  /* ── Events (gateway-hosted + UI-hosted, condition engine) ────────────── */
+
+  await T("Create Event dialog opens, lists systems, and defaults to one condition row", () => {
+    openEventCreateDialog();
+    try {
+      ok(dlgEventForm.open, "dialog opened");
+      eq($("event-form-title").textContent, "Create Event");
+      eq($("dlg-event-create").textContent, "Create event");
+      ok($("event-systems").children.length > 0, "systems checkboxes populated from state.sources");
+      eq($("event-conditions").children.length, 1, "starts with one condition row");
+      eq($("event-match-row").hidden, true, "match row hidden with only one condition");
+    } finally {
+      dlgEventForm.close();
+    }
+  });
+
+  await T("+ Add condition reveals the match row; Remove hides it again", () => {
+    openEventCreateDialog();
+    try {
+      $("event-add-condition").click();
+      eq($("event-conditions").children.length, 2);
+      eq($("event-match-row").hidden, false, "match row shown once there are 2+ conditions");
+      $("event-conditions").querySelector("[data-remove-condition]").click();
+      eq($("event-conditions").children.length, 1);
+      eq($("event-match-row").hidden, true);
+    } finally {
+      dlgEventForm.close();
+    }
+  });
+
+  await T("buildEventConditions/buildEventAction read the form's real DOM state", () => {
+    openEventCreateDialog();
+    try {
+      const row = $("event-conditions").children[0];
+      row.querySelector('[data-field="metric"]').value = "mem";
+      row.querySelector('[data-field="op"]').value = ">=";
+      row.querySelector('[data-field="threshold"]').value = "42";
+      eq(JSON.stringify(buildEventConditions()), JSON.stringify([{ type: "metric", metric: "mem", op: ">=", threshold: 42 }]));
+
+      $("event-action-kind").value = "recording";
+      $("event-action-kind").dispatchEvent(new Event("change"));
+      $("event-action-duration").value = "7";
+      $("event-safe").checked = true;
+      $("event-safe").dispatchEvent(new Event("change"));
+      $("event-max-keep").value = "3600";
+      const action = buildEventAction();
+      eq(action.kind, "recording");
+      eq(action.duration_minutes, 7);
+      eq(action.minutes, null);
+      eq(action.safe, true);
+      eq(action.max_keep_seconds, 3600);
+    } finally {
+      dlgEventForm.close();
+    }
+  });
+
+  await T("creating a gateway-hosted event round-trips through POST /events/create", async () => {
+    openEventCreateDialog();
+    try {
+      $("event-name").value = "e2e cpu high";
+      $("event-hosted").value = "gateway";
+      const row = $("event-conditions").children[0];
+      row.querySelector('[data-field="threshold"]').value = "95";
+      $("event-action-minutes").value = "3";
+      await $("dlg-event-create").onclick();
+      const { event_ids } = await get("/events/list");
+      ok(event_ids.length > 0, "at least one gateway event registered");
+      const st = await get(`/events/${event_ids[event_ids.length - 1]}`);
+      eq(st.name, "e2e cpu high");
+      eq(st.conditions[0].threshold, 95);
+      eq(st.action.minutes, 3);
+      await post(`/events/${st.event_id}/cancel`, {});
+    } finally {
+      dlgEventForm.close();
+    }
+  });
+
+  await T("creating a UI-hosted event persists it locally and lists it", async () => {
+    const before = loadUiEvents().length;
+    openEventCreateDialog();
+    try {
+      $("event-name").value = "e2e ui event";
+      $("event-hosted").value = "ui";
+      await $("dlg-event-create").onclick();
+    } finally {
+      dlgEventForm.close();
+    }
+    const list = loadUiEvents();
+    eq(list.length, before + 1);
+    eq(list[list.length - 1].name, "e2e ui event");
+    eq(list[list.length - 1].armed, true, "starts armed/watching");
+    saveUiEvents(list.slice(0, before)); // clean up after ourselves
+  });
+
+  await T("Edit Events lists both gateway and UI events with an Update button", async () => {
+    await post("/events/create", {
+      name: "e2e edit-list gw",
+      conditions: [{ type: "metric", metric: "cpu", op: ">", threshold: 50 }],
+      action: { kind: "recording", duration_minutes: 5 },
+    });
+    const list = loadUiEvents();
+    list.push({
+      id: "ui-e2e-edit", name: "e2e edit-list ui", sourceIds: [], match: "any",
+      conditions: [{ type: "log", pattern: "x" }],
+      action: { kind: "recording", duration_minutes: 5 },
+      enabled: true, status: "armed", armed: true, logCursors: {},
+    });
+    saveUiEvents(list);
+    try {
+      await openEventListDialog();
+      const text = $("events-list").textContent;
+      ok(text.includes("e2e edit-list gw"), "gateway event listed");
+      ok(text.includes("e2e edit-list ui"), "ui event listed");
+      ok([...$("events-list").querySelectorAll("button")].some((b) => b.textContent === "Update"), "Update button present");
+    } finally {
+      dlgEventList.close();
+      const gwIds = (await get("/events/list")).event_ids;
+      for (const id of gwIds) {
+        const st = await get(`/events/${id}`);
+        if (st.name === "e2e edit-list gw") await post(`/events/${id}/cancel`, {});
+      }
+      saveUiEvents(loadUiEvents().filter((e) => e.id !== "ui-e2e-edit"));
+    }
+  });
+
+  await T("Update on a UI event opens the form pre-filled and saves changes via editingEvent", async () => {
+    const list = loadUiEvents();
+    list.push({
+      id: "ui-e2e-update", name: "before update", sourceIds: [], match: "any",
+      conditions: [{ type: "metric", metric: "cpu", op: ">", threshold: 10 }],
+      action: { kind: "recording", duration_minutes: 5 },
+      enabled: true, status: "armed", armed: true, logCursors: {},
+    });
+    saveUiEvents(list);
+    try {
+      const ev = loadUiEvents().find((e) => e.id === "ui-e2e-update");
+      openEventEditForm(ev, "ui");
+      eq($("event-form-title").textContent, "Edit Event");
+      eq($("dlg-event-create").textContent, "Save changes");
+      eq($("event-name").value, "before update");
+      eq($("event-hosted").disabled, true, "hosted can't change on edit");
+      eq($("event-conditions").children[0].querySelector('[data-field="threshold"]').value, "10");
+
+      $("event-name").value = "after update";
+      await $("dlg-event-create").onclick();
+      const updated = loadUiEvents().find((e) => e.id === "ui-e2e-update");
+      eq(updated.name, "after update");
+    } finally {
+      saveUiEvents(loadUiEvents().filter((e) => e.id !== "ui-e2e-update"));
+    }
+  });
+
+  await T("Update on a gateway event calls POST /events/{id}/update", async () => {
+    const { event_id } = await post("/events/create", {
+      name: "before gw update",
+      conditions: [{ type: "metric", metric: "cpu", op: ">", threshold: 20 }],
+      action: { kind: "recording", duration_minutes: 5 },
+    });
+    try {
+      const ev = await get(`/events/${event_id}`);
+      openEventEditForm(ev, "gateway");
+      eq($("event-name").value, "before gw update");
+      $("event-name").value = "after gw update";
+      await $("dlg-event-create").onclick();
+      const st = await get(`/events/${event_id}`);
+      eq(st.name, "after gw update");
+    } finally {
+      await post(`/events/${event_id}/cancel`, {});
+    }
+  });
+
+  await T("checkUiConditions: metric condition fires from state.series's latest bucket", () => {
+    const realSeries = state.series;
+    state.series = { services: [{ sid: "sX", name: "svc", cpu: [null, 10, 95], mem: [], net: [] }] };
+    try {
+      const ev = { sourceIds: ["sX"], conditions: [{ type: "metric", metric: "cpu", op: ">", threshold: 80 }], match: "any" };
+      ok(checkUiMetricCondition(ev, ev.conditions[0]), "95 > 80 should match the latest non-null bucket");
+      const evNoMatch = { sourceIds: ["sX"], conditions: [{ type: "metric", metric: "cpu", op: ">", threshold: 99 }], match: "any" };
+      eq(checkUiMetricCondition(evNoMatch, evNoMatch.conditions[0]), null, "95 > 99 is false");
+    } finally {
+      state.series = realSeries;
+    }
+  });
+
+  await T("checkUiConditions: match 'all' requires every condition, 'any' requires one", async () => {
+    const realSeries = state.series;
+    state.series = { services: [{ sid: "sX", name: "svc", cpu: [90], mem: [5], net: [] }] };
+    try {
+      const anyEv = {
+        sourceIds: ["sX"], match: "any", logCursors: {},
+        conditions: [
+          { type: "metric", metric: "cpu", op: ">", threshold: 80 },
+          { type: "metric", metric: "mem", op: ">", threshold: 999 },
+        ],
+      };
+      ok(await checkUiConditions(anyEv), "any: one of two conditions met is enough");
+
+      const allEv = {
+        sourceIds: ["sX"], match: "all", logCursors: {},
+        conditions: [
+          { type: "metric", metric: "cpu", op: ">", threshold: 80 },
+          { type: "metric", metric: "mem", op: ">", threshold: 999 },
+        ],
+      };
+      eq(await checkUiConditions(allEv), null, "all: one unmet condition blocks the trigger");
+    } finally {
+      state.series = realSeries;
+    }
+  });
+
+  await T("uiEventTick keeps watching: no refire while true, refires once cleared and re-met", async () => {
+    const realSeries = state.series;
+    const list = loadUiEvents();
+    list.push({
+      id: "ui-e2e-tick", name: "e2e tick event", sourceIds: ["sX"], match: "any", enabled: true,
+      status: "armed", armed: true, logCursors: {},
+      conditions: [{ type: "metric", metric: "cpu", op: ">", threshold: 80 }],
+      action: { kind: "recording", duration_minutes: 5 },
+    });
+    saveUiEvents(list);
+    const realPost = post;
+    let sessionCalls = 0;
+    post = async (path, body) => {
+      if (path === "/session/start") { sessionCalls++; return { session_id: `fake-${sessionCalls}` }; }
+      return realPost(path, body);
+    };
+    try {
+      state.series = { services: [{ sid: "sX", name: "svc", cpu: [90], mem: [], net: [] }] };
+      await uiEventTick();
+      eq(loadUiEvents().find((e) => e.id === "ui-e2e-tick").triggerCount, 1, "fired once");
+
+      await uiEventTick(); // still 90 -- must not refire
+      eq(loadUiEvents().find((e) => e.id === "ui-e2e-tick").triggerCount, 1);
+
+      state.series = { services: [{ sid: "sX", name: "svc", cpu: [10], mem: [], net: [] }] };
+      await uiEventTick(); // condition clears
+      const cleared = loadUiEvents().find((e) => e.id === "ui-e2e-tick");
+      eq(cleared.status, "armed");
+      eq(cleared.triggerCount, 1);
+
+      state.series = { services: [{ sid: "sX", name: "svc", cpu: [95], mem: [], net: [] }] };
+      await uiEventTick(); // met again -- keeps watching, no reset() needed
+      eq(loadUiEvents().find((e) => e.id === "ui-e2e-tick").triggerCount, 2);
+    } finally {
+      post = realPost;
+      state.series = realSeries;
+      saveUiEvents(loadUiEvents().filter((e) => e.id !== "ui-e2e-tick"));
     }
   });
 
@@ -721,6 +1075,48 @@
   await T("frequency help button is wired to the help IPC", () => {
     ok(typeof $("btn-freq-help").onclick === "function", "button has a handler");
     ok(typeof window.cttc?.openHelp === "function", "openHelp exposed via preload");
+  });
+
+  /* ── New Gateway / Edit Gateways (in-window dialog, not a separate
+     window/HTML page -- see app.js's openNewGatewayDialog/
+     openEditGatewaysDialog) ───────────────────────────────────────────── */
+
+  await T("New Gateway opens dlg-gateway-setup in 'new' mode", () => {
+    openNewGatewayDialog();
+    try {
+      ok(dlgGatewaySetup.open, "dialog opened");
+      eq($("gw-title").textContent, "New Gateway");
+      eq($("gw-intro").hidden, false);
+      eq($("gw-select-row").hidden, true);
+      eq($("gw-btn-uninstall").hidden, true);
+      eq($("gw-btn-connect").textContent, "Connect");
+      eq(typeof window.cttc?.addGateway, "function", "addGateway exposed via preload");
+      ok(!window.cttc?.newGateway, "old separate-window IPC method is gone");
+    } finally {
+      dlgGatewaySetup.close();
+    }
+  });
+
+  await T("Edit Gateways opens dlg-gateway-setup in 'edit' mode, populated from getGateways", async () => {
+    await openEditGatewaysDialog();
+    try {
+      ok(dlgGatewaySetup.open, "dialog opened");
+      eq($("gw-title").textContent, "Edit Gateways");
+      eq($("gw-intro").hidden, true);
+      eq($("gw-select-row").hidden, false);
+      eq($("gw-btn-uninstall").hidden, false);
+      // nothing picked yet -- ssh/image/connect fields start disabled
+      eq($("gw-btn-connect").disabled, true);
+      eq($("gw-ssh-user").disabled, true);
+    } finally {
+      dlgGatewaySetup.close();
+    }
+  });
+
+  await T("gw-btn-cancel closes the dialog without submitting", () => {
+    openNewGatewayDialog();
+    $("gw-btn-cancel").click();
+    eq(dlgGatewaySetup.open, false);
   });
 
   /* ── gateway dropdown ──────────────────────────────────────────────────── */
@@ -827,15 +1223,35 @@
     eq(opts.includeHost, false, "host choice returned");
   });
 
+  await T("clear-sources asks for confirmation first, and does nothing if declined", () => {
+    const realConfirm = window.confirm;
+    let asked = null;
+    window.confirm = (msg) => { asked = msg; return false; };
+    try {
+      const before = state.sources.length;
+      $("btn-clear-sources").click();
+      ok(asked && asked.includes(String(before)), "confirm() was shown with the source count");
+      eq(state.sources.length, before, "declining leaves sources untouched");
+    } finally {
+      window.confirm = realConfirm;
+    }
+  });
+
   // destructive — must stay the last test: closes every source, then reopens
   // the demo files so the app is left usable.
-  await T("clear-sources button closes everything", async () => {
+  await T("clear-sources button closes everything once confirmed", async () => {
     const files = state.sources
       .filter((s) => !String(s.path).startsWith("docker://"))
       .map((s) => ({ path: s.path, live: false }));
     ok(files.length >= 2, "have demo files to restore");
-    $("btn-clear-sources").click();
-    await until(() => state.sources.length === 0, "all sources closed");
+    const realConfirm = window.confirm;
+    window.confirm = () => true;
+    try {
+      $("btn-clear-sources").click();
+      await until(() => state.sources.length === 0, "all sources closed");
+    } finally {
+      window.confirm = realConfirm;
+    }
     eq($("empty-state").hidden, false, "empty state visible again");
     await post("/open", { files });
     await refreshAll();

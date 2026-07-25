@@ -85,7 +85,7 @@ const state = {
   series: null,           // /series payload for current view
   ticks: new Map(),       // log source id -> counts[]
   visible: new Map(),     // series name -> bool
-  hiddenSamples: new Set(), // loaded .cttc file path -> hidden (whole-file toggle)
+  hiddenSamples: new Set(), // loaded .cttc-metric/.cttc-record path -> hidden (whole-file toggle)
   hoverGroup: "svc",      // strip group under the pointer: "svc" | "host"
   chartStyle: prefs.get("chartStyle", "lines"), // "lines" | "bars"
   showHost: prefs.get("showHost", true),
@@ -166,7 +166,8 @@ function themeVar(name) {
 
 /* ── sample vs. live styling ───────────────────────────────────────────────
    Per stay-the-course/sampled-vs-live-data.md: live data stays a solid,
-   full-saturation line/fill; data coming from a loaded .cttc sample is
+   full-saturation line/fill; data coming from a loaded .cttc-metric/
+   .cttc-record sample is
    grayed + dashed/hatched instead. Each *sample file* (source id) gets its
    own gray level + dash rhythm, so several loaded samples stay visually
    distinguishable from each other and from live data. */
@@ -181,7 +182,8 @@ const SAMPLE_GRAY_LEVELS = [0.3, 0.45, 0.6, 0.75];
 
 // A source is "live" (still being tailed/polled) unless the server marked
 // it live:false, which only happens for sources restored from a loaded
-// .cttc file (see State.load_sample in server.py) -- everything else
+// .cttc-metric/.cttc-record file (see State.load_sample in server.py) --
+// everything else
 // (opened files, docker/ssh collectors) stays live.
 function isLiveSid(sid) {
   const src = state.sources.find((s) => s.id === sid);
@@ -191,14 +193,15 @@ function basename(p) {
   return String(p || "").split("/").pop();
 }
 // text to append after a container/source name when it comes from a loaded
-// .cttc sample, e.g. "api — sample-2026-07-18.cttc"
+// .cttc-metric/.cttc-record sample, e.g. "api — sample-2026-07-18.cttc-metric"
 function sampleFileLabel(sid) {
   const src = state.sources.find((s) => s.id === sid);
   if (!src || src.live !== false) return "";
   const base = basename(src.path);
   return base ? ` — ${base}` : "";
 }
-// group every non-live source by its originating .cttc file, so the whole
+// group every non-live source by its originating .cttc-metric/.cttc-record
+// file, so the whole
 // file's data can be shown/hidden with one click
 function sampleFileGroups() {
   const byPath = new Map();
@@ -209,7 +212,8 @@ function sampleFileGroups() {
   }
   return [...byPath.values()];
 }
-// true if this source belongs to a loaded .cttc file the user has toggled
+// true if this source belongs to a loaded .cttc-metric/.cttc-record file the
+// user has toggled
 // off via the sample-files switch in the legend (see renderSampleFiles()) --
 // checked everywhere a sample-sourced series/lane/panel might need hiding.
 function isSampleHidden(sid) {
@@ -688,6 +692,7 @@ function attachLaneEvents(c) {
     state.hoverX = null;
     drawAll();
   });
+  c.addEventListener("wheel", (e) => handleWheelZoom(c, e), { passive: false });
 }
 
 /* ── legend ─────────────────────────────────────────────────────────────── */
@@ -779,7 +784,8 @@ function legendChip(text) {
   return chip;
 }
 
-// one row per loaded .cttc file, with a slide switch to show/hide everything
+// one row per loaded .cttc-metric/.cttc-record file, with a slide switch to
+// show/hide everything
 // from that file (charts, lanes, panels) in a single click
 function renderSampleFiles() {
   const groups = sampleFileGroups();
@@ -852,7 +858,7 @@ function renderLegend() {
     const sample = !isLiveSid(s.sid);
     const cls = (state.visible.get(s.name) === false ? "off " : "") + (sample ? "sample" : "");
     const item = legendItem(s.name, cls.trim(), s.name + sampleFileLabel(s.sid));
-    if (sample) item.title = "from loaded .cttc metrics";
+    if (sample) item.title = "from loaded .cttc-metric/.cttc-record data";
     item.onclick = () => {
       state.visible.set(s.name, state.visible.get(s.name) === false);
       relist();
@@ -1028,7 +1034,7 @@ async function exportSample(t0, t1) {
       setStatus("could not start host telemetry: " + (err.message || err));
     }
   }
-  const name = `metrics-${new Date(t0).toISOString().slice(0, 19).replace(/[T:]/g, "-")}.cttc`;
+  const name = `metrics-${new Date(t0).toISOString().slice(0, 19).replace(/[T:]/g, "-")}.cttc-metric`;
   try {
     // fetch the sample's bytes from the server itself (works identically
     // whether server.py is this same machine's embedded process or a
@@ -1329,6 +1335,7 @@ function attachChartEvents() {
       if (x < MARGIN_L || !state.view) return;
       timeContextMenu(e, xToT(x));
     });
+    c.addEventListener("wheel", (e) => handleWheelZoom(c, e), { passive: false });
   }
 }
 
@@ -1392,9 +1399,9 @@ function resetZoom() {
   if (!state.range || state.range.min_ts == null) return;
   const pad = Math.max(1000, (state.range.max_ts - state.range.min_ts) * 0.01);
   setView(state.range.min_ts - pad, state.range.max_ts + pad);
-  // center the cursor (and with it every log panel) on the middle of the
-  // data, matching what a double-click on the timeline does
-  setCursor((state.range.min_ts + state.range.max_ts) / 2);
+  // place the cursor (and with it every log panel) on now, not mid-range --
+  // "now" is where a user resetting zoom almost always wants to look next
+  setCursor(Date.now());
 }
 
 // double-clicking anywhere on the timeline (charts or log density lanes)
@@ -1412,6 +1419,31 @@ function zoomAt(t, factor) {
   if (!state.view) return;
   const span = (state.view.t1 - state.view.t0) * factor;
   setView(t - span / 2, t + span / 2);
+}
+
+// zoom in/out around `t`, keeping `t` itself fixed at the same point in the
+// view rather than re-centering on it -- what a wheel/trackpad zoom needs so
+// the spot under the cursor doesn't jump on every notch (mirrors zoomAt(),
+// which recenters instead, for the right-click menu's "Zoom in/out here").
+function zoomAtAnchored(t, factor) {
+  if (!state.view) return;
+  const { t0, t1 } = state.view;
+  setView(t - (t - t0) * factor, t + (t1 - t) * factor);
+}
+
+// mouse-wheel / trackpad zoom over a chart or density lane: scroll down
+// (deltaY > 0) zooms out, scroll up zooms in, anchored on the point under
+// the cursor. ctrl/meta+wheel is left alone (trackpad pinch-zoom sends wheel
+// events with ctrlKey set on most platforms -- browsers reserve that
+// gesture for page zoom, and hijacking it would fight the OS).
+const WHEEL_ZOOM_FACTOR = 1.15;
+function handleWheelZoom(c, e) {
+  if (!state.view || e.ctrlKey || e.metaKey) return;
+  e.preventDefault();
+  const rect = c.getBoundingClientRect();
+  const x = e.clientX - rect.left;
+  const t = x >= MARGIN_L ? xToT(x) : (state.view.t0 + state.view.t1) / 2;
+  zoomAtAnchored(t, e.deltaY > 0 ? WHEEL_ZOOM_FACTOR : 1 / WHEEL_ZOOM_FACTOR);
 }
 
 const DEFAULT_SPAN = 10 * 60 * 1000; // initial window: now ± 5 min
@@ -1574,7 +1606,7 @@ class Panel {
     name.title = src.path;
     this.sampleBadge = document.createElement("span");
     this.sampleBadge.className = "sample-badge";
-    this.sampleBadge.title = "static data from loaded .cttc metrics";
+    this.sampleBadge.title = "static data from loaded .cttc-metric/.cttc-record data";
     this.sampleBadge.hidden = true;
     this.countEl = document.createElement("span");
     this.countEl.className = "muted";
@@ -1976,6 +2008,8 @@ $("btn-set").onclick = async () => {
 // close every open source and forget the remembered last-session containers,
 // so the next launch starts with nothing and the set-sources dialog opens.
 $("btn-clear-sources").onclick = async () => {
+  if (!state.sources.length) return; // nothing to clear -- no point asking
+  if (!confirm(`Close all ${state.sources.length} open source${state.sources.length === 1 ? "" : "s"}? This can't be undone.`)) return;
   try {
     await Promise.all(state.sources.map((s) => post("/close", { id: s.id })));
     prefs.set("lastDockerSessions", []);
@@ -1985,14 +2019,16 @@ $("btn-clear-sources").onclick = async () => {
   }
 };
 
-/* ── load .cttc metrics (separate from the Docker "Set sources" flow) ──── */
+/* ── load .cttc-metric/.cttc-record files (separate from the Docker "Set
+   sources" flow) ──────────────────────────────────────────────────── */
 
 // reads a local path's bytes (via main.js, which has fs access the renderer
 // doesn't) and POSTs them to /files/upload -- works identically whether
 // server.py is this machine's embedded process or a remote one (see
 // docs/architecture/remote-server.md phase 3), unlike sending the path
 // itself, which only means anything when client and server share a
-// filesystem. `segment` picks one recording out of a multi-segment .cttc
+// filesystem. `segment` picks one recording out of a multi-segment
+// .cttc-record
 // (see the Recording feature below) -- omitted on the first attempt, which
 // is enough for an ordinary single-segment file and only comes back with
 // needs_selection (not opened) when there's more than one to choose from.
@@ -2056,11 +2092,13 @@ $("btn-load-sample").onclick = async () => {
   let paths = [];
   if (window.cttc?.pickFiles) paths = await window.cttc.pickFiles();
   else {
-    const p = prompt("Path to .cttc metrics file:");
+    const p = prompt("Path to .cttc-metric file:");
     if (p) paths = [p];
   }
   const open = openPaths();
-  const files = paths.filter((p) => p.endsWith(".cttc") && !open.has(`upload://${basename(p)}`));
+  const files = paths.filter(
+    (p) => p.endsWith(".cttc-metric") && !open.has(`upload://${basename(p)}`)
+  );
   if (!files.length) return;
   try {
     const errors = [];
@@ -2075,7 +2113,7 @@ $("btn-load-sample").onclick = async () => {
 
 /* ── Recording (Start/Pause/Stop/Open Recording, Recording menu) ─────────
    Each Record→Pause span is flushed as one more segment into the same
-   .cttc archive via /sample/record (byte-oriented, mirroring Capture
+   .cttc-record archive via /sample/record (byte-oriented, mirroring Capture
    metrics/Load metrics -- no shared-filesystem assumption), rather than
    each span becoming its own file. A path is chosen once, at Start
    Recording; every later flush overwrites that same local file. */
@@ -2199,10 +2237,10 @@ async function openRecording() {
   let paths = [];
   if (window.cttc?.pickFiles) paths = await window.cttc.pickFiles("Open Recording");
   else {
-    const p = prompt("Path to a recorded .cttc file:");
+    const p = prompt("Path to a recorded .cttc-record file:");
     if (p) paths = [p];
   }
-  const files = paths.filter((p) => p.endsWith(".cttc"));
+  const files = paths.filter((p) => p.endsWith(".cttc-record"));
   if (!files.length) return;
   try {
     const errors = [];
@@ -2284,6 +2322,7 @@ if (!POPOUT_KIND) {
 
 function openThemeDialog() {
   $("theme-hl-color").value = prefs.get("hlColor", DEFAULT_HL_COLOR);
+  $("theme-status-bar-toggle").checked = statusBarEnabled;
   dlgTheme.showModal();
 }
 $("theme-hl-color").oninput = (e) => applyHlColor(e.target.value); // live preview
@@ -2302,6 +2341,31 @@ $("dlg-theme-close").onclick = () => {
   applyHlColor(prefs.get("hlColor", DEFAULT_HL_COLOR)); // discard live preview
   dlgTheme.close();
 };
+
+/* ── event status bar (Appearance > Status bar) ───────────────────────────
+   A slim, persistent bar at the bottom of the window reporting when an
+   event is created or fires -- separate from the toolbar's #status (which
+   is for ordinary action feedback), since an event can fire from a
+   background poll with nobody having just clicked anything. Takes effect
+   immediately, like the theme mode switch, rather than waiting on Save. */
+const DEFAULT_STATUS_BAR_VISIBLE = true;
+let statusBarEnabled = prefs.get("statusBarVisible", DEFAULT_STATUS_BAR_VISIBLE);
+function syncStatusBarVisibility() {
+  $("app-status-bar").hidden = !statusBarEnabled;
+}
+function setStatusBarVisible(visible) {
+  statusBarEnabled = visible;
+  prefs.set("statusBarVisible", visible);
+  syncStatusBarVisibility();
+}
+$("theme-status-bar-toggle").onchange = (e) => setStatusBarVisible(e.target.checked);
+if (!POPOUT_KIND) {
+  syncStatusBarVisibility();
+  $("app-status-bar-text").textContent = "No event activity yet";
+}
+function notifyEvent(text) {
+  $("app-status-bar-text").textContent = `${new Date().toLocaleTimeString()} — ${text}`;
+}
 
 /* ── docker host activity log (ssh:// connections) ──────────────────────── */
 
@@ -2488,6 +2552,264 @@ function openSettingsDialog() {
 }
 $("dlg-settings-close").onclick = () => dlgSettings.close();
 
+/* ── New Gateway / Edit Gateways ──────────────────────────────────────────
+   One dialog, two modes -- ported from the old gateway-setup.html/js (a
+   separate window loaded with ?mode=new or ?mode=edit): now that both live
+   in this same window as an ordinary <dialog> (like Settings), the mode is
+   just a JS variable set when opening rather than a URL/page reload, and
+   "close" is dlgGatewaySetup.close() rather than window.close(). The
+   first-run/no-local-docker wizard is unaffected -- it still runs in its
+   own separate window (there's no main window yet at that point to host a
+   dialog in) and still uses the original gateway-setup.html/js. */
+const dlgGatewaySetup = $("dlg-gateway-setup");
+let gwMode = "new"; // "new" | "edit"
+let gwGateways = [];
+
+function gwKeyOf(g) {
+  return `${g.host}:${g.port}`;
+}
+function gwSelectedGateway() {
+  return gwGateways.find((g) => gwKeyOf(g) === $("gw-select").value);
+}
+
+for (const radio of document.querySelectorAll('input[name="gw-key-mode"]')) {
+  radio.onchange = () => {
+    const paste = radio.value === "paste" && radio.checked;
+    $("gw-key-path").disabled = paste;
+    $("gw-btn-browse").disabled = paste;
+    $("gw-key-paste").disabled = !paste;
+  };
+}
+for (const radio of document.querySelectorAll('input[name="gw-image-source"]')) {
+  radio.onchange = () => {
+    $("gw-image-ref-row").hidden = radio.value !== "registry" || !radio.checked;
+    $("gw-image-tarball-row").hidden = radio.value !== "tarball" || !radio.checked;
+  };
+}
+$("gw-btn-browse").onclick = async () => {
+  const paths = await window.cttc.pickFiles("Choose your SSH private key");
+  if (paths.length) $("gw-key-path").value = paths[0];
+};
+$("gw-image-tarball-browse").onclick = async () => {
+  const paths = await window.cttc.pickFiles("Choose the server image .tar.gz");
+  if (paths.length) $("gw-image-tarball-path").value = paths[0];
+};
+$("gw-btn-cancel").onclick = () => dlgGatewaySetup.close();
+$("gw-btn-activity-toggle").onclick = () => {
+  $("gw-activity-log").hidden = !$("gw-activity-log").hidden;
+  $("gw-btn-activity-toggle").textContent = $("gw-activity-log").hidden ? "Show activity" : "Hide activity";
+};
+if (!POPOUT_KIND) {
+  window.cttc?.onSetupLog?.((line) => {
+    $("gw-activity").hidden = false;
+    $("gw-activity-log").textContent += ($("gw-activity-log").textContent ? "\n" : "") + line;
+    $("gw-activity-log").scrollTop = $("gw-activity-log").scrollHeight;
+  });
+}
+
+// Edit mode only. Every field this touches (ssh/key + image + Connect/
+// Uninstall) is disabled until something is actually picked from the
+// dropdown -- rather than hiding the form outright, so it's obvious at a
+// glance that there's more here once a gateway is chosen. "This machine"
+// (embedded) has no ssh settings to edit -- those fields stay disabled, but
+// Connect (relabeled "Update image") still re-provisions the local
+// container with the chosen image.
+function gwFillFormForEdit(g) {
+  $("gw-error").hidden = true;
+  const sshFields = [
+    $("gw-ssh-user"), $("gw-ssh-host"), $("gw-ssh-port"), $("gw-key-path"), $("gw-btn-browse"), $("gw-key-paste"),
+    ...document.querySelectorAll('input[name="gw-key-mode"]'),
+  ];
+  const imageFields = [
+    ...document.querySelectorAll('input[name="gw-image-source"]'),
+    $("gw-image-ref"), $("gw-image-tarball-browse"), $("gw-image-tarball-path"),
+  ];
+
+  if (!g) {
+    for (const el of [...sshFields, ...imageFields]) el.disabled = true;
+    $("gw-btn-connect").disabled = true;
+    $("gw-btn-uninstall").disabled = true;
+    $("gw-ssh-user").value = "";
+    $("gw-ssh-host").value = "";
+    $("gw-key-path").value = "";
+    return;
+  }
+
+  $("gw-btn-connect").disabled = false;
+  $("gw-btn-uninstall").disabled = false;
+  for (const el of imageFields) el.disabled = false;
+  const isRemote = g.mode !== "embedded";
+  for (const el of sshFields) el.disabled = !isRemote;
+  $("gw-btn-connect").textContent = isRemote ? "Save changes" : "Update image";
+  if (isRemote) {
+    const at = g.sshTarget.lastIndexOf("@");
+    $("gw-ssh-user").value = at === -1 ? "" : g.sshTarget.slice(0, at);
+    $("gw-ssh-host").value = at === -1 ? g.sshTarget : g.sshTarget.slice(at + 1);
+    $("gw-ssh-port").value = g.sshPort || 22;
+    document.querySelector('input[name="gw-key-mode"][value="path"]').checked = true;
+    $("gw-key-paste").disabled = true;
+    $("gw-key-path").value = g.sshKey || "";
+  } else {
+    $("gw-ssh-user").value = "";
+    $("gw-ssh-host").value = "";
+    $("gw-key-path").value = "";
+  }
+}
+
+async function gwLoadGatewaysForEdit() {
+  gwGateways = await window.cttc.getGateways();
+  const prevKey = $("gw-select").value;
+  $("gw-select").innerHTML = "";
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = "— Select a gateway —";
+  $("gw-select").appendChild(placeholder);
+  for (const g of gwGateways) {
+    const opt = document.createElement("option");
+    opt.value = gwKeyOf(g);
+    const loc = g.port == null ? g.host : `${g.host}:${g.port}`;
+    opt.textContent = `${g.label || g.host} (${loc})${g.active ? " — active" : ""}`;
+    $("gw-select").appendChild(opt);
+  }
+  $("gw-select").value = gwGateways.some((g) => gwKeyOf(g) === prevKey) ? prevKey : "";
+  gwFillFormForEdit(gwSelectedGateway());
+}
+$("gw-select").onchange = () => gwFillFormForEdit(gwSelectedGateway());
+
+$("gw-btn-uninstall").onclick = async () => {
+  const g = gwSelectedGateway();
+  if (!g) return;
+  if (!confirm(`Uninstall ${g.label || g.host}? This stops and removes its container.`)) return;
+  $("gw-error").hidden = true;
+  $("gw-activity-log").textContent = "";
+  $("gw-wait-msg").textContent = "Uninstalling, please wait…";
+  $("gw-form").hidden = true;
+  $("gw-wait").hidden = false;
+  const result = await window.cttc.uninstallGateway(g);
+  $("gw-wait").hidden = true;
+  $("gw-form").hidden = false;
+  $("gw-wait-msg").textContent = "Applying changes, please wait…";
+  if (!result.ok) {
+    $("gw-error").textContent = result.error;
+    $("gw-error").hidden = false;
+    return;
+  }
+  await gwLoadGatewaysForEdit();
+};
+
+function gwReadImageSource() {
+  const mode = document.querySelector('input[name="gw-image-source"]:checked').value;
+  if (mode === "registry") return { type: "registry", ref: $("gw-image-ref").value.trim() };
+  if (mode === "tarball") return { type: "tarball", path: $("gw-image-tarball-path").value };
+  return null; // "default" -- let the server side resolve its usual fallback
+}
+
+$("gw-form").onsubmit = async (e) => {
+  e.preventDefault();
+  const gw = gwMode === "edit" ? gwSelectedGateway() : null;
+  if (gwMode === "edit" && !gw) return; // nothing picked yet -- button is disabled anyway
+  const isEmbeddedEdit = gwMode === "edit" && gw.mode === "embedded";
+
+  $("gw-error").hidden = true;
+  $("gw-activity-log").textContent = "";
+
+  const keyMode = document.querySelector('input[name="gw-key-mode"]:checked').value;
+  const imageSource = gwReadImageSource();
+  const payload = {
+    sshUser: $("gw-ssh-user").value.trim(),
+    sshHost: $("gw-ssh-host").value.trim(),
+    sshPort: Number($("gw-ssh-port").value),
+    keyMode,
+    keyPath: keyMode === "path" ? $("gw-key-path").value : null,
+    keyContents: keyMode === "paste" ? $("gw-key-paste").value : null,
+    imageSource,
+  };
+  if (!isEmbeddedEdit && keyMode === "path" && !payload.keyPath) {
+    $("gw-error").textContent = "Choose a private key file, or switch to pasting its contents.";
+    $("gw-error").hidden = false;
+    return;
+  }
+  if (!isEmbeddedEdit && keyMode === "paste" && !payload.keyContents.trim()) {
+    $("gw-error").textContent = "Paste the private key's contents, or switch to a file.";
+    $("gw-error").hidden = false;
+    return;
+  }
+  if (imageSource?.type === "tarball" && !imageSource.path) {
+    $("gw-error").textContent = "Choose a .tar.gz file, or switch to a registry reference / the bundled image.";
+    $("gw-error").hidden = false;
+    return;
+  }
+  if (imageSource?.type === "registry" && !imageSource.ref) {
+    $("gw-error").textContent = "Enter an image reference (repo:tag), or switch to the bundled image.";
+    $("gw-error").hidden = false;
+    return;
+  }
+
+  $("gw-form").hidden = true;
+  $("gw-wait").hidden = false;
+  $("gw-btn-connect").disabled = true;
+
+  const result =
+    gwMode === "edit"
+      ? await window.cttc.saveGatewayEdit({ ...payload, key: gwKeyOf(gw), mode: gw.mode })
+      : await window.cttc.addGateway(payload);
+
+  if (!result.ok) {
+    $("gw-form").hidden = false;
+    $("gw-wait").hidden = true;
+    $("gw-btn-connect").disabled = false;
+    $("gw-error").textContent = result.error;
+    $("gw-error").hidden = false;
+    return;
+  }
+  if (gwMode === "edit") {
+    // stays open (unlike New Gateway, saving here doesn't necessarily need
+    // to close anything) -- refresh so the dropdown/prefill reflect what
+    // was just saved
+    $("gw-form").hidden = false;
+    $("gw-wait").hidden = true;
+    await gwLoadGatewaysForEdit();
+  } else {
+    // gateway-add-submit already offered a restart on the main-process
+    // side (see main.js) -- nothing left to do here but close
+    dlgGatewaySetup.close();
+  }
+};
+
+function openNewGatewayDialog() {
+  gwMode = "new";
+  $("gw-title").textContent = "New Gateway";
+  $("gw-intro").hidden = false;
+  $("gw-select-row").hidden = true;
+  $("gw-btn-uninstall").hidden = true;
+  $("gw-btn-connect").textContent = "Connect";
+  $("gw-btn-connect").disabled = false;
+  $("gw-wait-msg").textContent = "Connecting, please wait…";
+  $("gw-form").hidden = false;
+  $("gw-wait").hidden = true;
+  $("gw-error").hidden = true;
+  $("gw-activity").hidden = true;
+  $("gw-activity-log").textContent = "";
+  $("gw-form").reset();
+  dlgGatewaySetup.showModal();
+}
+
+async function openEditGatewaysDialog() {
+  gwMode = "edit";
+  $("gw-title").textContent = "Edit Gateways";
+  $("gw-intro").hidden = true;
+  $("gw-select-row").hidden = false;
+  $("gw-btn-uninstall").hidden = false;
+  $("gw-wait-msg").textContent = "Applying changes, please wait…";
+  $("gw-form").hidden = false;
+  $("gw-wait").hidden = true;
+  $("gw-error").hidden = true;
+  $("gw-activity").hidden = true;
+  $("gw-activity-log").textContent = "";
+  await gwLoadGatewaysForEdit();
+  dlgGatewaySetup.showModal();
+}
+
 // "Collect CTTC Own Logs" -- main.js owns the actual file writing (it's the
 // only process that sees its own logs and the server subprocess's stderr),
 // this just reflects/toggles that state. Turning it on for the first time
@@ -2505,6 +2827,499 @@ if (!POPOUT_KIND) {
     syncLogCollectStatus(result);
   };
 }
+/* ── Events: watch CPU/MEM/NET thresholds or a log regex on chosen systems,
+   snapshot or record automatically when the condition is met ────────────
+   "Gateway"-hosted events are registered on the server (server/events.py)
+   and keep watching even if this window closes; "this app"-hosted events
+   are evaluated right here against data the renderer already has (or a
+   small targeted fetch for it), and only watch while this window is open.
+   Either way, triggering reuses the same primitives the manual Capture
+   Metrics/Record features already use (GET /files/download, POST
+   /session/start) -- an event is just an automatic way to call them. */
+
+const UI_EVENTS_KEY = "uiEvents";
+function loadUiEvents() {
+  return prefs.get(UI_EVENTS_KEY, []);
+}
+function saveUiEvents(list) {
+  prefs.set(UI_EVENTS_KEY, list);
+}
+
+const dlgEventForm = $("dlg-event-form");
+const dlgEventList = $("dlg-event-list");
+
+// null while creating a brand-new event; {id, hosted} while dlg-event-form
+// is instead editing an existing one (see openEventEditForm) -- the same
+// form and the same submit button (#dlg-event-create) serve both, since an
+// edit is just a create() whose fields start pre-filled and whose submit
+// calls update() instead.
+let editingEvent = null;
+
+function resetEventForm() {
+  renderEventSystemsPicker();
+  $("event-name").value = "";
+  $("event-hosted").value = "gateway";
+  $("event-hosted").disabled = false;
+  $("event-conditions").innerHTML = "";
+  addEventConditionRow();
+  syncEventMatchRowVisibility();
+  $("event-action-kind").value = "snapshot";
+  $("event-action-minutes").value = "5";
+  $("event-action-duration").value = "10";
+  $("event-safe").checked = false;
+  $("event-max-keep").value = "86400";
+  syncEventActionFields();
+  $("event-max-keep-row").hidden = true;
+}
+
+function openEventCreateDialog() {
+  editingEvent = null;
+  resetEventForm();
+  $("event-form-title").textContent = "Create Event";
+  $("dlg-event-create").textContent = "Create event";
+  dlgEventForm.showModal();
+}
+$("btn-event-create").onclick = openEventCreateDialog;
+$("dlg-event-form-cancel").onclick = () => dlgEventForm.close();
+
+// Edit Events > Update on a row: same form, pre-filled from the event's
+// current fields; `hosted` can't be changed here (moving an event from
+// local to gateway or back isn't supported -- create a new one instead).
+function openEventEditForm(ev, hosted) {
+  editingEvent = { id: hosted === "gateway" ? ev.event_id : ev.id, hosted };
+  resetEventForm();
+  $("event-name").value = ev.name;
+  $("event-hosted").value = hosted;
+  $("event-hosted").disabled = true;
+  const sourceIds = new Set(hosted === "gateway" ? ev.source_ids : ev.sourceIds);
+  for (const cb of document.querySelectorAll("[data-event-system]")) cb.checked = sourceIds.has(cb.value);
+
+  $("event-conditions").innerHTML = "";
+  for (const cond of ev.conditions) {
+    addEventConditionRow();
+    const row = $("event-conditions").lastElementChild;
+    row.querySelector('[data-field="type"]').value = cond.type;
+    row.querySelector('[data-field="type"]').dispatchEvent(new Event("change"));
+    if (cond.type === "metric") {
+      row.querySelector('[data-field="metric"]').value = cond.metric;
+      row.querySelector('[data-field="op"]').value = cond.op;
+      row.querySelector('[data-field="threshold"]').value = cond.threshold;
+    } else {
+      row.querySelector('[data-field="pattern"]').value = cond.pattern;
+    }
+  }
+  syncEventMatchRowVisibility();
+  $("event-match").value = ev.match;
+
+  $("event-action-kind").value = ev.action.kind;
+  syncEventActionFields();
+  $("event-action-minutes").value = ev.action.minutes || 5;
+  $("event-action-duration").value = ev.action.duration_minutes || 10;
+  $("event-safe").checked = !!ev.action.safe;
+  $("event-max-keep-row").hidden = !ev.action.safe;
+  $("event-max-keep").value = ev.action.max_keep_seconds || 86400;
+
+  $("event-form-title").textContent = "Edit Event";
+  $("dlg-event-create").textContent = "Save changes";
+  dlgEventList.close();
+  dlgEventForm.showModal();
+}
+
+async function openEventListDialog() {
+  await refreshEventsList();
+  dlgEventList.showModal();
+}
+$("btn-event-edit").onclick = openEventListDialog;
+$("dlg-event-list-close").onclick = () => dlgEventList.close();
+
+function renderEventSystemsPicker() {
+  const box = $("event-systems");
+  box.innerHTML = "";
+  for (const s of state.sources) {
+    const label = document.createElement("label");
+    label.className = "ctl block";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.value = s.id;
+    cb.dataset.eventSystem = "1";
+    label.appendChild(cb);
+    label.append(` ${s.name} (${s.kind})`);
+    box.appendChild(label);
+  }
+  if (!state.sources.length) box.textContent = "No open sources yet -- events will monitor everything once sources exist.";
+}
+function selectedEventSystems() {
+  return [...document.querySelectorAll('[data-event-system]:checked')].map((cb) => cb.value);
+}
+
+// an event can carry more than one condition (see events.py's `match`) --
+// each row here is one condition (metric threshold or log regex), added/
+// removed freely; "Trigger when" (any/all) only matters -- and so is only
+// shown -- once there's more than one row.
+function addEventConditionRow() {
+  const box = $("event-conditions");
+  const row = document.createElement("div");
+  row.className = "keys-box";
+  row.dataset.conditionRow = "1";
+  row.innerHTML = `
+    <label class="ctl">Condition
+      <select data-field="type">
+        <option value="metric">Metric threshold</option>
+        <option value="log">Log regular expression</option>
+      </select>
+    </label>
+    <span data-fields="metric">
+      <label class="ctl">Metric
+        <select data-field="metric">
+          <option value="cpu">CPU %</option>
+          <option value="mem">MEM %</option>
+          <option value="net">NET B/s</option>
+        </select>
+      </label>
+      <label class="ctl">Op
+        <select data-field="op">
+          <option value=">">&gt;</option>
+          <option value="<">&lt;</option>
+          <option value=">=">&gt;=</option>
+          <option value="<=">&lt;=</option>
+          <option value="=">=</option>
+        </select>
+      </label>
+      <label class="ctl">Threshold <input data-field="threshold" type="number" step="any" value="80" /></label>
+    </span>
+    <span data-fields="log" hidden>
+      <label class="ctl block">Regex <input data-field="pattern" type="text" placeholder="e.g. ERROR|FATAL" /></label>
+    </span>
+    <button type="button" data-remove-condition>Remove</button>
+  `;
+  row.querySelector('[data-field="type"]').onchange = (e) => {
+    const isMetric = e.target.value === "metric";
+    row.querySelector('[data-fields="metric"]').hidden = !isMetric;
+    row.querySelector('[data-fields="log"]').hidden = isMetric;
+  };
+  row.querySelector("[data-remove-condition]").onclick = () => {
+    row.remove();
+    syncEventMatchRowVisibility();
+  };
+  box.appendChild(row);
+  syncEventMatchRowVisibility();
+}
+$("event-add-condition").onclick = addEventConditionRow;
+function syncEventMatchRowVisibility() {
+  $("event-match-row").hidden = $("event-conditions").children.length < 2;
+}
+
+function syncEventActionFields() {
+  const isSnapshot = $("event-action-kind").value === "snapshot";
+  $("event-action-minutes-row").hidden = !isSnapshot;
+  $("event-action-duration-row").hidden = isSnapshot;
+}
+$("event-action-kind").onchange = syncEventActionFields;
+$("event-safe").onchange = (e) => { $("event-max-keep-row").hidden = !e.target.checked; };
+
+function buildEventConditions() {
+  return [...document.querySelectorAll("[data-condition-row]")].map((row) => {
+    const type = row.querySelector('[data-field="type"]').value;
+    if (type === "metric") {
+      return {
+        type: "metric",
+        metric: row.querySelector('[data-field="metric"]').value,
+        op: row.querySelector('[data-field="op"]').value,
+        threshold: Number(row.querySelector('[data-field="threshold"]').value),
+      };
+    }
+    return { type: "log", pattern: row.querySelector('[data-field="pattern"]').value };
+  });
+}
+function buildEventAction() {
+  const kind = $("event-action-kind").value;
+  return {
+    kind,
+    minutes: kind === "snapshot" ? Number($("event-action-minutes").value) : null,
+    duration_minutes: kind === "recording" ? Number($("event-action-duration").value) : null,
+    safe: $("event-safe").checked,
+    max_keep_seconds: $("event-safe").checked ? Number($("event-max-keep").value) : null,
+  };
+}
+
+$("dlg-event-create").onclick = async () => {
+  const name = $("event-name").value.trim() || "unnamed event";
+  const sourceIds = selectedEventSystems();
+  const conditions = buildEventConditions();
+  const action = buildEventAction();
+  const match = $("event-match").value;
+  if (!conditions.length) { setStatus("add at least one condition"); return; }
+  try {
+    if (editingEvent) {
+      const { id, hosted } = editingEvent;
+      if (hosted === "gateway") {
+        await post(`/events/${id}/update`, { name, source_ids: sourceIds, conditions, match, action });
+      } else {
+        const list = loadUiEvents();
+        const ev = list.find((x) => x.id === id);
+        if (ev) Object.assign(ev, { name, sourceIds, conditions, match, action });
+        saveUiEvents(list);
+      }
+      setStatus(`event "${name}" updated`);
+      notifyEvent(`Event "${name}" updated`);
+    } else if ($("event-hosted").value === "gateway") {
+      await post("/events/create", { name, source_ids: sourceIds, conditions, match, action });
+      setStatus(`event "${name}" created`);
+      notifyEvent(`Event "${name}" created`);
+    } else {
+      const list = loadUiEvents();
+      list.push({
+        id: `ui${Date.now()}`,
+        name, sourceIds, conditions, match, action,
+        enabled: true, status: "armed", armed: true,
+        triggeredAt: null, triggerDetail: null, artifactPath: null,
+        logCursors: {}, // {conditionIndex: {sourceId: rowsScanned}}
+      });
+      saveUiEvents(list);
+      setStatus(`event "${name}" created`);
+      notifyEvent(`Event "${name}" created`);
+    }
+    dlgEventForm.close();
+  } catch (err) {
+    setStatus(`could not ${editingEvent ? "update" : "create"} event: ` + (err.message || err));
+  }
+};
+
+// one row per event, gateway- and UI-hosted alike, each with its own
+// enable/disable, reset (re-arm after a trigger), and delete/cancel
+function renderEventRow(ev, hosted) {
+  const row = document.createElement("div");
+  row.className = "ctl block";
+  const condText = (c) => (c.type === "metric" ? `${c.metric} ${c.op} ${c.threshold}` : `log ~ /${c.pattern}/`);
+  const conditions = (ev.conditions || []).map(condText).join(ev.match === "all" ? " AND " : " OR ");
+  const act = ev.action.kind === "snapshot" ? `snapshot (last ${ev.action.minutes}m)` : `record ${ev.action.duration_minutes}m`;
+  row.textContent = `[${hosted}] ${ev.name} -- ${conditions} -> ${act} -- ${ev.status}${ev.status === "triggered" ? ` (${ev.trigger_detail || ev.triggerDetail || ""})` : ""} `;
+
+  const mkBtn = (label, fn) => {
+    const b = document.createElement("button");
+    b.textContent = label;
+    b.type = "button";
+    b.onclick = fn;
+    return b;
+  };
+  const id = hosted === "gateway" ? ev.event_id : ev.id;
+  row.appendChild(mkBtn("Update", () => openEventEditForm(ev, hosted)));
+  row.appendChild(mkBtn(ev.enabled ? "Disable" : "Enable", async () => {
+    if (hosted === "gateway") await post(`/events/${id}/${ev.enabled ? "disable" : "enable"}`, {});
+    else { const list = loadUiEvents(); const e = list.find((x) => x.id === id); e.enabled = !e.enabled; saveUiEvents(list); }
+    refreshEventsList();
+  }));
+  if (ev.status === "triggered") {
+    row.appendChild(mkBtn("Reset", async () => {
+      if (hosted === "gateway") await post(`/events/${id}/reset`, {});
+      else { const list = loadUiEvents(); const e = list.find((x) => x.id === id); e.armed = true; e.status = "armed"; saveUiEvents(list); }
+      refreshEventsList();
+    }));
+    const artifactId = hosted === "gateway" ? ev.artifact_id : ev.artifactPath;
+    if (artifactId) {
+      row.appendChild(mkBtn("Save…", async () => {
+        try {
+          if (hosted === "gateway") {
+            const res = await fetch(`${API}/session/${artifactId}/download`);
+            if (!res.ok) throw new Error(`download failed: ${res.status}`);
+            const bytes = new Uint8Array(await res.arrayBuffer());
+            const ext = res.headers.get("Content-Disposition")?.includes(".cttc-record") ? ".cttc-record" : ".cttc-metric";
+            await saveBinaryFile(`${ev.name}-${id}${ext}`, bytes);
+          } else if (window.cttc?.readFile) {
+            const bytes = await window.cttc.readFile(artifactId);
+            await saveBinaryFile(artifactId.split("/").pop(), bytes);
+          }
+        } catch (err) {
+          setStatus("could not save event artifact: " + (err.message || err));
+        }
+      }));
+    }
+  }
+  row.appendChild(mkBtn(hosted === "gateway" ? "Cancel" : "Delete", async () => {
+    if (hosted === "gateway") await post(`/events/${id}/cancel`, {});
+    else saveUiEvents(loadUiEvents().filter((x) => x.id !== id));
+    refreshEventsList();
+  }));
+  return row;
+}
+
+async function refreshEventsList() {
+  const box = $("events-list");
+  box.innerHTML = "";
+  try {
+    const { event_ids } = await get("/events/list");
+    for (const id of event_ids) {
+      const ev = await get(`/events/${id}`);
+      box.appendChild(renderEventRow(ev, "gateway"));
+    }
+  } catch {
+    /* gateway may not support /events (older server) -- UI events still work */
+  }
+  for (const ev of loadUiEvents()) box.appendChild(renderEventRow(ev, "ui"));
+  if (!box.children.length) box.textContent = "No events yet.";
+}
+
+/* ── UI-hosted event engine: evaluates conditions against data this window
+   already has (or a small targeted fetch), triggers via the same
+   /files/download + /session/start primitives the manual features use,
+   and saves the result locally via window.cttc.saveEventArtifact (silent
+   -- no save dialog, since nobody's necessarily watching a background
+   trigger). Metric conditions read the last non-null bucket already in
+   state.series (the chart's own live-tailing data); log conditions poll
+   /logs for the tail added since the last check, same cursor idea as the
+   gateway's own events.py. */
+const _OPS_JS = {
+  ">": (v, t) => v > t, "<": (v, t) => v < t,
+  ">=": (v, t) => v >= t, "<=": (v, t) => v <= t, "=": (v, t) => v === t,
+};
+function uiEventMonitoredIds(ev) {
+  return ev.sourceIds?.length ? ev.sourceIds : state.sources.map((s) => s.id);
+}
+function checkUiMetricCondition(ev, cond) {
+  const ids = new Set(uiEventMonitoredIds(ev));
+  const cmp = _OPS_JS[cond.op];
+  for (const svc of state.series?.services || []) {
+    if (!ids.has(svc.sid)) continue;
+    const arr = svc[cond.metric] || [];
+    for (let i = arr.length - 1; i >= 0; i--) {
+      if (arr[i] != null) return cmp(arr[i], cond.threshold) ? `${svc.sid}/${svc.name}: ${cond.metric}=${arr[i]}` : null;
+    }
+  }
+  return null;
+}
+// a log condition only watches lines appended after its cursor -- cursors
+// are keyed per condition index (not just source id) so two log conditions
+// on the same source in one event never share (and so corrupt) each
+// other's read position, mirroring events.py's own per-condition cursors
+async function checkUiLogCondition(ev, cond, condIndex) {
+  const pattern = new RegExp(cond.pattern);
+  const cursors = (ev.logCursors[condIndex] ||= {});
+  for (const sid of uiEventMonitoredIds(ev)) {
+    const src = state.sources.find((s) => s.id === sid && s.kind === "log");
+    if (!src) continue;
+    const start = cursors[sid] || 0;
+    try {
+      const { total, rows } = await get(`/logs?source=${sid}&start=${start}&count=200`);
+      cursors[sid] = total;
+      for (const r of rows) if (pattern.test(r.text)) return `${sid}: matched ${JSON.stringify(r.text)}`;
+    } catch { /* source may have closed since -- skip this tick */ }
+  }
+  return null;
+}
+// every condition is always evaluated (never short-circuited) so a log
+// condition's cursor keeps advancing regardless of `match` or of an
+// earlier condition already having fired -- mirrors events.py's _check()
+async function checkUiConditions(ev) {
+  const details = [];
+  for (let i = 0; i < ev.conditions.length; i++) {
+    const cond = ev.conditions[i];
+    details.push(cond.type === "metric" ? checkUiMetricCondition(ev, cond) : await checkUiLogCondition(ev, cond, i));
+  }
+  const hits = details.filter((d) => d != null);
+  if (ev.match === "all") return hits.length === ev.conditions.length ? hits.join("; ") : null;
+  return hits[0] || null;
+}
+
+async function fireUiEvent(ev, detail) {
+  ev.armed = false;
+  ev.status = "triggered";
+  ev.triggeredAt = Date.now();
+  ev.triggerDetail = detail;
+  ev.triggerCount = (ev.triggerCount || 0) + 1;
+  notifyEvent(`Event "${ev.name}" fired (${detail})`);
+  try {
+    if (ev.action.kind === "snapshot") {
+      const t1 = Date.now(), t0 = t1 - ev.action.minutes * 60000;
+      const params = new URLSearchParams({ from: t0, to: t1, include_host: "1" });
+      const res = await fetch(`${API}/files/download?${params}`);
+      if (!res.ok) throw new Error(`snapshot failed: ${res.status}`);
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      const name = `${ev.name}-${ev.id}.cttc-metric`;
+      const opts = { safe: ev.action.safe, maxKeepMs: ev.action.max_keep_seconds ? ev.action.max_keep_seconds * 1000 : null };
+      ev.artifactPath = window.cttc?.saveEventArtifact ? await window.cttc.saveEventArtifact(name, bytes, opts) : null;
+    } else {
+      const { session_id } = await post("/session/start", {
+        duration_minutes: ev.action.duration_minutes, safe: ev.action.safe, max_keep_seconds: ev.action.max_keep_seconds,
+      });
+      ev.artifactPath = session_id; // resolved to a real local path once the recording completes, see uiEventTick's poll
+      ev._pendingGatewaySessionId = session_id;
+    }
+  } catch (err) {
+    setStatus(`event "${ev.name}" trigger failed: ` + (err.message || err));
+  }
+  saveUiEvents(loadUiEvents().map((x) => (x.id === ev.id ? ev : x)));
+}
+
+// once a UI-hosted recording action's gateway session completes, fetch the
+// bytes and replace the placeholder session id with a real local path
+async function resolvePendingUiRecordings() {
+  const list = loadUiEvents();
+  let changed = false;
+  for (const ev of list) {
+    if (!ev._pendingGatewaySessionId) continue;
+    try {
+      const st = await get(`/session/${ev._pendingGatewaySessionId}/status`);
+      if (!st.ready) continue;
+      const res = await fetch(`${API}/session/${ev._pendingGatewaySessionId}/download`);
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      const name = `${ev.name}-${ev.id}.cttc-record`;
+      const opts = { safe: ev.action.safe, maxKeepMs: ev.action.max_keep_seconds ? ev.action.max_keep_seconds * 1000 : null };
+      ev.artifactPath = window.cttc?.saveEventArtifact ? await window.cttc.saveEventArtifact(name, bytes, opts) : null;
+      delete ev._pendingGatewaySessionId;
+      changed = true;
+    } catch { /* not ready yet, or gateway unreachable this tick */ }
+  }
+  if (changed) saveUiEvents(list);
+}
+
+// gateway-hosted events trigger entirely server-side (see events.py's own
+// tick()) -- this window only finds out by polling, so it has to remember
+// each event's last-seen status itself to notice the armed -> triggered
+// transition (and only notify once per transition, not every poll).
+const gatewayEventLastStatus = new Map();
+async function pollGatewayEventTriggers() {
+  try {
+    const { event_ids } = await get("/events/list");
+    for (const id of event_ids) {
+      const st = await get(`/events/${id}`);
+      const last = gatewayEventLastStatus.get(id);
+      if (st.status === "triggered" && last !== "triggered") {
+        notifyEvent(`Event "${st.name}" fired (${st.trigger_detail || ""})`);
+      }
+      gatewayEventLastStatus.set(id, st.status);
+    }
+    for (const id of [...gatewayEventLastStatus.keys()]) {
+      if (!event_ids.includes(id)) gatewayEventLastStatus.delete(id); // cancelled elsewhere
+    }
+  } catch { /* gateway may be unreachable this tick, or not support /events/* yet */ }
+}
+
+// An event keeps watching until disabled or deleted -- there's no one-shot
+// "fires once and waits" state. To avoid re-firing (and re-snapshotting/
+// re-recording) on every tick for as long as a condition happens to stay
+// true, firing is edge-triggered via `ev.armed` (mirrors events.py's own
+// `_armed` latch): only a not-met -> met transition fires; once met,
+// `armed` goes false until the condition is seen not-met again.
+async function uiEventTick() {
+  if (POPOUT_KIND) return; // one evaluator per app instance is enough
+  await resolvePendingUiRecordings();
+  await pollGatewayEventTriggers();
+  const list = loadUiEvents();
+  for (const ev of list) {
+    if (!ev.enabled) continue;
+    const detail = await checkUiConditions(ev);
+    if (detail) {
+      if (ev.armed !== false) await fireUiEvent(ev, detail);
+      ev.status = "triggered";
+    } else {
+      ev.armed = true;
+      ev.status = "armed";
+    }
+  }
+  saveUiEvents(list); // persists log cursor advances even without a trigger
+}
+if (!POPOUT_KIND) setInterval(uiEventTick, 3000);
+
 $("btn-freq-help").onclick = () => window.cttc.openHelp("frequency");
 $("btn-popout-telemetry").onclick = () => {
   state.poppedOut.add("telemetry");
@@ -2662,8 +3477,8 @@ if (!POPOUT_KIND) {
     "set-sources": () => $("btn-set").click(),
     "clear-sources": () => $("btn-clear-sources").click(),
     "load-metrics": () => $("btn-load-sample").click(),
-    "new-gateway": () => window.cttc.newGateway(),
-    "edit-gateways": () => window.cttc.editGateways(),
+    "new-gateway": () => openNewGatewayDialog(),
+    "edit-gateways": () => openEditGatewaysDialog(),
     "open-theme": () => openThemeDialog(),
     "open-settings": () => openSettingsDialog(),
     // View > Actual Size (Ctrl/Cmd+0) otherwise only resets the browser
@@ -2733,6 +3548,30 @@ if (!POPOUT_KIND) {
     }
     setDock(prefs.get("actionBarDock", "left"));
     window.cttc?.onActionBarRedock?.(() => setDock(prefs.get("actionBarLastDock", "left")));
+
+    // Collapsible sidebar sections (Gateway/Sources/Metrics/Preferences):
+    // each starts collapsed (see index.html's .ab-group-body[hidden]) and
+    // toggles open on its header click; which ones are open persists across
+    // launches, keyed by data-section so reordering the sections in markup
+    // doesn't scramble anyone's saved state.
+    const SIDEBAR_EXPANDED_KEY = "sidebarExpandedSections";
+    function setSidebarSectionExpanded(group, expanded) {
+      const body = group.querySelector(".ab-group-body");
+      if (!body) return;
+      body.hidden = !expanded;
+      group.dataset.expanded = String(expanded);
+      const section = group.dataset.section;
+      const state = prefs.get(SIDEBAR_EXPANDED_KEY, {});
+      state[section] = expanded;
+      prefs.set(SIDEBAR_EXPANDED_KEY, state);
+    }
+    const savedSidebarState = prefs.get(SIDEBAR_EXPANDED_KEY, {});
+    for (const group of actionBar.querySelectorAll(".ab-group[data-section]")) {
+      const header = group.querySelector(".ab-group-header");
+      if (!header) continue;
+      setSidebarSectionExpanded(group, !!savedSidebarState[group.dataset.section]);
+      header.onclick = () => setSidebarSectionExpanded(group, group.dataset.expanded !== "true");
+    }
   }
 
   // Accelerators for actions with no native browser default (edit shortcuts
