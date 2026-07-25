@@ -668,6 +668,62 @@ async def _run_docker_cli(desc: str, args: list[str], log: list, timeout: float)
     return stdout.decode(errors="replace")
 
 
+async def _find_own_container() -> tuple[str, str] | None:
+    """(id, name) of the gateway's own running container -- the one whose
+    image basename is "cttc-gateway" (see docker-compose.yml), same
+    filtering logic docker_ps() already uses to hide it from the
+    monitorable-target list. None if this server isn't running
+    containerized at all (the embedded/bare-process fallback -- see
+    main.js), or docker itself isn't reachable."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "docker",
+            "ps",
+            "--format",
+            "{{json .}}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+    except (TimeoutError, OSError):
+        return None
+    for line in out.decode(errors="replace").splitlines():
+        if not line.strip():
+            continue
+        row = jloads(line)
+        if row["Image"].split(":")[0].rsplit("/", 1)[-1] == "cttc-gateway":
+            return row["ID"], row["Names"]
+    return None
+
+
+async def gather_own_container_logs(timeout: float = 15.0) -> tuple[str, bytes]:
+    """(name, log bytes) for `docker logs` on the gateway's own container --
+    "Ship Logs" (Settings > Collect CTTC Own Logs) bundles this alongside
+    the client's own .cttc-log files. Falls back to an explanatory message
+    (not an error) when there's no own container to find."""
+    found = await _find_own_container()
+    if found is None:
+        return (
+            "gateway",
+            b"could not find this gateway's own container "
+            b"(docker ps found nothing running the cttc-gateway image -- "
+            b"this server may not be running containerized)\n",
+        )
+    container_id, name = found
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "docker",
+            "logs",
+            container_id,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except (TimeoutError, OSError) as e:
+        out = f"could not gather gateway logs: {e}".encode()
+    return name, out
+
+
 async def docker_ps(host: str | None, ssh_key: str | None = None) -> dict:
     """List containers (and swarm services, when the daemon is a manager)."""
     host = normalize_docker_host(host)
@@ -1571,6 +1627,26 @@ async def route_health():
     """Cheap liveness probe -- no state/docker/disk access, just confirms the
     process is up and answering HTTP, for the renderer's status indicator."""
     return {"ok": True}
+
+
+@app.get("/mlog")
+async def route_mlog():
+    """Ship Logs (Settings > Collect CTTC Own Logs, main.js's "ship-logs"):
+    `docker logs` on the gateway's own container, named after it -- see
+    gather_own_container_logs(). The filename travels in a header (like
+    /sample/record's segment index) since a plain download response has no
+    other structured place to carry it."""
+    name, data = await gather_own_container_logs()
+    return Response(
+        content=data,
+        media_type="text/plain",
+        headers={
+            "X-CTTC-Gateway-Name": name,
+            "Content-Disposition": f'attachment; filename="{name}.log"',
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Expose-Headers": "X-CTTC-Gateway-Name",
+        },
+    )
 
 
 @app.get("/sources")

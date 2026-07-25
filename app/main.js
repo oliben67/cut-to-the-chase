@@ -26,6 +26,7 @@ const {
   logFileName,
 } = require("./lib/log-collector");
 const { saveArtifact, listArtifacts, sweepArtifacts } = require("./lib/event-artifacts");
+const { buildZip } = require("./lib/zip-writer");
 
 const SERVER_DIR = path.join(__dirname, "server");
 const APP_ICON = path.join(__dirname, "assets", "icon.png");
@@ -968,18 +969,83 @@ ipcMain.handle("set-log-collector-enabled", async (_e, enabled) => {
     writeLogCollectorSettings({ ...settings, enabled: false });
     return { ok: true, enabled: false };
   }
-  let dir = settings.dir;
-  if (!dir) {
-    const r = await dialog.showOpenDialog({
-      title: "Choose a folder for CTTC's own logs",
-      properties: ["openDirectory", "createDirectory"],
-    });
-    if (r.canceled || !r.filePaths[0]) return { ok: false, enabled: false };
-    dir = r.filePaths[0];
-  }
+  // Always asks, every time it's turned on -- rather than only the first
+  // time -- so switching it on always means "collect here", not "collect
+  // wherever it was last pointed". Defaults to the previous folder (if
+  // any) so re-confirming the same location is just Enter/Choose, not a
+  // fresh navigation each time.
+  const r = await dialog.showOpenDialog({
+    title: "Choose a folder for CTTC's own logs",
+    defaultPath: settings.dir || undefined,
+    properties: ["openDirectory", "createDirectory"],
+  });
+  if (r.canceled || !r.filePaths[0]) return { ok: false, enabled: false };
+  const dir = r.filePaths[0];
   startLogCollector(dir);
   writeLogCollectorSettings({ enabled: true, dir });
   return { ok: true, enabled: true, dir };
+});
+
+// "Ship logs" (Settings > Collect CTTC Own Logs, far-right icon button):
+// bundles every local .cttc-log file with the gateway's own `docker logs`
+// output (GET /mlog -- server.py's gather_own_container_logs) into one
+// zip, then offers to erase the local .cttc-log files now that they're
+// safely archived. Silent no-op (not an error) if log collection was never
+// turned on -- there's nothing local to ship, only the gateway's own log.
+ipcMain.handle("ship-logs", async () => {
+  const settings = readLogCollectorSettings();
+  const dir = settings.dir;
+  const localFiles = dir
+    ? fs
+        .readdirSync(dir)
+        .filter((f) => f.endsWith(".cttc-log"))
+        .map((f) => path.join(dir, f))
+    : [];
+
+  const entries = localFiles.map((p) => ({ name: path.basename(p), data: fs.readFileSync(p) }));
+
+  try {
+    const res = await fetch(`http://${serverHost}:${serverPort}/mlog`, { signal: AbortSignal.timeout(20000) });
+    const gatewayName = res.headers.get("X-CTTC-Gateway-Name") || "gateway";
+    const bytes = Buffer.from(await res.arrayBuffer());
+    entries.push({ name: `${gatewayName}.log`, data: bytes });
+  } catch (err) {
+    entries.push({ name: "gateway.log", data: Buffer.from(`could not reach the gateway: ${err.message || err}\n`) });
+  }
+
+  if (!entries.length) return { ok: false, error: "Nothing to ship -- no local .cttc-log files and no gateway log." };
+
+  const zip = buildZip(entries);
+  const r = await dialog.showSaveDialog({
+    title: "Save shipped logs",
+    defaultPath: `cttc-logs-${new Date().toISOString().slice(0, 19).replace(/[T:]/g, "-")}.zip`,
+    filters: [{ name: "Zip archive", extensions: ["zip"] }],
+  });
+  if (r.canceled || !r.filePath) return { ok: false, canceled: true };
+  await fs.promises.writeFile(r.filePath, zip);
+
+  let erased = false;
+  if (localFiles.length) {
+    const confirmed = await dialog.showMessageBox({
+      type: "question",
+      message: `Erase the ${localFiles.length} local .cttc-log file${localFiles.length === 1 ? "" : "s"} now that they're zipped?`,
+      detail: r.filePath,
+      buttons: ["Erase", "Keep"],
+      defaultId: 1,
+      cancelId: 1,
+    });
+    if (confirmed.response === 0) {
+      for (const p of localFiles) {
+        try {
+          fs.unlinkSync(p);
+        } catch {
+          /* best-effort */
+        }
+      }
+      erased = true;
+    }
+  }
+  return { ok: true, path: r.filePath, fileCount: entries.length, erased };
 });
 
 // Re-provisions a gateway at (possibly new) ssh settings and updates its

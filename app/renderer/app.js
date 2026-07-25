@@ -2342,12 +2342,13 @@ $("dlg-theme-close").onclick = () => {
   dlgTheme.close();
 };
 
-/* ── event status bar (Appearance > Status bar) ───────────────────────────
-   A slim, persistent bar at the bottom of the window reporting when an
-   event is created or fires -- separate from the toolbar's #status (which
-   is for ordinary action feedback), since an event can fire from a
-   background poll with nobody having just clicked anything. Takes effect
-   immediately, like the theme mode switch, rather than waiting on Save. */
+/* ── status bar (Appearance > Status bar) ─────────────────────────────────
+   A slim, persistent bar at the bottom of the window reporting things that
+   happen in the background with nobody having just clicked anything: an
+   event created/fired, or the gateway connection going down/coming back --
+   separate from the toolbar's #status (ordinary action feedback for
+   something the user just did). Takes effect immediately, like the theme
+   mode switch, rather than waiting on Save. */
 const DEFAULT_STATUS_BAR_VISIBLE = true;
 let statusBarEnabled = prefs.get("statusBarVisible", DEFAULT_STATUS_BAR_VISIBLE);
 function syncStatusBarVisibility() {
@@ -2812,10 +2813,10 @@ async function openEditGatewaysDialog() {
 
 // "Collect CTTC Own Logs" -- main.js owns the actual file writing (it's the
 // only process that sees its own logs and the server subprocess's stderr),
-// this just reflects/toggles that state. Turning it on for the first time
-// prompts for a directory (see main.js's set-log-collector-enabled); if
-// that prompt is cancelled the switch flips back off rather than claiming
-// to be on with nothing actually being written.
+// this just reflects/toggles that state. Turning it on always prompts for
+// a directory (see main.js's set-log-collector-enabled), every time, not
+// just the first; if that prompt is cancelled the switch flips back off
+// rather than claiming to be on with nothing actually being written.
 function syncLogCollectStatus(settings) {
   $("log-collect-toggle").checked = !!settings?.enabled;
   $("log-collect-status").textContent = settings?.dir ? `Folder: ${settings.dir}` : "";
@@ -2825,6 +2826,36 @@ if (!POPOUT_KIND) {
   $("log-collect-toggle").onchange = async (e) => {
     const result = await window.cttc?.setLogCollectorEnabled?.(e.target.checked);
     syncLogCollectStatus(result);
+  };
+}
+
+// Reassignable wrapper (window.cttc's own properties are read-only --
+// contextBridge.exposeInMainWorld -- so tests substitute this instead;
+// same reasoning as pickRecordingSavePath/getRecordingMarkerFromDisk above).
+async function shipLogsViaMain() {
+  return window.cttc?.shipLogs ? window.cttc.shipLogs() : null;
+}
+
+// "Ship logs": gathers local .cttc-log files + the gateway's own docker
+// logs into one zip (main.js's "ship-logs", which also owns the Save
+// dialog and the erase-afterward confirmation), then reports the outcome
+// via the toolbar status + bottom status bar (a background-ish action, not
+// unlike an event trigger, so it gets the same "did something happen"
+// visibility there).
+if (!POPOUT_KIND) {
+  $("btn-ship-logs").onclick = async () => {
+    try {
+      const result = await shipLogsViaMain();
+      if (!result) return;
+      if (result.canceled) { setStatus("ship logs canceled"); return; }
+      if (!result.ok) { setStatus(result.error || "could not ship logs"); return; }
+      const msg = `shipped ${result.fileCount} log file${result.fileCount === 1 ? "" : "s"} to ${result.path}` +
+        (result.erased ? " (local .cttc-log files erased)" : "");
+      setStatus(msg);
+      notifyEvent(msg);
+    } catch (err) {
+      setStatus("ship logs failed: " + (err.message || err));
+    }
   };
 }
 /* ── Events: watch CPU/MEM/NET thresholds or a log regex on chosen systems,
@@ -3637,19 +3668,45 @@ connectSSE();
   $("server-status-location").textContent = PORT == null || PORT === "null" ? statusHost : `${statusHost}:${PORT}`;
   const HEALTH_POLL_MS = 5000;
   const btn = $("server-status-btn");
-  const setState = (state, detail) => {
+  // The status pill itself only ever shows a colored dot + "Switch
+  // gateway…" -- the actual failure text goes to the bottom status bar
+  // (notifyEvent), not a tooltip nobody's necessarily hovering over.
+  const setState = (state) => {
     el.dataset.state = state;
-    btn.title = detail ? `${detail}` : "Switch gateway…";
+    btn.title = "Switch gateway…";
   };
+  let checking = false;
+  // The last *confirmed* (up/down) state, for edge-detecting the
+  // notifyEvent transition -- el.dataset.state itself gets a transient
+  // "checking" flash first (below), which would otherwise erase "down"
+  // before this same call learns whether it recovered.
+  let lastConfirmed = null;
   const check = async () => {
-    // Only flash "checking" when we don't already know the answer -- once
-    // "up", routine re-polls shouldn't flicker the dot on every request.
-    if (el.dataset.state !== "up") setState("checking");
+    // setInterval doesn't wait for a previous call to finish -- a slow
+    // /health round trip overlapping the next tick could otherwise race
+    // two checks against the same dataset.state/notifyEvent, flapping the
+    // down/up transition text. One in-flight check at a time.
+    if (checking) return;
+    checking = true;
     try {
-      await get("/health");
-      setState("up");
-    } catch (err) {
-      setState("down", String(err.message || err));
+      // Only flash "checking" when we don't already know the answer --
+      // once "up", routine re-polls shouldn't flicker the dot on every
+      // request.
+      if (el.dataset.state !== "up") setState("checking");
+      try {
+        await get("/health");
+        if (lastConfirmed === "down") notifyEvent("Gateway connection restored");
+        lastConfirmed = "up";
+        setState("up");
+      } catch (err) {
+        // only notify on the down transition -- not every 5s re-poll
+        // while it stays down
+        if (lastConfirmed !== "down") notifyEvent(`Gateway connection failed: ${err.message || err}`);
+        lastConfirmed = "down";
+        setState("down");
+      }
+    } finally {
+      checking = false;
     }
   };
   check();

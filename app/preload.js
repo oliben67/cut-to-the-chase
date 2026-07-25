@@ -39,6 +39,7 @@ contextBridge.exposeInMainWorld("cttc", {
   setThemeMode: (mode) => ipcRenderer.send("set-theme-mode", mode),
   getLogCollectorSettings: () => ipcRenderer.invoke("get-log-collector-settings"),
   setLogCollectorEnabled: (enabled) => ipcRenderer.invoke("set-log-collector-enabled", enabled),
+  shipLogs: () => ipcRenderer.invoke("ship-logs"),
   saveEventArtifact: (name, bytes, opts) => ipcRenderer.invoke("save-event-artifact", name, bytes, opts),
   listEventArtifacts: () => ipcRenderer.invoke("list-event-artifacts"),
 });

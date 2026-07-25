@@ -1180,6 +1180,10 @@ pre.snapshot-body {
 
 /* settings dialog fieldsets (remote connection, update server image) */
 .keys-box { border: 1px solid var(--border); border-radius: var(--radius-md); margin: 8px 0; }
+/* "Ship logs" (Settings > Collect CTTC Own Logs): icon-only button, aligned
+   with the toggle/status row, no label text -- title="Ship logs" on hover is
+   the only affordance, same as the frequency "?" help button elsewhere. */
+.log-collect-row { display: flex; width: 100%; justify-content: space-between; }
 .keys-box .radio-row { display: flex; align-items: center; gap: 6px; font-size: 13px; margin: 4px 0; }
 .keys-box .radio-row input { width: auto; }
 .keys-box legend { font-size: 12px; color: var(--text-secondary); padding: 0 4px; }

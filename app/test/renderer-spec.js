@@ -757,6 +757,41 @@
     eq(body.hidden, true, "collapses again on a second click");
   });
 
+  /* ── Ship logs (Settings > Collect CTTC Own Logs) ─────────────────────── */
+
+  await T("ship-logs button is icon-only (no visible text) with a hover title", () => {
+    const btn = $("btn-ship-logs");
+    ok(btn, "button exists");
+    eq(btn.title, "Ship logs");
+    eq(btn.textContent.trim(), "", "no visible label -- icon only");
+    ok(btn.querySelector("svg"), "has an icon");
+  });
+
+  await T("clicking ship-logs invokes the shipLogs wrapper and reports the result", async () => {
+    const real = shipLogsViaMain;
+    let called = false;
+    shipLogsViaMain = async () => { called = true; return { ok: true, path: "/tmp/x.zip", fileCount: 2, erased: true }; };
+    try {
+      $("btn-ship-logs").click();
+      await until(() => called, "shipLogs invoked");
+      await until(() => $("status").textContent.includes("/tmp/x.zip"), "status reflects the result");
+      ok($("status").textContent.includes("erased"));
+    } finally {
+      shipLogsViaMain = real;
+    }
+  });
+
+  await T("ship-logs reports a cancel without claiming success", async () => {
+    const real = shipLogsViaMain;
+    shipLogsViaMain = async () => ({ canceled: true });
+    try {
+      $("btn-ship-logs").click();
+      await until(() => $("status").textContent.includes("canceled"), "status reflects the cancel");
+    } finally {
+      shipLogsViaMain = real;
+    }
+  });
+
   /* ── status bar (event notifications) ─────────────────────────────────── */
 
   await T("status bar is shown by default and toggled from Appearance", () => {
@@ -1117,6 +1152,29 @@
     openNewGatewayDialog();
     $("gw-btn-cancel").click();
     eq(dlgGatewaySetup.open, false);
+  });
+
+  await T("gateway connection failure notifies the status bar, not just the pill's tooltip", async () => {
+    // capture notifyEvent's own calls rather than reading the DOM after the
+    // fact -- other concurrent background notifiers (uiEventTick, etc.)
+    // share the same status bar text and could overwrite a one-time
+    // "restored" message before a DOM poll ever samples it.
+    const realNotify = notifyEvent;
+    const calls = [];
+    notifyEvent = (msg) => { calls.push(msg); realNotify(msg); };
+    const realGet = get;
+    get = async (path) => { if (path === "/health") throw new Error("boom"); return realGet(path); };
+    try {
+      await until(() => $("server-status").dataset.state === "down", "went down", 100);
+      ok(calls.some((m) => m.includes("Gateway connection failed")), JSON.stringify(calls));
+      eq($("server-status-btn").title, "Switch gateway…", "pill tooltip stays generic, no error text");
+      get = realGet;
+      await until(() => $("server-status").dataset.state === "up", "recovered", 100);
+      ok(calls.some((m) => m.includes("Gateway connection restored")), JSON.stringify(calls));
+    } finally {
+      get = realGet;
+      notifyEvent = realNotify;
+    }
   });
 
   /* ── gateway dropdown ──────────────────────────────────────────────────── */

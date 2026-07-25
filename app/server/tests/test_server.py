@@ -855,6 +855,67 @@ class TestDockerPs:
             await server.docker_ps(None)
 
 
+class TestGatherOwnContainerLogs:
+    """/mlog (Ship Logs): finds the gateway's own running container by
+    image basename -- same filtering logic docker_ps() uses to hide it from
+    the monitorable-target list -- then `docker logs` it."""
+
+    async def test_finds_and_logs_own_container(self, monkeypatch):
+        gw_line = json.dumps(
+            {"ID": "2" * 20, "Names": "cttc-gateway-cttc-gateway-1", "Image": "cttc-gateway:latest"}
+        ).encode()
+        web_line = json.dumps({"ID": "1" * 20, "Names": "web", "Image": "nginx"}).encode()
+
+        async def fake_exec(*args, **k):
+            if args[1] == "ps":
+                return FakeAsyncProc(communicate_result=(web_line + b"\n" + gw_line + b"\n", b""))
+            assert args[1] == "logs"
+            assert args[2] == "2" * 20
+            return FakeAsyncProc(communicate_result=(b"log line 1\nlog line 2\n", b""))
+
+        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+        name, data = await server.gather_own_container_logs()
+        assert name == "cttc-gateway-cttc-gateway-1"
+        assert data == b"log line 1\nlog line 2\n"
+
+    async def test_no_own_container_found(self, monkeypatch):
+        web_line = json.dumps({"ID": "1" * 20, "Names": "web", "Image": "nginx"}).encode()
+
+        async def fake_exec(*args, **k):
+            return FakeAsyncProc(communicate_result=(web_line + b"\n", b""))
+
+        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+        name, data = await server.gather_own_container_logs()
+        assert name == "gateway"
+        assert b"could not find" in data
+
+    async def test_docker_unreachable(self, monkeypatch):
+        async def fake_exec(*args, **k):
+            raise OSError("docker not found")
+
+        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+        name, data = await server.gather_own_container_logs()
+        assert name == "gateway"
+        assert b"could not find" in data
+
+    async def test_docker_logs_itself_times_out(self, monkeypatch):
+        gw_line = json.dumps({"ID": "2" * 20, "Names": "gw", "Image": "cttc-gateway"}).encode()
+
+        class HangingProc(FakeAsyncProc):
+            async def communicate(self):
+                await asyncio.sleep(3600)
+
+        async def fake_exec(*args, **k):
+            if args[1] == "ps":
+                return FakeAsyncProc(communicate_result=(gw_line + b"\n", b""))
+            return HangingProc()
+
+        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+        name, data = await server.gather_own_container_logs(timeout=0.05)
+        assert name == "gw"
+        assert b"could not gather gateway logs" in data
+
+
 class FakeState:
     def __init__(self):
         self.events = []
@@ -2066,6 +2127,21 @@ class TestEventsEndpoints:
 
 
 # ── /files/* (phase 3: upload/download, docs/architecture/remote-server.md) ──
+
+
+class TestMlogEndpoint:
+    async def test_returns_logs_with_name_header(self, api, monkeypatch):
+        base, _ = api
+
+        async def fake_gather(timeout=15.0):
+            return "my-gateway", b"hello from the gateway\n"
+
+        monkeypatch.setattr(server, "gather_own_container_logs", fake_gather)
+        code, headers, data = get_raw(base, "/mlog")
+        assert code == 200
+        assert data == b"hello from the gateway\n"
+        assert headers["X-CTTC-Gateway-Name"] == "my-gateway"
+        assert 'filename="my-gateway.log"' in headers["Content-Disposition"]
 
 
 class TestFilesEndpoints:
