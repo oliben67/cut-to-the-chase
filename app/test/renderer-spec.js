@@ -123,12 +123,14 @@
 
   /* ── toolbar controls ─────────────────────────────────────────────────── */
 
-  await T("chart style switch toggles lines/bars and persists", () => {
+  await T("chart style segmented control toggles lines/bars and persists", () => {
     const before = state.chartStyle;
-    $("chk-style").click();
+    const other = before === "bars" ? "btn-style-lines" : "btn-style-histogram";
+    $(other).click();
     ok(state.chartStyle !== before, "flipped");
     eq(prefs.get("chartStyle", null), state.chartStyle, "persisted");
-    $("chk-style").click();
+    const back = before === "bars" ? "btn-style-histogram" : "btn-style-lines";
+    $(back).click();
     eq(state.chartStyle, before, "flipped back");
   });
 

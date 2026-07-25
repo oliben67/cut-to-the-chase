@@ -921,14 +921,16 @@ function armSampleCapture() {
 }
 
 // mousedown on a chart/lane: records where a possible drag started, and
-// whether this drag would export a sample (Shift held, or "capture
-// metrics" armed) rather than zoom -- decided up front since dragIsSample
-// also determines the selection band's color while dragging (see
-// drawVerticals()).
+// whether this drag would export a sample (Shift held, Ctrl/Cmd held, or
+// "capture metrics" armed) rather than zoom -- decided up front since
+// dragIsSample also determines the selection band's color while dragging
+// (see drawVerticals()). Ctrl/Cmd+drag is a second way in alongside Shift
+// (kept, not replaced) -- plain drag stays zoom, the primary/most-used
+// gesture, so it was never up for grabs here.
 function timelineDown(c, e) {
   const rect = c.getBoundingClientRect();
   dragStart = e.clientX - rect.left;
-  dragIsSample = e.shiftKey || sampleArmed;
+  dragIsSample = e.shiftKey || e.ctrlKey || e.metaKey || sampleArmed;
   dragX = null;
 }
 
@@ -1535,7 +1537,7 @@ function assignColorSlots() {
 
 async function setCursor(t, opts = {}) {
   state.cursorT = t;
-  $("cursor-label").textContent = "t = " + new Date(t).toISOString().replace("T", " ").replace("Z", " UTC");
+  $("cursor-label-text").textContent = "t = " + new Date(t).toISOString().replace("T", " ").replace("Z", " UTC");
   drawAll();
   for (const p of panels.values()) p.jumpTo(t);
   if (opts.broadcast !== false) window.cttc?.broadcastSync?.({ type: "cursor", t });
@@ -1622,8 +1624,12 @@ class Panel {
     right.append(popout, close);
     if (POPOUT_KIND === "log") {
       const popback = document.createElement("button");
-      popback.textContent = "⤴ Pop back";
-      popback.title = "Pop back into the main window";
+      popback.className = "popback btn-flat";
+      popback.innerHTML =
+        '<svg class="btn-flat-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">' +
+        '<path d="m12 2a9.95 9.95 0 0 0 -7 2.88v-1.88a1 1 0 0 0 -2 0v5a1 1 0 0 0 1 1h5a1 1 0 0 0 0-2h-3.2242a7.9872 7.9872 0 1 1 .2613 10.3335 1 1 0 1 0 -1.49 1.334 10 10 0 1 0 7.4529-16.6675z"/></svg>' +
+        "Bring Back";
+      popback.title = "Bring back into the main window";
       popback.onclick = () => window.close();
       right.append(popback);
     }
@@ -2253,6 +2259,29 @@ function applyHlColor(color) {
 }
 applyHlColor(prefs.get("hlColor", DEFAULT_HL_COLOR));
 
+// Light/Dark/System: unlike the highlight color, this takes effect (and
+// persists) the moment you click it rather than waiting on Save/Cancel --
+// nativeTheme.themeSource (see main.js) is process-wide, so it's set from
+// here rather than gated behind this one dialog closing. Main window only:
+// it's a single global switch, not something every popout needs to (re-)set.
+const DEFAULT_THEME_MODE = "system";
+function syncThemeModeButtons(mode) {
+  for (const b of $("theme-mode-switch").querySelectorAll("button")) {
+    b.dataset.active = String(b.dataset.mode === mode);
+  }
+}
+function setThemeMode(mode) {
+  prefs.set("themeMode", mode);
+  window.cttc?.setThemeMode?.(mode);
+  syncThemeModeButtons(mode);
+}
+if (!POPOUT_KIND) {
+  for (const b of $("theme-mode-switch").querySelectorAll("button")) {
+    b.onclick = () => setThemeMode(b.dataset.mode);
+  }
+  setThemeMode(prefs.get("themeMode", DEFAULT_THEME_MODE));
+}
+
 function openThemeDialog() {
   $("theme-hl-color").value = prefs.get("hlColor", DEFAULT_HL_COLOR);
   dlgTheme.showModal();
@@ -2261,6 +2290,7 @@ $("theme-hl-color").oninput = (e) => applyHlColor(e.target.value); // live previ
 $("dlg-theme-reset").onclick = () => {
   $("theme-hl-color").value = DEFAULT_HL_COLOR;
   applyHlColor(DEFAULT_HL_COLOR);
+  setThemeMode("light");
 };
 $("dlg-theme-save").onclick = () => {
   const color = $("theme-hl-color").value;
@@ -2430,10 +2460,51 @@ $("dlg-ok").onclick = async () => {
 
 /* ── toolbar ────────────────────────────────────────────────────────────── */
 
-$("win-secs").onchange = (e) => {
-  state.windowMs = Math.max(0, Number(e.target.value) || 0) * 1000;
+// Poll interval has two live controls now (toolbar + the Settings dialog's
+// own copy) -- both need to stay in sync with each other and with a
+// detached action-bar window's own copy (see onSetPollInterval below), so
+// the actual state update lives in one place. A zero-second window would
+// highlight nothing (or everything, depending on how the ± compare is
+// read) -- 1s is the smallest interval that still means something.
+function setWindowSecs(v) {
+  const secs = Math.max(1, Math.floor(Number(v)) || 1);
+  state.windowMs = secs * 1000;
+  $("win-secs").value = secs;
+  $("win-secs-sidebar").value = secs;
   for (const p of panels.values()) p.render();
-};
+}
+// "input" (not "change") so it takes effect immediately as you type/adjust,
+// rather than waiting for blur/Enter.
+$("win-secs").oninput = (e) => setWindowSecs(e.target.value);
+$("win-secs-sidebar").oninput = (e) => setWindowSecs(e.target.value);
+if (!POPOUT_KIND) window.cttc?.onSetPollInterval?.((secs) => setWindowSecs(secs));
+
+// Settings: a real dialog (like Appearance), not an inline foldout --
+// opened via the shared data-action dispatch (see RENDERER_ACTIONS'
+// "open-settings" entry below), same as Appearance's "open-theme".
+const dlgSettings = $("dlg-settings");
+function openSettingsDialog() {
+  dlgSettings.showModal();
+}
+$("dlg-settings-close").onclick = () => dlgSettings.close();
+
+// "Collect CTTC Own Logs" -- main.js owns the actual file writing (it's the
+// only process that sees its own logs and the server subprocess's stderr),
+// this just reflects/toggles that state. Turning it on for the first time
+// prompts for a directory (see main.js's set-log-collector-enabled); if
+// that prompt is cancelled the switch flips back off rather than claiming
+// to be on with nothing actually being written.
+function syncLogCollectStatus(settings) {
+  $("log-collect-toggle").checked = !!settings?.enabled;
+  $("log-collect-status").textContent = settings?.dir ? `Folder: ${settings.dir}` : "";
+}
+if (!POPOUT_KIND) {
+  window.cttc?.getLogCollectorSettings?.().then((settings) => settings && syncLogCollectStatus(settings));
+  $("log-collect-toggle").onchange = async (e) => {
+    const result = await window.cttc?.setLogCollectorEnabled?.(e.target.checked);
+    syncLogCollectStatus(result);
+  };
+}
 $("btn-freq-help").onclick = () => window.cttc.openHelp("frequency");
 $("btn-popout-telemetry").onclick = () => {
   state.poppedOut.add("telemetry");
@@ -2446,17 +2517,20 @@ $("btn-popout-host").onclick = () => {
   window.cttc.popout("host", null, popoutView());
 };
 
-// reflects state.chartStyle onto the lines/histogram toggle switch --
+// reflects state.chartStyle onto the lines/histogram segmented control --
 // called on boot and whenever the style changes from elsewhere.
 function syncStyleButton() {
-  $("chk-style").checked = state.chartStyle === "bars";
+  $("btn-style-lines").dataset.active = String(state.chartStyle !== "bars");
+  $("btn-style-histogram").dataset.active = String(state.chartStyle === "bars");
 }
-$("chk-style").onchange = (e) => {
-  state.chartStyle = e.target.checked ? "bars" : "lines";
+function setChartStyle(style) {
+  state.chartStyle = style;
   prefs.set("chartStyle", state.chartStyle);
   syncStyleButton();
   drawAll();
-};
+}
+$("btn-style-lines").onclick = () => setChartStyle("lines");
+$("btn-style-histogram").onclick = () => setChartStyle("bars");
 
 $("btn-host-toggle").onclick = () => {
   state.showHost = !state.showHost;
@@ -2586,10 +2660,21 @@ if (!POPOUT_KIND) {
 
   const RENDERER_ACTIONS = {
     "set-sources": () => $("btn-set").click(),
+    "clear-sources": () => $("btn-clear-sources").click(),
     "load-metrics": () => $("btn-load-sample").click(),
     "new-gateway": () => window.cttc.newGateway(),
     "edit-gateways": () => window.cttc.editGateways(),
     "open-theme": () => openThemeDialog(),
+    "open-settings": () => openSettingsDialog(),
+    // View > Actual Size (Ctrl/Cmd+0) otherwise only resets the browser
+    // page's own zoom level (window.cttc.menubarAction, handled in main.js)
+    // -- which does nothing to the timeline's pan/zoom. "Reset zoom"
+    // reads as one action to a user, so it should also reset/recenter the
+    // chart, not leave it wherever it was panned/zoomed to.
+    "zoom-reset": () => {
+      resetZoom();
+      window.cttc?.menubarAction?.("zoom-reset");
+    },
     undo: () => document.execCommand("undo"),
     redo: () => document.execCommand("redo"),
     cut: () => document.execCommand("cut"),
@@ -2609,6 +2694,46 @@ if (!POPOUT_KIND) {
     const btn = e.target.closest("button[data-action]");
     if (btn) runMenuAction(btn.dataset.action);
   });
+
+  // A detached action-bar window has no access to this document (it's a
+  // separate renderer) -- it forwards its clicks here over IPC instead of
+  // running them locally, so Undo/Redo/etc. still act on this window's own
+  // content rather than the (empty) detached window's. Main window only --
+  // main.js only ever forwards to the tracked mainWindow, but registering
+  // this in every popout too would be pure dead weight.
+  if (!POPOUT_KIND) window.cttc?.onRunAction?.(runMenuAction);
+
+  /* ── dockable action bar (File/Edit/View/Window/Help as buttons,
+     left/right/top/bottom/detached) -- main window only: popouts hide the
+     bar entirely (see body[class*="popout-"] in style.css) and have no
+     business opening/closing the shared detached-bar window themselves. */
+  const appBody = $("app-body");
+  const actionBar = $("action-bar");
+  if (!POPOUT_KIND && appBody && actionBar) {
+    actionBar.addEventListener("click", (e) => {
+      const btn = e.target.closest("button[data-action]");
+      if (btn) runMenuAction(btn.dataset.action);
+    });
+
+    function setDock(dock) {
+      prefs.set("actionBarDock", dock);
+      // Remembers the last real (non-detached) position separately, so
+      // Redock can restore it -- "actionBarDock" alone would just say
+      // "detached" once you've detached it, with nothing to go back to.
+      if (dock !== "detached") prefs.set("actionBarLastDock", dock);
+      appBody.dataset.dock = dock === "detached" ? "detached" : dock;
+      for (const b of actionBar.querySelectorAll(".ab-dock-btn")) {
+        b.dataset.current = String(b.dataset.dockTo === dock);
+      }
+      if (dock === "detached") window.cttc?.openActionBarWindow?.();
+      else window.cttc?.closeActionBarWindow?.();
+    }
+    for (const b of actionBar.querySelectorAll(".ab-dock-btn")) {
+      b.onclick = () => setDock(b.dataset.dockTo);
+    }
+    setDock(prefs.get("actionBarDock", "left"));
+    window.cttc?.onActionBarRedock?.(() => setDock(prefs.get("actionBarLastDock", "left")));
+  }
 
   // Accelerators for actions with no native browser default (edit shortcuts
   // like Ctrl+C/V/Z work out of the box in inputs/contenteditable and are
@@ -2737,11 +2862,22 @@ connectSSE();
           close();
           setStatus(`Switching to ${g.label || g.host}…`);
           const r = await window.cttc.switchGateway(g);
-          if (!r.ok) setStatus(`Could not switch gateway: ${r.error}`);
+          if (!r.ok) setStatus(r.error);
         };
       }
       dropdown.appendChild(item);
     }
+    // Passive per-item reachability, checked fresh every time the dropdown
+    // opens -- purely informational (including for the active entry, if
+    // it's the one that's gone down): never triggers a switch on its own,
+    // just flags the item so it's visible before you try it, or notice the
+    // gateway you're already on has stopped responding.
+    const items = [...dropdown.querySelectorAll(".gateway-item")];
+    gateways.forEach((g, i) => {
+      window.cttc.checkGateway(g).then((ok) => {
+        items[i].dataset.reachable = String(ok);
+      });
+    });
   };
 
   btn.onclick = async (e) => {

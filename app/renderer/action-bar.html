@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; style-src 'self'; script-src 'self'" />
+  <title>CTTC Actions</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <aside id="action-bar" class="detached">
+    <div class="ab-dock-controls">
+      <button type="button" id="ab-redock" class="btn-flat" title="Bring back into the main window"><svg class="btn-flat-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="m12 2a9.95 9.95 0 0 0 -7 2.88v-1.88a1 1 0 0 0 -2 0v5a1 1 0 0 0 1 1h5a1 1 0 0 0 0-2h-3.2242a7.9872 7.9872 0 1 1 .2613 10.3335 1 1 0 1 0 -1.49 1.334 10 10 0 1 0 7.4529-16.6675z"/></svg>Bring Back</button>
+    </div>
+    <div class="ab-group">
+      <div class="ab-group-label">Gateway</div>
+      <button data-action="new-gateway"><span class="ab-icon">⛨</span>New Gateway…</button>
+      <button data-action="edit-gateways"><span class="ab-icon">⚙</span>Edit Gateway</button>
+    </div>
+    <div class="ab-group">
+      <div class="ab-group-label">Sources</div>
+      <button data-action="set-sources"><span class="ab-icon">＋</span>Set Sources…</button>
+      <button data-action="clear-sources"><span class="ab-icon">🗑</span>Clear Sources</button>
+    </div>
+    <div class="ab-group">
+      <div class="ab-group-label">Metrics</div>
+      <button data-action="load-metrics"><span class="ab-icon">📂</span>Load Metrics…</button>
+    </div>
+    <div class="ab-group">
+      <div class="ab-group-label">Preferences</div>
+      <button data-action="open-theme"><span class="ab-icon">◐</span>Appearance…</button>
+      <button data-action="open-settings"><span class="ab-icon">☰</span>Settings…</button>
+    </div>
+    <div class="ab-group">
+      <div class="ab-group-label">Help</div>
+      <button data-action="about"><span class="ab-icon">ⓘ</span>About CTTC</button>
+    </div>
+    <div class="ab-group ab-group-bottom">
+      <button data-action="quit"><span class="ab-icon">⏻</span>Quit</button>
+    </div>
+  </aside>
+  <script src="action-bar.js"></script>
+</body>
+</html>

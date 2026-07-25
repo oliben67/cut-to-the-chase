@@ -296,8 +296,8 @@ View the result as a **Raw** table or as **JSON**, and save it with
 
 To save a time range for later analysis or to share it:
 
-1. **Shift+drag** across the charts (or right-click → **✂ Capture metrics**,
-   then drag) — the selection shows as an orange band.
+1. **Shift+drag** or **Ctrl/Cmd+drag** across the charts (or right-click →
+   **✂ Capture metrics**, then drag) — the selection shows as an orange band.
 2. In the **Save metrics** dialog choose whether to include host telemetry
    (if it isn't being collected yet, ticking the box starts it for future
    captures) and, optionally, an **Encrypt for** key.

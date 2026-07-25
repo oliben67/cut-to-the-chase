@@ -1,7 +1,8 @@
 "use strict";
 
-const { app, BrowserWindow, dialog, ipcMain, Menu, shell } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain, Menu, shell, nativeTheme } = require("electron");
 const { spawn } = require("child_process");
+const fs = require("fs");
 const path = require("path");
 const readline = require("readline");
 const {
@@ -19,6 +20,11 @@ const {
   uninstallRemoteContainer,
 } = require("./lib/server-provision");
 const { readGateways, recordGateway, removeGateway, gatewayKey } = require("./lib/gateway-registry");
+const {
+  readSettings: readLogCollectorSettings,
+  writeSettings: writeLogCollectorSettings,
+  logFileName,
+} = require("./lib/log-collector");
 
 const SERVER_DIR = path.join(__dirname, "server");
 const APP_ICON = path.join(__dirname, "assets", "icon.png");
@@ -40,6 +46,36 @@ function isActiveGateway(g) {
   return g.mode === "embedded" ? serverHost === "127.0.0.1" : g.host === serverHost && g.port === serverPort;
 }
 
+// Shared by get-gateways and switch-gateway's failure message (which needs
+// to name the gateway it's staying on).
+function listGatewaysWithActiveFlag() {
+  const gateways = readGateways();
+  // "This machine" is always a selectable gateway, even if a local
+  // container has never actually been provisioned here (recordGateway only
+  // ever runs after one succeeds) -- it just won't have a real port yet, so
+  // there's nothing to re-verify/switch to until Edit Gateways' Save
+  // actually provisions one.
+  if (!gateways.some((g) => g.mode === "embedded")) {
+    gateways.unshift({ mode: "embedded", host: "127.0.0.1", port: null, label: "This machine" });
+  }
+  for (const g of gateways) g.active = isActiveGateway(g);
+  return gateways;
+}
+
+// Read-only reachability probe for the dropdown's passive per-item status
+// (never triggers a switch on its own -- see check-gateway below). The
+// never-provisioned "This machine" placeholder has no port to check and is
+// always treated as reachable.
+async function checkGatewayReachable(entry) {
+  if (entry.mode === "embedded" && entry.port == null) return true;
+  try {
+    const r = await fetch(`http://${entry.host}:${entry.port}/health`, { signal: AbortSignal.timeout(4000) });
+    return r.ok;
+  } catch {
+    return false;
+  }
+}
+
 // Every window's DevTools console (Help > Developer Tools) is the one place
 // a user can see logs regardless of whether the app was launched from a
 // terminal or double-clicked -- so main-process logging (including the
@@ -51,15 +87,38 @@ function broadcastLog(level, text) {
     win.webContents.send("main-log", { level, text });
   }
 }
+
+// "Collect CTTC Own Logs" (Preferences > Settings): an optional third sink
+// alongside the console/DevTools ones above, writing to a file instead --
+// covers the server subprocess's own logging too (see mainError below),
+// since serverProc's stderr is already piped through mainError, not just
+// this process's own messages.
+let logCollectorStream = null;
+function startLogCollector(dir) {
+  stopLogCollector();
+  logCollectorStream = fs.createWriteStream(path.join(dir, logFileName()), { flags: "a" });
+}
+function stopLogCollector() {
+  if (logCollectorStream) {
+    logCollectorStream.end();
+    logCollectorStream = null;
+  }
+}
+function writeToLogCollector(text) {
+  logCollectorStream?.write(`${new Date().toISOString()} ${text}\n`);
+}
+
 function mainLog(...args) {
   const text = args.map(String).join(" ");
   console.log(text);
   broadcastLog("log", text);
+  writeToLogCollector(text);
 }
 function mainError(...args) {
   const text = args.map(String).join(" ");
   console.error(text);
   broadcastLog("error", text);
+  writeToLogCollector(`ERROR ${text}`);
 }
 
 function startServer(extraArgs) {
@@ -119,7 +178,8 @@ function showAboutDialog() {
       `${APP_TAGLINE}\n\n` +
       `Version ${app.getVersion()}\n` +
       `\u00A9 ${new Date().getFullYear()} Olivier Steck\n\n` +
-      `Built with:\n${stack.map((s) => `  \u2022 ${s}`).join("\n")}`,
+      `Built with:\n${stack.map((s) => `  \u2022 ${s}`).join("\n")}\n\n` +
+      `Icons by Flaticon (flaticon.com)`,
     buttons: ["OK"],
     noLink: true,
   });
@@ -244,6 +304,7 @@ async function createWindow() {
   win.on("closed", () => {
     if (mainWindow === win) mainWindow = null;
     if (gatewayManagerWindow && !gatewayManagerWindow.isDestroyed()) gatewayManagerWindow.close();
+    if (actionBarWindow && !actionBarWindow.isDestroyed()) actionBarWindow.close();
     for (const popout of popoutWindows.values()) {
       if (!popout.isDestroyed()) popout.close();
     }
@@ -672,24 +733,16 @@ function runSetupWizard() {
   });
 }
 
-// Run Setup / Update Image / switch-gateway don't hot-swap the already-loaded
-// window's server connection on their own (its page was loaded with the
-// *old* host/port baked into the URL) -- but a full app.relaunch() threw away
-// the whole process (every popout, the splash-free startup already done)
-// just to change a query string. Reloading only the main window with the
+// Run Setup / Update Image don't hot-swap the already-loaded window's server
+// connection on their own (its page was loaded with the *old* host/port
+// baked into the URL) -- but a full app.relaunch() threw away the whole
+// process (every popout, the splash-free startup already done) just to
+// change a query string. Reloading only the main window with the
 // now-updated serverHost/serverPort gets the same fresh-connection result
 // without restarting CTTC itself. Popouts hold their own stale connection
 // the same way, so they're closed rather than left pointing at the old
 // gateway; the main window's own panels re-fetch from the new one on load.
-async function offerRestart(message) {
-  const r = await dialog.showMessageBox({
-    type: "info",
-    message,
-    buttons: ["Reconnect Now", "Later"],
-    defaultId: 0,
-    cancelId: 1,
-  });
-  if (r.response !== 0) return;
+async function reconnectMainWindow() {
   for (const popout of popoutWindows.values()) {
     if (!popout.isDestroyed()) popout.close();
   }
@@ -701,29 +754,35 @@ async function offerRestart(message) {
     await createWindow();
   }
 }
+// Still confirmed for Run Setup / Update Image / uninstall -- those are
+// deliberate settings-screen actions, not the quick status-pill switcher
+// (see switch-gateway below, which reconnects immediately with no prompt).
+async function offerRestart(message) {
+  const r = await dialog.showMessageBox({
+    type: "info",
+    message,
+    buttons: ["Reconnect Now", "Later"],
+    defaultId: 0,
+    cancelId: 1,
+  });
+  if (r.response !== 0) return;
+  await reconnectMainWindow();
+}
 
 // Backs the status-pill dropdown in the main window: every gateway this
 // client has ever actually connected to, newest first, with the currently
 // active one flagged so the renderer can highlight it.
-ipcMain.handle("get-gateways", () => {
-  const gateways = readGateways();
-  // "This machine" is always a selectable gateway, even if a local
-  // container has never actually been provisioned here (recordGateway only
-  // ever runs after one succeeds) -- it just won't have a real port yet, so
-  // there's nothing to re-verify/switch to until Edit Gateways' Save
-  // actually provisions one.
-  if (!gateways.some((g) => g.mode === "embedded")) {
-    gateways.unshift({ mode: "embedded", host: "127.0.0.1", port: null, label: "This machine" });
-  }
-  for (const g of gateways) {
-    g.active = isActiveGateway(g);
-  }
-  return gateways;
-});
+ipcMain.handle("get-gateways", () => listGatewaysWithActiveFlag());
+
+// Read-only: lets the dropdown flag a gateway as unreachable without
+// switching to it or changing anything -- purely informational, including
+// for the currently-active entry (see switch-gateway's own health check for
+// the one place a failed probe actually blocks an action).
+ipcMain.handle("check-gateway", (_e, entry) => checkGatewayReachable(entry));
 
 // Switching gateways doesn't re-provision anything -- these are all
 // gateways already confirmed running at some point; a quick /health check
-// just confirms it's still up before committing to it, since restarting
+// just confirms it's still up before committing to it, since reconnecting
 // into a dead gateway would be a worse experience than an upfront error
 // here. "embedded" means point back at this machine (clears
 // connection.json, same as Run Setup's "Revert to Local"); anything else
@@ -731,16 +790,19 @@ ipcMain.handle("get-gateways", () => {
 // never-provisioned "This machine" placeholder (see get-gateways -- no
 // real port yet) has nothing to health-check; switching to it just falls
 // back to the ordinary embedded-mode startup path (with or without local
-// Docker) the same as if no gateway had ever been configured.
+// Docker) the same as if no gateway had ever been configured. No
+// confirmation dialog here (unlike Run Setup/Update Image/uninstall) --
+// this is the quick status-pill switcher, meant to feel immediate; the
+// renderer shows its own "Switching to X…" status message while this runs.
 ipcMain.handle("switch-gateway", async (_e, entry) => {
   const isUnprovisionedLocal = entry.mode === "embedded" && entry.port == null;
-  if (!isUnprovisionedLocal) {
-    try {
-      const r = await fetch(`http://${entry.host}:${entry.port}/health`, { signal: AbortSignal.timeout(5000) });
-      if (!r.ok) throw new Error(`gateway responded ${r.status}`);
-    } catch (err) {
-      return { ok: false, error: `could not reach ${entry.host}:${entry.port}: ${err.message || err}` };
-    }
+  if (!isUnprovisionedLocal && !(await checkGatewayReachable(entry))) {
+    const current = listGatewaysWithActiveFlag().find((g) => g.active);
+    const currentLabel = current?.label || (serverHost === "127.0.0.1" ? "This machine" : serverHost);
+    return {
+      ok: false,
+      error: `Failed to reach ${entry.label || entry.host} (${entry.host}:${entry.port}) — staying on ${currentLabel}.`,
+    };
   }
   if (entry.mode === "embedded") {
     clearConnectionConfig();
@@ -763,7 +825,7 @@ ipcMain.handle("switch-gateway", async (_e, entry) => {
     serverHost = entry.host;
     serverPort = entry.port;
   }
-  await offerRestart(`Reconnect CTTC to switch to ${entry.label}?`);
+  await reconnectMainWindow();
   return { ok: true };
 });
 
@@ -821,6 +883,98 @@ function openGatewayManager() {
   });
 }
 ipcMain.handle("edit-gateways", () => openGatewayManager());
+
+// The dockable action bar's "detached" mode: a small always-on-top window
+// with the same buttons as the docked bar. It has no access to the main
+// window's document, so every button click there is forwarded here
+// (action-bar-trigger) and relayed to the main window's own renderer
+// (run-action) instead of running locally -- Undo/Redo/Reload/etc. need to
+// act on the main window's content, not this window's (which has none).
+let actionBarWindow = null;
+function openActionBarWindow() {
+  if (actionBarWindow && !actionBarWindow.isDestroyed()) {
+    actionBarWindow.focus();
+    return;
+  }
+  actionBarWindow = new BrowserWindow({
+    width: 220,
+    height: 520,
+    minWidth: 160,
+    minHeight: 200,
+    alwaysOnTop: true,
+    icon: APP_ICON,
+    show: false,
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+  actionBarWindow.once("ready-to-show", () => actionBarWindow.show());
+  actionBarWindow.setMenuBarVisibility(false);
+  actionBarWindow.loadFile(path.join(__dirname, "renderer", "action-bar.html"));
+  // Closing this window by ANY means -- the Bring Back button, the OS
+  // window-close control, Cmd+W, clicking off it if it's ever made
+  // click-outside-dismissible -- must redock the sidebar back to its last
+  // position. Without this, simply closing the floating window (instead of
+  // clicking Bring Back) left #action-bar hidden (data-dock="detached")
+  // with no window left to show it in at all.
+  actionBarWindow.on("closed", () => {
+    actionBarWindow = null;
+    mainWindow?.webContents.send("action-bar-redock");
+  });
+}
+function closeActionBarWindow() {
+  if (actionBarWindow && !actionBarWindow.isDestroyed()) actionBarWindow.close();
+}
+ipcMain.handle("open-action-bar-window", () => openActionBarWindow());
+ipcMain.handle("close-action-bar-window", () => closeActionBarWindow());
+ipcMain.on("action-bar-trigger", (_e, action) => {
+  mainWindow?.webContents.send("run-action", action);
+});
+// The 'closed' handler above is what actually sends the redock signal --
+// this just closes the window (Bring Back is one way to trigger that, not
+// the only one).
+ipcMain.on("action-bar-redock", () => {
+  closeActionBarWindow();
+});
+ipcMain.on("action-bar-poll-interval", (_e, secs) => {
+  mainWindow?.webContents.send("set-poll-interval", secs);
+});
+
+// nativeTheme.themeSource is process-wide (affects every window's
+// prefers-color-scheme match, plus native dialogs/menus), so this doesn't
+// need per-window plumbing the way the other renderer-owned settings do --
+// the renderer just tells main.js once and it's applied everywhere.
+ipcMain.on("set-theme-mode", (_e, mode) => {
+  if (mode === "light" || mode === "dark" || mode === "system") nativeTheme.themeSource = mode;
+});
+
+// "Collect CTTC Own Logs" (Preferences > Settings). Turning it on for the
+// first time (no directory saved yet) prompts for one; every later toggle
+// reuses the saved directory without asking again. Toggling off just stops
+// the file sink -- the directory is remembered for next time either way.
+ipcMain.handle("get-log-collector-settings", () => readLogCollectorSettings());
+ipcMain.handle("set-log-collector-enabled", async (_e, enabled) => {
+  const settings = readLogCollectorSettings();
+  if (!enabled) {
+    stopLogCollector();
+    writeLogCollectorSettings({ ...settings, enabled: false });
+    return { ok: true, enabled: false };
+  }
+  let dir = settings.dir;
+  if (!dir) {
+    const r = await dialog.showOpenDialog({
+      title: "Choose a folder for CTTC's own logs",
+      properties: ["openDirectory", "createDirectory"],
+    });
+    if (r.canceled || !r.filePaths[0]) return { ok: false, enabled: false };
+    dir = r.filePaths[0];
+  }
+  startLogCollector(dir);
+  writeLogCollectorSettings({ enabled: true, dir });
+  return { ok: true, enabled: true, dir };
+});
 
 // Re-provisions a gateway at (possibly new) ssh settings and updates its
 // registry entry in place -- editing the *currently active* gateway also
@@ -929,6 +1083,12 @@ app.whenReady().then(async () => {
   // the window `icon` option is ignored on macOS; the running app's Dock icon
   // must be set explicitly (only affects unpackaged runs — packaged apps use .icns)
   if (process.platform === "darwin") app.dock.setIcon(APP_ICON);
+  // "Collect CTTC Own Logs" was left on from a previous run -- a fresh
+  // timestamped file for this launch, same as toggling it on mid-session.
+  {
+    const logSettings = readLogCollectorSettings();
+    if (logSettings.enabled && logSettings.dir) startLogCollector(logSettings.dir);
+  }
   try {
     // files passed on the command line open at startup: npm start -- file1 file2
     const fileArgs = process.argv.slice(app.isPackaged ? 1 : 2).filter((a) => !a.startsWith("-"));
@@ -988,6 +1148,8 @@ function stopServer() {
 
 app.on("window-all-closed", () => {
   stopServer();
+  stopLogCollector();
   app.quit();
 });
 app.on("before-quit", stopServer);
+app.on("before-quit", stopLogCollector);
