@@ -42,12 +42,17 @@ from typing import Literal
 import docker
 import orjson
 import uvicorn
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 
 import files  # local sibling module (server/files.py) -- upload/download endpoints
+from cttc_format import RECORD_EXT, is_cttc_archive
+from events import Action, EventManager, InvalidEvent, LogCondition, MetricCondition, UnknownEvent
+from recording_session import RecordingSessionManager, UnknownSession
+from rolling_buffer import RollingBufferManager, UnknownBuffer
+from scheduler import InvalidSchedule, Scheduler, UnknownSchedule
 
 logger = logging.getLogger("cttc")
 
@@ -1050,11 +1055,17 @@ class MultiSegmentSample(Exception):
 
 
 class State:
-    def __init__(self, transforms_dir: Path):
+    def __init__(self, transforms_dir: Path, sessions_dir: Path | None = None):
         self.sources: dict[str, Source] = {}
         self.registry = TransformRegistry(transforms_dir)
         self.listeners: list[asyncio.Queue] = []
         self.next_id = 1
+        self.rolling_buffers = RollingBufferManager(self)
+        self.recording_sessions = RecordingSessionManager(
+            self, sessions_dir or transforms_dir / "sessions"
+        )
+        self.scheduler = Scheduler(self.recording_sessions)
+        self.events = EventManager(self, self.rolling_buffers, self.recording_sessions)
 
     def broadcast(self, event: dict):
         for q in list(self.listeners):
@@ -1159,15 +1170,26 @@ class State:
         return opened
 
     def _write_segment(
-        self, z: zipfile.ZipFile, seg_idx: int, t0: float, t1: float, include_host: bool
+        self,
+        z: zipfile.ZipFile,
+        seg_idx: int,
+        t0: float,
+        t1: float,
+        include_host: bool,
+        source_ids: set[str] | None = None,
     ) -> list[dict]:
         """Write one segment's per-source log/metric slices in [t0, t1] into
         the already-open zip `z`, namespaced under seg{seg_idx}/ so multiple
         segments (recorded across separate Record/Pause spans, possibly
         merged in from an earlier archive -- see merge_sample_bytes) never
-        collide on filename. Returns that segment's manifest sources list."""
+        collide on filename. Returns that segment's manifest sources list.
+        `source_ids`, if given, restricts output to that subset (used by the
+        rolling buffer feature to freeze the set of sources live at
+        buffer-start time, ignoring sources opened/closed afterward)."""
         meta = []
         for i, s in enumerate(self.sources.values()):
+            if source_ids is not None and s.id not in source_ids:
+                continue
             if not include_host and getattr(s, "is_host", False):
                 continue
             if s.kind == "log":
@@ -1195,15 +1217,21 @@ class State:
         return meta
 
     def build_sample_bytes(
-        self, t0: float, t1: float, include_host: bool = True
+        self,
+        t0: float,
+        t1: float,
+        include_host: bool = True,
+        source_ids: set[str] | None = None,
     ) -> tuple[bytes, list[dict]]:
         """Build a one-segment .cttc sample's bytes (the ordinary Capture
         Metrics / --static export path -- see merge_sample_bytes for the
         Recording feature's multi-segment append). Returns (data, meta);
-        meta's length is the "how many sources" count callers report."""
+        meta's length is the "how many sources" count callers report.
+        `source_ids` restricts the segment to that subset of sources (see
+        rolling_buffer.RollingBufferManager)."""
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-            meta = self._write_segment(z, 0, t0, t1, include_host)
+            meta = self._write_segment(z, 0, t0, t1, include_host, source_ids)
             segment = {"from": t0, "to": t1, "created": now_iso(), "sources": meta}
             z.writestr("manifest.json", jdumps({"version": 2, "segments": [segment]}))
         return buf.getvalue(), meta
@@ -1416,6 +1444,17 @@ async def tail_loop(state: State, interval: float = 1.0):
                 except OSError:
                     continue
                 state.broadcast({"type": "update", "source": src.id})
+
+
+async def sessions_loop(state: State, interval: float = 1.0):
+    """Drives recording_session.py's duration-elapsed/TTL-sweep checks,
+    scheduler.py's due-schedule firing, and events.py's condition checks --
+    see each module's docstring."""
+    while True:
+        await asyncio.sleep(interval)
+        state.scheduler.tick()
+        state.recording_sessions.tick()
+        state.events.tick()
 
 
 # ── HTTP API (FastAPI) ────────────────────────────────────────────────────────
@@ -1687,7 +1726,7 @@ async def route_open(request: Request):
     opened, errors, needs_selection = [], [], []
     for f in body.get("files", []):
         try:
-            if str(f["path"]).endswith(".cttc"):
+            if is_cttc_archive(str(f["path"])):
                 opened.extend(st.load_sample(f["path"], segment=f.get("segment")))
                 continue
             src = st.open_file(
@@ -1761,6 +1800,307 @@ async def route_sample_record(request: Request):
             "Access-Control-Expose-Headers": "X-CTTC-Source-Count, X-CTTC-Segment-Index",
         },
     )
+
+
+@app.post("/buffer/start")
+async def route_buffer_start(request: Request):
+    body = await request.json()
+    st = get_state(request)
+    buffer_id = st.rolling_buffers.start(float(body["minutes"]))
+    return {"buffer_id": buffer_id}
+
+
+@app.post("/buffer/{buffer_id}/pause")
+async def route_buffer_pause(buffer_id: str, request: Request):
+    st = get_state(request)
+    try:
+        st.rolling_buffers.pause(buffer_id)
+    except UnknownBuffer:
+        raise HTTPException(status_code=404, detail=f"unknown buffer: {buffer_id}")
+    return {"ok": True}
+
+
+@app.post("/buffer/{buffer_id}/stop")
+async def route_buffer_stop(buffer_id: str, request: Request):
+    st = get_state(request)
+    try:
+        data, meta = st.rolling_buffers.stop(buffer_id)
+    except UnknownBuffer:
+        raise HTTPException(status_code=404, detail=f"unknown buffer: {buffer_id}")
+    return Response(
+        content=data,
+        media_type="application/octet-stream",
+        headers={
+            "X-CTTC-Source-Count": str(len(meta)),
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Expose-Headers": "X-CTTC-Source-Count",
+        },
+    )
+
+
+@app.post("/session/start")
+async def route_session_start(request: Request):
+    """Start an on-demand recording session (see recording_session.py).
+    Returns the session_id immediately -- the client polls
+    /session/{id}/status until "completed", then GETs /session/{id}/download
+    for the .cttc-record bytes."""
+    body = await request.json() if await request.body() else {}
+    st = get_state(request)
+    session_id = st.recording_sessions.start(
+        duration_minutes=float(body["duration_minutes"]) if "duration_minutes" in body else None,
+        safe=bool(body.get("safe", False)),
+        max_keep_seconds=float(body["max_keep_seconds"]) if body.get("max_keep_seconds") else None,
+    )
+    return {"session_id": session_id}
+
+
+@app.post("/session/{session_id}/stop")
+async def route_session_stop(session_id: str, request: Request):
+    st = get_state(request)
+    try:
+        st.recording_sessions.stop(session_id)
+    except UnknownSession:
+        raise HTTPException(status_code=404, detail=f"unknown session: {session_id}")
+    return {"ok": True}
+
+
+@app.post("/session/{session_id}/safe")
+async def route_session_safe(session_id: str, request: Request):
+    """Flag a session as safe from the default TTL sweep, kept instead for
+    up to `max_keep_seconds` from completion -- call this when a recording
+    is expected to (or already did) run longer than the gateway's default
+    retention window, so it isn't erased before the client collects it."""
+    body = await request.json()
+    st = get_state(request)
+    try:
+        st.recording_sessions.mark_safe(session_id, float(body["max_keep_seconds"]))
+    except UnknownSession:
+        raise HTTPException(status_code=404, detail=f"unknown session: {session_id}")
+    return {"ok": True}
+
+
+@app.get("/session/{session_id}/status")
+async def route_session_status(session_id: str, request: Request):
+    st = get_state(request)
+    try:
+        return st.recording_sessions.status_of(session_id)
+    except UnknownSession:
+        raise HTTPException(status_code=404, detail=f"unknown session: {session_id}")
+
+
+@app.get("/session/{session_id}/download")
+async def route_session_download(session_id: str, request: Request):
+    st = get_state(request)
+    try:
+        data = st.recording_sessions.download(session_id)
+    except UnknownSession:
+        raise HTTPException(
+            status_code=404, detail=f"unknown or not-yet-completed session: {session_id}"
+        )
+    return Response(
+        content=data,
+        media_type="application/octet-stream",
+        headers={
+            "Content-Disposition": f'attachment; filename="{session_id}{RECORD_EXT}"',
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
+
+
+@app.post("/session/ttl")
+async def route_session_ttl(request: Request):
+    """Set the gateway's default retention TTL (seconds) for completed
+    recording sessions not flagged safe -- 24h unless a client changes it
+    here (see recording_session.py's module docstring)."""
+    body = await request.json()
+    st = get_state(request)
+    st.recording_sessions.set_default_ttl(float(body["seconds"]))
+    return {"ok": True}
+
+
+@app.post("/scheduler/create")
+async def route_scheduler_create(request: Request):
+    """Register a schedule -- give exactly one of `start_at` (epoch ms,
+    one-shot) or `cron` (a 5-field cron expression, recurring). Returns the
+    schedule_id; poll /scheduler/{id} to discover each fired occurrence's
+    session_id as it's triggered, then poll/download it via the ordinary
+    /session/* endpoints."""
+    body = await request.json()
+    st = get_state(request)
+    try:
+        schedule_id = st.scheduler.create(
+            duration_minutes=float(body["duration_minutes"]),
+            start_at=float(body["start_at"]) if body.get("start_at") is not None else None,
+            cron=body.get("cron"),
+            safe=bool(body.get("safe", False)),
+            max_keep_seconds=float(body["max_keep_seconds"])
+            if body.get("max_keep_seconds")
+            else None,
+        )
+    except InvalidSchedule as e:
+        raise bad_request(str(e))
+    return {"schedule_id": schedule_id}
+
+
+@app.get("/scheduler/{schedule_id}")
+async def route_scheduler_status(schedule_id: str, request: Request):
+    st = get_state(request)
+    try:
+        return st.scheduler.status_of(schedule_id)
+    except UnknownSchedule:
+        raise HTTPException(status_code=404, detail=f"unknown schedule: {schedule_id}")
+
+
+@app.post("/scheduler/{schedule_id}/cancel")
+async def route_scheduler_cancel(schedule_id: str, request: Request):
+    st = get_state(request)
+    try:
+        st.scheduler.cancel(schedule_id)
+    except UnknownSchedule:
+        raise HTTPException(status_code=404, detail=f"unknown schedule: {schedule_id}")
+    return {"ok": True}
+
+
+def _parse_condition(body: dict):
+    ctype = body.get("type")
+    if ctype == "metric":
+        return MetricCondition(
+            metric=body["metric"], op=body["op"], threshold=float(body["threshold"])
+        )
+    if ctype == "log":
+        return LogCondition(pattern=body["pattern"])
+    raise bad_request(f"condition.type must be 'metric' or 'log', got {ctype!r}")
+
+
+def _parse_action(body: dict) -> Action:
+    return Action(
+        kind=body.get("kind"),
+        minutes=float(body["minutes"]) if body.get("minutes") is not None else None,
+        duration_minutes=float(body["duration_minutes"])
+        if body.get("duration_minutes") is not None
+        else None,
+        safe=bool(body.get("safe", False)),
+        max_keep_seconds=float(body["max_keep_seconds"]) if body.get("max_keep_seconds") else None,
+    )
+
+
+@app.post("/events/create")
+async def route_events_create(request: Request):
+    """Register a gateway-hosted event -- see events.py's module docstring.
+    `source_ids` picks which systems are watched (omit/empty for every
+    currently-open source); `conditions` is a non-empty list of
+    `{"type": "metric", "metric": "cpu"|"mem"|"net", "op": ">"|"<"|">="|"<="|"=",
+    "threshold": N}` and/or `{"type": "log", "pattern": "<regex>"}`;
+    `match` ("any", the default, or "all") picks whether one or every
+    condition must hold; `action` is either
+    `{"kind": "snapshot", "minutes": N, ...}` or
+    `{"kind": "recording", "duration_minutes": N, ...}` (both accept the
+    same `safe`/`max_keep_seconds` as /session/*)."""
+    body = await request.json()
+    st = get_state(request)
+    try:
+        conditions = [_parse_condition(c) for c in body.get("conditions") or []]
+        action = _parse_action(body.get("action") or {})
+        event_id = st.events.create(
+            name=body.get("name", ""),
+            source_ids=set(body.get("source_ids") or []),
+            conditions=conditions,
+            action=action,
+            match=body.get("match", "any"),
+        )
+    except InvalidEvent as e:
+        raise bad_request(str(e))
+    except (KeyError, TypeError) as e:
+        raise bad_request(f"malformed event request: {e}")
+    return {"event_id": event_id}
+
+
+@app.get("/events/list")
+async def route_events_list(request: Request):
+    # NOT "/events" -- that path is already the SSE stream (see route_events
+    # above, `new EventSource(API + "/events")` in app.js); registering
+    # another handler on the exact same path would shadow one of them (a
+    # plain fetch() to a live SSE stream never resolves .json(), which is
+    # exactly the silent-hang bug this comment is here to keep from
+    # regressing -- see the events.py feature's own event listing, unrelated
+    # to this file's live-update SSE "events").
+    st = get_state(request)
+    return {"event_ids": st.events.list_ids()}
+
+
+@app.get("/events/{event_id}")
+async def route_events_status(event_id: str, request: Request):
+    st = get_state(request)
+    try:
+        return st.events.status_of(event_id)
+    except UnknownEvent:
+        raise HTTPException(status_code=404, detail=f"unknown event: {event_id}")
+
+
+@app.post("/events/{event_id}/enable")
+async def route_events_enable(event_id: str, request: Request):
+    st = get_state(request)
+    try:
+        st.events.enable(event_id)
+    except UnknownEvent:
+        raise HTTPException(status_code=404, detail=f"unknown event: {event_id}")
+    return {"ok": True}
+
+
+@app.post("/events/{event_id}/disable")
+async def route_events_disable(event_id: str, request: Request):
+    st = get_state(request)
+    try:
+        st.events.disable(event_id)
+    except UnknownEvent:
+        raise HTTPException(status_code=404, detail=f"unknown event: {event_id}")
+    return {"ok": True}
+
+
+@app.post("/events/{event_id}/reset")
+async def route_events_reset(event_id: str, request: Request):
+    st = get_state(request)
+    try:
+        st.events.reset(event_id)
+    except UnknownEvent:
+        raise HTTPException(status_code=404, detail=f"unknown event: {event_id}")
+    return {"ok": True}
+
+
+@app.post("/events/{event_id}/update")
+async def route_events_update(event_id: str, request: Request):
+    """Edit Event: change an existing event in place (same id, same
+    trigger history). Same body shape as /events/create, but every field
+    is optional -- only the ones present are changed (see
+    EventManager.update)."""
+    body = await request.json()
+    st = get_state(request)
+    try:
+        st.events.update(
+            event_id,
+            name=body.get("name"),
+            source_ids=set(body["source_ids"]) if "source_ids" in body else None,
+            conditions=[_parse_condition(c) for c in body["conditions"]] if "conditions" in body else None,
+            action=_parse_action(body["action"]) if "action" in body else None,
+            match=body.get("match"),
+        )
+    except UnknownEvent:
+        raise HTTPException(status_code=404, detail=f"unknown event: {event_id}")
+    except InvalidEvent as e:
+        raise bad_request(str(e))
+    except (KeyError, TypeError) as e:
+        raise bad_request(f"malformed event request: {e}")
+    return {"ok": True}
+
+
+@app.post("/events/{event_id}/cancel")
+async def route_events_cancel(event_id: str, request: Request):
+    st = get_state(request)
+    try:
+        st.events.cancel(event_id)
+    except UnknownEvent:
+        raise HTTPException(status_code=404, detail=f"unknown event: {event_id}")
+    return {"ok": True}
 
 
 @app.post("/docker/ps")
@@ -1843,6 +2183,12 @@ def main():
     )
     ap.add_argument("--transforms-dir", default=str(Path(__file__).parent / "transforms"))
     ap.add_argument(
+        "--sessions-dir",
+        default=str(Path(__file__).parent / "sessions"),
+        help="where recording_session.py stores completed .cttc-record files "
+        "awaiting client collection",
+    )
+    ap.add_argument(
         "--naive-tz",
         choices=["utc", "local"],
         default="utc",
@@ -1862,7 +2208,7 @@ def main():
 async def _run(args):
     import socket as _socket
 
-    state = State(Path(args.transforms_dir))
+    state = State(Path(args.transforms_dir), Path(args.sessions_dir))
     app.state.cttc = state
 
     for f in args.files:
@@ -1890,6 +2236,7 @@ async def _run(args):
     logger.info("listening on %s:%d", args.host, port)
 
     asyncio.ensure_future(tail_loop(state))
+    asyncio.ensure_future(sessions_loop(state))
     try:
         await server.serve()
     except KeyboardInterrupt:

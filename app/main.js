@@ -25,6 +25,7 @@ const {
   writeSettings: writeLogCollectorSettings,
   logFileName,
 } = require("./lib/log-collector");
+const { saveArtifact, listArtifacts, sweepArtifacts } = require("./lib/event-artifacts");
 
 const SERVER_DIR = path.join(__dirname, "server");
 const APP_ICON = path.join(__dirname, "assets", "icon.png");
@@ -296,14 +297,14 @@ async function createWindow() {
     },
   });
   mainWindow = win;
-  // Auxiliary windows (popouts, Edit Gateways) have no reason to keep
-  // running once the main window they belong to is gone -- without this,
-  // closing just the main window while Edit Gateways is open leaves it as
-  // an orphaned window with nothing behind it, and window-all-closed never
-  // fires to actually quit the app.
+  // Auxiliary windows (popouts, the detached action bar) have no reason to
+  // keep running once the main window they belong to is gone -- without
+  // this, closing just the main window leaves them orphaned with nothing
+  // behind them, and window-all-closed never fires to actually quit the
+  // app. New Gateway/Edit Gateways are dialogs in the main window itself
+  // now (see index.html's #dlg-gateway-setup), so they close with it.
   win.on("closed", () => {
     if (mainWindow === win) mainWindow = null;
-    if (gatewayManagerWindow && !gatewayManagerWindow.isDestroyed()) gatewayManagerWindow.close();
     if (actionBarWindow && !actionBarWindow.isDestroyed()) actionBarWindow.close();
     for (const popout of popoutWindows.values()) {
       if (!popout.isDestroyed()) popout.close();
@@ -414,7 +415,7 @@ ipcMain.handle("save-binary", async (_e, defaultName, bytes) => {
   const r = await dialog.showSaveDialog({
     title: "Save metrics",
     defaultPath: defaultName,
-    filters: [{ name: "CTTC metrics", extensions: ["cttc"] }],
+    filters: [{ name: "CTTC metrics", extensions: ["cttc-metric"] }],
   });
   if (r.canceled || !r.filePath) return null;
   await require("fs").promises.writeFile(r.filePath, Buffer.from(bytes));
@@ -441,8 +442,8 @@ ipcMain.handle("read-file", async (_e, filePath) => {
 ipcMain.handle("pick-recording-path", async () => {
   const r = await dialog.showSaveDialog({
     title: "Start Recording",
-    defaultPath: `recording-${new Date().toISOString().slice(0, 19).replace(/[T:]/g, "-")}.cttc`,
-    filters: [{ name: "CTTC metrics", extensions: ["cttc"] }],
+    defaultPath: `recording-${new Date().toISOString().slice(0, 19).replace(/[T:]/g, "-")}.cttc-record`,
+    filters: [{ name: "CTTC recording", extensions: ["cttc-record"] }],
   });
   return r.canceled || !r.filePath ? null : r.filePath;
 });
@@ -450,6 +451,15 @@ ipcMain.handle("pick-recording-path", async () => {
 ipcMain.handle("write-binary-file", async (_e, filePath, bytes) => {
   await require("fs").promises.writeFile(filePath, Buffer.from(bytes));
 });
+
+/* ── Events (renderer/app.js's UI-hosted event engine) ────────────────────
+   A UI-hosted event's triggered snapshot/recording is saved silently (no
+   save dialog -- nobody's necessarily watching when a background event
+   fires) under ~/.cttc/events/, with a TTL-driven sweep run periodically
+   here rather than by the renderer, since only this process has fs access. */
+ipcMain.handle("save-event-artifact", (_e, name, bytes, opts) => saveArtifact(name, bytes, opts));
+ipcMain.handle("list-event-artifacts", () => listArtifacts());
+setInterval(() => sweepArtifacts(), 3600_000); // hourly, same cadence as the gateway's own TTL sweep tick
 
 // Durable, client-side marker (per the client/server/docker-host model's
 // "client owns its own recovery state" -- see the Recording feature): if
@@ -643,16 +653,52 @@ async function checkServerHostDocker(host, port, onLog) {
 // `serverHost`/`serverPort` directly on success; closing it without
 // succeeding rejects, which the caller treats the same as any other startup
 // failure.
+
+// Shared by the first-run wizard's own dynamic gateway-setup-submit handler
+// below and the in-window "New Gateway" dialog's static gateway-add-submit
+// handler (see index.html's #dlg-gateway-setup / app.js) -- both do exactly
+// this to actually stand up a remote gateway, they just differ in which
+// window's activity log the ssh/docker output streams to, and in what
+// happens to the caller's own window afterward (the wizard resolves a
+// promise and destroys itself; the in-window dialog just reports ok/error).
+// Throws (rather than returning {ok:false,...}) so both callers can share
+// one try/catch.
+async function provisionRemoteGateway(payload, onLog) {
+  const host = hostFromTarget(`${payload.sshUser}@${payload.sshHost}`);
+  const existing = readGateways().find((g) => g.host === host);
+  if (existing) {
+    throw new Error(
+      `A gateway already exists at ${host} (${existing.label}) -- use File > Gateways > Edit Gateways to modify it instead.`
+    );
+  }
+  const sshKey = payload.keyMode === "paste" ? writeKeyFile(payload.keyContents) : copyKeyFile(payload.keyPath);
+  const cfg = {
+    sshTarget: `${payload.sshUser}@${payload.sshHost}`,
+    sshKey,
+    sshPort: payload.sshPort,
+    remotePort: 8765, // the CTTC server's fixed container port; see docker-compose.yml
+  };
+  const remote = await ensureRemoteContainer(cfg, {
+    sshBin: process.env.CTTC_SSH_BIN || "ssh",
+    resourcesDir: resourcesDirForApp(),
+    source: payload.imageSource || undefined,
+    onLog,
+  });
+  return { remote, cfg };
+}
+
 let wizardWindow = null;
 function runSetupWizard() {
   return new Promise((resolve, reject) => {
     let settled = false;
     wizardWindow = new BrowserWindow({
       width: 520,
-      // Taller than Edit Gateways' window: New Gateway's intro heading +
-      // explanatory paragraph (see gateway-setup.html's #new-intro) takes
-      // real vertical space that edit mode doesn't have (a single label +
-      // dropdown replaces it there -- see openGatewayManager below).
+      // This is only ever "mode=new" now -- File > Gateways > New Gateway/
+      // Edit Gateways from an already-running app use index.html's own
+      // #dlg-gateway-setup dialog instead (see app.js's
+      // openNewGatewayDialog/openEditGatewaysDialog); this window is just
+      // the first-run/no-local-docker fallback, before any main window
+      // exists to host a dialog in.
       height: 860,
       minWidth: 480,
       minHeight: 560,
@@ -686,28 +732,9 @@ function runSetupWizard() {
 
     ipcMain.handle("gateway-setup-submit", async (_e, payload) => {
       try {
-        const host = hostFromTarget(`${payload.sshUser}@${payload.sshHost}`);
-        const existing = readGateways().find((g) => g.host === host);
-        if (existing) {
-          return {
-            ok: false,
-            error: `A gateway already exists at ${host} (${existing.label}) -- use File > Gateways > Edit Gateways to modify it instead.`,
-          };
-        }
-        const sshKey =
-          payload.keyMode === "paste" ? writeKeyFile(payload.keyContents) : copyKeyFile(payload.keyPath);
-        const cfg = {
-          sshTarget: `${payload.sshUser}@${payload.sshHost}`,
-          sshKey,
-          sshPort: payload.sshPort,
-          remotePort: 8765, // the CTTC server's fixed container port; see docker-compose.yml
-        };
-        const remote = await ensureRemoteContainer(cfg, {
-          sshBin: process.env.CTTC_SSH_BIN || "ssh",
-          resourcesDir: resourcesDirForApp(),
-          source: payload.imageSource || undefined,
-          onLog: (line) => wizardWindow?.webContents.send("setup-log", line),
-        });
+        const { remote, cfg } = await provisionRemoteGateway(payload, (line) =>
+          wizardWindow?.webContents.send("setup-log", line)
+        );
         serverHost = remote.host;
         serverPort = remote.port;
         saveConnectionConfig(cfg);
@@ -829,60 +856,39 @@ ipcMain.handle("switch-gateway", async (_e, entry) => {
   return { ok: true };
 });
 
-// File > Gateways > New Gateway: always just provisions a new one -- picking
-// an existing gateway to revert to (including "This machine") or
-// reconfigure is the status-pill dropdown/Edit Gateways' job now, not this
-// one's, so there's no "already connected, revert or reconfigure?" prompt
-// here anymore.
-ipcMain.handle("new-gateway", async () => {
+// File > Gateways > New Gateway, once the app is already running: index.html
+// now has its own #dlg-gateway-setup dialog for this (see app.js's
+// openNewGatewayDialog) rather than a separate window -- this just does the
+// actual provisioning the dialog's Connect button asks for, streaming
+// activity into the *main* window's own log instead of a wizard window's.
+// Always just provisions a new one -- picking an existing gateway to revert
+// to (including "This machine") or reconfigure is the status-pill dropdown/
+// Edit Gateways' job, not this one's, so there's no "already connected,
+// revert or reconfigure?" prompt here.
+ipcMain.handle("gateway-add-submit", async (_e, payload) => {
   try {
-    await runSetupWizard();
-  } catch {
-    return; // cancelled -- nothing changed, no need to restart
+    const { remote, cfg } = await provisionRemoteGateway(payload, (line) =>
+      mainWindow?.webContents.send("setup-log", line)
+    );
+    serverHost = remote.host;
+    serverPort = remote.port;
+    saveConnectionConfig(cfg);
+    recordGateway({
+      mode: "remote",
+      host: remote.host,
+      port: remote.port,
+      label: cfg.sshTarget,
+      sshTarget: cfg.sshTarget,
+      sshKey: cfg.sshKey,
+      ...(cfg.sshPort ? { sshPort: cfg.sshPort } : {}),
+    });
+    await checkServerHostDocker(remote.host, remote.port, (line) => mainWindow?.webContents.send("setup-log", line));
+  } catch (err) {
+    return { ok: false, error: err.message || String(err) };
   }
   await offerRestart("Reconnect CTTC to apply the new connection settings?");
+  return { ok: true };
 });
-
-// File > Gateways > Edit Gateways: manages the recorded list itself (edit
-// an existing gateway's ssh settings, or uninstall it) -- a separate,
-// non-modal window since (unlike New Gateway) it isn't gating app startup.
-let gatewayManagerWindow = null;
-function openGatewayManager() {
-  if (gatewayManagerWindow && !gatewayManagerWindow.isDestroyed()) {
-    gatewayManagerWindow.focus();
-    return;
-  }
-  gatewayManagerWindow = new BrowserWindow({
-    // Same width as New Gateway -- both render the identical #gateway-setup
-    // layout, so a different window width just left the two screens with
-    // mismatched side margins for no reason.
-    width: 520,
-    // Shorter than New Gateway's window: edit mode has less content above
-    // the shared ssh/key/image fields (a compact label + dropdown vs. New
-    // Gateway's intro heading + paragraph) -- 57px less, measured via each
-    // mode's #gateway-setup scrollHeight at the same window size -- so a
-    // matching height here left extra empty space below the Save/Uninstall
-    // buttons that New Gateway's Connect/Skip row doesn't have.
-    height: 803,
-    minWidth: 480,
-    minHeight: 560,
-    icon: APP_ICON,
-    show: false,
-    webPreferences: {
-      preload: path.join(__dirname, "preload.js"),
-      contextIsolation: true,
-      nodeIntegration: false,
-    },
-  });
-  gatewayManagerWindow.once("ready-to-show", () => gatewayManagerWindow.show());
-  gatewayManagerWindow.setMenuBarVisibility(false);
-  attachEditContextMenu(gatewayManagerWindow);
-  gatewayManagerWindow.loadFile(path.join(__dirname, "renderer", "gateway-setup.html"), { search: "mode=edit" });
-  gatewayManagerWindow.on("closed", () => {
-    gatewayManagerWindow = null;
-  });
-}
-ipcMain.handle("edit-gateways", () => openGatewayManager());
 
 // The dockable action bar's "detached" mode: a small always-on-top window
 // with the same buttons as the docked bar. It has no access to the main
@@ -978,8 +984,8 @@ ipcMain.handle("set-log-collector-enabled", async (_e, enabled) => {
 
 // Re-provisions a gateway at (possibly new) ssh settings and updates its
 // registry entry in place -- editing the *currently active* gateway also
-// updates connection.json and offers a restart, since this window can't
-// hot-swap the main window's already-loaded connection.
+// updates connection.json and offers a restart, since the already-loaded
+// page can't hot-swap its own connection without one.
 ipcMain.handle("gateway-manage-save", async (_e, payload) => {
   try {
     // "This machine" has no ssh settings to change -- Save/Update here only
@@ -1014,7 +1020,7 @@ ipcMain.handle("gateway-manage-save", async (_e, payload) => {
     const remote = await ensureRemoteContainer(cfg, {
       sshBin: process.env.CTTC_SSH_BIN || "ssh",
       source: payload.imageSource || undefined,
-      onLog: (line) => gatewayManagerWindow?.webContents.send("setup-log", line),
+      onLog: (line) => mainWindow?.webContents.send("setup-log", line),
     });
     const wasActive = payload.key === `${serverHost}:${serverPort}`;
     recordGateway({

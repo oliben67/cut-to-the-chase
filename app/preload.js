@@ -18,8 +18,7 @@ contextBridge.exposeInMainWorld("cttc", {
   menubarAction: (action) => ipcRenderer.invoke("menubar-action", action),
   submitSetup: (payload) => ipcRenderer.invoke("gateway-setup-submit", payload),
   onSetupLog: (cb) => ipcRenderer.on("setup-log", (_e, line) => cb(line)),
-  newGateway: () => ipcRenderer.invoke("new-gateway"),
-  editGateways: () => ipcRenderer.invoke("edit-gateways"),
+  addGateway: (payload) => ipcRenderer.invoke("gateway-add-submit", payload),
   saveGatewayEdit: (payload) => ipcRenderer.invoke("gateway-manage-save", payload),
   uninstallGateway: (entry) => ipcRenderer.invoke("gateway-manage-uninstall", entry),
   pickRecordingPath: () => ipcRenderer.invoke("pick-recording-path"),
@@ -40,4 +39,6 @@ contextBridge.exposeInMainWorld("cttc", {
   setThemeMode: (mode) => ipcRenderer.send("set-theme-mode", mode),
   getLogCollectorSettings: () => ipcRenderer.invoke("get-log-collector-settings"),
   setLogCollectorEnabled: (enabled) => ipcRenderer.invoke("set-log-collector-enabled", enabled),
+  saveEventArtifact: (name, bytes, opts) => ipcRenderer.invoke("save-event-artifact", name, bytes, opts),
+  listEventArtifacts: () => ipcRenderer.invoke("list-event-artifacts"),
 });

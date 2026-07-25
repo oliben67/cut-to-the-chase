@@ -403,39 +403,91 @@ body {
 #action-bar.detached .ab-group {
   flex-direction: column;
   padding-top: 6px;
-  border-top: 1px solid var(--border);
 }
-/* whichever section is first (right after the ribbon) shouldn't show a
-   divider floating right under it with nothing above to divide from --
-   targets "the first .ab-group" structurally (the ribbon is always
-   immediately before it) rather than a specific named section, so it stays
-   correct if the sections are ever reordered again. */
 .ab-dock-controls + .ab-group {
   padding-top: 0;
-  border-top: none;
 }
 /* About/Quit pinned to the very bottom of the sidebar -- only meaningful in
    the vertical (left/right/detached) layouts #action-bar itself is a
    column in; a no-op in the horizontal top/bottom dock, where there's no
    "bottom" to pin to. */
 .ab-group-bottom { margin-top: auto; }
-.ab-group-label {
-  padding: 0 8px 4px;
-  font-size: 10px;
+
+/* Collapsible sections (Gateway/Sources/Metrics/Preferences): a header
+   button (icon + title + chevron) toggles its .ab-group-body -- collapsed
+   by default (see app.js's sidebar-section toggle), expanding in place
+   rather than as a flyout so the sidebar stays a single scrollable column.
+   Meaningless in the horizontal top/bottom dock (no room for a title,
+   and nothing to collapse into) -- there the header hides and the body's
+   buttons always show, flowing in a row like any other top-level button
+   (see the two overrides below), matching the flat About/Quit buttons'
+   own display there. */
+.ab-group-header {
+  width: 100%;
+  justify-content: flex-start;
+}
+.ab-group-title {
+  font-size: 11.5px;
   font-weight: 600;
   color: var(--muted);
   text-transform: uppercase;
   letter-spacing: 0.06em;
 }
-#app-body[data-dock="top"] .ab-group-label,
-#app-body[data-dock="bottom"] .ab-group-label {
+.ab-group-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  flex: 0 0 auto;
+}
+/* the custom sidebar icons (Gateway/Sources/Metrics/Preferences) are
+   inlined <svg> with fill="currentColor" -- flat, single-color art rather
+   than the original multi-tone exports, so they pick up --muted normally
+   and invert for free under the :active rule below (no per-icon override
+   needed, unlike .ab-icon's emoji glyphs, which set their own color). */
+.ab-group-icon svg { width: 24px; height: 24px; color: var(--muted); }
+.ab-chevron {
+  margin-left: auto;
+  font-size: 24.75px; /* 175% bigger than the original 9px */
+  color: var(--muted);
+  transition: transform 0.15s ease;
+}
+.ab-group[data-expanded="true"] .ab-chevron { transform: rotate(180deg); }
+.ab-group-body {
+  display: flex;
+  flex-direction: column;
+}
+/* Sub-items read as nested under their section header: a markedly
+   different (recessed-panel) background from the sidebar's own
+   --surface-2, plus extra left padding shifting the icon+label right --
+   distinguishes them from both the header row above and the flat
+   About/Quit buttons, which get neither. */
+.ab-group-body button {
+  background: var(--surface-1);
+  padding-left: 102px; /* header's own 10px padding + three icon-widths (24px each) + its 8px gap to the label -- shifted one more full icon-step right than before */
+}
+#app-body[data-dock="top"] .ab-group-header,
+#app-body[data-dock="bottom"] .ab-group-header {
   display: none;
+}
+#app-body[data-dock="top"] .ab-group-body,
+#app-body[data-dock="bottom"] .ab-group-body {
+  display: flex !important;
+  flex-direction: row;
+}
+/* the left-shift only reads as "nested under a header" in the vertical
+   sidebar layout -- in the horizontal dock every button sits in one flat
+   row already, so the indent (and the header it'd be relative to) has no
+   meaning there. */
+#app-body[data-dock="top"] .ab-group-body button,
+#app-body[data-dock="bottom"] .ab-group-body button {
+  padding-left: 10px;
 }
 .ab-group button {
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 12.5px;
+  font-size: 14.5px;
   background: none;
   border: 1px solid transparent;
   border-radius: var(--radius-sm);
@@ -443,16 +495,39 @@ body {
   white-space: nowrap;
 }
 .ab-group button:hover { background: var(--surface-3); }
-.ab-group button:active { background: color-mix(in srgb, var(--accent) 16%, var(--surface-3)); }
+/* Click feedback: reverse fg/bg instead of the usual accent-tinted hover --
+   applies uniformly to every sidebar button (section headers, their
+   sub-items, and the flat top-level About/Quit buttons alike), so About
+   presses the same way any other top-level item does. currentColor-based
+   children (.ab-group-icon svg, .ab-chevron) invert for free by inheriting
+   this element's color; .ab-icon's emoji glyphs set their own color and so
+   need the explicit override just below. */
+.ab-group button:active {
+  background: var(--text-primary);
+  color: var(--page);
+}
+.ab-group button:active .ab-icon,
+.ab-group button:active .ab-group-icon svg,
+.ab-group button:active .ab-chevron {
+  color: var(--page);
+}
 .ab-icon {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 16px;
+  width: 24px;
   flex: 0 0 auto;
   color: var(--muted);
-  font-size: 13px;
+  font-size: 22.5px;
+  /* most of these are still plain Unicode glyphs (⚙🗑📂⚡ etc., not New
+     Gateway's own now-inlined SVG) -- several have a default *color* emoji
+     presentation (the trash can, the folder, the lightning bolt) that a
+     flat monochrome sidebar shouldn't have alongside the flattened SVG
+     icons. font-variant-emoji forces the monochrome "text" glyph for every
+     character here that has one. */
+  font-variant-emoji: text;
 }
+.ab-icon svg { width: 1em; height: 1em; }
 #app-body[data-dock="left"] .ab-group button,
 #app-body[data-dock="right"] .ab-group button,
 #action-bar.detached .ab-group button {
@@ -1196,3 +1271,21 @@ body:has(#gateway-setup) { overflow-y: auto; }
 }
 #activity .linklike { padding: 4px 0; align-self: flex-start; }
 #activity .activity-log { max-height: calc(25vh - 36px); min-height: 60px; }
+
+/* Slim status bar (Appearance > Status bar) reporting when an event is
+   created or fires -- separate from #status in the toolbar (which is for
+   ordinary action feedback like "metrics saved"), since events can report
+   from a background poll with nobody having just clicked anything. Plain
+   flow, not fixed -- sits as the last item in body's flex column, below
+   #app-body, so it never overlaps #activity's own fixed overlay. */
+.app-status-bar {
+  flex: 0 0 auto;
+  padding: 3px 12px;
+  font-size: 11px;
+  color: var(--muted);
+  background: var(--surface-2);
+  border-top: 1px solid var(--border);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
