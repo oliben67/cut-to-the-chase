@@ -533,12 +533,6 @@ body {
   flex: 0 0 auto;
   color: var(--muted);
   font-size: 22.5px;
-  /* most of these are still plain Unicode glyphs (⚙🗑📂⚡ etc., not New
-     Gateway's own now-inlined SVG) -- several have a default *color* emoji
-     presentation (the trash can, the folder, the lightning bolt) that a
-     flat monochrome sidebar shouldn't have alongside the flattened SVG
-     icons. font-variant-emoji forces the monochrome "text" glyph for every
-     character here that has one. */
   font-variant-emoji: text;
 }
 .ab-icon svg { width: 1em; height: 1em; }
