@@ -383,6 +383,23 @@ function closeSplash() {
   splashWindow = null;
 }
 
+// A short, human-readable status line for the splash window -- deliberately
+// NOT the same firehose as mainLog/"main-log" (the main window's activity
+// log): that channel also carries raw command echoes ("$ ssh ...", "$
+// docker ..." -- see server-provision.js's run()) and unfiltered subprocess
+// stdout/stderr (progress bars, ssh warnings, multi-line dumps), which read
+// as garbled noise squeezed into a single-line status widget. Callers pair
+// this with their own mainLog() call for the full-detail line -- narrate()
+// below does exactly that for the common case of "one plain-English
+// sentence, nothing more.
+function splashStatus(text) {
+  if (splashWindow && !splashWindow.isDestroyed()) splashWindow.webContents.send("splash-status", text);
+}
+function narrate(text) {
+  mainLog(`$ ${text}`);
+  splashStatus(text);
+}
+
 let mainWindow = null;
 async function createWindow() {
   const win = new BrowserWindow({
@@ -690,7 +707,7 @@ async function connectToServer(fileArgs) {
   const cfg = loadConnectionConfig();
   if (cfg.mode === "embedded") {
     if (app.isPackaged && (await hasLocalDocker())) {
-      mainLog("$ starting the local gateway container...");
+      narrate("starting the local gateway container...");
       const { port } = await ensureLocalContainer({ resourcesDir: resourcesDirForApp(), onLog: mainLog });
       serverHost = "127.0.0.1";
       serverPort = port;
@@ -703,7 +720,7 @@ async function connectToServer(fileArgs) {
       recordGateway({ mode: "embedded", host: serverHost, port: serverPort, label: "This machine", connectionType: "local" });
       return;
     }
-    mainLog("$ starting the server...");
+    narrate("starting the server...");
     await startServer(fileArgs);
     return;
   }
@@ -715,7 +732,7 @@ async function connectToServer(fileArgs) {
   // First-time connect to a deployed gateway (see connectRemoteGateway):
   // tries direct HTTP first, falling back to an ssh tunnel if that times
   // out/fails.
-  mainLog(`$ connecting to ${cfg.sshTarget}...`);
+  narrate(`connecting to ${cfg.sshTarget}...`);
   const result = await connectRemoteGateway(cfg, { onLog: mainLog });
   serverHost = result.host;
   serverPort = result.port;
@@ -1446,7 +1463,7 @@ app.whenReady().then(async () => {
   // future connect attempt to that gateway fails ssh-tunnel.js's own
   // "something is already listening" guard with no obvious cause (see
   // lib/tunnel-registry.js).
-  mainLog("$ cleaning up any leftover connections from a previous session...");
+  narrate("cleaning up any leftover connections from a previous session...");
   killOrphanedTunnels();
   installMenu();
   // the window `icon` option is ignored on macOS; the running app's Dock icon
@@ -1471,7 +1488,7 @@ app.whenReady().then(async () => {
     // files passed on the command line open at startup: npm start -- file1 file2
     const fileArgs = process.argv.slice(app.isPackaged ? 1 : 2).filter((a) => !a.startsWith("-"));
     const cfg = loadConnectionConfig();
-    mainLog("$ checking for a local Docker installation...");
+    narrate("checking for a local Docker installation...");
     if (cfg.mode === "embedded" && !(await canBeServerLocally())) {
       try {
         await runSetupWizard();
@@ -1482,7 +1499,7 @@ app.whenReady().then(async () => {
         // still starting up; only fall back to the bare, docker-less
         // embedded server if that attempt itself fails.
         try {
-          mainLog("$ starting the local gateway container...");
+          narrate("starting the local gateway container...");
           const { port } = await ensureLocalContainer({ resourcesDir: resourcesDirForApp(), onLog: mainLog });
           serverHost = "127.0.0.1";
           serverPort = port;
@@ -1493,7 +1510,7 @@ app.whenReady().then(async () => {
           activeSshPort = undefined;
           mainLog(`[docker] server container running locally — port ${serverPort}`);
         } catch {
-          mainLog("$ starting the server...");
+          narrate("starting the server...");
           await startServer(fileArgs);
         }
       }
