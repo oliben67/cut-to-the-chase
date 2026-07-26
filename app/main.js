@@ -21,6 +21,7 @@ const {
 } = require("./lib/server-provision");
 const { readGateways, recordGateway, removeGateway, gatewayKey } = require("./lib/gateway-registry");
 const { openSshTunnel, closeSshTunnel } = require("./lib/ssh-tunnel");
+const { recordTunnel, removeTunnel, killOrphanedTunnels } = require("./lib/tunnel-registry");
 const {
   readSettings: readLogCollectorSettings,
   writeSettings: writeLogCollectorSettings,
@@ -59,6 +60,26 @@ let serverConnectionType = "local";
 // left to whatever called openSshTunnel) so switching or disconnecting from
 // a tunneled gateway can always find and kill the right process.
 let currentTunnel = null;
+let currentTunnelPort = null; // the local port currentTunnel forwards -- see setCurrentTunnel/clearCurrentTunnel
+
+// Every currentTunnel = await openSshTunnel(...) must be paired with
+// recordTunnel() (so a crash/force-quit before the next clearCurrentTunnel()
+// leaves a pid behind that the *next* launch's killOrphanedTunnels() can
+// still find and clean up -- see lib/tunnel-registry.js), and every closing
+// path must be paired with removeTunnel(). Centralized here rather than
+// duplicated at each of the several places currentTunnel is set/cleared.
+function setCurrentTunnel(handle, containerPort, sshTarget) {
+  currentTunnel = handle;
+  currentTunnelPort = containerPort;
+  recordTunnel({ pid: handle.proc.pid, containerPort, sshTarget });
+}
+function clearCurrentTunnel() {
+  if (!currentTunnel) return;
+  closeSshTunnel(currentTunnel);
+  removeTunnel(currentTunnelPort);
+  currentTunnel = null;
+  currentTunnelPort = null;
+}
 // The ssh target/port behind the *current* remote connection (tunneled or
 // direct) -- null for local. Exists purely for get-connection-info's
 // right-click detail popup (see app.js's status pill); nothing else needs
@@ -806,10 +827,7 @@ async function connectRemoteGateway(cfg, { onLog, forceTunnel = false } = {}) {
     onLog,
   });
 
-  if (currentTunnel) {
-    closeSshTunnel(currentTunnel);
-    currentTunnel = null;
-  }
+  clearCurrentTunnel();
 
   if (!forceTunnel) {
     try {
@@ -830,10 +848,11 @@ async function connectRemoteGateway(cfg, { onLog, forceTunnel = false } = {}) {
   }
 
   onLog?.(`$ ${remote.host}:${remote.port} not reachable directly -- opening an ssh tunnel instead...`);
-  currentTunnel = await openSshTunnel(
+  const tunnel = await openSshTunnel(
     { sshTarget: cfg.sshTarget, sshKey: cfg.sshKey, sshPort: cfg.sshPort, containerPort: remote.port },
     { sshBin, onLog }
   );
+  setCurrentTunnel(tunnel, remote.port, cfg.sshTarget);
   return {
     host: "127.0.0.1",
     port: remote.port,
@@ -1033,10 +1052,7 @@ ipcMain.handle("switch-gateway", async (_e, entry) => {
       };
     }
     recordCurrentGateway();
-    if (currentTunnel) {
-      closeSshTunnel(currentTunnel);
-      currentTunnel = null;
-    }
+    clearCurrentTunnel();
     clearConnectionConfig();
     if (isUnprovisionedLocal) {
       // never actually provisioned -- same startup path a fresh launch
@@ -1389,10 +1405,7 @@ ipcMain.handle("gateway-manage-uninstall", async (_e, entry) => {
     removeGateway(gatewayKey(entry));
     const wasActive = isActiveGateway(entry);
     if (wasActive) {
-      if (currentTunnel) {
-        closeSshTunnel(currentTunnel);
-        currentTunnel = null;
-      }
+      clearCurrentTunnel();
       clearConnectionConfig();
       // reverts to embedded mode, same as switch-gateway's isUnprovisionedLocal
       // path -- there's nothing left running locally to just point at, so
@@ -1408,6 +1421,13 @@ ipcMain.handle("gateway-manage-uninstall", async (_e, entry) => {
 });
 
 app.whenReady().then(async () => {
+  // Before anything else: kill any ssh -N -L tunnel left running by a
+  // previous session that never exited cleanly (crash, force quit, killed
+  // by an installer/uninstaller) -- otherwise it just sits on its forwarded
+  // port forever, and every future connect attempt to that gateway fails
+  // ssh-tunnel.js's own "something is already listening" guard with no
+  // obvious cause (see lib/tunnel-registry.js).
+  killOrphanedTunnels();
   // Shown before anything else, including installMenu() and the
   // canBeServerLocally() check below -- it shells out to `docker info` and
   // `ssh -V` (async; see lib/docker-check.js) and can take a few seconds
@@ -1484,11 +1504,11 @@ app.whenReady().then(async () => {
 function stopServer() {
   // An ssh -N -L tunnel *is* this process's own child (unlike the remote
   // server/local container it forwards to -- see the comment below), so it
-  // never outlives the app quitting.
-  if (currentTunnel) {
-    closeSshTunnel(currentTunnel);
-    currentTunnel = null;
-  }
+  // never outlives the app quitting *on an orderly exit*. A crash/force-quit
+  // still leaves it running with nothing left to close it -- see
+  // lib/tunnel-registry.js's killOrphanedTunnels(), called once at the next
+  // launch to clean up exactly that case.
+  clearCurrentTunnel();
   // A remote server (or a local Docker container -- see ensureLocalContainer's
   // `restart: unless-stopped`) is shared/persistent infrastructure, not this
   // process's own child: there's nothing local to tear down, and this
