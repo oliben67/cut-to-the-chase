@@ -3676,16 +3676,23 @@ connectSSE();
   const statusHost = HOST === "127.0.0.1" ? "localhost" : HOST;
   $("server-status-location").textContent = PORT == null || PORT === "null" ? statusHost : `${statusHost}:${PORT}`;
 
-  // "(tunnel)" suffix + the right-click details popup: connectionType/
-  // gateway identity/ssh info aren't in the URL's host=&port= (those are
-  // just the client-facing address, 127.0.0.1 for both local and tunneled),
-  // so they're fetched separately from main.js's connection state.
+  // Tunneled connections talk over 127.0.0.1 (HOST/PORT above), but showing
+  // "localhost" there would hide which gateway is actually active -- swap
+  // in the real gateway host:port + a "(tunnel)" suffix once
+  // getConnectionInfo confirms that's what this connection is.
+  // connectionType/gateway identity/ssh info aren't in the URL's host=&port=
+  // to begin with (those are just the client-facing address), so they're
+  // fetched separately from main.js's connection state.
   let connectionInfo = null;
   async function loadConnectionInfo() {
     if (!window.cttc?.getConnectionInfo) return;
     connectionInfo = await window.cttc.getConnectionInfo();
-    const suffix = connectionInfo.connectionType === "remote-tunnel" ? " (tunnel)" : "";
-    if (suffix) $("server-status-location").textContent += suffix;
+    if (connectionInfo.connectionType === "remote-tunnel") {
+      const loc = connectionInfo.gatewayPort == null
+        ? connectionInfo.gatewayHost
+        : `${connectionInfo.gatewayHost}:${connectionInfo.gatewayPort}`;
+      $("server-status-location").textContent = `${loc} (tunnel)`;
+    }
   }
   loadConnectionInfo();
 

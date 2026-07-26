@@ -153,28 +153,31 @@ tasks:
   # --cached --quiet ||` guard skips the commit (instead of failing the
   # task) on a no-op rebuild, e.g. re-running after nothing changed.
   build:release:win:
-    desc: "Build the Windows installer + deploy bundle   [usage: task build:release:win]"
+    desc: "Build the Windows installer + deploy bundle, and push it   [usage: task build:release:win]"
     cmds:
       - git -C ../releases checkout windows
       - npm run release:win -- {{.CLI_ARGS}}
       - git -C ../releases add -A
       - "git -C ../releases diff --cached --quiet || git -C ../releases commit -m 'chore(windows): rebuild deploy bundle'"
+      - git -C ../releases push origin windows
 
   build:release:mac:
-    desc: "Build the macOS installer + deploy bundle   [usage: task build:release:mac]"
+    desc: "Build the macOS installer + deploy bundle, and push it   [usage: task build:release:mac]"
     cmds:
       - git -C ../releases checkout mac
       - npm run release:mac -- {{.CLI_ARGS}}
       - git -C ../releases add -A
       - "git -C ../releases diff --cached --quiet || git -C ../releases commit -m 'chore(mac): rebuild deploy bundle'"
+      - git -C ../releases push origin mac
 
   build:release:linux:
-    desc: "Build the Linux AppImage + deploy bundle   [usage: task build:release:linux]"
+    desc: "Build the Linux AppImage + deploy bundle, and push it   [usage: task build:release:linux]"
     cmds:
       - git -C ../releases checkout linux
       - npm run release:linux -- {{.CLI_ARGS}}
       - git -C ../releases add -A
       - "git -C ../releases diff --cached --quiet || git -C ../releases commit -m 'chore(linux): rebuild deploy bundle'"
+      - git -C ../releases push origin linux
 
   build:release:all:
     desc: "Build all three platforms' installers + deploy bundles   [usage: task build:release:all]"

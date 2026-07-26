@@ -36,7 +36,27 @@ function sshTunnelArgs({ sshTarget, sshKey, sshPort, containerPort }) {
  * @param {{sshTarget: string, sshKey: string|null, sshPort?: number, containerPort: number}} cfg
  * @returns {Promise<{proc: import("child_process").ChildProcess}>}
  */
-function openSshTunnel(cfg, { spawnFn = spawn, sshBin = "ssh", onLog } = {}) {
+async function openSshTunnel(cfg, { spawnFn = spawn, sshBin = "ssh", onLog } = {}) {
+  // Refuse to shadow whatever's already using this port locally: the
+  // readiness check below is just "is *something* listening on
+  // 127.0.0.1:containerPort", which a leftover local "This machine"
+  // container (same fixed container port) or an orphaned tunnel from a
+  // crashed previous session would already satisfy *before* ssh even
+  // starts. Without this check, that pre-existing occupant would make the
+  // race below look like a successful connect, and every request would
+  // silently go to the wrong server instead of this gateway (e.g. a 404 on
+  // a route the stale/local one doesn't have).
+  const alreadyOpen = await waitForPortOpen("127.0.0.1", cfg.containerPort, { timeoutMs: 300 }).then(
+    () => true,
+    () => false
+  );
+  if (alreadyOpen) {
+    throw new Error(
+      `something is already listening on 127.0.0.1:${cfg.containerPort} -- close it before connecting to this gateway ` +
+        `(e.g. a local "This machine" container on the same port, or a tunnel left over from a previous session)`
+    );
+  }
+
   const args = sshTunnelArgs(cfg);
   onLog?.(`$ ${sshBin} ${args.join(" ")}`);
   const proc = spawnFn(sshBin, args, { stdio: ["ignore", "pipe", "pipe"] });
