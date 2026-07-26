@@ -256,6 +256,31 @@ body {
 }
 .gateway-dropdown .gateway-empty { padding: 6px 8px; font-size: 12px; color: var(--muted); }
 
+/* Right-click the status pill: connection type + (when tunneled) the ssh
+   details behind it -- see app.js's connection-info-popup block. Same
+   floating-card look as .gateway-dropdown, but read-only (no buttons/hover
+   state) since there's nothing to click here. */
+.connection-info-popup {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  position: absolute;
+  top: 100%;
+  right: 0;
+  min-width: 220px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+  padding: 8px 10px;
+  z-index: 50;
+  font-size: 12px;
+}
+.connection-info-popup .cip-row { display: flex; justify-content: space-between; gap: 12px; }
+.connection-info-popup .cip-label { color: var(--muted); }
+.connection-info-popup .cip-val { font-variant-numeric: tabular-nums; text-align: right; }
+.connection-info-popup .cip-sep { border-top: 1px solid var(--border); margin: 2px 0; }
+
 /* Record toolbar button's own status dot -- hidden (no dot) when idle,
    red+pulsing while actively recording, yellow steady while paused. */
 .recording-dot {

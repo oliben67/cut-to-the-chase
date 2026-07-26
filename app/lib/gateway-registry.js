@@ -10,7 +10,12 @@ const path = require("path");
 // main window's status pill has something to show without the user ever
 // re-typing an ssh target they've already used once. Distinct from
 // connection.json (lib/connection-config.js), which holds only the *active*
-// connection -- this is a history, kept even while pointed elsewhere.
+// connection -- this is a history, kept even while pointed elsewhere. Also
+// doubles as the "ssh-tunnel-gateways" list: every entry tracks
+// `connectionType` ("local" | "remote" | "remote-tunnel" -- see main.js's
+// connectRemoteGateway) alongside the usual host/port/ssh fields, and
+// `imageRef`, the gateway image version/ref that was last confirmed
+// installed there (see lib/server-provision.js's resolveSource).
 
 function defaultGatewaysPath(env) {
   const home = env.HOME || os.homedir();

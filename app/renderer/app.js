@@ -3670,9 +3670,74 @@ connectSSE();
   // URL main.js loaded it with) -- where the gateway actually is, not just
   // whether it's reachable, matters most for "remote" mode (see
   // docs/architecture/remote-server.md), where it's easy to forget which
-  // host is actually being talked to.
+  // host is actually being talked to. HOST/PORT alone can't tell a tunneled
+  // connection apart from a genuinely local one though (both are
+  // 127.0.0.1) -- getConnectionInfo (below) fills that gap.
   const statusHost = HOST === "127.0.0.1" ? "localhost" : HOST;
   $("server-status-location").textContent = PORT == null || PORT === "null" ? statusHost : `${statusHost}:${PORT}`;
+
+  // "(tunnel)" suffix + the right-click details popup: connectionType/
+  // gateway identity/ssh info aren't in the URL's host=&port= (those are
+  // just the client-facing address, 127.0.0.1 for both local and tunneled),
+  // so they're fetched separately from main.js's connection state.
+  let connectionInfo = null;
+  async function loadConnectionInfo() {
+    if (!window.cttc?.getConnectionInfo) return;
+    connectionInfo = await window.cttc.getConnectionInfo();
+    const suffix = connectionInfo.connectionType === "remote-tunnel" ? " (tunnel)" : "";
+    if (suffix) $("server-status-location").textContent += suffix;
+  }
+  loadConnectionInfo();
+
+  const popup = $("connection-info-popup");
+  function renderInfoRow(label, val) {
+    const row = document.createElement("div");
+    row.className = "cip-row";
+    const l = document.createElement("span");
+    l.className = "cip-label";
+    l.textContent = label;
+    const v = document.createElement("span");
+    v.className = "cip-val";
+    v.textContent = val;
+    row.append(l, v);
+    return row;
+  }
+  el.addEventListener("contextmenu", async (e) => {
+    e.preventDefault();
+    if (!popup) return;
+    await loadConnectionInfo(); // refresh -- may have switched gateways since the last popup
+    popup.innerHTML = "";
+    popup.appendChild(renderInfoRow("Connection", connectionInfo.connectionType));
+    if (connectionInfo.connectionType !== "local") {
+      popup.appendChild(renderInfoRow("Gateway", `${connectionInfo.gatewayHost}:${connectionInfo.gatewayPort}`));
+    }
+    if (connectionInfo.connectionType === "remote-tunnel") {
+      const sep = document.createElement("div");
+      sep.className = "cip-sep";
+      popup.appendChild(sep);
+      popup.appendChild(renderInfoRow("ssh target", connectionInfo.sshTarget));
+      if (connectionInfo.sshPort) popup.appendChild(renderInfoRow("ssh port", String(connectionInfo.sshPort)));
+      popup.appendChild(renderInfoRow("forwarded port", `localhost:${connectionInfo.port}`));
+    }
+    popup.hidden = false;
+  });
+  document.addEventListener("click", (e) => {
+    if (popup && !popup.hidden && !popup.contains(e.target)) popup.hidden = true;
+  });
+  // Right-clicking elsewhere doesn't fire a "click" event (only left-click
+  // does) -- without this, the popup would only ever close on a left click
+  // or Escape, staying stuck open through a right-click anywhere else.
+  document.addEventListener(
+    "contextmenu",
+    (e) => {
+      if (popup && !popup.hidden && !el.contains(e.target)) popup.hidden = true;
+    },
+    true
+  );
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && popup) popup.hidden = true;
+  });
+
   const HEALTH_POLL_MS = 5000;
   const btn = $("server-status-btn");
   // The status pill itself only ever shows a colored dot + "Switch

@@ -108,27 +108,45 @@ function scpArgs({ sshKey, sshPort }) {
  * registry is wired up).
  */
 function resolveSource(source, { resourcesDir } = {}) {
+  // imageRef is a best-effort human-readable label for "what version is
+  // this" -- recorded against the gateway registry entry (see
+  // lib/gateway-registry.js) so Edit Gateways/the status dropdown can show
+  // it. A custom tarball has no version string to read without unpacking
+  // it, so it's labeled by filename instead of left blank.
   if (source?.type === "tarball") {
-    return { kind: "tarball", tarballPath: source.path, composeFile: bundledOfflineComposePath({ resourcesDir }) };
+    return {
+      kind: "tarball",
+      tarballPath: source.path,
+      composeFile: bundledOfflineComposePath({ resourcesDir }),
+      imageRef: path.basename(source.path),
+    };
   }
   if (source?.type === "registry") {
-    return { kind: "registry", ref: source.ref, composeFile: registryComposePath({ resourcesDir }) };
+    return { kind: "registry", ref: source.ref, composeFile: registryComposePath({ resourcesDir }), imageRef: source.ref };
   }
   if (hasBundledTarball({ resourcesDir })) {
+    let imageRef = "bundled tarball";
+    try {
+      imageRef = readImageRef({ resourcesDir }).ref;
+    } catch {
+      /* image.json missing in this checkout -- keep the generic label */
+    }
     return {
       kind: "tarball",
       tarballPath: bundledTarballPath({ resourcesDir }),
       composeFile: bundledOfflineComposePath({ resourcesDir }),
+      imageRef,
     };
   }
-  return { kind: "registry", ref: readImageRef({ resourcesDir }).ref, composeFile: registryComposePath({ resourcesDir }) };
+  const ref = readImageRef({ resourcesDir }).ref;
+  return { kind: "registry", ref, composeFile: registryComposePath({ resourcesDir }), imageRef: ref };
 }
 
 /**
  * Gets the server container running on *this* machine: docker-load or
  * docker-pull per resolveSource(), then `docker compose up -d` with the
  * matching compose file, then wait for the fixed container port to open.
- * @returns {{port: number}}
+ * @returns {{port: number, imageRef: string}}
  */
 async function ensureLocalContainer({ spawnFn = spawn, resourcesDir, port = 8765, source } = {}) {
   const resolved = resolveSource(source, { resourcesDir });
@@ -141,19 +159,25 @@ async function ensureLocalContainer({ spawnFn = spawn, resourcesDir, port = 8765
   }
   await run(spawnFn, "docker", ["compose", "-f", resolved.composeFile, "up", "-d"], { env });
   await waitForPortOpen("127.0.0.1", port, { timeoutMs: 30000 });
-  return { port };
+  return { port, imageRef: resolved.imageRef };
 }
 
 /**
  * Gets the server container running on a *remote* Docker-enabled host over
  * ssh: scp's up the tarball+compose (offline path) or just the compose file
  * (registry path), execs the equivalent docker load/pull + compose up
- * there, then waits for the container's own /health to respond -- ssh is
- * only used here, for provisioning; the client talks to the running
- * container directly over plain HTTP afterwards (no tunnel/port-forward).
+ * there. ssh is only used here for provisioning -- the client normally
+ * talks to the running container directly over plain HTTP afterwards, no
+ * tunnel/port-forward -- but whether that direct path is actually reachable
+ * (vs. needing an ssh -L fallback) is a call this function deliberately
+ * leaves to its caller (see main.js's connectRemoteGateway): the health
+ * check below is a best-effort "is it up at all yet" wait, not a hard
+ * requirement -- a false negative here (reachable only via ssh, not
+ * directly) shouldn't fail provisioning, since the container itself is
+ * genuinely fine either way.
  * @param {{sshTarget: string, sshKey: string|null, sshPort?: number, remotePort: number, host?: string}} cfg
  * @param {{source?: {type: "tarball", path: string} | {type: "registry", ref: string}, onLog?: (line: string) => void}} [opts]
- * @returns {{host: string, port: number}}
+ * @returns {{host: string, port: number, imageRef: string}}
  */
 async function ensureRemoteContainer(cfg, { spawnFn = spawn, sshBin = "ssh", scpBin = "scp", resourcesDir, source, onLog } = {}) {
   const remoteDir = "cttc-gateway";
@@ -180,9 +204,13 @@ async function ensureRemoteContainer(cfg, { spawnFn = spawn, sshBin = "ssh", scp
     ], {}, onLog);
   }
 
-  onLog?.(`$ waiting for http://${host}:${cfg.remotePort}/health ...`);
-  await waitForHttpOk(`http://${host}:${cfg.remotePort}/health`, { timeoutMs: 30000 });
-  return { host, port: cfg.remotePort };
+  onLog?.(`$ waiting for the container to come up (checking http://${host}:${cfg.remotePort}/health) ...`);
+  try {
+    await waitForHttpOk(`http://${host}:${cfg.remotePort}/health`, { timeoutMs: 30000 });
+  } catch (err) {
+    onLog?.(`  → not reachable directly yet (${err.message || err}) -- caller will decide on an ssh tunnel`);
+  }
+  return { host, port: cfg.remotePort, imageRef: resolved.imageRef };
 }
 
 /**
