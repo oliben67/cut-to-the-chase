@@ -603,6 +603,68 @@ def ssh_host_and_port(host: str) -> tuple[list[str], str]:
     return extra, rest
 
 
+# ── per-host ssh identity pinning ─────────────────────────────────────────────
+#
+# docker_client()'s use_ssh_client transport and the plain `docker` CLI (docker_ps,
+# DockerLogSource) both shell out to the system ssh binary with no way to pass
+# a per-call -i -- unlike HostStatsSource, which builds its own ssh argv and can
+# just add -i directly. ssh_config is the only remaining place to pin an identity
+# for those two, so we maintain a small managed stanza per host there instead.
+# Without this, a source's ssh_key selection has no effect on them at all, and a
+# ssh-agent holding several keys can burn through sshd's MaxAuthTries trying the
+# wrong ones before ever offering the one that's actually authorized.
+SSH_HOST_CONFIG_PATH = Path("/etc/ssh/ssh_config.d/50-cttc-sources.conf")
+
+
+def _ssh_config_hostname(host: str | None) -> str | None:
+    """ssh://[user@]hostname[:port] -> bare hostname, or None for a local
+    target. ssh_config's Host patterns match only the bare hostname (ssh
+    splits off any user@ prefix before config matching), so that's the only
+    part of the target that belongs in a Host line."""
+    if not host or not host.startswith("ssh://"):
+        return None
+    _, target = ssh_host_and_port(host)
+    return target.rsplit("@", 1)[-1] or None
+
+
+def _write_ssh_config_stanza(hostname: str, ssh_key: str) -> None:
+    """Replace (or add) this host's managed block. No-op, quietly, when the
+    managed include directory isn't there or isn't writable -- e.g. running
+    server.py bare for local dev/tests, well outside the packaged container
+    that ships /etc/ssh/ssh_config.d/99-cttc-accept-new.conf (see Dockerfile).
+    In that case ssh falls back to whatever ambient identity it would have
+    used anyway -- same as before this pinning existed."""
+    path = SSH_HOST_CONFIG_PATH
+    begin, end = f"# cttc-source-begin: {hostname}\n", f"# cttc-source-end: {hostname}\n"
+    try:
+        existing = path.read_text() if path.is_file() else ""
+    except OSError:
+        return
+    existing = re.sub(re.escape(begin) + ".*?" + re.escape(end), "", existing, flags=re.DOTALL)
+    stanza = f"{begin}Host {hostname}\n  IdentityFile {ssh_key}\n  IdentitiesOnly yes\n{end}"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(existing + stanza)
+    except OSError:
+        pass
+
+
+async def ensure_ssh_identity(host: str | None, ssh_key: str | None) -> None:
+    """Pin `ssh_key` as the *only* identity ssh will offer for `host`'s
+    hostname, so this source's chosen key can't be starved out by other keys
+    an ssh-agent forwarded into this container happens to also be holding.
+    A no-op when there's no key to pin (falls back to the ambient agent/
+    default identity, same as always) or `host` has no ssh:// target."""
+    hostname = _ssh_config_hostname(host)
+    if not hostname or not ssh_key:
+        return
+    async with _ssh_config_write_lock:
+        await asyncio.to_thread(_write_ssh_config_stanza, hostname, ssh_key)
+
+
+_ssh_config_write_lock = asyncio.Lock()
+
+
 def list_ssh_keys() -> list[str]:
     """Private keys under ~/.ssh (files whose header says so)."""
     keys = []
@@ -906,6 +968,7 @@ class HostStatsSource(StatsSource):
                     "-o",
                     "ConnectTimeout=10",
                     *extra,
+                    *(["-i", ssh_key, "-o", "IdentitiesOnly=yes"] if ssh_key else []),
                     target,
                 ]
             else:
@@ -2182,21 +2245,27 @@ async def route_events_cancel(event_id: str, request: Request):
 @app.post("/docker/ps")
 async def route_docker_ps(request: Request):
     body = await request.json() if await request.body() else {}
-    return await docker_ps(body.get("host") or None, body.get("ssh_key") or None)
+    host = body.get("host") or None
+    ssh_key = body.get("ssh_key") or None
+    await ensure_ssh_identity(host, ssh_key)
+    return await docker_ps(host, ssh_key)
 
 
 @app.post("/docker/collect")
 async def route_docker_collect(request: Request):
     body = await request.json()
     st = get_state(request)
+    host = body.get("host") or None
+    ssh_key = body.get("ssh_key") or None
+    await ensure_ssh_identity(host, ssh_key)
     opened = st.collect_docker(
-        body.get("host") or None,
+        host,
         bool(body.get("stats", True)),
         body.get("logs", []),
         body.get("transforms", []),
         float(body.get("interval", 5)),
         bool(body.get("host_stats", True)),
-        body.get("ssh_key") or None,
+        ssh_key,
     )
     st.broadcast({"type": "sources"})
     return {"opened": opened, "sources": st.describe()}

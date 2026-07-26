@@ -752,7 +752,7 @@ async function startTracking(s) {
           host: host === "local" ? null : host,
           stats: false, host_stats: false, transforms: [],
           logs: [{ name: s.name, type: ttype }],
-          ssh_key: null,
+          ssh_key: dockerHostKeys.get(host) ?? null,
           interval: 5,
         });
       } catch (err) {
@@ -1032,7 +1032,7 @@ async function exportSample(t0, t1) {
       const host = currentDockerHost();
       await post("/docker/collect", {
         host, stats: false, host_stats: true, logs: [], transforms: [],
-        ssh_key: null,
+        ssh_key: dockerHostKeys.get(host || "local") ?? null,
         interval: 5,
       });
     } catch (err) {
@@ -1958,6 +1958,18 @@ function connectSSE() {
 
 const dlg = $("dlg-set");
 
+// SSH key actually used for each docker host reached via "Set Sources" --
+// keyed the same way as source paths (host string, or "local"). Populated
+// when a host is (re)connected from the dialog; follow-up /docker/collect
+// calls for that same host (startTracking, exportSample) that don't go
+// through the dialog reuse it instead of silently dropping back to null.
+const dockerHostKeys = new Map();
+
+$("docker-ssh-key-browse").onclick = async () => {
+  const paths = await window.cttc.pickFiles("Choose your SSH private key");
+  if (paths.length) $("docker-ssh-key").value = paths[0];
+};
+
 // names of the transform checkboxes ticked in Set Sources, in DOM order --
 // sent as-is to /docker/collect, which loads and applies them server-side.
 function chosenTransforms() {
@@ -2402,6 +2414,8 @@ async function listContainers() {
   renderActivityLog(null);
   const box = $("docker-targets");
   const host = normalizeDockerHost($("docker-host").value);
+  const sshKey = $("docker-ssh-key").value.trim() || null;
+  dockerHostKeys.set(host || "local", sshKey);
   // spelled out explicitly (rather than just "Connecting to <host>…") since
   // that phrasing reads as if *this browser page* opens a connection to
   // <host> -- it never does (fetch() can't even speak ssh://): the CTTC
@@ -2425,7 +2439,7 @@ async function listContainers() {
   $("docker-host").disabled = true;
   $("btn-ps-refresh").disabled = true;
   try {
-    const r = await post("/docker/ps", { host });
+    const r = await post("/docker/ps", { host, ssh_key: sshKey });
     clearInterval(tick);
     status.textContent = "";
     renderActivityLog(r.log);
@@ -2500,6 +2514,8 @@ $("dlg-ok").onclick = async () => {
   const transforms = chosenTransforms();
   try {
     const host = normalizeDockerHost($("docker-host").value);
+    const sshKey = $("docker-ssh-key").value.trim() || null;
+    dockerHostKeys.set(host || "local", sshKey);
     const logs = [...$("docker-targets").querySelectorAll("input:checked:not(:disabled)")].map((cb) => ({
       name: cb.value,
       type: cb.dataset.type,
@@ -2510,7 +2526,7 @@ $("dlg-ok").onclick = async () => {
       const collectReq = {
         host, stats, logs, transforms,
         host_stats: hostStats,
-        ssh_key: null,
+        ssh_key: sshKey,
         interval: Number($("docker-interval").value) || 5,
       };
       await post("/docker/collect", collectReq);

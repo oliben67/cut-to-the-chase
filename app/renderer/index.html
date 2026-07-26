@@ -239,6 +239,12 @@
       <label class="ctl block">Docker host
         <input id="docker-host" type="text" placeholder="empty = gateway Docker daemon, or user@host (ssh:// optional)" />
       </label>
+      <label class="ctl block">SSH key <span class="tdoc">(optional — leave empty to use the gateway host's ssh-agent/default identity)</span>
+        <span class="ctl">
+          <input id="docker-ssh-key" type="text" readonly placeholder="No file selected" />
+          <button id="docker-ssh-key-browse" type="button">Browse…</button>
+        </span>
+      </label>
       <div class="ctl">
         <button id="btn-ps-refresh" title="Connects from the CTTC server container's host, over ssh, to this target's docker daemon and lists its containers/services">Connect</button>
         <button id="btn-activity-toggle" class="linklike" type="button" hidden>Show activity</button>
