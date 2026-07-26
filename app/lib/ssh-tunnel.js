@@ -36,7 +36,7 @@ function sshTunnelArgs({ sshTarget, sshKey, sshPort, containerPort }) {
  * @param {{sshTarget: string, sshKey: string|null, sshPort?: number, containerPort: number}} cfg
  * @returns {Promise<{proc: import("child_process").ChildProcess}>}
  */
-async function openSshTunnel(cfg, { spawnFn = spawn, sshBin = "ssh", onLog } = {}) {
+async function openSshTunnel(cfg, { spawnFn = spawn, sshBin = "ssh", onLog, onUnexpectedExit } = {}) {
   // Refuse to shadow whatever's already using this port locally: the
   // readiness check below is just "is *something* listening on
   // 127.0.0.1:containerPort", which a leftover local "This machine"
@@ -46,6 +46,7 @@ async function openSshTunnel(cfg, { spawnFn = spawn, sshBin = "ssh", onLog } = {
   // race below look like a successful connect, and every request would
   // silently go to the wrong server instead of this gateway (e.g. a 404 on
   // a route the stale/local one doesn't have).
+  onLog?.(`checking whether 127.0.0.1:${cfg.containerPort} is already in use...`);
   const alreadyOpen = await waitForPortOpen("127.0.0.1", cfg.containerPort, { timeoutMs: 300 }).then(
     () => true,
     () => false
@@ -56,10 +57,12 @@ async function openSshTunnel(cfg, { spawnFn = spawn, sshBin = "ssh", onLog } = {
         `(e.g. a local "This machine" container on the same port, or a tunnel left over from a previous session)`
     );
   }
+  onLog?.(`127.0.0.1:${cfg.containerPort} is free`);
 
   const args = sshTunnelArgs(cfg);
   onLog?.(`$ ${sshBin} ${args.join(" ")}`);
   const proc = spawnFn(sshBin, args, { stdio: ["ignore", "pipe", "pipe"] });
+  onLog?.(`ssh tunnel process started (pid ${proc.pid})`);
   let stderr = "";
   let exited = false;
   proc.stdout?.on("data", (d) => onLog?.(String(d)));
@@ -71,16 +74,30 @@ async function openSshTunnel(cfg, { spawnFn = spawn, sshBin = "ssh", onLog } = {
   const exitPromise = new Promise((_resolve, reject) => {
     proc.once("error", (err) => {
       exited = true;
+      onLog?.(`ssh tunnel (pid ${proc.pid}) failed to start: ${err.message}`);
       reject(new Error(`could not start ${sshBin}: ${err.message}`));
     });
-    proc.once("exit", (code) => {
+    proc.once("exit", (code, signal) => {
       exited = true;
+      onLog?.(`ssh tunnel (pid ${proc.pid}) exited during setup (code ${code}, signal ${signal || "none"})`);
       if (code !== 0) reject(new Error(`ssh tunnel exited (code ${code}): ${stderr.trim() || "no output"}`));
     });
   });
 
   const readyPromise = waitForPortOpen("127.0.0.1", cfg.containerPort, { timeoutMs: 15000 }).then(() => {
     if (exited) throw new Error("ssh tunnel exited before the forwarded port opened");
+    onLog?.(`ssh tunnel established (pid ${proc.pid}): 127.0.0.1:${cfg.containerPort} -> ${cfg.sshTarget}:${cfg.containerPort}`);
+    // Once we're past the race above, nothing else is watching this process
+    // -- without a listener here, the tunnel can die mid-session (network
+    // blip, remote sshd idle timeout, laptop sleep/wake) with absolutely no
+    // indication why every subsequent request suddenly gets connection
+    // refused. onUnexpectedExit lets the caller (main.js) log it clearly and
+    // stop treating this as the active tunnel.
+    proc.once("exit", (code, signal) => {
+      onLog?.(`ssh tunnel (pid ${proc.pid}) exited unexpectedly (code ${code}, signal ${signal || "none"}) -- ` +
+        `127.0.0.1:${cfg.containerPort} is no longer reachable through it`);
+      onUnexpectedExit?.({ code, signal });
+    });
     return { proc };
   });
 
@@ -88,12 +105,13 @@ async function openSshTunnel(cfg, { spawnFn = spawn, sshBin = "ssh", onLog } = {
 }
 
 /** Kills a tunnel opened by openSshTunnel(). Safe to call with null/already-dead. */
-function closeSshTunnel(handle) {
+function closeSshTunnel(handle, { onLog } = {}) {
   if (handle?.proc && !handle.proc.killed) {
+    onLog?.(`closing ssh tunnel (pid ${handle.proc.pid})`);
     try {
       handle.proc.kill();
-    } catch {
-      /* best-effort */
+    } catch (err) {
+      onLog?.(`could not close ssh tunnel (pid ${handle.proc.pid}): ${err.message}`);
     }
   }
 }

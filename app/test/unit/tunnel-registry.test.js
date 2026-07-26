@@ -92,3 +92,41 @@ test("killOrphanedTunnels is a no-op (no write) when there's nothing recorded", 
   killOrphanedTunnels({ configPath: p });
   assert.equal(fs.existsSync(p), false);
 });
+
+test("killOrphanedTunnels logs a found-count line and one line per pid killed", () => {
+  const p = tmpPath();
+  const originalKill = process.kill;
+  process.kill = () => {};
+  const lines = [];
+  try {
+    recordTunnel({ pid: 111, containerPort: 8765, sshTarget: "u@a" }, { configPath: p });
+    killOrphanedTunnels({ configPath: p, onLog: (l) => lines.push(l) });
+    assert.ok(lines.some((l) => l.includes("found 1 leftover tunnel")));
+    assert.ok(lines.some((l) => l.includes("killed orphaned ssh tunnel (pid 111") && l.includes("u@a")));
+  } finally {
+    process.kill = originalKill;
+  }
+});
+
+test("killOrphanedTunnels logs an already-gone line when the pid errors", () => {
+  const p = tmpPath();
+  const originalKill = process.kill;
+  process.kill = () => {
+    throw new Error("ESRCH");
+  };
+  const lines = [];
+  try {
+    recordTunnel({ pid: 999, containerPort: 8765, sshTarget: "u@a" }, { configPath: p });
+    killOrphanedTunnels({ configPath: p, onLog: (l) => lines.push(l) });
+    assert.ok(lines.some((l) => l.includes("999") && l.includes("already gone")));
+  } finally {
+    process.kill = originalKill;
+  }
+});
+
+test("killOrphanedTunnels logs that there's nothing to clean up when the file is empty", () => {
+  const p = tmpPath();
+  const lines = [];
+  killOrphanedTunnels({ configPath: p, onLog: (l) => lines.push(l) });
+  assert.ok(lines.some((l) => l.includes("no leftover tunnels")));
+});

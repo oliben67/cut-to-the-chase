@@ -72,20 +72,28 @@ function removeTunnel(containerPort, { configPath } = {}) {
  * Best-effort kill of every tunnel recorded from a previous run, then wipes
  * the file -- called once at startup, before this session opens any tunnel
  * of its own, so a stale one left behind by an unclean exit can never block
- * a fresh connect. Silently ignores pids that are already gone (the normal
- * case: most exits *are* clean) or that error for any other reason (never
- * worth failing startup over).
+ * a fresh connect. Tolerates pids that are already gone (the normal case:
+ * most exits *are* clean) or that error for any other reason (never worth
+ * failing startup over) -- onLog reports which of the two happened for
+ * each, since this is exactly the step that silently fixes (or fails to
+ * fix) a "tunnel never establishes" report with no error of its own.
  */
-function killOrphanedTunnels({ configPath } = {}) {
+function killOrphanedTunnels({ configPath, onLog } = {}) {
   const list = readTunnels({ configPath });
+  if (!list.length) {
+    onLog?.("no leftover tunnels recorded from a previous session");
+    return list;
+  }
+  onLog?.(`found ${list.length} leftover tunnel(s) recorded from a previous session`);
   for (const t of list) {
     try {
       process.kill(t.pid, "SIGTERM");
-    } catch {
-      /* already dead, or never existed -- nothing to clean up */
+      onLog?.(`killed orphaned ssh tunnel (pid ${t.pid}, was forwarding port ${t.containerPort} to ${t.sshTarget})`);
+    } catch (err) {
+      onLog?.(`orphaned tunnel pid ${t.pid} (port ${t.containerPort}, ${t.sshTarget}) already gone: ${err.message}`);
     }
   }
-  if (list.length) writeTunnels([], { configPath });
+  writeTunnels([], { configPath });
   return list;
 }
 

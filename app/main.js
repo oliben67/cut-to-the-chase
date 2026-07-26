@@ -72,10 +72,12 @@ function setCurrentTunnel(handle, containerPort, sshTarget) {
   currentTunnel = handle;
   currentTunnelPort = containerPort;
   recordTunnel({ pid: handle.proc.pid, containerPort, sshTarget });
+  mainLog(`[tunnel] now active: pid ${handle.proc.pid}, 127.0.0.1:${containerPort} -> ${sshTarget}`);
 }
 function clearCurrentTunnel() {
   if (!currentTunnel) return;
-  closeSshTunnel(currentTunnel);
+  mainLog(`[tunnel] clearing active tunnel: pid ${currentTunnel.proc.pid}, port ${currentTunnelPort}`);
+  closeSshTunnel(currentTunnel, { onLog: mainLog });
   removeTunnel(currentTunnelPort);
   currentTunnel = null;
   currentTunnelPort = null;
@@ -874,7 +876,21 @@ async function connectRemoteGateway(cfg, { onLog, forceTunnel = false } = {}) {
   onLog?.(`$ ${remote.host}:${remote.port} not reachable directly -- opening an ssh tunnel instead...`);
   const tunnel = await openSshTunnel(
     { sshTarget: cfg.sshTarget, sshKey: cfg.sshKey, sshPort: cfg.sshPort, containerPort: remote.port },
-    { sshBin, onLog }
+    {
+      sshBin,
+      onLog,
+      // Only clear global state if this handle is *still* the active
+      // tunnel -- switching gateways in the meantime already replaced it
+      // with a newer one, whose own exit this must not be mistaken for.
+      onUnexpectedExit: () => {
+        if (currentTunnel === tunnel) {
+          mainError(`[tunnel] the active ssh tunnel to ${cfg.sshTarget} died unexpectedly -- reconnect to restore it`);
+          removeTunnel(currentTunnelPort);
+          currentTunnel = null;
+          currentTunnelPort = null;
+        }
+      },
+    }
   );
   setCurrentTunnel(tunnel, remote.port, cfg.sshTarget);
   return {
@@ -1464,7 +1480,7 @@ app.whenReady().then(async () => {
   // "something is already listening" guard with no obvious cause (see
   // lib/tunnel-registry.js).
   narrate("cleaning up any leftover connections from a previous session...");
-  killOrphanedTunnels();
+  killOrphanedTunnels({ onLog: mainLog });
   installMenu();
   // the window `icon` option is ignored on macOS; the running app's Dock icon
   // must be set explicitly (only affects unpackaged runs — packaged apps use .icns)
