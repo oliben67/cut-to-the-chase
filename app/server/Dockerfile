@@ -32,7 +32,14 @@ COPY pyproject.toml ./
 # uv treats the "dev" group as included by default -- --no-dev keeps
 # pytest/pytest-cov/coverage out of the deployed image
 RUN uv sync --no-dev
-COPY server.py files.py ./
+# every top-level module (server.py + its sibling modules -- cttc_format.py,
+# events.py, files.py, recording_session.py, rolling_buffer.py,
+# scheduler.py, ...) via one wildcard, so adding a new sibling module never
+# again silently works locally/in tests but ModuleNotFoundError-crashloops
+# in the shipped container because someone forgot to add it to an explicit
+# COPY list here. .dockerignore already keeps tests/, caches, and .venv/ out
+# of the build context, so this can't accidentally sweep those in.
+COPY *.py ./
 COPY transforms ./transforms
 
 FROM python:3.14-alpine
