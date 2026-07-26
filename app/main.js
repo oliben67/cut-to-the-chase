@@ -137,10 +137,42 @@ function broadcastLog(level, text) {
 // covers the server subprocess's own logging too (see mainError below),
 // since serverProc's stderr is already piped through mainError, not just
 // this process's own messages.
+// Where "Collect CTTC Own Logs" writes by default, the first time this app
+// has ever run on this machine (see app.whenReady() below) -- next to the
+// app itself, same folder the executable/AppImage lives in, rather than
+// some separate profile directory nobody thinks to look in. Falls back to
+// the writable userData dir if that folder turns out not to be writable
+// (e.g. a per-machine Program Files install, or a read-only AppImage mount)
+// -- see startLogCollector's error handling below, which is what actually
+// detects that and falls back live.
+function defaultLogCollectorDir() {
+  return app.isPackaged ? path.dirname(process.execPath) : app.getAppPath();
+}
+
 let logCollectorStream = null;
 function startLogCollector(dir) {
   stopLogCollector();
   logCollectorStream = fs.createWriteStream(path.join(dir, logFileName()), { flags: "a" });
+  // Without this, a write failure (most likely: `dir` isn't writable --
+  // Program Files without admin, a macOS .app bundle, a read-only AppImage
+  // mount) would be an unhandled 'error' on the stream, crashing the whole
+  // process instead of just leaving this one optional feature off.
+  logCollectorStream.on("error", (err) => {
+    const failedDir = dir;
+    stopLogCollector();
+    const settings = readLogCollectorSettings();
+    if (failedDir !== app.getPath("userData")) {
+      // Only retried once, into a directory Electron guarantees is
+      // writable -- if *that* somehow also fails, give up rather than loop.
+      const fallbackDir = app.getPath("userData");
+      mainError(`[log-collector] couldn't write to ${failedDir} (${err.message}) -- falling back to ${fallbackDir}`);
+      writeLogCollectorSettings({ ...settings, dir: fallbackDir });
+      startLogCollector(fallbackDir);
+    } else {
+      mainError(`[log-collector] couldn't write to ${failedDir} (${err.message}) -- turning log collection off`);
+      writeLogCollectorSettings({ ...settings, enabled: false });
+    }
+  });
 }
 function stopLogCollector() {
   if (logCollectorStream) {
@@ -1381,9 +1413,18 @@ app.whenReady().then(async () => {
   if (process.platform === "darwin") app.dock.setIcon(APP_ICON);
   // "Collect CTTC Own Logs" was left on from a previous run -- a fresh
   // timestamped file for this launch, same as toggling it on mid-session.
+  // A completely unconfigured install (no dir ever saved, never explicitly
+  // turned on or off) defaults to *on*, writing next to the app itself --
+  // once the user's touched the setting either way, that choice sticks.
   {
     const logSettings = readLogCollectorSettings();
-    if (logSettings.enabled && logSettings.dir) startLogCollector(logSettings.dir);
+    if (logSettings.dir == null && !logSettings.enabled) {
+      const dir = defaultLogCollectorDir();
+      writeLogCollectorSettings({ enabled: true, dir });
+      startLogCollector(dir);
+    } else if (logSettings.enabled && logSettings.dir) {
+      startLogCollector(logSettings.dir);
+    }
   }
   try {
     // files passed on the command line open at startup: npm start -- file1 file2
