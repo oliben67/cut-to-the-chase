@@ -51,7 +51,12 @@ function waitForHttpOk(url, { timeoutMs = 15000, intervalMs = 300, fetchFn = fet
   return new Promise((resolve, reject) => {
     const attempt = async () => {
       try {
-        const r = await fetchFn(url);
+        // Bounds *this* attempt on its own -- without it, a request that
+        // hangs instead of erroring (e.g. a firewall silently dropping the
+        // SYN rather than sending RST) never reaches the catch block below,
+        // so the deadline check never runs and the whole wait can hang well
+        // past timeoutMs regardless of how short it was set.
+        const r = await fetchFn(url, { signal: AbortSignal.timeout(Math.min(intervalMs * 3, 5000)) });
         if (r.ok) {
           resolve();
           return;

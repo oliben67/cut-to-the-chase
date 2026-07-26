@@ -186,6 +186,10 @@ tasks:
       - task: build:release:linux
         vars: { CLI_ARGS: '{{.CLI_ARGS}}' }
 
+  build:gateway:image:
+    desc: "Build the cttc-gateway server image and push it to the registry ref in releases/_repo/image.json   [usage: task build:gateway:image -- --force]"
+    cmd: ../releases/_shared/build-image.sh {{.CLI_ARGS}}
+
   # ── Dependencies ──────────────────────────────────────────────────────────
   deps:update:
     desc: Update server packages to their latest allowed versions

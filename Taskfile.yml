@@ -88,6 +88,12 @@ tasks:
       - task: app:build:release:linux
         vars: { CLI_ARGS: '{{.CLI_ARGS}}' }
 
+  build:gateway:image:
+    desc: "Build the cttc-gateway server image and push it to Docker Hub   [usage: task build:gateway:image -- --force]"
+    cmds:
+      - task: app:build:gateway:image
+        vars: { CLI_ARGS: '{{.CLI_ARGS}}' }
+
   build:all:
     desc: "Run all tests, then (if they pass) build every release, then stage the release submodule   [usage: task build:all]"
     cmds:
