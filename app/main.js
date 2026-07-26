@@ -367,7 +367,11 @@ function showSplash() {
     // the instant it's constructed, which is the "blank background" flash
     // this window exists to avoid in the first place.
     show: false,
-    webPreferences: { contextIsolation: true, nodeIntegration: false },
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      preload: path.join(__dirname, "preload.js"),
+    },
   });
   splashWindow.once("ready-to-show", () => splashWindow?.show());
   splashWindow.loadFile(path.join(__dirname, "renderer", "splash.html"));
@@ -686,7 +690,8 @@ async function connectToServer(fileArgs) {
   const cfg = loadConnectionConfig();
   if (cfg.mode === "embedded") {
     if (app.isPackaged && (await hasLocalDocker())) {
-      const { port } = await ensureLocalContainer({ resourcesDir: resourcesDirForApp() });
+      mainLog("$ starting the local gateway container...");
+      const { port } = await ensureLocalContainer({ resourcesDir: resourcesDirForApp(), onLog: mainLog });
       serverHost = "127.0.0.1";
       serverPort = port;
       activeGatewayHost = "127.0.0.1";
@@ -698,6 +703,7 @@ async function connectToServer(fileArgs) {
       recordGateway({ mode: "embedded", host: serverHost, port: serverPort, label: "This machine", connectionType: "local" });
       return;
     }
+    mainLog("$ starting the server...");
     await startServer(fileArgs);
     return;
   }
@@ -709,6 +715,7 @@ async function connectToServer(fileArgs) {
   // First-time connect to a deployed gateway (see connectRemoteGateway):
   // tries direct HTTP first, falling back to an ssh tunnel if that times
   // out/fails.
+  mainLog(`$ connecting to ${cfg.sshTarget}...`);
   const result = await connectRemoteGateway(cfg, { onLog: mainLog });
   serverHost = result.host;
   serverPort = result.port;
@@ -1324,6 +1331,7 @@ ipcMain.handle("gateway-manage-save", async (_e, payload) => {
       const { port } = await ensureLocalContainer({
         source: payload.imageSource || undefined,
         resourcesDir: resourcesDirForApp(),
+        onLog: mainLog,
       });
       recordGateway({ mode: "embedded", host: "127.0.0.1", port, label: "This machine", connectionType: "local" });
       if (activeGatewayHost === "127.0.0.1" && serverConnectionType === "local") {
@@ -1421,21 +1429,25 @@ ipcMain.handle("gateway-manage-uninstall", async (_e, entry) => {
 });
 
 app.whenReady().then(async () => {
-  // Before anything else: kill any ssh -N -L tunnel left running by a
-  // previous session that never exited cleanly (crash, force quit, killed
-  // by an installer/uninstaller) -- otherwise it just sits on its forwarded
-  // port forever, and every future connect attempt to that gateway fails
-  // ssh-tunnel.js's own "something is already listening" guard with no
-  // obvious cause (see lib/tunnel-registry.js).
-  killOrphanedTunnels();
   // Shown before anything else, including installMenu() and the
   // canBeServerLocally() check below -- it shells out to `docker info` and
   // `ssh -V` (async; see lib/docker-check.js) and can take a few seconds
   // against a slow/starting daemon or a plain "no docker on PATH" miss. The
   // gateway setup path closes this itself once its own window is ready to show (see
   // runSetupWizard()'s 'ready-to-show' handler) instead of stacking a
-  // second loading window on top of it.
+  // second loading window on top of it. Created before killOrphanedTunnels()
+  // below so its window exists to actually receive that step's status line
+  // (see splash.js/splash-status "main-log" mirroring) -- mainLog calls
+  // before a window exists have nothing to reach.
   showSplash();
+  // Kill any ssh -N -L tunnel left running by a previous session that never
+  // exited cleanly (crash, force quit, killed by an installer/uninstaller)
+  // -- otherwise it just sits on its forwarded port forever, and every
+  // future connect attempt to that gateway fails ssh-tunnel.js's own
+  // "something is already listening" guard with no obvious cause (see
+  // lib/tunnel-registry.js).
+  mainLog("$ cleaning up any leftover connections from a previous session...");
+  killOrphanedTunnels();
   installMenu();
   // the window `icon` option is ignored on macOS; the running app's Dock icon
   // must be set explicitly (only affects unpackaged runs — packaged apps use .icns)
@@ -1459,6 +1471,7 @@ app.whenReady().then(async () => {
     // files passed on the command line open at startup: npm start -- file1 file2
     const fileArgs = process.argv.slice(app.isPackaged ? 1 : 2).filter((a) => !a.startsWith("-"));
     const cfg = loadConnectionConfig();
+    mainLog("$ checking for a local Docker installation...");
     if (cfg.mode === "embedded" && !(await canBeServerLocally())) {
       try {
         await runSetupWizard();
@@ -1469,7 +1482,8 @@ app.whenReady().then(async () => {
         // still starting up; only fall back to the bare, docker-less
         // embedded server if that attempt itself fails.
         try {
-          const { port } = await ensureLocalContainer({ resourcesDir: resourcesDirForApp() });
+          mainLog("$ starting the local gateway container...");
+          const { port } = await ensureLocalContainer({ resourcesDir: resourcesDirForApp(), onLog: mainLog });
           serverHost = "127.0.0.1";
           serverPort = port;
           activeGatewayHost = "127.0.0.1";
@@ -1479,6 +1493,7 @@ app.whenReady().then(async () => {
           activeSshPort = undefined;
           mainLog(`[docker] server container running locally — port ${serverPort}`);
         } catch {
+          mainLog("$ starting the server...");
           await startServer(fileArgs);
         }
       }

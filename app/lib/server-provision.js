@@ -148,16 +148,17 @@ function resolveSource(source, { resourcesDir } = {}) {
  * matching compose file, then wait for the fixed container port to open.
  * @returns {{port: number, imageRef: string}}
  */
-async function ensureLocalContainer({ spawnFn = spawn, resourcesDir, port = 8765, source } = {}) {
+async function ensureLocalContainer({ spawnFn = spawn, resourcesDir, port = 8765, source, onLog } = {}) {
   const resolved = resolveSource(source, { resourcesDir });
   const env = { ...process.env };
   if (resolved.kind === "tarball") {
-    await run(spawnFn, "docker", ["load", "-i", resolved.tarballPath]);
+    await run(spawnFn, "docker", ["load", "-i", resolved.tarballPath], {}, onLog);
   } else {
     env.CTTC_IMAGE = resolved.ref;
-    await run(spawnFn, "docker", ["pull", resolved.ref]);
+    await run(spawnFn, "docker", ["pull", resolved.ref], {}, onLog);
   }
-  await run(spawnFn, "docker", ["compose", "-f", resolved.composeFile, "up", "-d"], { env });
+  await run(spawnFn, "docker", ["compose", "-f", resolved.composeFile, "up", "-d"], { env }, onLog);
+  onLog?.(`$ waiting for the container to come up on 127.0.0.1:${port} ...`);
   await waitForPortOpen("127.0.0.1", port, { timeoutMs: 30000 });
   return { port, imageRef: resolved.imageRef };
 }
