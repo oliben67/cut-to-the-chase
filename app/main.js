@@ -880,6 +880,15 @@ function runSetupWizard() {
     attachEditContextMenu(wizardWindow);
     wizardWindow.loadFile(path.join(__dirname, "renderer", "gateway-setup.html"), { search: "mode=new" });
     wizardWindow.on("closed", () => {
+      // The splash was already closed once this window's own 'ready-to-show'
+      // fired, so this window closing (successfully submitted, or
+      // cancelled) always drops to zero open windows for a moment -- without
+      // a window up before that happens, window-all-closed fires and quits
+      // the whole app right here, before the success path ever reaches
+      // createWindow() or the cancel path's local-fallback retry gets a
+      // chance to run. Re-showing it (idempotent, a no-op once the real main
+      // window is already up) bridges that gap either way.
+      showSplash();
       wizardWindow = null;
       if (!settled) {
         ipcMain.removeHandler("gateway-setup-submit");
