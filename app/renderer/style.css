@@ -425,6 +425,9 @@ body {
 .ab-group-header {
   width: 100%;
   justify-content: flex-start;
+  height: 32px; /* matches the main content's panel heads (#chart-head etc) */
+  padding-top: 3px;
+  padding-bottom: 3px;
 }
 .ab-group-title {
   font-size: 11.5px;
@@ -474,6 +477,31 @@ body {
 #app-body[data-dock="bottom"] .ab-group-body {
   display: flex !important;
   flex-direction: row;
+}
+/* thin, unobtrusive divider between related sub-items in a group body --
+   a hairline rather than a labeled section, so it reads as a soft grouping
+   hint rather than a hard boundary. */
+.ab-sep {
+  background: var(--border);
+  margin: 4px 10px;
+  height: 1px;
+}
+#app-body[data-dock="top"] .ab-sep,
+#app-body[data-dock="bottom"] .ab-sep {
+  width: 1px;
+  height: auto;
+  margin: 4px 0;
+}
+.ab-sep--dotted {
+  background: none;
+  border-top: 1px dotted var(--border);
+  height: 0;
+}
+#app-body[data-dock="top"] .ab-sep--dotted,
+#app-body[data-dock="bottom"] .ab-sep--dotted {
+  border-top: none;
+  border-left: 1px dotted var(--border);
+  width: 0;
 }
 /* the left-shift only reads as "nested under a header" in the vertical
    sidebar layout -- in the horizontal dock every button sits in one flat
@@ -706,7 +734,8 @@ body.sample-armed .strip { cursor: cell; }
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 2px 12px 4px;
+  height: 32px; /* matches the sidebar's .ab-group-header */
+  padding: 0 12px;
   font-size: 11px;
   font-weight: 600;
   color: var(--text-secondary);
@@ -820,7 +849,8 @@ body.sample-armed .strip { cursor: cell; }
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 4px 12px 2px;
+  height: 32px; /* matches the sidebar's .ab-group-header */
+  padding: 0 12px;
   border-top: 1px solid var(--border);
   margin-top: 4px;
   font-size: 11px;
@@ -839,7 +869,8 @@ body.sample-armed .strip { cursor: cell; }
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 4px 12px 2px;
+  height: 32px; /* matches the sidebar's .ab-group-header */
+  padding: 0 12px;
   border-top: 1px solid var(--border);
   margin-top: 4px;
   font-size: 11px;
@@ -1197,69 +1228,22 @@ pre.snapshot-body {
 
 /* gateway-setup.html (New Gateway / Edit Gateways -- a standalone page, not
    a <dialog>, so it needs its own top-level layout) -- everything else
-   (buttons, .keys-box fieldsets, .radio-row, .muted/.error/.linklike/
-   .activity-log, .dlg-actions) reuses the same rules as the main window's
-   dialogs above rather than duplicating them with hardcoded colors, so
-   this page respects the same light/dark theme instead of always being
-   dark regardless of it. */
+   (labels/inputs via .ctl/.ctl.block, .keys-box fieldsets, .radio-row,
+   .muted/.error/.linklike/.activity-log, .dlg-actions, h2/.dlg-intro) reuses
+   the exact same rules as #dlg-gateway-setup (index.html's in-app version of
+   this same form) so the two look and behave identically -- this page is
+   just that dialog's content poured into a standalone window instead of a
+   <dialog> element, for the pre-main-window first-run case. */
 /* Scroll safety net, scoped to only this page (never the main window,
    which manages its own internal scroll regions) via :has() -- a taller
    form, a larger OS font scale, or a small display can still reach content
    via scroll instead of silently clipping it. */
-body:has(#gateway-setup) { overflow-y: auto; }
-#gateway-setup { margin: 22px 0; padding: 0 20px 48px; }
-/* .keys-box has no explicit padding elsewhere -- the browser's UA default
-   fieldset padding (~0.75em sides) narrows its controls more than the
-   surrounding page padding does; tightened here so gateway-setup's inputs
-   use closer to the same width as the plain (non-fieldset) ones above them,
-   without changing #gateway-setup's own max-width. */
-#gateway-setup .keys-box { padding: 4px 10px 10px; }
-#gateway-setup h1 { font-size: 19px; font-weight: 600; letter-spacing: -0.01em; }
-#gateway-setup label { display: block; margin-top: 14px; font-size: 13px; color: var(--text-secondary); }
-#gateway-setup input[type="text"],
-#gateway-setup input[type="number"],
-#gateway-setup textarea,
-#gateway-setup select {
-  background: var(--surface-2);
-  border: 1px solid var(--border-strong);
-  color: var(--text-primary);
-  border-radius: var(--radius-sm);
-  padding: 6px 9px;
-  font-size: 13px;
-  box-sizing: border-box;
-  transition: border-color 0.1s ease;
-}
-#gateway-setup input[type="text"]:focus,
-#gateway-setup input[type="number"]:focus,
-#gateway-setup textarea:focus,
-#gateway-setup select:focus {
-  outline: none;
-  border-color: var(--accent);
-}
-/* stacked label-above-control layout (ssh user/host/port, the gateway
-   picker) -- scoped to a direct child of a bare <label> so it doesn't
-   fight the flex-row layouts below (.ctl's own inputs, #key-path-row's),
-   which size themselves. select needs this too -- without it,
-   #gateway-select-row's dropdown sat inline next to its "CTTC Gateways"
-   label instead of stacked like every other field, with a large gap. */
-#gateway-setup label > input[type="text"],
-#gateway-setup label > input[type="number"],
-#gateway-setup label > select {
-  display: block;
-  width: 100%;
-  margin-top: 4px;
-}
-/* the port number is at most 5 digits -- stretching it to the same width
-   as the hostname/username fields above it left a wide mostly-empty box
-   that read as an unfinished layout rather than a small numeric field */
-#gateway-setup label > input[type="number"]#ssh-port {
-  width: 100px;
-}
-/* indented to line up under the radio option's text (not the radio dot),
-   so these read as that option's own sub-fields rather than a separate row */
-#key-path-row { display: flex; gap: 8px; align-items: center; margin-left: 22px; }
-#key-path-row input { flex: 1; }
-#key-paste { margin-left: 22px; width: calc(100% - 22px); }
+body:has(#gateway-setup) { overflow-y: auto; background: var(--surface-1); }
+/* same card tone and width as the dialog it mirrors (dialog's own
+   min/max-width above), centered rather than left-edge-anchored since there's
+   no surrounding page chrome here to anchor against. */
+#gateway-setup { margin: 22px auto; padding: 0 20px 48px; max-width: 620px; }
+#gateway-setup h2 { margin: 0 0 10px; font-size: 15px; }
 .wait { text-align: center; margin-top: 40px; }
 .spinner {
   width: 32px; height: 32px; margin: 0 auto 12px;

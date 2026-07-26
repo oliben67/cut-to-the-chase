@@ -297,6 +297,11 @@ document.addEventListener("mouseover", (e) => {
   hintTarget = el;
   el.dataset.hintTitle = el.getAttribute("title");
   el.removeAttribute("title");
+  // native <dialog> elements paint in the browser's top layer, above any
+  // z-index in the regular DOM -- reparent the hint into the open dialog
+  // (if any) so it isn't hidden underneath it.
+  const dlg = el.closest("dialog[open]");
+  (dlg || document.body).appendChild(hintEl);
   hintEl.textContent = hintTarget.dataset.hintTitle;
   hintEl.hidden = false;
   positionHint(e);
@@ -3510,6 +3515,8 @@ if (!POPOUT_KIND) {
     "load-metrics": () => $("btn-load-sample").click(),
     "new-gateway": () => openNewGatewayDialog(),
     "edit-gateways": () => openEditGatewaysDialog(),
+    "event-create": () => $("btn-event-create").click(),
+    "event-edit": () => $("btn-event-edit").click(),
     "open-theme": () => openThemeDialog(),
     "open-settings": () => openSettingsDialog(),
     // View > Actual Size (Ctrl/Cmd+0) otherwise only resets the browser
