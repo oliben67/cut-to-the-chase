@@ -78,6 +78,14 @@ const state = {
   sources: [],            // /sources payload
   range: null,            // {min_ts, max_ts} global
   view: null,             // {t0, t1} visible window (ms)
+  // Whether the view auto-follows real time (see followNow()/goLive()) --
+  // true by default; any user-initiated pan/zoom (drag, wheel, nav thumb,
+  // double-click recenter, right-click zoom) turns it off via setView's own
+  // default behavior, since at that point the user is deliberately looking
+  // at a fixed window, not "now". Explicitly turned back on by goLive()
+  // (the nav's "now" label) and resetZoom() staying off on purpose --
+  // "fit all data" and "keep following now" are different intents.
+  live: true,
   cursorT: null,          // clicked time
   hoverX: null,           // crosshair pixel x (plot coords) or null
   hoverStrip: null,
@@ -127,6 +135,14 @@ const STRIPS = [
 ];
 const MARGIN_L = 46, MARGIN_R = 8, AXIS_H = 20;
 let stripH = prefs.get("stripH", 96); // strip height; the splitter resizes it
+
+// "now" line (Preferences > Appearance > "Now" line) -- a marker for the
+// actual current time, distinct from the cursor/selection accent line.
+const DEFAULT_NOW_COLOR = "#14b8a6";
+const DEFAULT_NOW_STYLE = "dotted";
+const NOW_LINE_DASHES = { dotted: [2, 4], dashed: [8, 5], solid: [] };
+let nowLineColor = prefs.get("nowLineColor", DEFAULT_NOW_COLOR);
+let nowLineStyle = prefs.get("nowLineStyle", DEFAULT_NOW_STYLE);
 
 // bytes/sec -> the largest unit (GB/MB/kB/B) that keeps the number >= 1,
 // one decimal place -- used for the NET strip's axis labels and tooltip.
@@ -393,6 +409,7 @@ function buildStrips() {
       c.className = "strip";
       c.dataset.strip = i;
       c.dataset.group = group;
+      c.title = "Click: move cursor  ·  Drag: zoom to selection  ·  Wheel: zoom in/out  ·  Ctrl/Cmd+wheel: scroll page";
       parent.appendChild(c);
       arr.push(c);
     });
@@ -628,6 +645,21 @@ function drawVerticals(ctx, h) {
     ctx.lineTo(state.hoverX + 0.5, h);
     ctx.stroke();
     ctx.setLineDash([]);
+  }
+  // "now" marker: real time progressing across the chart, independent of
+  // the cursor/selection -- see Preferences > Appearance > "Now" line.
+  if (state.view) {
+    const nowX = tToX(Date.now());
+    if (nowX >= MARGIN_L && nowX <= MARGIN_L + plotWidth()) {
+      ctx.strokeStyle = nowLineColor;
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash(NOW_LINE_DASHES[nowLineStyle] || []);
+      ctx.beginPath();
+      ctx.moveTo(nowX + 0.5, 0);
+      ctx.lineTo(nowX + 0.5, h);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
   }
 }
 
@@ -1404,13 +1436,64 @@ function updateTooltip(e, x) {
 
 let seriesTimer = null;
 
+// Formats a view span for the status bar, e.g. 1500 -> "1.5s", 125000 -> "2m 5s".
+function fmtSpan(ms) {
+  const s = ms / 1000;
+  if (s < 60) return s.toFixed(s < 10 ? 1 : 0) + "s";
+  const m = Math.floor(s / 60), rem = Math.round(s % 60);
+  if (m < 60) return rem ? `${m}m ${rem}s` : `${m}m`;
+  const h = Math.floor(m / 60), remM = m % 60;
+  return remM ? `${h}h ${remM}m` : `${h}h`;
+}
+
+function updateViewRangeLabel() {
+  const el = $("view-range-label");
+  if (!el) return;
+  if (!state.view) { el.textContent = ""; return; }
+  const t0 = new Date(state.view.t0).toISOString().replace("T", " ").replace(/\.\d+Z$/, " UTC");
+  el.textContent = `view: ${t0} + ${fmtSpan(state.view.t1 - state.view.t0)}`;
+}
+
 function setView(t0, t1, opts = {}) {
   if (t1 - t0 < 200) return; // 200ms minimum zoom
   state.view = { t0, t1 };
+  // Any caller *except* the live-follow ticker itself (opts._follow) is a
+  // deliberate pan/zoom -- the user just chose to look at a fixed window,
+  // so stop auto-advancing it out from under them.
+  if (!opts._follow) state.live = false;
   scheduleSeriesFetch();
   drawAll();
+  updateViewRangeLabel();
   if (opts.broadcast !== false) window.cttc?.broadcastSync?.({ type: "view", t0, t1 });
 }
+
+// Recenters the view on (now - FOLLOW_LAG), keeping the current span --
+// "centered a few seconds behind now" rather than pinned exactly to the
+// leading edge, so the most recent points aren't drawn flush against the
+// chart's right border. Used both by the 1s auto-follow ticker (see
+// followNowTick below) and by goLive() for an immediate jump.
+const FOLLOW_LAG = 5000;
+function followNow() {
+  const span = state.view ? state.view.t1 - state.view.t0 : DEFAULT_SPAN;
+  const center = Date.now() - FOLLOW_LAG;
+  setView(center - span / 2, center + span / 2, { _follow: true });
+}
+
+// The nav's "now" label: explicitly resumes live-following (unlike a plain
+// click elsewhere, which only recenters once and leaves live off).
+function goLive() {
+  state.live = true;
+  followNow();
+  setCursor(Date.now());
+}
+
+// Keeps the view sliding forward while live, and always redraws so the
+// "now" line advances even when the view is a fixed (non-live) window.
+setInterval(() => {
+  if (!state.view) return;
+  if (state.live) followNow();
+  else drawAll();
+}, 1000);
 
 function resetZoom() {
   if (!state.range || state.range.min_ts == null) return;
@@ -1499,6 +1582,10 @@ function updateTimelineNav(nav) {
   const x1 = ((state.view.t1 - lo) / span) * w;
   nav.thumb.style.left = `${Math.max(0, x0)}px`;
   nav.thumb.style.width = `${Math.max(8, x1 - x0)}px`;
+  nav.nowLabel.dataset.live = String(!!state.live);
+  nav.nowLabel.title = state.live
+    ? "Following the present -- click to jump anyway"
+    : "Jump back to the present and resume following it";
 }
 
 function attachTimelineNav(navEl) {
@@ -1508,7 +1595,7 @@ function attachTimelineNav(navEl) {
 
   nowLabel.addEventListener("click", (e) => {
     e.stopPropagation();
-    centerOnNow();
+    goLive();
   });
 
   thumb.addEventListener("mousedown", (e) => {
@@ -1990,7 +2077,7 @@ async function refreshAll() {
         const pad = Math.max(1000, (range.max_ts - range.min_ts) * 0.01);
         setView(range.min_ts - pad, range.max_ts + pad, { broadcast: false });
       } else {
-        resetZoom();
+        goLive();
       }
     }
     await fetchSeries();
@@ -2434,25 +2521,47 @@ if (!POPOUT_KIND) {
   setThemeMode(prefs.get("themeMode", DEFAULT_THEME_MODE));
 }
 
+function syncNowStyleButtons(style) {
+  for (const b of $("theme-now-style-switch").querySelectorAll("button")) {
+    b.dataset.active = String(b.dataset.style === style);
+  }
+}
+
 function openThemeDialog() {
   $("theme-hl-color").value = prefs.get("hlColor", DEFAULT_HL_COLOR);
   $("theme-status-bar-toggle").checked = statusBarEnabled;
+  $("theme-now-color").value = prefs.get("nowLineColor", DEFAULT_NOW_COLOR);
+  syncNowStyleButtons(prefs.get("nowLineStyle", DEFAULT_NOW_STYLE));
   dlgTheme.showModal();
 }
 $("theme-hl-color").oninput = (e) => applyHlColor(e.target.value); // live preview
+$("theme-now-color").oninput = (e) => { nowLineColor = e.target.value; drawAll(); }; // live preview
+for (const b of $("theme-now-style-switch").querySelectorAll("button")) {
+  b.onclick = () => { syncNowStyleButtons(b.dataset.style); nowLineStyle = b.dataset.style; drawAll(); };
+}
 $("dlg-theme-reset").onclick = () => {
   $("theme-hl-color").value = DEFAULT_HL_COLOR;
   applyHlColor(DEFAULT_HL_COLOR);
   setThemeMode("light");
+  $("theme-now-color").value = DEFAULT_NOW_COLOR;
+  nowLineColor = DEFAULT_NOW_COLOR;
+  syncNowStyleButtons(DEFAULT_NOW_STYLE);
+  nowLineStyle = DEFAULT_NOW_STYLE;
+  drawAll();
 };
 $("dlg-theme-save").onclick = () => {
   const color = $("theme-hl-color").value;
   prefs.set("hlColor", color);
   applyHlColor(color);
+  prefs.set("nowLineColor", nowLineColor);
+  prefs.set("nowLineStyle", nowLineStyle);
   dlgTheme.close();
 };
 $("dlg-theme-close").onclick = () => {
   applyHlColor(prefs.get("hlColor", DEFAULT_HL_COLOR)); // discard live preview
+  nowLineColor = prefs.get("nowLineColor", DEFAULT_NOW_COLOR); // discard live preview
+  nowLineStyle = prefs.get("nowLineStyle", DEFAULT_NOW_STYLE);
+  drawAll();
   dlgTheme.close();
 };
 
@@ -2565,6 +2674,16 @@ async function listContainers() {
       const g = document.createElement("div");
       g.className = "group";
       g.textContent = title;
+      g.title = "Click to select/deselect all of this group";
+      const groupBoxes = [];
+      // Click the group's own title to select/deselect every checkbox in it
+      // at once -- toggles based on current state, same as a tri-state
+      // checkbox would: any unchecked box means "select all", all checked
+      // means "deselect all".
+      g.onclick = () => {
+        const selectAll = groupBoxes.some((cb) => !cb.checked);
+        for (const cb of groupBoxes) cb.checked = selectAll;
+      };
       box.appendChild(g);
       for (const it of items) {
         const label = document.createElement("label");
@@ -2573,6 +2692,7 @@ async function listContainers() {
         cb.checked = true; // every detected container/service is followed by default
         cb.value = it.name;
         cb.dataset.type = type;
+        groupBoxes.push(cb);
         label.append(cb, ` ${it.name} `);
         const extra = document.createElement("span");
         extra.className = "tdoc";
@@ -3594,7 +3714,7 @@ applyPopoutLayout();
 // open on the same time range without resetting (or broadcasting) anything;
 // they then track the opener via sync-broadcast.
 if (!POPOUT_KIND) {
-  centerOnNow();
+  goLive();
 } else {
   const q = new URLSearchParams(location.search);
   const v0 = parseFloat(q.get("v0")), v1 = parseFloat(q.get("v1")), vc = parseFloat(q.get("vc"));
@@ -3776,6 +3896,16 @@ if (!POPOUT_KIND) {
       prefs.set("actionBarCollapsed", collapsed);
       actionBar.dataset.collapsed = String(collapsed);
       updateCollapseToggleIcon();
+      // The splitter drag sets an inline width/height (see applyActionBarSize
+      // below) which, being inline, would otherwise keep winning over the
+      // CSS rail-size rule for the collapsed state -- clear it collapsing,
+      // restore it expanding.
+      if (collapsed) {
+        actionBar.style.width = "";
+        actionBar.style.height = "";
+      } else {
+        applyActionBarSize();
+      }
       applyActionBarSize();
     }
     collapseToggle.onclick = () => setActionBarCollapsed(actionBar.dataset.collapsed !== "true");

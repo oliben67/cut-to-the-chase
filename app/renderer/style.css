@@ -550,6 +550,11 @@ body {
   font-size: 24.75px; /* 175% bigger than the original 9px */
   color: var(--muted);
   transition: transform 0.15s ease;
+  /* The ▾ glyph sits low in its own em box (most of the glyph's ink is in
+     the bottom half), which reads as "too low" next to the icon/title it's
+     lined up with -- nudge it up rather than fight the glyph's own metrics. */
+  position: relative;
+  top: -3px;
 }
 .ab-group[data-expanded="true"] .ab-chevron { transform: rotate(180deg); }
 .ab-group-body {
@@ -609,21 +614,28 @@ body {
 }
 .ab-group button {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   gap: 8px;
   font-size: 14.5px;
   background: none;
   border: 1px solid transparent;
   border-radius: var(--radius-sm);
   padding: 6px 10px;
-  /* Longer labels ("Remove Docker Daemon") wrap onto a second line rather
-     than clipping or forcing the whole sidebar wider -- widening it instead
-     shrinks the chart area, which (in a narrow window) can push a drag's
-     pixel distance under the 6px zoom-vs-click threshold in timelineUp(). */
+}
+/* Sub-items (Set Docker Daemon, Remove Docker Daemon, etc.) can carry a
+   longer label than a section header or the flat About/Quit buttons ever
+   do -- those wrap onto a second line rather than clipping or forcing the
+   whole sidebar wider (widening it instead shrinks the chart area, which in
+   a narrow window can push a drag's pixel distance under the 6px
+   zoom-vs-click threshold in timelineUp()). Scoped to .ab-group-body button
+   alone so single-line buttons keep their icon vertically centered against
+   the label instead of top-aligned against a line that never wraps. */
+.ab-group-body button {
+  align-items: flex-start;
   white-space: normal;
   text-wrap: balance;
 }
-.ab-group button .ab-icon { margin-top: 1px; } /* keeps the icon aligned with the label's first line now that items start-align instead of center */
+.ab-group-body button .ab-icon { margin-top: 1px; } /* keeps the icon aligned with the label's first line now that this row start-aligns instead of center */
 .ab-group button:hover { background: var(--surface-3); }
 /* Click feedback: reverse fg/bg instead of the usual accent-tinted hover --
    applies uniformly to every sidebar button (section headers, their
@@ -946,6 +958,8 @@ body.sample-armed .strip { cursor: cell; }
   user-select: none;
   pointer-events: auto;
 }
+.tl-now-label[data-live="true"] { color: var(--accent); }
+.tl-now-label[data-live="false"]::after { content: " \25c0"; }
 
 #lanes-head {
   display: flex;
@@ -1272,7 +1286,8 @@ dialog h2 { margin: 0 0 10px; font-size: 15px; }
 #docker-targets label { display: block; padding: 1px 0; }
 #docker-targets label.added { opacity: 0.55; }
 .tdoc { color: var(--muted); }
-#docker-targets .group { font-weight: 600; margin-top: 6px; color: var(--text-secondary); }
+#docker-targets .group { font-weight: 600; margin-top: 6px; color: var(--text-secondary); cursor: pointer; user-select: none; }
+#docker-targets .group:hover { color: var(--text-primary); }
 #transforms-box { border: 1px solid var(--border); border-radius: var(--radius-md); margin: 8px 0; }
 #transforms-box legend { font-size: 12px; color: var(--text-secondary); padding: 0 4px; }
 .dlg-intro { margin: 10px 0 6px; font-size: 12px; }

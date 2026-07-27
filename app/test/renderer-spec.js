@@ -153,6 +153,31 @@
     near((state.view.t0 + state.view.t1) / 2, Date.now(), 2000);
   });
 
+  await T("setView turns state.live off unless called with _follow", () => {
+    state.live = true;
+    setView(MID, MID + 60000);
+    ok(!state.live, "manual setView clears live");
+    state.live = false;
+    setView(MID, MID + 60000, { _follow: true });
+    ok(!state.live, "_follow doesn't itself turn live on");
+  });
+
+  await T("followNow recenters ~5s behind now, keeping the span", () => {
+    setView(MID, MID + 60000);
+    const span = state.view.t1 - state.view.t0;
+    followNow();
+    near(state.view.t1 - state.view.t0, span, 5, "span preserved");
+    near((state.view.t0 + state.view.t1) / 2, Date.now() - 5000, 2000, "centered ~5s behind now");
+  });
+
+  await T("goLive turns state.live on and jumps to the present", () => {
+    state.live = false;
+    setView(MID, MID + 60000);
+    goLive();
+    ok(state.live, "goLive sets state.live");
+    near((state.view.t0 + state.view.t1) / 2, Date.now() - 5000, 2000, "centered ~5s behind now");
+  });
+
   await T("resetZoom fits the data and places the cursor on now", () => {
     state.cursorT = null;
     resetZoom();
@@ -185,10 +210,11 @@
     drawAll();
   });
 
-  await T("timeline-nav 'now' label centers on the present", () => {
+  await T("timeline-nav 'now' label jumps live, centered 5s behind the present", () => {
     setView(MID, MID + 60000);
     document.querySelector("#chart-nav .tl-now-label").click();
-    near((state.view.t0 + state.view.t1) / 2, Date.now(), 2000, "centered on now");
+    near((state.view.t0 + state.view.t1) / 2, Date.now() - 5000, 2000, "centered ~5s behind now");
+    if (!state.live) throw new Error("expected state.live to be true after clicking 'now'");
   });
 
   await T("timeline-nav track click re-centers, keeping the span", () => {
@@ -578,6 +604,42 @@
       eq($("docker-stats").disabled, false, "stats enabled after fetch");
       eq($("dlg-ok").disabled, false, "Set Docker Daemon enabled after fetch");
       ok($("docker-targets").textContent.includes("demo"), "fetched container listed");
+    } finally {
+      post = realPost;
+      get = realGet;
+      dlg.close();
+    }
+  });
+
+  await T("clicking a group title in the Docker Daemon checklist toggles every checkbox in that group", async () => {
+    const realPost = post;
+    const realGet = get;
+    post = async (path, body) => {
+      if (path === "/docker/ps") {
+        return {
+          containers: [{ id: "a", name: "demo-a", image: "nginx" }, { id: "b", name: "demo-b", image: "nginx" }],
+          services: [],
+          log: [],
+        };
+      }
+      return realPost(path, body);
+    };
+    get = async (path) => (path === "/transforms" ? { transforms: [] } : realGet(path));
+    try {
+      $("btn-set").click();
+      $("docker-host").value = "";
+      await listContainers();
+      const boxes = [...$("docker-targets").querySelectorAll("input[type=checkbox]")];
+      eq(boxes.length, 2, "both containers listed");
+      ok(boxes.every((cb) => cb.checked), "checked by default");
+      const group = $("docker-targets").querySelector(".group");
+      group.click();
+      ok(boxes.every((cb) => !cb.checked), "group click deselects all");
+      group.click();
+      ok(boxes.every((cb) => cb.checked), "group click re-selects all");
+      boxes[0].checked = false;
+      group.click();
+      ok(boxes.every((cb) => cb.checked), "a mixed group selects all, rather than deselecting");
     } finally {
       post = realPost;
       get = realGet;
@@ -1385,11 +1447,30 @@
       eq(actionBar.dataset.collapsed, "true", "collapsed");
       eq(getComputedStyle($("app-body").querySelector(".ab-group")).display, "none", "groups hidden");
       eq(prefs.get("actionBarCollapsed", null), true, "persisted");
+      ok(actionBar.getBoundingClientRect().width < 40, "rail actually shrinks, not just hides its contents");
       $("ab-collapse-toggle").click();
       eq(actionBar.dataset.collapsed, "false", "restored");
       ok(getComputedStyle($("app-body").querySelector(".ab-group")).display !== "none", "groups visible again");
     } finally {
       if (actionBar.dataset.collapsed !== String(before)) $("ab-collapse-toggle").click();
+    }
+  });
+
+  await T("collapsing after a manual sidebar resize still shrinks the rail (regression: inline width from the splitter used to stick)", () => {
+    const actionBar = $("action-bar");
+    const beforeCollapsed = prefs.get("actionBarCollapsed", false);
+    const beforeWidth = prefs.get("actionBarWidth", 210);
+    try {
+      actionBar.style.width = "300px"; // simulate a prior splitter drag
+      prefs.set("actionBarWidth", 300);
+      $("ab-collapse-toggle").click();
+      ok(actionBar.getBoundingClientRect().width < 40, "collapsed rail ignores the leftover inline width");
+      $("ab-collapse-toggle").click();
+      near(actionBar.getBoundingClientRect().width, 300, 2, "restores the resized width");
+    } finally {
+      if (actionBar.dataset.collapsed !== String(beforeCollapsed)) $("ab-collapse-toggle").click();
+      prefs.set("actionBarWidth", beforeWidth);
+      actionBar.style.width = "";
     }
   });
 
