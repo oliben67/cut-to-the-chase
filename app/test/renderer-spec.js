@@ -474,6 +474,10 @@
   /* ── set-sources dialog logic ─────────────────────────────────────────── */
 
   await T("updateDockerDupes disables already-collected stats", () => {
+    // dup-checking only matters once Fetch has actually run -- otherwise
+    // every "what to collect" control stays disabled regardless (see
+    // setDockerFormEnabled/dockerFormFetched), so simulate that precondition.
+    setDockerFormEnabled(true);
     state.sources.push({ id: "__dup", path: "docker://local/stats", kind: "stats", live: true });
     try {
       $("docker-host").value = "";
@@ -487,6 +491,47 @@
       state.sources = state.sources.filter((s) => s.id !== "__dup");
       updateDockerDupes();
       eq($("docker-stats").disabled, false, "re-enabled");
+      setDockerFormEnabled(false);
+    }
+  });
+
+  await T("Set Docker Daemon dialog opens with the form empty and disabled", () => {
+    $("btn-set").click();
+    try {
+      eq($("docker-targets").innerHTML, "", "targets empty");
+      eq($("docker-stats").disabled, true, "stats disabled");
+      eq($("docker-interval").disabled, true, "interval disabled");
+      eq($("dlg-ok").disabled, true, "Set Docker Daemon disabled");
+      // only Docker host / SSH key / Fetch stay usable up front
+      eq($("docker-host").disabled, false, "host stays enabled");
+      eq($("docker-ssh-key").disabled, false, "ssh key stays enabled");
+      eq($("btn-ps-refresh").disabled, false, "fetch stays enabled");
+    } finally {
+      dlg.close();
+    }
+  });
+
+  await T("Fetch lists only the current host's containers and enables the form", async () => {
+    const realPost = post;
+    const realGet = get;
+    post = async (path, body) => {
+      if (path === "/docker/ps") {
+        return { containers: [{ id: "abc123", name: "demo", image: "nginx" }], services: [], log: [] };
+      }
+      return realPost(path, body);
+    };
+    get = async (path) => (path === "/transforms" ? { transforms: [] } : realGet(path));
+    try {
+      $("btn-set").click();
+      $("docker-host").value = ""; // empty -- the gateway/local daemon is used
+      await listContainers();
+      eq($("docker-stats").disabled, false, "stats enabled after fetch");
+      eq($("dlg-ok").disabled, false, "Set Docker Daemon enabled after fetch");
+      ok($("docker-targets").textContent.includes("demo"), "fetched container listed");
+    } finally {
+      post = realPost;
+      get = realGet;
+      dlg.close();
     }
   });
 

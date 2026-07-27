@@ -1997,11 +1997,18 @@ function openPaths() {
   return new Set(state.sources.map((s) => s.path));
 }
 
+// Whether Fetch has successfully listed the host currently typed into
+// Docker host -- until it has, every control it would otherwise toggle
+// (see updateDockerDupes below) must stay disabled regardless of duplicate
+// state, since typing alone (docker-host's oninput -> updateDockerDupes)
+// must never re-enable a control ahead of an actual fetch.
+let dockerFormFetched = false;
+
 function updateDockerDupes() {
   const hostKey = normalizeDockerHost($("docker-host").value) || "local";
   const paths = openPaths();
   const statsDup = paths.has(`docker://${hostKey}/stats`);
-  $("docker-stats").disabled = statsDup;
+  $("docker-stats").disabled = statsDup || !dockerFormFetched;
   if (statsDup) $("docker-stats").checked = false;
   $("docker-stats-note").textContent = statsDup ? "— already collecting" : "";
   // host telemetry is always requested now (no checkbox to disable) -- the
@@ -2009,31 +2016,32 @@ function updateDockerDupes() {
   $("docker-host-stats-note").textContent = paths.has(`docker://${hostKey}/host`) ? "— already collecting" : "";
 }
 
-$("btn-set").onclick = async () => {
+// Every control except Docker host / SSH key / Fetch starts empty and
+// disabled -- there's nothing to configure until Fetch has actually shown
+// what's running on the host currently typed in (see setDockerFormEnabled),
+// so nothing here is populated or enabled speculatively.
+$("btn-set").onclick = () => {
   $("docker-targets").innerHTML = "";
+  $("transforms-list").innerHTML = "none found in server/transforms/";
   $("docker-error").textContent = "";
+  setDockerFormEnabled(false);
   updateDockerDupes();
   renderActivityLog(null);
-  listContainers();
-  try {
-    const t = await get("/transforms");
-    const box = $("transforms-list");
-    box.innerHTML = t.transforms.length ? "" : "none found in server/transforms/";
-    for (const tr of t.transforms) {
-      const label = document.createElement("label");
-      const cb = document.createElement("input");
-      cb.type = "checkbox";
-      cb.value = tr.name;
-      label.append(cb, ` ${tr.name} `);
-      const doc = document.createElement("span");
-      doc.className = "tdoc";
-      doc.textContent = tr.doc || "";
-      label.appendChild(doc);
-      box.appendChild(label);
-    }
-  } catch { /* server down; dialog still usable once it's back */ }
   dlg.showModal();
 };
+
+// Toggles every "what to collect" control except Docker host/SSH key/Fetch
+// itself -- there's nothing meaningful to set until Fetch has shown what's
+// actually on the host, and re-fetching (a different host, or the same one
+// after it changed) means the previous answer no longer applies either.
+function setDockerFormEnabled(enabled) {
+  dockerFormFetched = enabled;
+  $("docker-stats").disabled = !enabled;
+  $("docker-interval").disabled = !enabled;
+  $("dlg-ok").disabled = !enabled;
+  for (const cb of $("docker-targets").querySelectorAll("input")) cb.disabled = !enabled;
+  for (const cb of $("transforms-list").querySelectorAll("input")) cb.disabled = !enabled;
+}
 
 // close every open source and forget the remembered last-session containers,
 // so the next launch starts with nothing and the set-sources dialog opens.
@@ -2447,10 +2455,14 @@ async function listContainers() {
     status.textContent = `${label} (${Math.round((Date.now() - t0) / 1000)}s)`;
   }, 1000);
   // disabled for the whole attempt (not just the button) so the host string
-  // can't be edited out from under an in-flight connect -- re-enabled in
-  // both the success and failure paths below, never left stuck disabled.
+  // can't be edited out from under an in-flight fetch -- re-enabled in both
+  // the success and failure paths below, never left stuck disabled. Every
+  // other control is disabled for the duration too (see setDockerFormEnabled)
+  // and only re-enabled on success, since a stale answer for a *different*
+  // host (or the same host before it changed) shouldn't stay selectable.
   $("docker-host").disabled = true;
   $("btn-ps-refresh").disabled = true;
+  setDockerFormEnabled(false);
   try {
     const r = await post("/docker/ps", { host, ssh_key: sshKey });
     clearInterval(tick);
@@ -2491,6 +2503,23 @@ async function listContainers() {
     addGroup("Swarm services (docker service logs)", r.services, "service");
     addGroup("Containers (docker logs)", r.containers, "container");
     if (!r.services.length && !r.containers.length) box.textContent = "nothing running";
+
+    const t = await get("/transforms").catch(() => ({ transforms: [] }));
+    const tbox = $("transforms-list");
+    tbox.innerHTML = t.transforms.length ? "" : "none found in server/transforms/";
+    for (const tr of t.transforms) {
+      const label = document.createElement("label");
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.value = tr.name;
+      label.append(cb, ` ${tr.name} `);
+      const doc = document.createElement("span");
+      doc.className = "tdoc";
+      doc.textContent = tr.doc || "";
+      label.appendChild(doc);
+      tbox.appendChild(label);
+    }
+    setDockerFormEnabled(true);
   } catch (err) {
     clearInterval(tick);
     status.textContent = "";
