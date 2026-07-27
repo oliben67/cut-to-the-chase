@@ -864,6 +864,32 @@ class TestDockerPs:
         got = await server.docker_ps(None)
         assert got["containers"] == [{"id": "1" * 12, "name": "web", "image": "nginx"}]
 
+    async def test_does_not_exclude_cttc_gateway_image_on_a_remote_host(self, monkeypatch):
+        # a remote ssh:// source is, by definition, a *different* machine --
+        # a container there that merely happens to share the "cttc-gateway"
+        # image/tag has nothing to do with this gateway and must be shown,
+        # unlike the local-daemon case above.
+        web_line = json.dumps({"ID": "1" * 20, "Names": "web", "Image": "nginx"}).encode()
+        gw_line = json.dumps(
+            {"ID": "2" * 20, "Names": "some-gateway", "Image": "cttc-gateway:latest"}
+        ).encode()
+        client = FakeSSHClient()
+        monkeypatch.setattr(server, "_connect_ssh", lambda host, key: client)
+
+        def fake_exec_remote(c, args, timeout):
+            if args[0] == "version":
+                return "27.0.0\n", "", 0
+            if args[0] == "service":
+                return "", "not a swarm manager", 1
+            return (web_line + b"\n" + gw_line + b"\n").decode(), "", 0
+
+        monkeypatch.setattr(server, "_exec_remote_docker", fake_exec_remote)
+        got = await server.docker_ps("ssh://u@h")
+        assert got["containers"] == [
+            {"id": "1" * 12, "name": "web", "image": "nginx"},
+            {"id": "2" * 12, "name": "some-gateway", "image": "cttc-gateway:latest"},
+        ]
+
     async def test_service_ls_failure_tolerated(self, monkeypatch):
         ps_line = json.dumps({"ID": "1" * 20, "Names": "web", "Image": "nginx"}).encode()
 

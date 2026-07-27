@@ -857,10 +857,17 @@ async def docker_ps(host: str | None, ssh_key: str | None = None) -> dict:
         containers = [
             {"id": r["ID"][:12], "name": r["Names"], "image": r["Image"]}
             for r in ps_rows
-            # the gateway's own container (image "cttc-gateway[:tag]", see
-            # docker-compose.yml) is infrastructure CTTC runs itself, not
-            # something to offer up as a monitorable target
-            if r["Image"].split(":")[0].rsplit("/", 1)[-1] != "cttc-gateway"
+            # Only ever hide this on the gateway's own daemon (host=None --
+            # server.py's own /var/run/docker.sock, wherever it's actually
+            # running: local, remote, or remote-tunnel all resolve here the
+            # same way). This container (image "cttc-gateway[:tag]", see
+            # docker-compose.yml) is infrastructure CTTC runs itself there,
+            # not something to offer up as a monitorable target -- but a
+            # remote ssh:// source is by definition a *different* machine
+            # (that's the whole point of Set Sources), so a container that
+            # merely happens to share that image name/tag there has nothing
+            # to do with this gateway and must never be hidden.
+            if host or r["Image"].split(":")[0].rsplit("/", 1)[-1] != "cttc-gateway"
         ]
 
         services = []

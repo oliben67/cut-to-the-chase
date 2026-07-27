@@ -480,7 +480,9 @@
       updateDockerDupes();
       eq($("docker-stats").disabled, true, "stats disabled");
       ok($("docker-stats-note").textContent.includes("already"), "note shown");
-      eq($("docker-host-stats").disabled, false, "host stats still allowed");
+      // host telemetry has no checkbox to disable (always requested) -- just
+      // a note when it's already open for this host, which it isn't here.
+      eq($("docker-host-stats-note").textContent, "", "host stats note empty");
     } finally {
       state.sources = state.sources.filter((s) => s.id !== "__dup");
       updateDockerDupes();

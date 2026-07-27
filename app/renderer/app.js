@@ -1605,6 +1605,10 @@ class Panel {
     this.el.className = "panel";
     const head = document.createElement("div");
     head.className = "panel-head";
+    const headTop = document.createElement("div");
+    headTop.className = "panel-head-top";
+    const headControls = document.createElement("div");
+    headControls.className = "panel-head-controls";
     const name = document.createElement("span");
     name.className = "name";
     name.textContent = src.name;
@@ -1615,8 +1619,6 @@ class Panel {
     this.sampleBadge.hidden = true;
     this.countEl = document.createElement("span");
     this.countEl.className = "muted";
-    this.errEl = document.createElement("span");
-    this.errEl.className = "error";
     const orderToggle = document.createElement("button");
     orderToggle.className = "icon-btn";
     const syncOrderToggle = () => {
@@ -1670,7 +1672,9 @@ class Panel {
       popback.onclick = () => window.close();
       right.append(popback);
     }
-    head.append(name, this.sampleBadge, this.countEl, this.errEl, orderToggle, searchToggle, right);
+    headTop.append(name, this.sampleBadge);
+    headControls.append(this.countEl, orderToggle, searchToggle, right);
+    head.append(headTop, headControls);
 
     this.searchBar = document.createElement("div");
     this.searchBar.className = "panel-search";
@@ -1703,7 +1707,15 @@ class Panel {
     this.body.className = "panel-body";
     this.spacer = document.createElement("div");
     this.spacer.className = "panel-spacer";
-    this.body.appendChild(this.spacer);
+    // Shown instead of the (otherwise blank) log view whenever this source
+    // has no rows at all and last reported an error -- a failed ssh/docker
+    // connection, "log stream ended" before ever ingesting a line, etc. --
+    // so a broken source reads as a clear message, not an empty box with a
+    // barely-visible one-line error tucked into the header.
+    this.emptyState = document.createElement("div");
+    this.emptyState.className = "panel-empty-state";
+    this.emptyState.hidden = true;
+    this.body.append(this.spacer, this.emptyState);
     this.body.addEventListener("scroll", () => this.render());
 
     this.el.append(head, this.searchBar, this.body);
@@ -1726,7 +1738,10 @@ class Panel {
     }
     this.countEl.textContent = `${this.total.toLocaleString()} entries` +
       (src.transforms?.length ? ` · ${src.transforms.join("+")}` : "");
-    this.errEl.textContent = src.error ? ` ${src.error}` : "";
+    const broken = this.total === 0 && !!src.error;
+    this.emptyState.hidden = !broken;
+    this.emptyState.textContent = broken ? src.error : "";
+    this.countEl.title = src.error || "";
     this.spacer.style.height = this.total * ROWH + "px";
     this.render();
   }
@@ -1985,15 +2000,13 @@ function openPaths() {
 function updateDockerDupes() {
   const hostKey = normalizeDockerHost($("docker-host").value) || "local";
   const paths = openPaths();
-  for (const [cbId, noteId, path] of [
-    ["docker-stats", "docker-stats-note", `docker://${hostKey}/stats`],
-    ["docker-host-stats", "docker-host-stats-note", `docker://${hostKey}/host`],
-  ]) {
-    const dup = paths.has(path);
-    $(cbId).disabled = dup;
-    if (dup) $(cbId).checked = false;
-    $(noteId).textContent = dup ? "— already collecting" : "";
-  }
+  const statsDup = paths.has(`docker://${hostKey}/stats`);
+  $("docker-stats").disabled = statsDup;
+  if (statsDup) $("docker-stats").checked = false;
+  $("docker-stats-note").textContent = statsDup ? "— already collecting" : "";
+  // host telemetry is always requested now (no checkbox to disable) -- the
+  // note just says so when it's already open for this host.
+  $("docker-host-stats-note").textContent = paths.has(`docker://${hostKey}/host`) ? "— already collecting" : "";
 }
 
 $("btn-set").onclick = async () => {
@@ -2521,22 +2534,21 @@ $("dlg-ok").onclick = async () => {
       type: cb.dataset.type,
     }));
     const stats = $("docker-stats").checked;
-    const hostStats = $("docker-host-stats").checked;
-    if (stats || hostStats || logs.length) {
-      const collectReq = {
-        host, stats, logs, transforms,
-        host_stats: hostStats,
-        ssh_key: sshKey,
-        interval: Number($("docker-interval").value) || 5,
-      };
-      await post("/docker/collect", collectReq);
-      // remember this collection request so it can be restored on next launch
-      const sessions = prefs.get("lastDockerSessions", []);
-      sessions.push(collectReq);
-      prefs.set("lastDockerSessions", sessions);
-      // containers picked here are the "selected" set shown in the legend
-      for (const l of logs) setTrack(l.name, "sel");
-    }
+    // Host telemetry (CPU/MEM/NET) is always requested once a source's host
+    // is set -- no separate opt-in checkbox to forget to tick.
+    const collectReq = {
+      host, stats, logs, transforms,
+      host_stats: true,
+      ssh_key: sshKey,
+      interval: Number($("docker-interval").value) || 5,
+    };
+    await post("/docker/collect", collectReq);
+    // remember this collection request so it can be restored on next launch
+    const sessions = prefs.get("lastDockerSessions", []);
+    sessions.push(collectReq);
+    prefs.set("lastDockerSessions", sessions);
+    // containers picked here are the "selected" set shown in the legend
+    for (const l of logs) setTrack(l.name, "sel");
     dlg.close();
     refreshAll();
   } catch (err) {
