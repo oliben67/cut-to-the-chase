@@ -1595,6 +1595,30 @@
     eq(p.reversed, startReversed, "restored");
   });
 
+  await T("log panels default to newest-first and land pinned to the very top on the boot-time cursor sync (goLive -> setCursor(now))", async () => {
+    // fresh panels (see Panel's constructor) always default to reversed --
+    // regression guard in case a stale localStorage value from a prior
+    // toggle elsewhere ever leaked into a brand new panel's own default.
+    for (const p of panels.values()) ok(p.reversed, "reversed (newest-first) by default");
+    const beforeCursor = state.cursorT;
+    try {
+      // the actual real-world path: goLive() calls setCursor(Date.now()),
+      // which jumps every panel's cursor to "now" -- for a reversed panel
+      // that lands on index_at's clamped last (newest) row, and centering
+      // that row instead of pinning it to the top could leave the newest
+      // entries scrolled just out of view above the fold. Confirmed
+      // separately against the real /index_at endpoint that a far-future t
+      // clamps to total-1 (visualIndexOf(total-1) === 0 when reversed), so
+      // this must resolve to scrollTop 0, not some centered positive offset.
+      await setCursor(Date.now());
+      for (const p of panels.values()) {
+        eq(p.body.scrollTop, 0, `${p.src.name}: newest entries visible at the very top after the boot cursor sync`);
+      }
+    } finally {
+      if (beforeCursor != null) await setCursor(beforeCursor);
+    }
+  });
+
   await T("container list refresh button re-lists docker targets", () => {
     const real = listContainers;
     let calls = 0;
