@@ -394,6 +394,14 @@ function showSplash() {
     },
   });
   splashWindow.once("ready-to-show", () => splashWindow?.show());
+  // Re-delivers whatever the latest narrate()/splashStatus() call already
+  // was (see splashStatus's own comment on why sends before this can be
+  // lost) the moment the page is actually able to receive it -- so
+  // whatever's on screen once it's shown is always real status, never the
+  // static "Loading CTTC…" placeholder baked into splash.html.
+  splashWindow.webContents.once("did-finish-load", () => {
+    if (lastSplashStatus != null) splashStatus(lastSplashStatus);
+  });
   splashWindow.loadFile(path.join(__dirname, "renderer", "splash.html"));
   return splashWindow;
 }
@@ -412,7 +420,18 @@ function closeSplash() {
 // this with their own mainLog() call for the full-detail line -- narrate()
 // below does exactly that for the common case of "one plain-English
 // sentence, nothing more.
+// Tracked here (not just fired-and-forgotten) so splash.html's static
+// "Loading CTTC…" placeholder never actually lingers on screen: the very
+// first narrate() calls in app.whenReady() below fire essentially
+// synchronously with showSplash(), which is well before the splash
+// window's own page has loaded far enough to have attached its
+// "splash-status" listener (loadFile() is async) -- webContents.send() to a
+// not-yet-listening renderer is simply lost, not queued, so without this
+// the window would sit on the placeholder text until whichever later
+// narrate() call happens to land after the page finishes loading.
+let lastSplashStatus = null;
 function splashStatus(text) {
+  lastSplashStatus = text;
   if (splashWindow && !splashWindow.isDestroyed()) splashWindow.webContents.send("splash-status", text);
 }
 function narrate(text) {
@@ -1035,9 +1054,15 @@ async function reconnectMainWindow() {
   // a no-op if none was ever shown for this particular reconnect.
   closeSplash();
 }
-// Still confirmed for Run Setup / Update Image / uninstall -- those are
-// deliberate settings-screen actions, not the quick status-pill switcher
-// (see switch-gateway below, which reconnects immediately with no prompt).
+// Still confirmed for Run Setup / Update Image / connection-settings changes
+// -- those are deliberate settings-screen actions with a gateway still
+// there to reconnect to either way, unlike uninstalling the *active*
+// gateway (see gateway-manage-uninstall above), which reconnects
+// immediately with no prompt: there's nothing left to "reconnect to" but
+// this same machine, and every open form is already stale the moment it
+// succeeds. Also unlike the quick status-pill switcher (see switch-gateway
+// below, which reconnects immediately with no prompt for a different
+// reason -- it's not a destructive action).
 async function offerRestart(message) {
   const r = await dialog.showMessageBox({
     type: "info",
@@ -1483,14 +1508,30 @@ ipcMain.handle("gateway-manage-uninstall", async (_e, entry) => {
     removeGateway(gatewayKey(entry));
     const wasActive = isActiveGateway(entry);
     if (wasActive) {
-      clearCurrentTunnel();
+      // stopServer() (not just clearCurrentTunnel()) so a bare `uv run
+      // server.py` dev fallback (see startServer -- the embedded/Docker
+      // path just reuses its already-running, restart:unless-stopped
+      // container instead) doesn't leak its old process, still holding
+      // whatever .cttc-metric/.cttc-record samples were loaded into it, as
+      // an orphan alongside the fresh one connectToServer is about to spawn.
+      stopServer();
       clearConnectionConfig();
       // reverts to embedded mode, same as switch-gateway's isUnprovisionedLocal
       // path -- there's nothing left running locally to just point at, so
       // this goes through the ordinary embedded startup (re-provision or
       // start local) rather than assuming a stale host/port still works.
+      // A brand-new embedded server process starts with zero sources, so
+      // this is also what guarantees no .cttc-metric/.cttc-record sample
+      // data lingers from the just-uninstalled gateway.
       await connectToServer([]);
-      await offerRestart("This gateway was uninstalled. Reconnect CTTC to switch back to this machine?");
+      // No confirmation here (unlike offerRestart's other callers, e.g.
+      // Update Image/Save changes) -- the gateway this window was actually
+      // talking to no longer exists the moment uninstall succeeds, so every
+      // open dialog/form and all renderer state is already stale. Reconnect
+      // immediately: reconnectMainWindow() reloads index.html from scratch,
+      // which closes every popout and every open dialog (Edit Gateway
+      // included) and resets all renderer state back to a fresh launch.
+      await reconnectMainWindow();
     }
     return { ok: true };
   } catch (err) {

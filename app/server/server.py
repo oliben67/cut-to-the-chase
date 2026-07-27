@@ -1391,6 +1391,25 @@ class State:
         self.sources[sid] = make(sid)
         return sid
 
+    def _update_poll_interval(self, sid: str, interval: float):
+        """Applies a *changed* poll interval to an already-running stats/host
+        collector reused by _open_or_reuse (whose own docstring otherwise
+        says differing settings on reuse are silently ignored) -- Edit
+        Docker Daemon's whole point is to let you change the poll interval
+        for a daemon you're already collecting from, so silently discarding
+        it there would make that control a no-op the moment anything is
+        already running. Safe to mutate in place with no lock: this runs on
+        the single-threaded event loop with no `await` before the source's
+        own poll loop next reads self.interval (see DockerStatsSource/
+        HostStatsSource's asyncio.sleep(self.interval - ...) below), and
+        transforms/ssh_key still follow the documented reuse-keeps-original
+        behavior -- only the interval, since that's the one thing the UI
+        that triggers this (Update Docker Daemon) actually claims to change."""
+        src = self.sources.get(sid)
+        if src is not None and getattr(src, "interval", None) != interval:
+            logger.info("collect_docker: updating poll interval for %s: %s -> %s", src.path, src.interval, interval)
+            src.interval = interval
+
     def collect_docker(
         self,
         host: str | None,
@@ -1414,23 +1433,23 @@ class State:
         hostname = (host or "local").split("@")[-1]
         hostkey = host or "local"
         if stats:
-            opened.append(
-                self._open_or_reuse(
-                    f"docker://{hostkey}/stats",
-                    lambda sid: DockerStatsSource(
-                        sid, f"stats@{hostname}", host, interval, self, ssh_key=ssh_key
-                    ),
-                )
+            sid = self._open_or_reuse(
+                f"docker://{hostkey}/stats",
+                lambda sid: DockerStatsSource(
+                    sid, f"stats@{hostname}", host, interval, self, ssh_key=ssh_key
+                ),
             )
+            self._update_poll_interval(sid, interval)
+            opened.append(sid)
         if host_stats:
-            opened.append(
-                self._open_or_reuse(
-                    f"docker://{hostkey}/host",
-                    lambda sid: HostStatsSource(
-                        sid, f"host@{hostname}", host, interval, self, ssh_key=ssh_key
-                    ),
-                )
+            sid = self._open_or_reuse(
+                f"docker://{hostkey}/host",
+                lambda sid: HostStatsSource(
+                    sid, f"host@{hostname}", host, interval, self, ssh_key=ssh_key
+                ),
             )
+            self._update_poll_interval(sid, interval)
+            opened.append(sid)
         for item in logs:
             target = item["name"]
             ttype = item.get("type", "container")

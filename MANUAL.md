@@ -134,10 +134,14 @@ the charts](docs/images/app-overview.png)
 From top to bottom:
 
 1. **Toolbar** — recording transport (⏺/⏸/⏹/⏏, see
-   [Automating with events](#automating-with-events)), the *poll interval*
-   (frequency) control, the 〜/▤ chart-style switch, the current **view
-   range**, and the cursor's UTC readout — see
-   [The status bar](#the-status-bar).
+   [Automating with events](#automating-with-events)), the **frequency**
+   control (labelled *Frequency* — not to be confused with the *poll
+   interval* field in Set/Edit Docker Daemon, which is the one that
+   actually changes how often the server polls Docker; this one only sizes
+   the ± highlight window, see
+   [The cursor and the frequency window](#the-cursor-and-the-frequency-window)),
+   the 〜/▤ chart-style switch, the current **view range**, and the
+   cursor's UTC readout — see [The status bar](#the-status-bar).
 2. **Telemetry** — the container legend, then the CPU % / MEM % / NET metric
    strips. In the screenshot the solid vertical line is the **cursor**,
    placed on one of `c3_worker`'s spikes; the **dotted line** further right
@@ -191,6 +195,14 @@ Gateway uses. If it reports an error, it also checks — and logs — whether
 the container is actually still there, since `docker compose down` can
 exit non-zero after partially succeeding.
 
+Uninstalling the gateway you're **currently connected to** immediately
+reconnects to this machine with no confirmation prompt: every open
+dialog/form and everything on screen is already stale the moment it
+succeeds (the gateway they belonged to is gone), so the whole app reloads
+to a fresh starting point instead — no leftover sources, no lingering
+`.cttc-metric`/`.cttc-record` sample data, nothing left pointing at a
+gateway that no longer exists.
+
 If a remote gateway becomes unreachable, CTTC automatically falls back to
 an SSH tunnel and shows a "Restarting, please wait…" splash while it
 reconnects — no action needed on your part.
@@ -211,9 +223,14 @@ in both is ticked by default**; untick whatever you don't want.
 
 - **📊 Telemetry** — two checkboxes:
   - **collect `docker stats` telemetry** — polls CPU/MEM/NET for *every*
-    container on the host on the chosen interval. Only *selected* containers
-    (see below) are actually *plotted*; the rest wait in the legend's
-    *others* group (see [The container legend](#the-container-legend)).
+    container on the host on the chosen **poll interval** (in seconds —
+    this is the control that actually changes how often the server polls
+    Docker, unlike the toolbar's *frequency* control). Only *selected*
+    containers (see below) are actually *plotted*; the rest wait in the
+    legend's *others* group (see [The container legend](#the-container-legend)).
+    Changing it in **Edit Docker Daemon…** and clicking **Update Docker
+    Daemon** takes effect immediately on the already-running collector, not
+    just on a fresh one.
   - **collect host telemetry** — CPU/MEM/NET of the docker host machine
     itself, shown in its own strip group at the bottom.
 - **📝 Logs** — click **Fetch** to list the running containers and swarm
@@ -239,6 +256,11 @@ Once a daemon is set, **Edit Docker Daemon…** re-opens this same form with
 the host and SSH key pre-filled and locked, **Fetch** relabelled
 **Refresh** (just re-probes for new containers/services rather than
 starting over), and the bottom button relabelled **Update Docker Daemon**.
+The checklist itself isn't blank while you wait for a Refresh — it starts
+pre-filled with every container/service already being followed, checked
+and immediately interactive, so you can untick something (or just click
+**Update Docker Daemon**) right away; **Refresh** additionally re-probes
+the live daemon for anything new or gone since you last set it.
 
 ### Remote hosts over SSH
 
@@ -313,6 +335,12 @@ you *selected* are plotted. Each known container is in one of three states:
 | **not selected** | grayed, behind the `others (N)` chip | telemetry arrives but is not plotted |
 | **hidden** | only counted in the `hidden (N)` chip | ignored entirely |
 
+Gray is reserved for *not selected*/*hidden* — every **selected** (plotted)
+container always gets its own distinct, fully-saturated color, no matter
+how many are open at once. The first 8 use the theme's curated palette;
+the 9th and beyond get procedurally generated colors that are always
+unique and never fall back to gray.
+
 Right-click a legend entry for actions:
 
 - on a *selected* entry — **Unselect** (park it under *others*) or **Hide
@@ -341,9 +369,13 @@ once.
 **Reordering**: drag a legend entry to a new spot to reorder it — its
 matching log panel moves to match, in the exact same relative position.
 Dragging a log panel's header reorders the same way in reverse, moving its
-legend entry to match: one shared order, two views onto it. Drag either one
-**out past the edge of the window** to detach it into its own pop-out
-window instead of reordering it (see [Pop-out windows](#pop-out-windows)).
+legend entry to match: one shared order, two views onto it. The header is
+the drag handle (so selecting log text or scrolling doesn't start a
+reorder by accident), but the whole panel — header and body — moves
+together as the drag ghost, so it's clear the *entire panel* is what's
+being repositioned. Drag either one **out past the edge of the window** to
+detach it into its own pop-out window instead of reordering it (see
+[Pop-out windows](#pop-out-windows)).
 
 ### Density lanes
 
@@ -642,7 +674,7 @@ This manual is installed **next to the CTTC executable** so it's available
 without an internet connection. Two ways to reach it from inside the app:
 
 - **sidebar → About CTTC**;
-- any **`?`** hint button in the toolbar (e.g. next to *poll interval*)
+- any **`?`** hint button in the toolbar (e.g. next to *frequency*)
   jumps straight to the relevant section.
 
 ## Troubleshooting

@@ -167,17 +167,30 @@ function fmtClock(ms, withMs) {
 /* ── categorical colors: fixed slot order, never cycled ─────────────────── */
 
 const slotByName = new Map();
-// One of the theme's 8 fixed --series-N colors, assigned the first time a
-// given series name is seen and never reassigned afterward (see
-// assignColorSlots(), which seeds this map in a stable sort order so colors
-// don't shuffle around as sources come and go). Past 8 concurrent series,
-// everything additional folds to a shared --muted gray rather than cycling
-// back through colors and creating ambiguous duplicates.
+// The first 8 concurrent series get one of the theme's curated --series-N
+// colors, assigned the first time a given series name is seen and never
+// reassigned afterward (see assignColorSlots(), which seeds this map in a
+// stable sort order so colors don't shuffle around as sources come and
+// go). Past 8, every *additional* container still gets its own genuinely
+// distinct, full-saturation color -- procedurally generated (golden-angle
+// hue rotation, so consecutive slots are always maximally far apart in hue
+// and never visually repeat, no matter how many containers there are) --
+// rather than folding to --muted gray. Gray is reserved for containers that
+// are actually disabled/not-selected (see legendItem's own "disabled"
+// class) -- a live, selected container must never read as "disabled" just
+// because it happened to be the 9th one.
+const GENERATED_COLOR_SAT = 68;
+function generatedSlotColor(slot) {
+  const hue = (slot * 137.508) % 360; // golden angle -- maximally spread hues, never repeats
+  const dark = window.matchMedia?.("(prefers-color-scheme: dark)").matches;
+  const lightness = dark ? 62 : 42; // brighter on a dark background, darker on a light one -- same idea as the curated --series-N pairs
+  return `hsl(${hue.toFixed(1)}, ${GENERATED_COLOR_SAT}%, ${lightness}%)`;
+}
 function colorFor(name) {
   if (!slotByName.has(name)) slotByName.set(name, slotByName.size);
   const slot = slotByName.get(name);
+  if (slot >= 8) return generatedSlotColor(slot);
   const css = getComputedStyle(document.documentElement);
-  if (slot >= 8) return css.getPropertyValue("--muted").trim(); // fold past 8: muted
   return css.getPropertyValue(`--series-${slot + 1}`).trim();
 }
 // Read a CSS custom property (e.g. "--accent") off :root -- the single
@@ -1796,7 +1809,7 @@ class Panel {
     // moves to match), or drag it out past the window's edge to pop it out
     // into its own window -- not offered inside an already-popped-out
     // window, which only ever shows the one panel it opened with.
-    if (POPOUT_KIND !== "log") wireDragReorder(head, src.name, () => openLogPopout(src.id));
+    if (POPOUT_KIND !== "log") wireDragReorder(head, src.name, () => openLogPopout(src.id), this.el);
 
     this.searchBar = document.createElement("div");
     this.searchBar.className = "panel-search";
@@ -2051,12 +2064,20 @@ function reorderTo(draggedName, targetName) {
 // when the drag ends outside this window's own bounds (checked in screen
 // coordinates, since dragend's clientX/Y are relative to whatever window
 // the pointer is over when it lets go), letting either side "drag out to
-// pop out" the same way.
-function wireDragReorder(el, name, onDetach) {
+// pop out" the same way. `dragImageEl` (defaults to `el` itself) is what's
+// actually shown as the drag ghost -- a log panel's header stays the
+// interactive handle (so selecting log text/scrolling doesn't start a
+// drag), but the ghost image is the *whole panel*, header and body moving
+// together, so it reads as "this panel is moving", not just its header.
+function wireDragReorder(el, name, onDetach, dragImageEl = el) {
   el.draggable = true;
   el.ondragstart = (e) => {
     e.dataTransfer.setData("text/cttc-series-name", name);
     e.dataTransfer.effectAllowed = "move";
+    if (dragImageEl !== el) {
+      const elRect = el.getBoundingClientRect();
+      e.dataTransfer.setDragImage(dragImageEl, e.clientX - elRect.left, e.clientY - elRect.top);
+    }
   };
   el.ondragover = (e) => {
     if (!e.dataTransfer.types.includes("text/cttc-series-name")) return;
@@ -2273,18 +2294,25 @@ $("btn-set").onclick = () => {
 $("btn-edit-docker-daemon").onclick = () => {
   dockerDaemonEditMode = true;
   const host = currentDockerHost();
+  const hostKey = host || "local";
   $("docker-host").value = host ? host.replace(/^ssh:\/\//, "") : "";
   $("docker-host").disabled = true;
-  $("docker-ssh-key").value = dockerHostKeys.get(host || "local") || "";
+  $("docker-ssh-key").value = dockerHostKeys.get(hostKey) || "";
   $("docker-ssh-key").disabled = true;
   $("docker-ssh-key-browse").disabled = true;
   $("dlg-set-title").textContent = "Edit Docker Daemon";
   $("btn-ps-refresh").textContent = "Refresh";
   $("dlg-ok").textContent = "Update Docker Daemon";
-  $("docker-targets").innerHTML = "";
   $("transforms-list").innerHTML = "none found in server/transforms/";
   $("docker-error").textContent = "";
-  setDockerFormEnabled(false);
+  // Pre-fill the checklist immediately from what's already being followed
+  // for this daemon -- editing shouldn't start from a blank form; Refresh
+  // still re-probes the live daemon for anything new/gone, but every
+  // already-tracked container/service is right there, checked, from the
+  // moment the dialog opens.
+  const { containers, services } = currentlyTrackedTargets(hostKey);
+  renderDockerTargets(containers, services, hostKey);
+  setDockerFormEnabled(true);
   updateDockerDupes();
   renderActivityLog(null);
   dlg.showModal();
@@ -2712,10 +2740,90 @@ $("btn-activity-toggle").onclick = () => {
   toggle.textContent = pre.hidden ? "Show activity" : "Hide activity";
 };
 
+// Builds one labelled group of checkboxes (Swarm services / Containers)
+// inside #docker-targets -- shared by listContainers()' live `docker ps`
+// result and btn-edit-docker-daemon's immediate pre-fill from already-open
+// sources (see renderDockerTargets below), so both end up with the exact
+// same look/behavior (group-select-all header, "already added" badge).
+function renderDockerTargetGroup(box, open, hostKey, title, items, type) {
+  if (!items.length) return;
+  const g = document.createElement("div");
+  g.className = "group";
+  g.textContent = title;
+  g.title = "Click to select/deselect all of this group";
+  const groupBoxes = [];
+  // Click the group's own title to select/deselect every checkbox in it at
+  // once -- toggles based on current state, same as a tri-state checkbox
+  // would: any unchecked box means "select all", all checked means
+  // "deselect all".
+  g.onclick = () => {
+    const selectAll = groupBoxes.some((cb) => !cb.checked);
+    for (const cb of groupBoxes) cb.checked = selectAll;
+  };
+  box.appendChild(g);
+  for (const it of items) {
+    const label = document.createElement("label");
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = true; // every detected/already-followed container/service starts ticked
+    cb.value = it.name;
+    cb.dataset.type = type;
+    groupBoxes.push(cb);
+    label.append(cb, ` ${it.name} `);
+    const extra = document.createElement("span");
+    extra.className = "tdoc";
+    extra.textContent = it.image || it.replicas || "";
+    // Left checked-but-interactive (not disabled) even when already being
+    // followed: "Set"/"Update" always syncs exactly to what's checked here
+    // (see dlg-ok), so unchecking an already-added item is how you stop
+    // following it, rather than needing to close its panel separately.
+    if (open.has(`docker://${hostKey}/${type}/${it.name}`)) {
+      label.classList.add("added");
+      extra.textContent = "already added";
+    }
+    label.appendChild(extra);
+    box.appendChild(label);
+  }
+}
+
+// Repopulates #docker-targets from a {name, image?, replicas?}[] pair --
+// either a live `docker ps` result (listContainers) or, immediately on
+// opening Edit Docker Daemon (before any Refresh), whatever's already being
+// followed for this host (see btn-edit-docker-daemon below).
+function renderDockerTargets(containers, services, hostKey) {
+  const box = $("docker-targets");
+  box.innerHTML = "";
+  const open = openPaths();
+  renderDockerTargetGroup(box, open, hostKey, "Swarm services (docker service logs)", services, "service");
+  renderDockerTargetGroup(box, open, hostKey, "Containers (docker logs)", containers, "container");
+  if (!services.length && !containers.length) box.textContent = "nothing running";
+}
+
+// The containers/services already being followed for `hostKey`, derived
+// from currently-open log sources (no live docker ps needed) -- what
+// btn-edit-docker-daemon pre-fills the checklist with immediately, before
+// Refresh ever runs, so editing an existing daemon isn't a blank form.
+function currentlyTrackedTargets(hostKey) {
+  // hostKey itself may be a full "ssh://user@host[:port]" (its own embedded
+  // slashes), so a regex expecting a single no-slash host segment would
+  // wrongly stop at its first slash -- hostKey is already known exactly
+  // here, so match this host's prefix directly instead (same fix as
+  // currentDockerHost()'s truncation bug elsewhere in this file).
+  const prefix = `docker://${hostKey}/`;
+  const containers = [], services = [];
+  for (const s of state.sources) {
+    const path = s.path || "";
+    if (!path.startsWith(prefix)) continue;
+    const rest = path.slice(prefix.length);
+    if (rest.startsWith("container/")) containers.push({ name: s.name });
+    else if (rest.startsWith("service/")) services.push({ name: s.name });
+  }
+  return { containers, services };
+}
+
 async function listContainers() {
   $("docker-error").textContent = "";
   renderActivityLog(null);
-  const box = $("docker-targets");
   const host = normalizeDockerHost($("docker-host").value);
   const sshKey = $("docker-ssh-key").value.trim() || null;
   dockerHostKeys.set(host || "local", sshKey);
@@ -2763,52 +2871,7 @@ async function listContainers() {
       await refreshAll();
     }
 
-    box.innerHTML = "";
-    const open = openPaths();
-    const hostKey = host || "local";
-    const addGroup = (title, items, type) => {
-      if (!items.length) return;
-      const g = document.createElement("div");
-      g.className = "group";
-      g.textContent = title;
-      g.title = "Click to select/deselect all of this group";
-      const groupBoxes = [];
-      // Click the group's own title to select/deselect every checkbox in it
-      // at once -- toggles based on current state, same as a tri-state
-      // checkbox would: any unchecked box means "select all", all checked
-      // means "deselect all".
-      g.onclick = () => {
-        const selectAll = groupBoxes.some((cb) => !cb.checked);
-        for (const cb of groupBoxes) cb.checked = selectAll;
-      };
-      box.appendChild(g);
-      for (const it of items) {
-        const label = document.createElement("label");
-        const cb = document.createElement("input");
-        cb.type = "checkbox";
-        cb.checked = true; // every detected container/service is followed by default
-        cb.value = it.name;
-        cb.dataset.type = type;
-        groupBoxes.push(cb);
-        label.append(cb, ` ${it.name} `);
-        const extra = document.createElement("span");
-        extra.className = "tdoc";
-        extra.textContent = it.image || it.replicas || "";
-        // Left checked-but-interactive (not disabled) even when already
-        // being followed: "Set" always syncs exactly to what's checked here
-        // (see dlg-ok), so unchecking an already-added item is how you stop
-        // following it, rather than needing to close its panel separately.
-        if (open.has(`docker://${hostKey}/${type}/${it.name}`)) {
-          label.classList.add("added");
-          extra.textContent = "already added";
-        }
-        label.appendChild(extra);
-        box.appendChild(label);
-      }
-    };
-    addGroup("Swarm services (docker service logs)", r.services, "service");
-    addGroup("Containers (docker logs)", r.containers, "container");
-    if (!r.services.length && !r.containers.length) box.textContent = "nothing running";
+    renderDockerTargets(r.containers, r.services, host || "local");
 
     const t = await get("/transforms").catch(() => ({ transforms: [] }));
     const tbox = $("transforms-list");
@@ -2829,7 +2892,7 @@ async function listContainers() {
   } catch (err) {
     clearInterval(tick);
     status.textContent = "";
-    box.innerHTML = "";
+    $("docker-targets").innerHTML = "";
     renderActivityLog(err.log);
     // A bare network-level failure (fetch() itself rejected -- server
     // unreachable, tunnel down, connection reset with zero bytes sent) has

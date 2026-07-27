@@ -72,11 +72,20 @@
     ok(fmtIso(0).endsWith(" UTC"));
   });
 
-  await T("colorFor assigns stable slots and folds past 8", () => {
+  await T("colorFor assigns stable slots and never folds to gray past 8", () => {
     const c1 = colorFor("__test_series_1");
     eq(colorFor("__test_series_1"), c1, "stable on repeat");
-    for (let i = 2; i <= 10; i++) colorFor("__test_series_" + i);
-    eq(colorFor("__test_series_10"), themeVar("--muted"), "9th+ folds to muted");
+    const colors = [];
+    for (let i = 1; i <= 12; i++) colors.push(colorFor("__test_series_" + i));
+    // every one of the first 12 concurrent series gets its own distinct
+    // color -- none of them (not just the first 8) may ever fold to the
+    // shared --muted gray, which is reserved for actually disabled/
+    // not-selected containers, not "the 9th+ live one".
+    const muted = themeVar("--muted");
+    ok(colors.every((c) => c !== muted), `no live series color may equal --muted: ${colors}`);
+    ok(new Set(colors).size === colors.length, `every color must be distinct: ${colors}`);
+    // stable on repeat past the 8-color curated palette too
+    eq(colorFor("__test_series_10"), colors[9], "9th+ slot color stable on repeat");
   });
 
   /* ── view management ──────────────────────────────────────────────────── */
@@ -667,6 +676,31 @@
       dockerHostKeys.delete("ssh://u@h");
       dlg.close();
       $("btn-set").click(); // resets host/ssh-key/labels back to create-mode defaults
+      dlg.close();
+    }
+  });
+
+  await T("Edit Docker Daemon pre-fills the checklist with already-followed containers/services before any Refresh", () => {
+    const fakeStats = { id: "__prefill_stats", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
+    const fakeContainer = { id: "__prefill_c", path: "docker://ssh://u@h/container/demo-c", name: "demo-c", kind: "log", live: true };
+    const fakeService = { id: "__prefill_s", path: "docker://ssh://u@h/service/demo-svc", name: "demo-svc", kind: "log", live: true };
+    state.sources.push(fakeStats, fakeContainer, fakeService);
+    dockerHostKeys.set("ssh://u@h", "/path/to/key");
+    try {
+      $("btn-edit-docker-daemon").click();
+      const text = $("docker-targets").textContent;
+      ok(text.includes("demo-c"), `container pre-filled: ${text}`);
+      ok(text.includes("demo-svc"), `service pre-filled: ${text}`);
+      const boxes = [...$("docker-targets").querySelectorAll("input[type=checkbox]")];
+      eq(boxes.length, 2, "one checkbox per already-followed container/service");
+      ok(boxes.every((cb) => cb.checked), "pre-filled entries start checked");
+      ok(boxes.every((cb) => !cb.disabled), "pre-filled entries are immediately interactive, no Refresh needed");
+      ok($("docker-targets").querySelectorAll("label.added").length === 2, "both marked already added");
+    } finally {
+      state.sources = state.sources.filter((s) => !s.id.startsWith("__prefill_"));
+      dockerHostKeys.delete("ssh://u@h");
+      dlg.close();
+      $("btn-set").click();
       dlg.close();
     }
   });
@@ -1636,6 +1670,37 @@
       eq(calls[0], sid, "for the dragged panel's source id");
     } finally {
       openLogPopout = real;
+    }
+  });
+
+  await T("dragging a log panel's header shows the whole panel (header + body) as the drag ghost", () => {
+    const sid = [...panels.keys()][0];
+    const panel = panels.get(sid);
+    const realSetDragImage = DataTransfer.prototype.setDragImage;
+    const calls = [];
+    DataTransfer.prototype.setDragImage = function (...args) { calls.push(args); };
+    try {
+      const head = panel.el.querySelector(".panel-head");
+      const dt = new DataTransfer();
+      head.dispatchEvent(new DragEvent("dragstart", { bubbles: true, cancelable: true, dataTransfer: dt, clientX: 10, clientY: 10 }));
+      eq(calls.length, 1, "setDragImage called");
+      eq(calls[0][0], panel.el, "drag image is the whole panel (header + body), not just the header");
+    } finally {
+      DataTransfer.prototype.setDragImage = realSetDragImage;
+    }
+  });
+
+  await T("dragging a legend entry uses the entry itself as the drag ghost (no body to include)", () => {
+    const item = [...$("legend").querySelectorAll(".legend-item")].find((i) => !i.className.includes("disabled"));
+    const realSetDragImage = DataTransfer.prototype.setDragImage;
+    let called = false;
+    DataTransfer.prototype.setDragImage = function () { called = true; };
+    try {
+      const dt = new DataTransfer();
+      item.dispatchEvent(new DragEvent("dragstart", { bubbles: true, cancelable: true, dataTransfer: dt }));
+      ok(!called, "no custom drag image needed -- the browser's default (the entry itself) is already right");
+    } finally {
+      DataTransfer.prototype.setDragImage = realSetDragImage;
     }
   });
 

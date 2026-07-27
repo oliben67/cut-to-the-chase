@@ -1553,18 +1553,42 @@ class TestState:
         for sid in ids:
             state.close_source(sid)
 
-    async def test_collect_docker_reuse_ignores_the_second_call_s_settings(
+    async def test_collect_docker_reuse_applies_a_new_poll_interval_but_ignores_other_settings(
+        self, state, docker_cli, monkeypatch
+    ):
+        """A reused stats/host-stats collector picks up a *changed* poll
+        interval from the new call (see _update_poll_interval) -- Edit
+        Docker Daemon's poll interval field must actually take effect even
+        when collection for that daemon is already running, not silently
+        no-op forever until you close and reopen it by hand. Everything
+        else about the reused source (here: nothing else varies for stats,
+        but see the log-source-side reuse tests for transforms/ssh_key)
+        still follows the original documented reuse semantics."""
+        _no_op_docker(monkeypatch)
+        first = state.collect_docker(
+            None, stats=True, logs=[], transforms=[], interval=1.0, host_stats=False
+        )
+        second = state.collect_docker(
+            None, stats=True, logs=[], transforms=[], interval=99.0, host_stats=False
+        )  # different interval, same target
+        assert second == first  # still the exact same collector, not a second one
+        src = state.sources[first[0]]
+        assert src.interval == 99.0  # the new call's interval was applied
+        state.close_source(first[0])
+
+    async def test_collect_docker_reuse_is_a_no_op_when_the_interval_is_unchanged(
         self, state, docker_cli, monkeypatch
     ):
         _no_op_docker(monkeypatch)
         first = state.collect_docker(
             None, stats=True, logs=[], transforms=[], interval=1.0, host_stats=False
         )
-        state.collect_docker(
-            None, stats=True, logs=[], transforms=[], interval=99.0, host_stats=False
-        )  # different interval, same target
         src = state.sources[first[0]]
-        assert src.interval == 1.0  # untouched by the second, reused call
+        src.interval = 1.0  # sanity: still what we started it with
+        state.collect_docker(
+            None, stats=True, logs=[], transforms=[], interval=1.0, host_stats=False
+        )
+        assert src.interval == 1.0
         state.close_source(first[0])
 
     async def test_collect_docker_repeated_calls_for_the_same_target_start_only_one(
