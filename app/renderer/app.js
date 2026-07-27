@@ -2476,8 +2476,11 @@ async function listContainers() {
         const extra = document.createElement("span");
         extra.className = "tdoc";
         extra.textContent = it.image || it.replicas || "";
+        // Left checked-but-interactive (not disabled) even when already
+        // being followed: "Set" always syncs exactly to what's checked here
+        // (see dlg-ok), so unchecking an already-added item is how you stop
+        // following it, rather than needing to close its panel separately.
         if (open.has(`docker://${hostKey}/${type}/${it.name}`)) {
-          cb.disabled = true;
           label.classList.add("added");
           extra.textContent = "already added";
         }
@@ -2529,10 +2532,21 @@ $("dlg-ok").onclick = async () => {
     const host = normalizeDockerHost($("docker-host").value);
     const sshKey = $("docker-ssh-key").value.trim() || null;
     dockerHostKeys.set(host || "local", sshKey);
-    const logs = [...$("docker-targets").querySelectorAll("input:checked:not(:disabled)")].map((cb) => ({
+    const hostKey = host || "local";
+    const logs = [...$("docker-targets").querySelectorAll("input:checked")].map((cb) => ({
       name: cb.value,
       type: cb.dataset.type,
     }));
+    // "Set" syncs exactly to this checklist: any container/service log
+    // already being followed for this host that isn't checked now gets
+    // closed, not just left running alongside whatever's newly picked.
+    const keep = new Set(logs.map((l) => `docker://${hostKey}/${l.type}/${l.name}`));
+    const toClose = state.sources.filter((s) => {
+      const m = /^docker:\/\/([^/]+)\/(container|service)\/.+$/.exec(s.path || "");
+      return m && m[1] === hostKey && !keep.has(s.path);
+    });
+    for (const s of toClose) await post("/close", { id: s.id });
+
     const stats = $("docker-stats").checked;
     // Host telemetry (CPU/MEM/NET) is always requested once a source's host
     // is set -- no separate opt-in checkbox to forget to tick.
