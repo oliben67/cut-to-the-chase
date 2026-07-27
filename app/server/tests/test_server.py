@@ -734,6 +734,62 @@ def raw_stats(cpu_pct=10.0, mem_bytes=1024 * 1024, mem_limit=4 * 1024 * 1024, ne
     }
 
 
+class FakeSSHClient:
+    """Stand-in for paramiko.SSHClient -- tests patch server._connect_ssh to
+    return one of these instead of ever opening a real ssh connection."""
+
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class FakeChannel:
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+
+    def set_combine_stderr(self, v):
+        pass
+
+    def recv(self, n):
+        return self._chunks.pop(0) if self._chunks else b""
+
+    def close(self):
+        pass
+
+
+class FakeSSHClientStreaming(FakeSSHClient):
+    """FakeSSHClient whose exec_command() drives a FakeChannel -- for
+    DockerLogSource's remote (paramiko-streaming) path."""
+
+    def __init__(self, chunks):
+        super().__init__()
+        self.channel = FakeChannel(chunks)
+        self.last_cmd = None
+
+    def exec_command(self, cmd, timeout=None):
+        self.last_cmd = cmd
+        stdout = types.SimpleNamespace(channel=self.channel)
+        return None, stdout, None
+
+
+class TestSshParamikoHelpers:
+    def test_parse_ssh_target_full(self):
+        assert server._parse_ssh_target("ssh://user@host:2222") == ("host", "user", 2222)
+
+    def test_parse_ssh_target_no_user_default_port(self):
+        assert server._parse_ssh_target("ssh://host") == ("host", None, 22)
+
+    def test_parse_docker_size_binary_and_decimal_units(self):
+        assert server._parse_docker_size("648B") == 648.0
+        assert server._parse_docker_size("12.3MiB") == pytest.approx(12.3 * 1024**2)
+        assert server._parse_docker_size("1.9GB") == pytest.approx(1.9 * 1000**3)
+
+    def test_parse_docker_size_garbage_is_zero(self):
+        assert server._parse_docker_size("--") == 0.0
+
+
 class TestNormalizeDockerHost:
     def test_none_and_empty(self):
         assert server.normalize_docker_host(None) is None
@@ -754,17 +810,20 @@ class TestDockerPs:
     ssh host) -- so it can genuinely kill a hung invocation on timeout."""
 
     async def test_normalizes_bare_user_at_host(self, monkeypatch):
+        client = FakeSSHClient()
+        monkeypatch.setattr(server, "_connect_ssh", lambda host, key: client)
         captured = []
 
-        async def fake_exec(*args, **k):
-            captured.append(args)
+        def fake_exec_remote(c, args, timeout):
+            captured.append(list(args))
             if args[-1] == "{{.Server.Version}}":
-                return FakeAsyncProc(communicate_result=(b"27.0.0\n", b""))
-            return FakeAsyncProc(communicate_result=(b"", b""))
+                return "27.0.0\n", "", 0
+            return "", "", 0
 
-        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(server, "_exec_remote_docker", fake_exec_remote)
         await server.docker_ps("u@h")
-        assert list(captured[0][:3]) == ["docker", "-H", "ssh://u@h"]
+        assert captured[0] == ["version", "--format", "{{.Server.Version}}"]
+        assert client.closed  # docker_ps always closes the ssh connection it opened
 
     async def test_ok_with_services(self, monkeypatch):
         ps_line = json.dumps({"ID": "1" * 20, "Names": "web", "Image": "nginx"}).encode()
@@ -819,13 +878,19 @@ class TestDockerPs:
         assert (await server.docker_ps(None))["services"] == []
 
     async def test_preflight_reports_missing_docker(self, monkeypatch):
-        async def fake_exec(*args, **k):
-            return FakeAsyncProc(
-                returncode=1, communicate_result=(b"", b"command not found: docker")
-            )
-
-        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(server, "_connect_ssh", lambda host, key: FakeSSHClient())
+        monkeypatch.setattr(
+            server, "_exec_remote_docker", lambda c, a, t: ("", "command not found: docker", 1)
+        )
         with pytest.raises(server.DockerPsError, match="not installed"):
+            await server.docker_ps("ssh://u@h")
+
+    async def test_ssh_connect_failure_reported(self, monkeypatch):
+        def boom(host, key):
+            raise OSError("Connection refused")
+
+        monkeypatch.setattr(server, "_connect_ssh", boom)
+        with pytest.raises(server.DockerPsError, match="could not ssh to"):
             await server.docker_ps("ssh://u@h")
 
     async def test_failure_raises_and_carries_log(self, monkeypatch):
@@ -978,6 +1043,54 @@ class TestDockerStatsSource:
         finally:
             src.stop()
 
+    async def test_remote_polls_via_ssh_sudo_docker_stats(self, docker_cli, monkeypatch):
+        client = FakeSSHClient()
+        monkeypatch.setattr(server, "_connect_ssh", lambda host, key: client)
+        row = {
+            "Name": "web",
+            "CPUPerc": "12.50%",
+            "MemPerc": "3.00%",
+            "MemUsage": "12.3MiB / 1.907GiB",
+            "NetIO": "648B / 1.2kB",
+        }
+        captured = []
+
+        def fake_exec(c, args, timeout):
+            captured.append(list(args))
+            return json.dumps(row) + "\n", "", 0
+
+        monkeypatch.setattr(server, "_exec_remote_docker", fake_exec)
+        src = server.DockerStatsSource("d4", "stats@h", "ssh://u@h", 0.05, FakeState())
+        try:
+            deadline = time.time() + 3
+            while not src.series and time.time() < deadline:
+                await asyncio.sleep(0.02)
+            assert "web" in src.series
+            assert captured[0] == ["stats", "--no-stream", "--format", "{{json .}}"]
+            assert src.path == "docker://ssh://u@h/stats"
+        finally:
+            src.stop()
+        assert client.closed  # stop() closes the persistent ssh connection
+
+    async def test_remote_stats_failure_reconnects_next_tick(self, docker_cli, monkeypatch):
+        clients = [FakeSSHClient(), FakeSSHClient()]
+        monkeypatch.setattr(server, "_connect_ssh", lambda host, key: clients.pop(0))
+        monkeypatch.setattr(server, "_exec_remote_docker", lambda c, a, **kw: ("", "boom", 1))
+        src = server.DockerStatsSource("d5", "stats@h", "ssh://u@h", 0.05, FakeState())
+        try:
+            deadline = time.time() + 3
+            while src.error is None and time.time() < deadline:
+                await asyncio.sleep(0.02)
+            assert "boom" in src.error
+            # the failed connection should have been closed and cleared, so
+            # the next tick reconnects (draining the second fake client too)
+            deadline = time.time() + 3
+            while clients and time.time() < deadline:
+                await asyncio.sleep(0.02)
+            assert not clients
+        finally:
+            src.stop()
+
 
 class FakeAsyncStdout:
     def __init__(self, chunks, hang_after=False):
@@ -1047,20 +1160,40 @@ class TestDockerLogSource:
         src.stop()
 
     async def test_service_target_uses_service_logs(self, docker_cli, monkeypatch):
-        captured = {}
-
-        async def fake_exec(*args, **k):
-            captured["cmd"] = args
-            return FakeAsyncProc([])
-
-        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+        client = FakeSSHClientStreaming([b"2026-01-02T03:04:05Z hello\n"])
+        monkeypatch.setattr(server, "_connect_ssh", lambda host, key: client)
         src = server.DockerLogSource(
             "l2", "api", "ssh://u@h", "service", "api", [], FakeState(), ssh_key="/tmp/k"
         )
         deadline = time.time() + 3
+        while src.total() < 1 and time.time() < deadline:
+            await asyncio.sleep(0.02)
+        assert src.total() == 1
+        assert src.path == "docker://ssh://u@h/service/api"
+        assert client.last_cmd.startswith("sudo docker service logs")
+        src.stop()
+        assert client.closed  # stop() closes the ssh connection it opened
+
+    async def test_remote_log_stream_ends(self, docker_cli, monkeypatch):
+        client = FakeSSHClientStreaming([b"one line\n"])
+        monkeypatch.setattr(server, "_connect_ssh", lambda host, key: client)
+        src = server.DockerLogSource("l5", "web", "ssh://u@h", "container", "web", [], FakeState())
+        deadline = time.time() + 3
         while src.error is None and time.time() < deadline:
             await asyncio.sleep(0.02)
-        assert list(captured["cmd"][:4]) == ["docker", "-H", "ssh://u@h", "service"]
+        assert src.error == "log stream ended"
+        src.stop()
+
+    async def test_remote_ssh_connect_failure_recorded(self, docker_cli, monkeypatch):
+        def boom(host, key):
+            raise OSError("Connection refused")
+
+        monkeypatch.setattr(server, "_connect_ssh", boom)
+        src = server.DockerLogSource("l6", "web", "ssh://u@h", "container", "web", [], FakeState())
+        deadline = time.time() + 3
+        while src.error is None and time.time() < deadline:
+            await asyncio.sleep(0.02)
+        assert "Connection refused" in src.error
         src.stop()
 
     async def test_spawn_failure_recorded(self, docker_cli, monkeypatch):

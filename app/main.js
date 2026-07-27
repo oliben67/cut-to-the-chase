@@ -1012,6 +1012,10 @@ async function reconnectMainWindow() {
   } else {
     await createWindow();
   }
+  // Closes whatever splash the caller showed while getting here (e.g.
+  // switch-gateway's "Restarting, please wait…" during ssh tunnel setup) --
+  // a no-op if none was ever shown for this particular reconnect.
+  closeSplash();
 }
 // Still confirmed for Run Setup / Update Image / uninstall -- those are
 // deliberate settings-screen actions, not the quick status-pill switcher
@@ -1120,6 +1124,14 @@ ipcMain.handle("switch-gateway", async (_e, entry) => {
     sshPort: entry.sshPort,
     remotePort: entry.port,
   };
+  // Shown up front: a fallback-to-tunnel reconnect can take several seconds
+  // (ssh provisioning, waiting for the forwarded port) with nothing else in
+  // view once switch-gateway starts, since it reconnects immediately with
+  // no confirmation dialog of its own (unlike offerRestart's callers).
+  // reconnectMainWindow() closes this once the new page has loaded; the
+  // catch below closes it on failure, since that path never reaches there.
+  showSplash();
+  splashStatus("Restarting, please wait…");
   try {
     const result = await connectRemoteGateway(cfg, {
       onLog: (line) => mainWindow?.webContents.send("setup-log", line),
@@ -1145,6 +1157,7 @@ ipcMain.handle("switch-gateway", async (_e, entry) => {
       imageRef: result.imageRef,
     });
   } catch (err) {
+    closeSplash();
     return { ok: false, error: `Failed to switch to ${entry.label || entry.host}: ${err.message || err}` };
   }
   await reconnectMainWindow();
