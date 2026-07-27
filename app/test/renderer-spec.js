@@ -1550,7 +1550,7 @@
     ok(!$("server-status").classList.contains("open"), "wrapper no longer marked open");
   });
 
-  await T("host block shows the loading state before first host sample", () => {
+  await T("host block shows the loading state before first host sample, titled for the local machine", () => {
     state.sources.push({ id: "__hload", kind: "stats", is_host: true,
                          path: "docker://local/host", live: true, name: "host@local" });
     try {
@@ -1558,10 +1558,23 @@
       eq(hostBlockEl.hidden, false, "host block appears");
       eq($("host-loading").hidden, false, "loading indicator shown");
       eq(hostChartsEl.hidden, true, "charts hidden while loading");
+      eq($("host-title").textContent, "Host telemetry — this machine", "titled for the local daemon");
     } finally {
       state.sources = state.sources.filter((s) => s.id !== "__hload");
       drawAll();
       eq(hostBlockEl.hidden, true, "host block gone again");
+    }
+  });
+
+  await T("host block is titled with the remote docker daemon's hostname", () => {
+    state.sources.push({ id: "__hremote", kind: "stats", is_host: true,
+                         path: "docker://ssh://u@example.com/host", live: true, name: "host@example.com" });
+    try {
+      drawAll();
+      eq($("host-title").textContent, "Host telemetry — example.com", "titled with the bare hostname, no user@");
+    } finally {
+      state.sources = state.sources.filter((s) => s.id !== "__hremote");
+      drawAll();
     }
   });
 

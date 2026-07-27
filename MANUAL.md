@@ -391,8 +391,10 @@ and support the same click / drag / double-click gestures.
 
 ### Host telemetry
 
-When host telemetry is collected, a separate **Host telemetry** strip group
-appears at the bottom of the chart block with its own CPU/MEM/NET strips and
+When host telemetry is collected, a separate **Host telemetry — `<name>`**
+strip group appears at the bottom of the chart block, named for the docker
+daemon system it's actually reporting on (`this machine`, or the remote
+host's name for an `ssh://` daemon) — with its own CPU/MEM/NET strips and
 its own timeline navigator. While the first reading is on its way you'll see
 a brief ⏳ loading indicator. The ▾/▸ button collapses the group; ⧉ pops it
 out into its own window. Its visibility choice persists.

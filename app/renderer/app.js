@@ -465,6 +465,17 @@ function allSvcSeries() {
   return (state.series?.services || []).filter((s) => !s.host);
 }
 
+// "Host telemetry" on its own doesn't say *which* host -- server.py names
+// the host-stats source "host@<hostname>" (bare hostname, no user@, see
+// HostStatsSource) specifically so the client can pull it back out here.
+function hostTelemetryLabel() {
+  const src = state.sources.find((s) => s.kind === "stats" && s.is_host);
+  const name = String(src?.name || "");
+  const host = name.startsWith("host@") ? name.slice("host@".length) : "";
+  if (!host || host === "local") return "Host telemetry — this machine";
+  return `Host telemetry — ${host}`;
+}
+
 function drawAll() {
   if (!state.view) return;
   const hasHost = seriesOf("host", false).length > 0;
@@ -474,6 +485,7 @@ function drawAll() {
   const hostPoppedOut = !POPOUT_KIND && state.poppedOut.has("host");
   // a "telemetry"/"log" popout only ever shows containers, never the host.
   hostBlockEl.hidden = POPOUT_KIND === "host" ? false : (POPOUT_KIND != null || !(hasHost || hostLoading) || hostPoppedOut);
+  if (!hostBlockEl.hidden) $("host-title").textContent = hostTelemetryLabel();
   const showingHostArea = !hostBlockEl.hidden && state.showHost;
   $("host-loading").hidden = !(showingHostArea && hostLoading);
   hostChartsEl.hidden = !showingHostArea || hostLoading;
