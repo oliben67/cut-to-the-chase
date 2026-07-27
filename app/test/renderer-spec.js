@@ -1291,6 +1291,22 @@
     }
   });
 
+  await T("sidebar collapse toggle hides the groups and shrinks the rail, restore brings them back", () => {
+    const actionBar = $("action-bar");
+    const before = prefs.get("actionBarCollapsed", false);
+    try {
+      $("ab-collapse-toggle").click();
+      eq(actionBar.dataset.collapsed, "true", "collapsed");
+      eq(getComputedStyle($("app-body").querySelector(".ab-group")).display, "none", "groups hidden");
+      eq(prefs.get("actionBarCollapsed", null), true, "persisted");
+      $("ab-collapse-toggle").click();
+      eq(actionBar.dataset.collapsed, "false", "restored");
+      ok(getComputedStyle($("app-body").querySelector(".ab-group")).display !== "none", "groups visible again");
+    } finally {
+      if (actionBar.dataset.collapsed !== String(before)) $("ab-collapse-toggle").click();
+    }
+  });
+
   await T("legend right-click offers a per-series pop-out", async () => {
     const real = openSeriesPopout;
     const calls = [];

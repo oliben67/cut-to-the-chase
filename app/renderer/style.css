@@ -373,6 +373,44 @@ body {
   border-left: 1px solid var(--border);
 }
 
+/* Collapsed: shrinks to a thin rail along the dock's own axis (width for
+   left/right, height for top/bottom) -- the cross axis (height/width) still
+   spans the full app-body automatically, same as expanded, since neither
+   state sets it explicitly and flex's default align-items:stretch already
+   does that. Only #ab-collapse-toggle stays visible; everything else
+   (.ab-group sections, the other dock buttons) is hidden outright rather
+   than just scrolled out of view, so there's nothing to accidentally tab
+   into while collapsed. */
+#action-bar[data-collapsed="true"] .ab-group,
+#action-bar[data-collapsed="true"] .ab-dock-btn[data-dock-to] {
+  display: none;
+}
+#action-bar[data-collapsed="true"] {
+  overflow: visible;
+  padding: 3px;
+}
+/* .ab-dock-controls normally bleeds past #action-bar's own side padding to
+   sit flush edge-to-edge (see its own comment) -- that negative-margin trick
+   assumes the wider expanded padding, so it has to be reset here or it'd
+   overshoot the much narrower collapsed rail. */
+#action-bar[data-collapsed="true"] .ab-dock-controls {
+  margin: 0;
+  padding: 0;
+  border-bottom: none;
+  background: none;
+  justify-content: center;
+}
+#app-body[data-dock="left"] #action-bar[data-collapsed="true"],
+#app-body[data-dock="right"] #action-bar[data-collapsed="true"] {
+  width: 28px;
+}
+#app-body[data-dock="top"] #action-bar[data-collapsed="true"],
+#app-body[data-dock="bottom"] #action-bar[data-collapsed="true"] {
+  width: 100%;
+  height: 28px;
+  flex-wrap: nowrap;
+}
+
 /* The row itself is the thing that shrinks (50% less padding around it) --
    the icons inside stay the same size as icon buttons anywhere else in the
    app (.icon-btn: 26px box, 17px glyph -- see the panel popout/close
@@ -538,15 +576,21 @@ body {
 }
 .ab-group button {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 8px;
   font-size: 14.5px;
   background: none;
   border: 1px solid transparent;
   border-radius: var(--radius-sm);
   padding: 6px 10px;
-  white-space: nowrap;
+  /* Longer labels ("Remove Docker Daemon") wrap onto a second line rather
+     than clipping or forcing the whole sidebar wider -- widening it instead
+     shrinks the chart area, which (in a narrow window) can push a drag's
+     pixel distance under the 6px zoom-vs-click threshold in timelineUp(). */
+  white-space: normal;
+  text-wrap: balance;
 }
+.ab-group button .ab-icon { margin-top: 1px; } /* keeps the icon aligned with the label's first line now that items start-align instead of center */
 .ab-group button:hover { background: var(--surface-3); }
 /* Click feedback: reverse fg/bg instead of the usual accent-tinted hover --
    applies uniformly to every sidebar button (section headers, their

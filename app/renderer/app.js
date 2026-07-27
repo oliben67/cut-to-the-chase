@@ -2468,6 +2468,19 @@ async function listContainers() {
     clearInterval(tick);
     status.textContent = "";
     renderActivityLog(r.log);
+
+    // A successful fetch means "here's what's actually running now" -- any
+    // container/service still tracked from a previous fetch (this host or
+    // a different one) no longer reflects that and must go, not linger
+    // alongside the fresh list. Host-level telemetry (docker://.../stats,
+    // docker://.../host) is not a container and is deliberately left alone
+    // here -- it's the host we just fetched from, not something to drop.
+    const stale = state.sources.filter((s) => /^docker:\/\/[^/]+\/(container|service)\//.test(s.path || ""));
+    if (stale.length) {
+      await Promise.all(stale.map((s) => post("/close", { id: s.id })));
+      await refreshAll();
+    }
+
     box.innerHTML = "";
     const open = openPaths();
     const hostKey = host || "local";
@@ -3646,16 +3659,41 @@ if (!POPOUT_KIND) {
       // "detached" once you've detached it, with nothing to go back to.
       if (dock !== "detached") prefs.set("actionBarLastDock", dock);
       appBody.dataset.dock = dock === "detached" ? "detached" : dock;
-      for (const b of actionBar.querySelectorAll(".ab-dock-btn")) {
+      for (const b of actionBar.querySelectorAll(".ab-dock-btn[data-dock-to]")) {
         b.dataset.current = String(b.dataset.dockTo === dock);
       }
       if (dock === "detached") window.cttc?.openActionBarWindow?.();
       else window.cttc?.closeActionBarWindow?.();
+      updateCollapseToggleIcon();
     }
-    for (const b of actionBar.querySelectorAll(".ab-dock-btn")) {
+    for (const b of actionBar.querySelectorAll(".ab-dock-btn[data-dock-to]")) {
       b.onclick = () => setDock(b.dataset.dockTo);
     }
+
+    // Collapses the sidebar to a thin rail (full height for left/right dock,
+    // full width for top/bottom -- see style.css) with just this one button
+    // left to restore it, rather than removing it from the layout entirely.
+    // The restore chevron always points "into" the content area, whichever
+    // edge that is for the current dock, so it has to be recomputed on
+    // every dock change too, not just when the collapsed state itself flips.
+    const collapseToggle = $("ab-collapse-toggle");
+    const COLLAPSE_ICON = { top: "▾", bottom: "▴", left: "▸", right: "◂" };
+    const EXPAND_ICON = { top: "▴", bottom: "▾", left: "◂", right: "▸" };
+    function updateCollapseToggleIcon() {
+      const dock = appBody.dataset.dock === "detached" ? prefs.get("actionBarLastDock", "left") : appBody.dataset.dock;
+      const collapsed = actionBar.dataset.collapsed === "true";
+      collapseToggle.textContent = collapsed ? (EXPAND_ICON[dock] || "▸") : (COLLAPSE_ICON[dock] || "◂");
+      collapseToggle.title = collapsed ? "Show sidebar" : "Hide sidebar";
+    }
+    function setActionBarCollapsed(collapsed) {
+      prefs.set("actionBarCollapsed", collapsed);
+      actionBar.dataset.collapsed = String(collapsed);
+      updateCollapseToggleIcon();
+    }
+    collapseToggle.onclick = () => setActionBarCollapsed(actionBar.dataset.collapsed !== "true");
+
     setDock(prefs.get("actionBarDock", "left"));
+    setActionBarCollapsed(prefs.get("actionBarCollapsed", false));
     window.cttc?.onActionBarRedock?.(() => setDock(prefs.get("actionBarLastDock", "left")));
 
     // Collapsible sidebar sections (Gateway/Sources/Metrics/Preferences):
