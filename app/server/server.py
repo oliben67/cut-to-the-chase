@@ -635,6 +635,8 @@ def _connect_ssh(host: str, ssh_key: str | None) -> paramiko.SSHClient:
     CTTC_ID_RSA mount / app/lib/server-provision.js), which is exactly what a
     source with no key of its own should try."""
     hostname, username, port = _parse_ssh_target(host)
+    identity = ssh_key or "ssh-agent/default identity discovery"
+    logger.info("ssh: connecting to %s@%s:%d (key: %s)", username or "<default user>", hostname, port, identity)
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     kwargs: dict = {"hostname": hostname, "port": port, "timeout": 10, "banner_timeout": 10, "auth_timeout": 10}
@@ -642,7 +644,19 @@ def _connect_ssh(host: str, ssh_key: str | None) -> paramiko.SSHClient:
         kwargs["username"] = username
     if ssh_key:
         kwargs["key_filename"] = ssh_key
-    client.connect(**kwargs)
+    t0 = time.monotonic()
+    try:
+        client.connect(**kwargs)
+    except Exception as e:
+        logger.warning("ssh: connect to %s:%d failed after %.1fms: %s: %s", hostname, port, (time.monotonic() - t0) * 1000, type(e).__name__, e)
+        raise
+    transport = client.get_transport()
+    logger.info(
+        "ssh: connected to %s:%d in %.1fms (server: %s, cipher: %s)",
+        hostname, port, (time.monotonic() - t0) * 1000,
+        transport.remote_version if transport else "?",
+        transport.local_cipher if transport else "?",
+    )
     return client
 
 
@@ -657,10 +671,17 @@ def _exec_remote_docker(client: paramiko.SSHClient, args: list[str], timeout: fl
     before the remote `docker system dial-stdio` it runs -- so this shells
     out the equivalent of `ssh user@host sudo docker <args>` explicitly."""
     cmd = "sudo docker " + " ".join(shlex.quote(a) for a in args)
+    t0 = time.monotonic()
+    logger.debug("ssh: exec `%s` (timeout=%.1fs)", cmd, timeout)
     _stdin, stdout, stderr = client.exec_command(cmd, timeout=timeout)
     out = stdout.read().decode(errors="replace")
     err = stderr.read().decode(errors="replace").strip()
     rc = stdout.channel.recv_exit_status()
+    elapsed_ms = (time.monotonic() - t0) * 1000
+    if rc == 0:
+        logger.debug("ssh: `%s` -> exit 0 in %.1fms (%d bytes stdout)", cmd, elapsed_ms, len(out))
+    else:
+        logger.info("ssh: `%s` -> exit %d in %.1fms: %s", cmd, rc, elapsed_ms, err or "(no stderr)")
     return out, err, rc
 
 
@@ -1282,6 +1303,7 @@ class DockerLogSource(LogSource):
         assert self.host is not None  # only ever called from _follow's own `if self.host` guard
         self._ssh_client = await asyncio.to_thread(_connect_ssh, self.host, self.ssh_key)
         cmd = "sudo docker " + " ".join(shlex.quote(a) for a in self._args)
+        logger.info("ssh: starting persistent log follow for %s: `%s`", self.path, cmd)
         _stdin, stdout_f, _stderr = await asyncio.to_thread(self._ssh_client.exec_command, cmd)
         channel = stdout_f.channel
         self._channel = channel
@@ -1786,6 +1808,33 @@ async def _unhandled_error_handler(request: Request, exc: Exception):
         media_type="application/json",
         status_code=500,
     )
+
+
+@app.middleware("http")
+async def _access_log(request: Request, call_next):
+    # Detailed REST activity log for every request this server handles --
+    # uvicorn's own access log is disabled (see main()'s access_log=False,
+    # which just prints a bare "METHOD path HTTP/1.1" 200 OK" line with no
+    # timing/client/size) in favor of this single, consistent line covering
+    # every route including the ones handled by the exception handlers
+    # above (their response status code comes back through call_next()
+    # like any other, no separate logging needed there). Deliberately never
+    # logs request/response *bodies* -- those can be arbitrarily large
+    # (file uploads, log/metric payloads) or sensitive (ssh keys, private
+    # key PEMs) -- just method/path/query/client/status/size/timing.
+    start = time.monotonic()
+    client = request.client.host if request.client else "?"
+    query = f"?{request.url.query}" if request.url.query else ""
+    try:
+        response = await call_next(request)
+    except Exception as e:
+        elapsed_ms = (time.monotonic() - start) * 1000
+        logger.info("%s %s%s from %s -> unhandled exception after %.1fms: %s", request.method, request.url.path, query, client, elapsed_ms, e)
+        raise
+    elapsed_ms = (time.monotonic() - start) * 1000
+    size = response.headers.get("content-length", "?")
+    logger.info("%s %s%s from %s -> %d (%s bytes, %.1fms)", request.method, request.url.path, query, client, response.status_code, size, elapsed_ms)
+    return response
 
 
 @app.middleware("http")

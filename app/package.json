@@ -7,10 +7,16 @@
     "start": "electron .",
     "test:unit": "node --test test/unit/*.test.js",
     "test:e2e": "./test/run-e2e.sh",
+    "build:manual": "node build/build-manual.js",
+    "predist:win": "npm run build:manual",
     "dist:win": "electron-builder --win nsis --x64",
+    "predist:win:zip": "npm run build:manual",
     "dist:win:zip": "electron-builder --win zip --x64",
+    "predist:win:slim": "npm run build:manual",
     "dist:win:slim": "electron-builder --win nsis --x64 --config electron-builder.win-slim.json",
+    "predist:mac": "npm run build:manual",
     "dist:mac": "electron-builder --mac dmg",
+    "predist:linux": "npm run build:manual",
     "dist:linux": "electron-builder --linux AppImage",
     "release:win": "../releases/windows/build-bundle.sh",
     "release:mac": "../releases/macos/build-bundle.sh",
@@ -40,7 +46,8 @@
     },
     "extraResources": [
       { "from": "../releases/_repo/image.json", "to": "image.json" },
-      { "from": "../releases/_repo/docker-compose.yml", "to": "docker-compose.registry.yml" }
+      { "from": "../releases/_repo/docker-compose.yml", "to": "docker-compose.registry.yml" },
+      { "from": "build/CTTC-Manual.html", "to": "CTTC-Manual.html" }
     ],
     "win": {
       "target": ["nsis"],

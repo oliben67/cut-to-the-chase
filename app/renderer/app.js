@@ -883,6 +883,15 @@ function openSeriesPopout(name) {
   window.cttc?.popout?.("series", name, popoutView());
 }
 
+// open one log panel in its own synced window -- shared by its ⧉ button and
+// dragging its header out past the window's edge (kept as a plain function,
+// same reason as openSeriesPopout above, so the E2E spec can stub it)
+function openLogPopout(sid) {
+  state.poppedOut.add(sid);
+  syncPanels();
+  window.cttc?.popout?.("log", sid, popoutView());
+}
+
 function seriesPopoutMenuEntry(s) {
   return window.cttc?.popout
     ? [[`⧉ Open “${s.name}” in its own window`, () => openSeriesPopout(s.name)]]
@@ -895,7 +904,8 @@ function renderLegend() {
   let all = allSvcSeries();
   // a series popout's legend shows just its one series, always as selected
   if (POPOUT_KIND === "series") all = all.filter((s) => s.name === POPOUT_ID);
-  const sel = all.filter((s) => POPOUT_KIND === "series" || trackStateOf(s) === "sel");
+  const sel = all.filter((s) => POPOUT_KIND === "series" || trackStateOf(s) === "sel")
+    .sort((a, b) => orderOf(a.name) - orderOf(b.name));
   const mut = POPOUT_KIND === "series" ? [] : all.filter((s) => trackStateOf(s) === "mut");
   const hid = POPOUT_KIND === "series" ? [] : all.filter((s) => trackStateOf(s) === "hid");
 
@@ -914,6 +924,10 @@ function renderLegend() {
       [`Unselect “${s.name}” (keep listed, disabled)`, () => { setTrack(s.name, "mut"); relist(); }],
       [`Hide “${s.name}” entirely`, () => { setTrack(s.name, "hid"); relist(); }],
     ]);
+    // Drag to reorder (moves this container's log panel to match), or drag
+    // out past the window's edge to pop its telemetry out into its own
+    // window -- same "drag out to detach" gesture as the log panel below.
+    if (POPOUT_KIND !== "series") wireDragReorder(item, s.name, () => openSeriesPopout(s.name));
     legendEl.appendChild(item);
   }
 
@@ -1747,11 +1761,7 @@ class Panel {
     popout.textContent = "⧉";
     popout.hidden = !window.cttc?.popout || POPOUT_KIND != null;
     popout.title = "Open this log in its own window";
-    popout.onclick = () => {
-      state.poppedOut.add(src.id);
-      syncPanels();
-      window.cttc.popout("log", src.id, popoutView());
-    };
+    popout.onclick = () => openLogPopout(src.id);
     const close = document.createElement("button");
     close.className = "close";
     close.textContent = "✕";
@@ -1782,6 +1792,11 @@ class Panel {
     headTop.append(name, this.sampleBadge);
     headControls.append(this.countEl, orderToggle, searchToggle, right);
     head.append(headTop, headControls);
+    // Drag the header to reorder this panel (and its matching legend entry
+    // moves to match), or drag it out past the window's edge to pop it out
+    // into its own window -- not offered inside an already-popped-out
+    // window, which only ever shows the one panel it opened with.
+    if (POPOUT_KIND !== "log") wireDragReorder(head, src.name, () => openLogPopout(src.id));
 
     this.searchBar = document.createElement("div");
     this.searchBar.className = "panel-search";
@@ -2012,6 +2027,55 @@ function orderOf(name) {
   return state.panelOrder[name];
 }
 
+// Drag-and-drop reordering: the legend and the log panels below share this
+// same by-name order (see state.panelOrder/orderOf), so dragging a legend
+// entry to a new spot reorders that container's log panel to match, and
+// dragging a log panel's header reorders its legend entry the same way --
+// one order, two views onto it.
+function reorderTo(draggedName, targetName) {
+  if (draggedName === targetName) return;
+  orderOf(draggedName); // make sure both names have an assigned slot before...
+  orderOf(targetName); // ...building the array to reinsert into
+  const arr = Object.keys(state.panelOrder).sort((a, b) => state.panelOrder[a] - state.panelOrder[b]);
+  const from = arr.indexOf(draggedName);
+  arr.splice(from, 1);
+  arr.splice(arr.indexOf(targetName), 0, draggedName);
+  arr.forEach((n, i) => { state.panelOrder[n] = i; });
+  prefs.set("panelOrder", state.panelOrder);
+  renderLegend();
+  syncPanels();
+}
+
+// Common dragstart/dragover/drop wiring for anything draggable-by-name
+// (legend entries, panel headers) -- `onDetach` fires instead of a reorder
+// when the drag ends outside this window's own bounds (checked in screen
+// coordinates, since dragend's clientX/Y are relative to whatever window
+// the pointer is over when it lets go), letting either side "drag out to
+// pop out" the same way.
+function wireDragReorder(el, name, onDetach) {
+  el.draggable = true;
+  el.ondragstart = (e) => {
+    e.dataTransfer.setData("text/cttc-series-name", name);
+    e.dataTransfer.effectAllowed = "move";
+  };
+  el.ondragover = (e) => {
+    if (!e.dataTransfer.types.includes("text/cttc-series-name")) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+  };
+  el.ondrop = (e) => {
+    const dragged = e.dataTransfer.getData("text/cttc-series-name");
+    if (!dragged) return;
+    e.preventDefault();
+    reorderTo(dragged, name);
+  };
+  el.ondragend = (e) => {
+    const outside = e.screenX < window.screenX || e.screenX > window.screenX + window.outerWidth ||
+      e.screenY < window.screenY || e.screenY > window.screenY + window.outerHeight;
+    if (outside) onDetach();
+  };
+}
+
 function syncPanels() {
   let logs = state.sources.filter((s) => s.kind === "log");
   if (POPOUT_KIND === "log") logs = logs.filter((s) => s.id === POPOUT_ID);
@@ -2108,7 +2172,28 @@ const dlg = $("dlg-set");
 // when a host is (re)connected from the dialog; follow-up /docker/collect
 // calls for that same host (startTracking, exportSample) that don't go
 // through the dialog reuse it instead of silently dropping back to null.
-const dockerHostKeys = new Map();
+// Persisted via prefs (not just an in-memory Map): without this, restarting
+// the app forgot every remote host's ssh key even though its docker
+// collection itself is restored on launch, so "Edit Docker Daemon" ->
+// Refresh silently fell back to no key at all and failed for any host that
+// actually needs one.
+class PersistedMap extends Map {
+  constructor(prefKey) {
+    super(Object.entries(prefs.get(prefKey, {})));
+    this.prefKey = prefKey;
+  }
+  set(k, v) {
+    super.set(k, v);
+    prefs.set(this.prefKey, Object.fromEntries(this));
+    return this;
+  }
+  delete(k) {
+    const had = super.delete(k);
+    if (had) prefs.set(this.prefKey, Object.fromEntries(this));
+    return had;
+  }
+}
+const dockerHostKeys = new PersistedMap("dockerHostKeys");
 
 $("docker-ssh-key-browse").onclick = async () => {
   const paths = await window.cttc.pickFiles("Choose your SSH private key");
@@ -2146,16 +2231,26 @@ function updateDockerDupes() {
   $("docker-host-stats-note").textContent = paths.has(`docker://${hostKey}/host`) ? "— already collecting" : "";
 }
 
+// Whether the dialog is currently in "Edit Docker Daemon" mode -- listContainers()'s
+// finally-block needs this so a Refresh doesn't unlock the host/ssh-key
+// fields that Edit mode deliberately locked (see btn-edit-docker-daemon
+// below): Fetch (create mode) and Refresh (edit mode) share the exact same
+// listContainers() function, so the difference has to be tracked here
+// rather than duplicated per-caller.
+let dockerDaemonEditMode = false;
+
 // Every control except Docker host / SSH key / Fetch starts empty and
 // disabled -- there's nothing to configure until Fetch has actually shown
 // what's running on the host currently typed in (see setDockerFormEnabled),
 // so nothing here is populated or enabled speculatively.
 $("btn-set").onclick = () => {
+  dockerDaemonEditMode = false;
   $("docker-host").value = "";
   $("docker-host").disabled = false;
   $("docker-ssh-key").value = "";
   $("docker-ssh-key").disabled = false;
   $("docker-ssh-key-browse").disabled = false;
+  $("dlg-set-title").textContent = "Set Docker Daemon";
   $("btn-ps-refresh").textContent = "Fetch";
   $("dlg-ok").textContent = "Set Docker Daemon";
   $("docker-targets").innerHTML = "";
@@ -2176,12 +2271,14 @@ $("btn-set").onclick = () => {
 // create flow -- disabled inputs' .value reads normally, so nothing there
 // needs to branch on which button opened the dialog.
 $("btn-edit-docker-daemon").onclick = () => {
+  dockerDaemonEditMode = true;
   const host = currentDockerHost();
   $("docker-host").value = host ? host.replace(/^ssh:\/\//, "") : "";
   $("docker-host").disabled = true;
   $("docker-ssh-key").value = dockerHostKeys.get(host || "local") || "";
   $("docker-ssh-key").disabled = true;
   $("docker-ssh-key-browse").disabled = true;
+  $("dlg-set-title").textContent = "Edit Docker Daemon";
   $("btn-ps-refresh").textContent = "Refresh";
   $("dlg-ok").textContent = "Update Docker Daemon";
   $("docker-targets").innerHTML = "";
@@ -2748,7 +2845,14 @@ async function listContainers() {
       ? `The CTTC server reached out to ${host || "the local daemon"} and failed: ${String(err.message || err)}`
       : `Could not reach the CTTC server itself at 127.0.0.1:${PORT} (${String(err.message || err)}) — check the connection/tunnel.`;
   } finally {
-    $("docker-host").disabled = false;
+    // Edit mode locked host/ssh-key/browse on purpose (see
+    // btn-edit-docker-daemon) -- a Refresh re-probing the same daemon must
+    // leave them locked, not spring back open the moment the request ends.
+    if (!dockerDaemonEditMode) {
+      $("docker-host").disabled = false;
+      $("docker-ssh-key").disabled = false;
+      $("docker-ssh-key-browse").disabled = false;
+    }
     $("btn-ps-refresh").disabled = false;
   }
 }
@@ -2847,6 +2951,32 @@ function openSettingsDialog() {
 }
 $("dlg-settings-close").onclick = () => dlgSettings.close();
 
+// Settings > Danger > Hard Reset: closes every open source (stopping
+// collection server-side, same as Remove Docker Daemon) and wipes every
+// persisted UI preference (prefs' entire localStorage namespace -- track
+// states, panelOrder, dockerHostKeys, sidebar dock/size, theme, the "now"
+// line style, everything), then reloads to boot exactly like a brand-new
+// install. A real confirm() (not a styled dialog) on purpose -- its
+// blocking, plain-text, native-chrome nature reads as more serious than
+// anything CTTC could style itself, matching how irreversible this is.
+// kept as a plain function (like openSeriesPopout/openLogPopout above) so
+// the E2E spec can stub the actual page navigation away
+function reloadApp() {
+  location.reload();
+}
+$("btn-hard-reset").onclick = async () => {
+  if (!confirm("Hard Reset: this closes every open source, erases all saved CTTC preferences on this machine, and reloads the app. This cannot be undone. Continue?")) return;
+  try {
+    await Promise.all(state.sources.map((s) => post("/close", { id: s.id })));
+  } catch (err) {
+    // Don't let a close failure block the reset the user explicitly asked
+    // for -- the local prefs wipe below is unconditional either way.
+    console.error(err);
+  }
+  localStorage.clear();
+  reloadApp();
+};
+
 /* ── New Gateway / Edit Gateways ──────────────────────────────────────────
    One dialog, two modes -- ported from the old gateway-setup.html/js (a
    separate window loaded with ?mode=new or ?mode=edit): now that both live
@@ -2906,9 +3036,11 @@ if (!POPOUT_KIND) {
 // Uninstall) is disabled until something is actually picked from the
 // dropdown -- rather than hiding the form outright, so it's obvious at a
 // glance that there's more here once a gateway is chosen. "This machine"
-// (embedded) has no ssh settings to edit -- those fields stay disabled, but
-// Connect (relabeled "Update image") still re-provisions the local
-// container with the chosen image.
+// (embedded) is filtered out of the dropdown entirely by
+// gwLoadGatewaysForEdit -- every entry reachable here is a real, editable/
+// uninstallable remote or local-docker gateway, so isRemote below is
+// effectively always true, but the check is left in place as a defensive
+// fallback rather than assumed.
 function gwFillFormForEdit(g) {
   $("gw-error").hidden = true;
   const sshFields = [
@@ -2951,8 +3083,19 @@ function gwFillFormForEdit(g) {
   }
 }
 
+// "This machine" (the embedded/local gateway, always present -- see main.js's
+// recordGateway({mode: "embedded", label: "This machine", ...})) has no
+// connection settings to edit and must never be uninstalled: it isn't a
+// gateway *entry* the user added, it's just always there. Filtered out here
+// (a plain, stubbable function -- see the E2E spec), not from
+// window.cttc.getGateways() itself, since the toolbar's gateway-switcher
+// dropdown still needs to offer switching *to* it.
+function editableGateways(gateways) {
+  return gateways.filter((g) => g.mode !== "embedded");
+}
+
 async function gwLoadGatewaysForEdit() {
-  gwGateways = await window.cttc.getGateways();
+  gwGateways = editableGateways(await window.cttc.getGateways());
   const prevKey = $("gw-select").value;
   $("gw-select").innerHTML = "";
   const placeholder = document.createElement("option");

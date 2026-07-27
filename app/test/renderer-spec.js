@@ -661,12 +661,53 @@
       eq($("docker-ssh-key-browse").disabled, true, "browse locked");
       eq($("btn-ps-refresh").textContent, "Refresh", "Fetch relabeled Refresh");
       eq($("dlg-ok").textContent, "Update Docker Daemon", "confirm relabeled");
+      eq($("dlg-set-title").textContent, "Edit Docker Daemon", "dialog titled for editing, not creating");
     } finally {
       state.sources = state.sources.filter((s) => s.id !== "__edit_test");
       dockerHostKeys.delete("ssh://u@h");
       dlg.close();
       $("btn-set").click(); // resets host/ssh-key/labels back to create-mode defaults
       dlg.close();
+    }
+  });
+
+  await T("Refresh in Edit Docker Daemon re-fetches, leaves checkboxes selectable, and keeps host/ssh-key locked", async () => {
+    const fakeSrc = { id: "__edit_test2", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
+    state.sources.push(fakeSrc);
+    dockerHostKeys.set("ssh://u@h", "/path/to/key");
+    const realPost = post;
+    const realGet = get;
+    post = async (path, body) => {
+      if (path === "/docker/ps") return { containers: [{ id: "x", name: "demo-x", image: "nginx" }], services: [], log: [] };
+      return realPost(path, body);
+    };
+    get = async (path) => (path === "/transforms" ? { transforms: [] } : realGet(path));
+    try {
+      $("btn-edit-docker-daemon").click();
+      $("btn-ps-refresh").click();
+      await until(() => $("docker-targets").textContent.includes("demo-x"), "checklist populated after Refresh");
+      const cb = $("docker-targets").querySelector("input[type=checkbox]");
+      ok(cb, "checkbox rendered");
+      eq(cb.disabled, false, "checkbox is selectable, not locked, in edit mode");
+      eq($("docker-host").disabled, true, "host stays locked after a Refresh in edit mode");
+      eq($("docker-ssh-key").disabled, true, "ssh key stays locked after a Refresh in edit mode");
+    } finally {
+      post = realPost;
+      get = realGet;
+      state.sources = state.sources.filter((s) => s.id !== "__edit_test2");
+      dockerHostKeys.delete("ssh://u@h");
+      dlg.close();
+      $("btn-set").click();
+      dlg.close();
+    }
+  });
+
+  await T("dockerHostKeys persists across restarts (regression: was in-memory only, lost the ssh key on relaunch)", () => {
+    try {
+      dockerHostKeys.set("ssh://persist-test@h", "/some/key/path");
+      eq(prefs.get("dockerHostKeys", {})["ssh://persist-test@h"], "/some/key/path", "written to prefs, not just kept in memory");
+    } finally {
+      dockerHostKeys.delete("ssh://persist-test@h");
     }
   });
 
@@ -678,6 +719,7 @@
       eq($("docker-ssh-key-browse").disabled, false, "browse unlocked");
       eq($("btn-ps-refresh").textContent, "Fetch", "Fetch label restored");
       eq($("dlg-ok").textContent, "Set Docker Daemon", "confirm label restored");
+      eq($("dlg-set-title").textContent, "Set Docker Daemon", "dialog re-titled for creating, not editing");
     } finally {
       dlg.close();
     }
@@ -1343,6 +1385,27 @@
     }
   });
 
+  await T("editableGateways excludes 'This machine' -- never updatable/uninstallable", () => {
+    const input = [
+      { mode: "embedded", host: "127.0.0.1", port: null, label: "This machine" },
+      { mode: "ssh", host: "remote-host", port: 2222, label: "remote-host", sshTarget: "u@remote-host", active: false },
+    ];
+    const out = editableGateways(input);
+    ok(!out.some((g) => g.mode === "embedded"), "'This machine' filtered out");
+    eq(out.length, 1, "real gateway kept");
+    eq(out[0].label, "remote-host", "the right one kept");
+  });
+
+  await T("Edit Gateways dropdown reflects editableGateways' filtering", async () => {
+    await openEditGatewaysDialog();
+    try {
+      const labels = [...$("gw-select").options].map((o) => o.textContent);
+      ok(!labels.some((l) => l.includes("This machine")), `"This machine" must not be selectable here: ${JSON.stringify(labels)}`);
+    } finally {
+      dlgGatewaySetup.close();
+    }
+  });
+
   await T("gw-btn-cancel closes the dialog without submitting", () => {
     openNewGatewayDialog();
     $("gw-btn-cancel").click();
@@ -1523,6 +1586,59 @@
     }
   });
 
+  const dragDrop = (fromEl, toEl) => {
+    const dt = new DataTransfer();
+    fromEl.dispatchEvent(new DragEvent("dragstart", { bubbles: true, cancelable: true, dataTransfer: dt }));
+    toEl.dispatchEvent(new DragEvent("dragover", { bubbles: true, cancelable: true, dataTransfer: dt }));
+    toEl.dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: dt }));
+    fromEl.dispatchEvent(new DragEvent("dragend", { bubbles: true, cancelable: true, dataTransfer: dt, screenX: window.screenX + 10, screenY: window.screenY + 10 }));
+  };
+
+  await T("dragging a legend entry reorders it and its matching log panel to match", () => {
+    const before = { ...state.panelOrder };
+    try {
+      const items = () => [...$("legend").querySelectorAll(".legend-item")].filter((i) => !i.className.includes("disabled"));
+      const all = items();
+      ok(all.length >= 3, "at least 3 selected entries to make the reorder unambiguous");
+      const dragged = all[0], target = all[2];
+      const nameA = dragged.textContent, nameC = target.textContent;
+      dragDrop(dragged, target);
+      const after = items().map((i) => i.textContent);
+      eq(after.indexOf(nameA), after.indexOf(nameC) - 1, "dragged entry now sits right before its drop target");
+      // the matching log panels reordered in #panels the same way
+      const panelNames = [...panelsEl.querySelectorAll(".panel .name")].map((n) => n.textContent);
+      const ia = panelNames.indexOf(names.find((n) => nameA.includes(n)));
+      const ic = panelNames.indexOf(names.find((n) => nameC.includes(n)));
+      if (ia !== -1 && ic !== -1) eq(ia, ic - 1, "log panels reordered to match the legend");
+    } finally {
+      state.panelOrder = before;
+      prefs.set("panelOrder", before);
+      renderLegend();
+      syncPanels();
+    }
+  });
+
+  await T("dragging a log panel header out past the window's edge pops it out", () => {
+    const sid = [...panels.keys()][0];
+    const panel = panels.get(sid);
+    const real = openLogPopout;
+    const calls = [];
+    openLogPopout = (id) => calls.push(id);
+    try {
+      const head = panel.el.querySelector(".panel-head");
+      const dt = new DataTransfer();
+      head.dispatchEvent(new DragEvent("dragstart", { bubbles: true, cancelable: true, dataTransfer: dt }));
+      head.dispatchEvent(new DragEvent("dragend", {
+        bubbles: true, cancelable: true, dataTransfer: dt,
+        screenX: window.screenX - 500, screenY: window.screenY - 500,
+      }));
+      eq(calls.length, 1, "popout requested when dropped outside the window");
+      eq(calls[0], sid, "for the dragged panel's source id");
+    } finally {
+      openLogPopout = real;
+    }
+  });
+
   await T("export dialog resolves host choice", async () => {
     const p = askExportOptions();
     await until(() => dlgExport.open, "export dialog open");
@@ -1530,6 +1646,20 @@
     $("dlg-export-ok").click();
     const opts = await p;
     eq(opts.includeHost, false, "host choice returned");
+  });
+
+  await T("Hard Reset asks for confirmation first, and does nothing if declined", () => {
+    const realConfirm = window.confirm;
+    let asked = null;
+    window.confirm = (msg) => { asked = msg; return false; };
+    try {
+      const before = state.sources.length;
+      $("btn-hard-reset").click();
+      ok(asked && asked.includes("cannot be undone"), "confirm() shown, warns it's irreversible");
+      eq(state.sources.length, before, "declining leaves sources untouched");
+    } finally {
+      window.confirm = realConfirm;
+    }
   });
 
   await T("clear-sources asks for confirmation first, and does nothing if declined", () => {
@@ -1565,6 +1695,33 @@
     await post("/open", { files });
     await refreshAll();
     ok(state.sources.length >= 2, "demo files restored");
+  });
+
+  // destructive and wipes localStorage -- must stay the very last test.
+  await T("Hard Reset (confirmed) closes every source, clears localStorage, and reloads", async () => {
+    const realConfirm = window.confirm;
+    const realReload = reloadApp;
+    const realPost = post;
+    const closedIds = [];
+    let reloaded = false;
+    window.confirm = () => true;
+    reloadApp = () => { reloaded = true; };
+    post = async (path, body) => {
+      if (path === "/close") { closedIds.push(body.id); return {}; }
+      return realPost(path, body);
+    };
+    prefs.set("hardResetCanary", "should not survive");
+    try {
+      const expectedIds = state.sources.map((s) => s.id);
+      $("btn-hard-reset").click();
+      await until(() => reloaded, "reloadApp called");
+      eq(closedIds.sort().join(), expectedIds.sort().join(), "every open source was closed");
+      eq(prefs.get("hardResetCanary", null), null, "localStorage wiped");
+    } finally {
+      window.confirm = realConfirm;
+      reloadApp = realReload;
+      post = realPost;
+    }
   });
 
   localStorage.clear();

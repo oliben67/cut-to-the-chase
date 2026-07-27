@@ -1357,6 +1357,14 @@ pre.snapshot-body {
 .keys-box .radio-row { display: flex; align-items: center; gap: 6px; font-size: 13px; margin: 4px 0; }
 .keys-box .radio-row input { width: auto; }
 .keys-box legend { font-size: 12px; color: var(--text-secondary); padding: 0 4px; }
+.danger-zone { border-color: var(--critical); }
+.danger-zone legend { color: var(--critical); }
+.btn-danger {
+  background: var(--critical);
+  color: #fff;
+  border: 1px solid var(--critical);
+}
+.btn-danger:hover { background: color-mix(in srgb, var(--critical) 85%, black); }
 .keys-box input[type="text"] { flex: 1; min-width: 200px; }
 .keys-box textarea {
   width: 100%;

@@ -3,3 +3,4 @@ server/.venv/
 server/uv.lock
 demo/data/
 dist/
+build/CTTC-Manual.html

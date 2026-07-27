@@ -230,18 +230,20 @@ async function ensureRemoteContainer(cfg, { spawnFn = spawn, sshBin = "ssh", scp
 }
 
 /**
- * Stops and removes the local gateway container (Edit Gateways' Uninstall,
- * for the "This machine" entry). Leaves the image itself alone -- just the
- * container/network compose created, matching `docker compose down`'s
- * default scope.
+ * Stops and removes the local gateway container *and* its image (Edit
+ * Gateways' Uninstall, for a local-docker entry) -- `--rmi all` extends
+ * `docker compose down`'s default scope (container + network only) to also
+ * drop the image, so a re-install pulls/loads it fresh rather than silently
+ * reusing whatever's still cached.
  */
-async function uninstallLocalContainer({ spawnFn = spawn, resourcesDir } = {}) {
+async function uninstallLocalContainer({ spawnFn = spawn, resourcesDir, onLog } = {}) {
   const resolved = resolveSource(undefined, { resourcesDir });
-  await run(spawnFn, "docker", ["compose", "-f", resolved.composeFile, "down"]);
+  await run(spawnFn, "docker", ["compose", "-f", resolved.composeFile, "down", "--rmi", "all"], {}, onLog);
 }
 
 /**
- * Stops and removes a remote gateway container over ssh, then deletes the
+ * Stops and removes a remote gateway container *and* its image over ssh
+ * (see uninstallLocalContainer above for why `--rmi all`), then deletes the
  * remoteDir ensureRemoteContainer created it in (the tarball/compose file
  * copied there have no further use once uninstalled).
  * @param {{sshTarget: string, sshKey: string|null, sshPort?: number}} cfg
@@ -252,10 +254,31 @@ async function uninstallRemoteContainer(cfg, { spawnFn = spawn, sshBin = "ssh", 
   await run(
     spawnFn,
     sshBin,
-    [...ssh, `cd ${remoteDir} && docker compose down; cd "$HOME" && rm -rf ${remoteDir}`],
+    [...ssh, `cd ${remoteDir} && docker compose down --rmi all; cd "$HOME" && rm -rf ${remoteDir}`],
     {},
     onLog
   );
+}
+
+// Best-effort post-mortem for a failed uninstall: reports (via onLog,
+// non-fatal either way) whether the container is actually still there --
+// `docker compose down` can exit non-zero after partially succeeding, so a
+// reported error doesn't necessarily mean nothing happened. Never throws:
+// this is diagnostic information for the activity log, not a result the
+// caller should have to handle failing itself.
+async function checkStillInstalled(entry, { spawnFn = spawn, resourcesDir, sshBin = "ssh", onLog } = {}) {
+  onLog?.("$ checking whether the container is still there...");
+  try {
+    if (entry.mode === "embedded") {
+      const resolved = resolveSource(undefined, { resourcesDir });
+      await run(spawnFn, "docker", ["compose", "-f", resolved.composeFile, "ps", "-a"], {}, onLog);
+    } else {
+      const ssh = sshExecArgs({ sshTarget: entry.sshTarget, sshKey: entry.sshKey, sshPort: entry.sshPort });
+      await run(spawnFn, sshBin, [...ssh, "cd cttc-gateway && docker compose ps -a"], {}, onLog);
+    }
+  } catch (err) {
+    onLog?.(`  could not check: ${err.message}`);
+  }
 }
 
 module.exports = {
@@ -268,4 +291,5 @@ module.exports = {
   ensureRemoteContainer,
   uninstallLocalContainer,
   uninstallRemoteContainer,
+  checkStillInstalled,
 };

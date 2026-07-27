@@ -789,6 +789,36 @@ class TestSshParamikoHelpers:
     def test_parse_docker_size_garbage_is_zero(self):
         assert server._parse_docker_size("--") == 0.0
 
+    def test_exec_remote_docker_logs_the_command_and_a_clean_exit_at_debug(self, caplog):
+        class FakeExecClient:
+            def exec_command(self, cmd, timeout=None):
+                stdout = types.SimpleNamespace(
+                    read=lambda: b"ok\n", channel=types.SimpleNamespace(recv_exit_status=lambda: 0)
+                )
+                stderr = types.SimpleNamespace(read=lambda: b"")
+                return None, stdout, stderr
+
+        with caplog.at_level("DEBUG", logger="cttc"):
+            out, err, rc = server._exec_remote_docker(FakeExecClient(), ["ps"], timeout=5)
+        assert (out, err, rc) == ("ok\n", "", 0)
+        messages = [r.message for r in caplog.records if r.name == "cttc"]
+        assert any("sudo docker ps" in m and "exit 0" in m for m in messages), messages
+
+    def test_exec_remote_docker_logs_a_nonzero_exit_at_info_with_stderr(self, caplog):
+        class FakeExecClient:
+            def exec_command(self, cmd, timeout=None):
+                stdout = types.SimpleNamespace(
+                    read=lambda: b"", channel=types.SimpleNamespace(recv_exit_status=lambda: 1)
+                )
+                stderr = types.SimpleNamespace(read=lambda: b"permission denied")
+                return None, stdout, stderr
+
+        with caplog.at_level("INFO", logger="cttc"):
+            _out, err, rc = server._exec_remote_docker(FakeExecClient(), ["ps"], timeout=5)
+        assert rc == 1 and err == "permission denied"
+        messages = [r.message for r in caplog.records if r.name == "cttc"]
+        assert any("exit 1" in m and "permission denied" in m for m in messages), messages
+
 
 class TestNormalizeDockerHost:
     def test_none_and_empty(self):
@@ -1813,6 +1843,35 @@ class TestHttpApi:
         code, j = get(base, "/range")
         assert j["min_ts"] == ms(2026, 1, 2, 3, 0, 0)
         assert j["max_ts"] == ms(2026, 1, 2, 3, 0, 10)
+
+    def test_every_request_is_access_logged_in_detail(self, api, caplog):
+        base, _ = api
+        with caplog.at_level("INFO", logger="cttc"):
+            code, _ = get(base, "/sources")
+        assert code == 200
+        lines = [r.message for r in caplog.records if r.name == "cttc"]
+        match = next((m for m in lines if "/sources" in m), None)
+        assert match, lines
+        assert match.startswith("GET /sources")
+        assert "200" in match
+        assert "ms)" in match  # timing recorded
+
+    def test_access_log_includes_query_string_and_client(self, api, caplog):
+        base, st = api
+        sid = next(s.id for s in st.sources.values() if s.kind == "log")
+        with caplog.at_level("INFO", logger="cttc"):
+            get(base, f"/logs?source={sid}&start=0&count=10")
+        match = next((r.message for r in caplog.records if r.name == "cttc" and "/logs" in r.message), None)
+        assert match
+        assert f"?source={sid}&start=0&count=10" in match
+        assert "127.0.0.1" in match
+
+    def test_access_log_reflects_error_status_codes(self, api, caplog):
+        base, _ = api
+        with caplog.at_level("INFO", logger="cttc"):
+            get(base, "/logs?source=nope")
+        match = next((r.message for r in caplog.records if r.name == "cttc" and "/logs" in r.message), None)
+        assert match and " 400 " in match
 
     def test_range_empty(self, tmp_path):
         base, srv, t = boot_server(server.State(tmp_path))

@@ -18,6 +18,7 @@ const {
   ensureRemoteContainer,
   uninstallLocalContainer,
   uninstallRemoteContainer,
+  checkStillInstalled,
 } = require("./lib/server-provision");
 const { readGateways, recordGateway, removeGateway, gatewayKey } = require("./lib/gateway-registry");
 const { openSshTunnel, closeSshTunnel } = require("./lib/ssh-tunnel");
@@ -34,11 +35,26 @@ const SERVER_DIR = path.join(__dirname, "server");
 const APP_ICON = path.join(__dirname, "assets", "icon.png");
 // one-liner as published on GitHub (kept in sync with package.json's "description")
 const APP_TAGLINE = "Correlate container telemetry with service logs on a shared clickable timeline";
-// in-app "?" help buttons link here, one anchor per User Manual section
+// in-app "?" help buttons and About > User Manual open this -- a local,
+// self-contained copy bundled next to the app (see package.json's
+// extraResources and build/build-manual.js, which generates it from
+// MANUAL.md) so the manual works offline and doesn't depend on GitHub being
+// reachable. Falls back to the GitHub copy only if that file is somehow
+// missing (e.g. an unpackaged dev checkout that never ran build:manual).
 const HELP_URL = "https://github.com/oliben67/cut-to-the-chase/blob/main/MANUAL.md";
 const HELP_TOPICS = {
   frequency: "#the-cursor-and-the-frequency-window",
 };
+function localManualPath() {
+  const p = app.isPackaged
+    ? path.join(process.resourcesPath, "CTTC-Manual.html")
+    : path.join(__dirname, "build", "CTTC-Manual.html");
+  return fs.existsSync(p) ? p : null;
+}
+function helpUrl(anchor) {
+  const local = localManualPath();
+  return local ? `file://${local}${anchor}` : HELP_URL + anchor;
+}
 let serverProc = null;
 // serverHost/serverPort are the actual address the client (renderer + this
 // process's own fetch calls) talks to -- 127.0.0.1 for embedded/local *and*
@@ -264,7 +280,7 @@ function startServer(extraArgs) {
   });
 }
 
-function showAboutDialog() {
+async function showAboutDialog() {
   const stack = [
     `Electron ${process.versions.electron}`,
     `Chromium ${process.versions.chrome}`,
@@ -273,7 +289,7 @@ function showAboutDialog() {
     "orjson >=3.10",
     "psutil >=5.9",
   ];
-  dialog.showMessageBox({
+  const { response } = await dialog.showMessageBox({
     type: "info",
     icon: APP_ICON,
     title: `About ${app.name}`,
@@ -284,9 +300,11 @@ function showAboutDialog() {
       `\u00A9 ${new Date().getFullYear()} Olivier Steck\n\n` +
       `Built with:\n${stack.map((s) => `  \u2022 ${s}`).join("\n")}\n\n` +
       `Icons by Flaticon (flaticon.com)`,
-    buttons: ["OK"],
+    buttons: ["OK", "User Manual"],
+    defaultId: 0,
     noLink: true,
   });
+  if (response === 1) await shell.openExternal(helpUrl(""));
 }
 
 // menu items that just trigger something in the renderer (open a dialog,
@@ -527,7 +545,7 @@ ipcMain.handle("pick-files", async (_e, title) => {
 
 ipcMain.handle("open-help", async (_e, topic) => {
   const anchor = HELP_TOPICS[topic] || "";
-  await shell.openExternal(HELP_URL + anchor);
+  await shell.openExternal(helpUrl(anchor));
 });
 
 // phase 3 of docs/architecture/remote-server.md: the renderer fetches a
@@ -1442,18 +1460,24 @@ ipcMain.handle("gateway-manage-save", async (_e, payload) => {
   }
 });
 
-// Stops and removes the gateway's container (locally, or over ssh for a
-// remote one), then drops it from the recorded list. Uninstalling the
-// *currently active* gateway reverts connection.json to embedded mode
-// (nothing else left to point at) and offers a restart.
+// Stops and removes the gateway's container *and* image (locally, or over
+// ssh for a remote one), then drops it from the recorded list. Uninstalling
+// the *currently active* gateway reverts connection.json to embedded mode
+// (nothing else left to point at) and offers a restart. Streams progress to
+// the same activity log New/Edit Gateway use (see gw-activity/onSetupLog in
+// app.js) rather than uninstalling silently; on failure, also checks (and
+// logs) whether the container is actually still there -- `docker compose
+// down` can exit non-zero after partially succeeding, so the raw error
+// alone doesn't tell you whether anything's left to clean up by hand.
 ipcMain.handle("gateway-manage-uninstall", async (_e, entry) => {
+  const onLog = (line) => mainWindow?.webContents.send("setup-log", line);
   try {
     if (entry.mode === "embedded") {
-      await uninstallLocalContainer({ resourcesDir: resourcesDirForApp() });
+      await uninstallLocalContainer({ resourcesDir: resourcesDirForApp(), onLog });
     } else {
       await uninstallRemoteContainer(
         { sshTarget: entry.sshTarget, sshKey: entry.sshKey, sshPort: entry.sshPort },
-        { sshBin: process.env.CTTC_SSH_BIN || "ssh" }
+        { sshBin: process.env.CTTC_SSH_BIN || "ssh", onLog }
       );
     }
     removeGateway(gatewayKey(entry));
@@ -1470,6 +1494,11 @@ ipcMain.handle("gateway-manage-uninstall", async (_e, entry) => {
     }
     return { ok: true };
   } catch (err) {
+    await checkStillInstalled(entry, {
+      resourcesDir: resourcesDirForApp(),
+      sshBin: process.env.CTTC_SSH_BIN || "ssh",
+      onLog,
+    });
     return { ok: false, error: err.message || String(err) };
   }
 });
