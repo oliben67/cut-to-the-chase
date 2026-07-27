@@ -252,15 +252,21 @@ Daemon** syncs exactly to what's checked here: unticking an
 already-followed container stops following it, the same as if you'd closed
 its panel.
 
-Once a daemon is set, **Edit Docker Daemon…** re-opens this same form with
-the host and SSH key pre-filled and locked, **Fetch** relabelled
-**Refresh** (just re-probes for new containers/services rather than
-starting over), and the bottom button relabelled **Update Docker Daemon**.
-The checklist itself isn't blank while you wait for a Refresh — it starts
-pre-filled with every container/service already being followed, checked
-and immediately interactive, so you can untick something (or just click
-**Update Docker Daemon**) right away; **Refresh** additionally re-probes
-the live daemon for anything new or gone since you last set it.
+**Edit Docker Daemon…** and **Remove Docker Daemon** are only enabled once
+a daemon is actually being watched — nothing to edit or remove otherwise.
+Once one is set, **Edit Docker Daemon…** re-opens this same form with the
+host and SSH key pre-filled and locked, **Fetch** relabelled **Refresh**
+(just re-probes for new containers/services rather than starting over),
+and the bottom button relabelled **Update Docker Daemon**. The checklist
+itself isn't blank while you wait for a Refresh — it starts pre-filled with
+every container/service already being followed, checked and immediately
+interactive, so you can untick something (or just click **Update Docker
+Daemon**) right away. **Refresh** diffs the checklist against the daemon's
+actual current state rather than replacing it wholesale: a container
+that's gone (stopped/removed) drops off the list, a new one appears
+ticked, and anything still there keeps exactly whatever you last
+checked/unchecked it to — Refresh never silently discards an in-progress
+edit.
 
 ### Remote hosts over SSH
 

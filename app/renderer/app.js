@@ -1055,6 +1055,25 @@ function currentDockerHost() {
   return null;
 }
 
+// Whether *any* docker:// source (stats/host/container/service, local or
+// remote) is currently open -- unlike currentDockerHost() above, this is a
+// plain yes/no including the local daemon, which currentDockerHost()
+// deliberately reports as null (it's answering "what host string, if any,
+// should a form pre-fill", not "is a daemon being watched at all").
+function hasDockerDaemon() {
+  return state.sources.some((s) => /^docker:\/\//.test(s.path || ""));
+}
+
+// Edit/Remove Docker Daemon only make sense once something is actually
+// being watched -- enabling them regardless invited editing/removing a
+// daemon that doesn't exist (Edit would show a locked, empty form; Remove
+// had nothing to close). Called after every state.sources refresh.
+function syncDockerDaemonButtons() {
+  const active = hasDockerDaemon();
+  $("btn-edit-docker-daemon").disabled = !active;
+  $("btn-clear-sources").disabled = !active;
+}
+
 const dlgExport = $("dlg-export");
 
 async function askExportOptions() {
@@ -2155,6 +2174,7 @@ async function refreshAll() {
     state.range = range;
     $("empty-state").hidden = state.sources.length > 0;
     syncPanels();
+    syncDockerDaemonButtons();
     if (range.min_ts != null && !hadView) {
       if (POPOUT_KIND) {
         // popout fallback (no view handed over): fit quietly, never yank the
@@ -2745,7 +2765,12 @@ $("btn-activity-toggle").onclick = () => {
 // result and btn-edit-docker-daemon's immediate pre-fill from already-open
 // sources (see renderDockerTargets below), so both end up with the exact
 // same look/behavior (group-select-all header, "already added" badge).
-function renderDockerTargetGroup(box, open, hostKey, title, items, type) {
+// `wasChecked` (name+type -> bool) carries over whatever the user had
+// ticked/unticked in the checklist *before* this render -- a Refresh must
+// update the list to match the daemon's actual current state (new
+// containers appear, gone ones disappear) without silently re-ticking
+// something the user had just deliberately unchecked.
+function renderDockerTargetGroup(box, open, hostKey, title, items, type, wasChecked) {
   if (!items.length) return;
   const g = document.createElement("div");
   g.className = "group";
@@ -2765,7 +2790,11 @@ function renderDockerTargetGroup(box, open, hostKey, title, items, type) {
     const label = document.createElement("label");
     const cb = document.createElement("input");
     cb.type = "checkbox";
-    cb.checked = true; // every detected/already-followed container/service starts ticked
+    // Newly seen (never rendered before) starts ticked, matching "every
+    // detected/already-followed container/service starts ticked" -- one
+    // already in the checklist keeps whatever the user last left it at.
+    const key = `${type}:${it.name}`;
+    cb.checked = wasChecked.has(key) ? wasChecked.get(key) : true;
     cb.value = it.name;
     cb.dataset.type = type;
     groupBoxes.push(cb);
@@ -2789,13 +2818,23 @@ function renderDockerTargetGroup(box, open, hostKey, title, items, type) {
 // Repopulates #docker-targets from a {name, image?, replicas?}[] pair --
 // either a live `docker ps` result (listContainers) or, immediately on
 // opening Edit Docker Daemon (before any Refresh), whatever's already being
-// followed for this host (see btn-edit-docker-daemon below).
+// followed for this host (see btn-edit-docker-daemon below). Re-renders
+// are a diff against the checklist's own current state, not a blind wipe:
+// a Refresh that finds a container gone (stopped/removed) drops it, one
+// that's new appears ticked, and anything still there keeps exactly
+// whatever the user last checked/unchecked it to -- "check if anything
+// changed server-side and update the list accordingly" without discarding
+// in-progress edits.
 function renderDockerTargets(containers, services, hostKey) {
   const box = $("docker-targets");
+  const wasChecked = new Map();
+  for (const cb of box.querySelectorAll("input[type=checkbox]")) {
+    wasChecked.set(`${cb.dataset.type}:${cb.value}`, cb.checked);
+  }
   box.innerHTML = "";
   const open = openPaths();
-  renderDockerTargetGroup(box, open, hostKey, "Swarm services (docker service logs)", services, "service");
-  renderDockerTargetGroup(box, open, hostKey, "Containers (docker logs)", containers, "container");
+  renderDockerTargetGroup(box, open, hostKey, "Swarm services (docker service logs)", services, "service", wasChecked);
+  renderDockerTargetGroup(box, open, hostKey, "Containers (docker logs)", containers, "container", wasChecked);
   if (!services.length && !containers.length) box.textContent = "nothing running";
 }
 

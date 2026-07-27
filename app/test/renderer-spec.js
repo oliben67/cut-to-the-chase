@@ -659,9 +659,12 @@
   await T("Edit Docker Daemon pre-fills and locks host/ssh-key, relabels buttons", () => {
     const fakeSrc = { id: "__edit_test", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
     state.sources.push(fakeSrc);
+    syncDockerDaemonButtons(); // a real app calls this via refreshAll() whenever state.sources changes
     dockerHostKeys.set("ssh://u@h", "/path/to/key");
     try {
       eq(currentDockerHost(), "ssh://u@h", "host resolved correctly (not truncated to 'ssh:')");
+      eq($("btn-edit-docker-daemon").disabled, false, "Edit enabled once a daemon is being watched");
+      eq($("btn-clear-sources").disabled, false, "Remove enabled once a daemon is being watched");
       $("btn-edit-docker-daemon").click();
       eq($("docker-host").value, "u@h", "host prefilled (scheme stripped for editing)");
       eq($("docker-host").disabled, true, "host locked");
@@ -673,6 +676,7 @@
       eq($("dlg-set-title").textContent, "Edit Docker Daemon", "dialog titled for editing, not creating");
     } finally {
       state.sources = state.sources.filter((s) => s.id !== "__edit_test");
+      syncDockerDaemonButtons();
       dockerHostKeys.delete("ssh://u@h");
       dlg.close();
       $("btn-set").click(); // resets host/ssh-key/labels back to create-mode defaults
@@ -680,11 +684,18 @@
     }
   });
 
+  await T("Edit/Remove Docker Daemon are disabled when no daemon is being watched", () => {
+    ok(!hasDockerDaemon(), "no docker:// source open in this suite's baseline state");
+    eq($("btn-edit-docker-daemon").disabled, true, "Edit disabled");
+    eq($("btn-clear-sources").disabled, true, "Remove disabled");
+  });
+
   await T("Edit Docker Daemon pre-fills the checklist with already-followed containers/services before any Refresh", () => {
     const fakeStats = { id: "__prefill_stats", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
     const fakeContainer = { id: "__prefill_c", path: "docker://ssh://u@h/container/demo-c", name: "demo-c", kind: "log", live: true };
     const fakeService = { id: "__prefill_s", path: "docker://ssh://u@h/service/demo-svc", name: "demo-svc", kind: "log", live: true };
     state.sources.push(fakeStats, fakeContainer, fakeService);
+    syncDockerDaemonButtons();
     dockerHostKeys.set("ssh://u@h", "/path/to/key");
     try {
       $("btn-edit-docker-daemon").click();
@@ -698,6 +709,7 @@
       ok($("docker-targets").querySelectorAll("label.added").length === 2, "both marked already added");
     } finally {
       state.sources = state.sources.filter((s) => !s.id.startsWith("__prefill_"));
+      syncDockerDaemonButtons();
       dockerHostKeys.delete("ssh://u@h");
       dlg.close();
       $("btn-set").click();
@@ -708,6 +720,7 @@
   await T("Refresh in Edit Docker Daemon re-fetches, leaves checkboxes selectable, and keeps host/ssh-key locked", async () => {
     const fakeSrc = { id: "__edit_test2", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
     state.sources.push(fakeSrc);
+    syncDockerDaemonButtons();
     dockerHostKeys.set("ssh://u@h", "/path/to/key");
     const realPost = post;
     const realGet = get;
@@ -729,6 +742,51 @@
       post = realPost;
       get = realGet;
       state.sources = state.sources.filter((s) => s.id !== "__edit_test2");
+      syncDockerDaemonButtons();
+      dockerHostKeys.delete("ssh://u@h");
+      dlg.close();
+      $("btn-set").click();
+      dlg.close();
+    }
+  });
+
+  await T("Refresh diffs against the daemon's real state: gone containers drop, new ones appear checked, unchanged ones keep the user's own tick", async () => {
+    const fakeContainerA = { id: "__diff_a", path: "docker://ssh://u@h/container/demo-a", name: "demo-a", kind: "log", live: true };
+    const fakeContainerB = { id: "__diff_b", path: "docker://ssh://u@h/container/demo-b", name: "demo-b", kind: "log", live: true };
+    state.sources.push(fakeContainerA, fakeContainerB);
+    syncDockerDaemonButtons();
+    dockerHostKeys.set("ssh://u@h", "/path/to/key");
+    const realPost = post;
+    const realGet = get;
+    // The real daemon now only has demo-a (demo-b was removed) plus a
+    // brand-new demo-c that was never tracked before.
+    post = async (path, body) => {
+      if (path === "/docker/ps") {
+        return { containers: [{ id: "a", name: "demo-a" }, { id: "c", name: "demo-c" }], services: [], log: [] };
+      }
+      return realPost(path, body);
+    };
+    get = async (path) => (path === "/transforms" ? { transforms: [] } : realGet(path));
+    try {
+      $("btn-edit-docker-daemon").click();
+      // pre-filled immediately from currentlyTrackedTargets, before any Refresh
+      let names = [...$("docker-targets").querySelectorAll("input[type=checkbox]")].map((cb) => cb.value);
+      eq(names.sort().join(), "demo-a,demo-b", "pre-filled with both already-tracked containers");
+      // the user deliberately unchecks demo-a before refreshing
+      const cbA = [...$("docker-targets").querySelectorAll("input[type=checkbox]")].find((cb) => cb.value === "demo-a");
+      cbA.checked = false;
+      $("btn-ps-refresh").click();
+      await until(() => $("docker-targets").textContent.includes("demo-c"), "checklist updated after Refresh");
+      const boxes = [...$("docker-targets").querySelectorAll("input[type=checkbox]")];
+      names = boxes.map((cb) => cb.value);
+      eq(names.sort().join(), "demo-a,demo-c", "demo-b (gone server-side) dropped, demo-c (new) appears");
+      eq(boxes.find((cb) => cb.value === "demo-a").checked, false, "demo-a's deliberate uncheck survives the Refresh");
+      eq(boxes.find((cb) => cb.value === "demo-c").checked, true, "demo-c (newly seen) starts checked");
+    } finally {
+      post = realPost;
+      get = realGet;
+      state.sources = state.sources.filter((s) => !s.id.startsWith("__diff_"));
+      syncDockerDaemonButtons();
       dockerHostKeys.delete("ssh://u@h");
       dlg.close();
       $("btn-set").click();
@@ -1731,6 +1789,13 @@
     const realConfirm = window.confirm;
     let asked = null;
     window.confirm = (msg) => { asked = msg; return false; };
+    // Only enabled while a docker daemon is being watched (see
+    // syncDockerDaemonButtons) -- this test is about the confirm/decline
+    // behavior of the click handler itself, exercised directly regardless
+    // of whether the demo's file-only sources would otherwise leave it
+    // disabled.
+    const wasDisabled = $("btn-clear-sources").disabled;
+    $("btn-clear-sources").disabled = false;
     try {
       const before = state.sources.length;
       $("btn-clear-sources").click();
@@ -1738,6 +1803,7 @@
       eq(state.sources.length, before, "declining leaves sources untouched");
     } finally {
       window.confirm = realConfirm;
+      $("btn-clear-sources").disabled = wasDisabled;
     }
   });
 
@@ -1750,11 +1816,14 @@
     ok(files.length >= 2, "have demo files to restore");
     const realConfirm = window.confirm;
     window.confirm = () => true;
+    const wasDisabled = $("btn-clear-sources").disabled;
+    $("btn-clear-sources").disabled = false;
     try {
       $("btn-clear-sources").click();
       await until(() => state.sources.length === 0, "all sources closed");
     } finally {
       window.confirm = realConfirm;
+      $("btn-clear-sources").disabled = wasDisabled;
     }
     eq($("empty-state").hidden, false, "empty state visible again");
     await post("/open", { files });
