@@ -93,6 +93,14 @@ const state = {
   track: prefs.get("track", {}),           // series name -> "sel" | "mut" | "hid"
   showOthers: prefs.get("showOthers", true), // list not-selected containers in legend
   poppedOut: new Set(),   // "telemetry" and/or log source ids moved to their own window
+  // log source name -> stable position among sibling panels, assigned once
+  // per name and kept forever after -- lets a panel hidden (legend
+  // click/close) or popped-out-then-brought-back land back in the exact
+  // slot it had before instead of wherever syncPanels() happens to (re)add
+  // it. Keyed by name (not the ephemeral per-session source id) so it
+  // survives the source itself being closed and reopened, same as
+  // state.track/state.visible above.
+  panelOrder: prefs.get("panelOrder", {}),
 };
 
 /* Tracking states: "sel" plots + normal legend entry; "mut" (not selected)
@@ -867,6 +875,7 @@ function renderLegend() {
     item.onclick = () => {
       state.visible.set(s.name, state.visible.get(s.name) === false);
       relist();
+      syncPanels(); // this container's log panel (if any) hides/reappears alongside its chart series
     };
     item.oncontextmenu = (e) => ctxMenu(e, [
       ...seriesPopoutMenuEntry(s),
@@ -978,7 +987,10 @@ function hasHostSeries() {
 // use if we need to start host-telemetry collection from the export dialog
 function currentDockerHost() {
   for (const s of state.sources) {
-    const m = /^docker:\/\/([^/]+)\//.exec(s.path || "");
+    // hostkey itself is "local" or a full "ssh://user@host[:port]" (which
+    // has its own slashes) -- a plain "up to the first slash" match would
+    // truncate that down to just "ssh:".
+    const m = /^docker:\/\/(local|ssh:\/\/[^/]+)\//.exec(s.path || "");
     if (m) return m[1] === "local" ? null : m[1];
   }
   return null;
@@ -1656,8 +1668,16 @@ class Panel {
     const close = document.createElement("button");
     close.className = "close";
     close.textContent = "✕";
-    close.title = "Close source";
-    close.onclick = async () => { await post("/close", { id: src.id }); refreshAll(); };
+    close.title = "Disable this container's telemetry (logs + chart) -- keeps collecting in the background, still Set Docker Daemon-synced";
+    // Same hide as switching it off from the Telemetry legend -- not an
+    // actual /close: collection keeps running server-side, and re-enabling
+    // it (from the legend) brings this exact panel back at the same spot,
+    // since it never actually left panels/#panels.
+    close.onclick = () => {
+      state.visible.set(src.name, false);
+      relist();
+      syncPanels();
+    };
     const right = document.createElement("div");
     right.className = "panel-head-right";
     right.append(popout, close);
@@ -1894,6 +1914,17 @@ class Panel {
 
 }
 
+// Assigns (once) or looks up a log panel's stable position among its
+// siblings -- see state.panelOrder's own comment.
+function orderOf(name) {
+  if (!(name in state.panelOrder)) {
+    const used = Object.values(state.panelOrder);
+    state.panelOrder[name] = used.length ? Math.max(...used) + 1 : 0;
+    prefs.set("panelOrder", state.panelOrder);
+  }
+  return state.panelOrder[name];
+}
+
 function syncPanels() {
   let logs = state.sources.filter((s) => s.kind === "log");
   if (POPOUT_KIND === "log") logs = logs.filter((s) => s.id === POPOUT_ID);
@@ -1913,7 +1944,19 @@ function syncPanels() {
     } else {
       p.update(s);
     }
-    p.el.hidden = isSampleHidden(s.id);
+    // Hidden (not removed) when its container's telemetry was switched off
+    // via the legend or the panel's own close button (see Panel's close
+    // handler) -- collection keeps running server-side either way, so it's
+    // still right here, at the exact same spot, whenever it's switched back on.
+    p.el.hidden = isSampleHidden(s.id) || state.visible.get(s.name) === false;
+  }
+  // Reorders the DOM to match panelOrder every sync -- appendChild on an
+  // already-attached node just moves it, so this is cheap and keeps a
+  // popped-out-then-brought-back (or hidden-then-shown) panel in its
+  // original slot relative to its siblings rather than wherever it was
+  // (re)created just now.
+  for (const sid of [...panels.keys()].sort((a, b) => orderOf(panels.get(a).src.name) - orderOf(panels.get(b).src.name))) {
+    panelsEl.appendChild(panels.get(sid).el);
   }
 }
 
@@ -2021,6 +2064,39 @@ function updateDockerDupes() {
 // what's running on the host currently typed in (see setDockerFormEnabled),
 // so nothing here is populated or enabled speculatively.
 $("btn-set").onclick = () => {
+  $("docker-host").value = "";
+  $("docker-host").disabled = false;
+  $("docker-ssh-key").value = "";
+  $("docker-ssh-key").disabled = false;
+  $("docker-ssh-key-browse").disabled = false;
+  $("btn-ps-refresh").textContent = "Fetch";
+  $("dlg-ok").textContent = "Set Docker Daemon";
+  $("docker-targets").innerHTML = "";
+  $("transforms-list").innerHTML = "none found in server/transforms/";
+  $("docker-error").textContent = "";
+  setDockerFormEnabled(false);
+  updateDockerDupes();
+  renderActivityLog(null);
+  dlg.showModal();
+};
+
+// Reopens the same dialog pre-pointed at whatever Docker daemon is
+// currently active (see currentDockerHost()/dockerHostKeys) -- host and ssh
+// key are locked (this is "reconfigure/refresh what's already set", not
+// "pick a new target": use Set Docker Daemon for that), and Fetch becomes
+// Refresh, since it's re-probing a known daemon rather than connecting to a
+// new one. Submitting still goes through the same dlg-ok handler as the
+// create flow -- disabled inputs' .value reads normally, so nothing there
+// needs to branch on which button opened the dialog.
+$("btn-edit-docker-daemon").onclick = () => {
+  const host = currentDockerHost();
+  $("docker-host").value = host ? host.replace(/^ssh:\/\//, "") : "";
+  $("docker-host").disabled = true;
+  $("docker-ssh-key").value = dockerHostKeys.get(host || "local") || "";
+  $("docker-ssh-key").disabled = true;
+  $("docker-ssh-key-browse").disabled = true;
+  $("btn-ps-refresh").textContent = "Refresh";
+  $("dlg-ok").textContent = "Update Docker Daemon";
   $("docker-targets").innerHTML = "";
   $("transforms-list").innerHTML = "none found in server/transforms/";
   $("docker-error").textContent = "";
@@ -2583,9 +2659,18 @@ $("dlg-ok").onclick = async () => {
     // already being followed for this host that isn't checked now gets
     // closed, not just left running alongside whatever's newly picked.
     const keep = new Set(logs.map((l) => `docker://${hostKey}/${l.type}/${l.name}`));
+    // hostKey itself may be a full "ssh://user@host[:port]" (its own
+    // slashes), so a capture-group regex here would wrongly stop at the
+    // first slash inside it -- hostKey is already known exactly, so just
+    // match this host's prefix directly instead of re-extracting it.
+    const hostPrefix = `docker://${hostKey}/`;
     const toClose = state.sources.filter((s) => {
-      const m = /^docker:\/\/([^/]+)\/(container|service)\/.+$/.exec(s.path || "");
-      return m && m[1] === hostKey && !keep.has(s.path);
+      const p = s.path || "";
+      return (
+        p.startsWith(hostPrefix) &&
+        /^(container|service)\//.test(p.slice(hostPrefix.length)) &&
+        !keep.has(p)
+      );
     });
     for (const s of toClose) await post("/close", { id: s.id });
 
@@ -3595,6 +3680,7 @@ if (!POPOUT_KIND) {
 
   const RENDERER_ACTIONS = {
     "set-sources": () => $("btn-set").click(),
+    "edit-docker-daemon": () => $("btn-edit-docker-daemon").click(),
     "clear-sources": () => $("btn-clear-sources").click(),
     "load-metrics": () => $("btn-load-sample").click(),
     "new-gateway": () => openNewGatewayDialog(),
@@ -3665,6 +3751,7 @@ if (!POPOUT_KIND) {
       if (dock === "detached") window.cttc?.openActionBarWindow?.();
       else window.cttc?.closeActionBarWindow?.();
       updateCollapseToggleIcon();
+      applyActionBarSize();
     }
     for (const b of actionBar.querySelectorAll(".ab-dock-btn[data-dock-to]")) {
       b.onclick = () => setDock(b.dataset.dockTo);
@@ -3689,8 +3776,53 @@ if (!POPOUT_KIND) {
       prefs.set("actionBarCollapsed", collapsed);
       actionBar.dataset.collapsed = String(collapsed);
       updateCollapseToggleIcon();
+      applyActionBarSize();
     }
     collapseToggle.onclick = () => setActionBarCollapsed(actionBar.dataset.collapsed !== "true");
+
+    // Drag-resize the sidebar via #action-bar-splitter (see style.css for
+    // its positioning, which reuses the same row/row-reverse/column/
+    // column-reverse trick #action-bar's own edge placement relies on).
+    // Persisted per axis, not per dock direction, so switching left<->right
+    // (or top<->bottom) keeps whatever size was set rather than resetting
+    // it -- only collapsing (the rail's own fixed size, set in CSS) and
+    // "detached" (no docked bar at all) skip applying it.
+    const ACTION_BAR_MIN = 120, ACTION_BAR_MAX = 480;
+    function applyActionBarSize() {
+      if (actionBar.dataset.collapsed === "true") return;
+      const dock = appBody.dataset.dock;
+      if (dock === "left" || dock === "right") {
+        actionBar.style.width = prefs.get("actionBarWidth", 210) + "px";
+        actionBar.style.height = "";
+      } else if (dock === "top" || dock === "bottom") {
+        actionBar.style.height = prefs.get("actionBarHeight", 210) + "px";
+        actionBar.style.width = "";
+      }
+    }
+    const splitter = $("action-bar-splitter");
+    splitter.addEventListener("mousedown", (e) => {
+      const dock = appBody.dataset.dock;
+      if (dock === "detached" || actionBar.dataset.collapsed === "true") return;
+      e.preventDefault();
+      splitter.classList.add("dragging");
+      const rect = actionBar.getBoundingClientRect();
+      const startX = e.clientX, startY = e.clientY, startW = rect.width, startH = rect.height;
+      const clamp = (v) => Math.min(ACTION_BAR_MAX, Math.max(ACTION_BAR_MIN, v));
+      const move = (ev) => {
+        if (dock === "left") actionBar.style.width = clamp(startW + (ev.clientX - startX)) + "px";
+        else if (dock === "right") actionBar.style.width = clamp(startW - (ev.clientX - startX)) + "px";
+        else if (dock === "top") actionBar.style.height = clamp(startH + (ev.clientY - startY)) + "px";
+        else if (dock === "bottom") actionBar.style.height = clamp(startH - (ev.clientY - startY)) + "px";
+      };
+      const up = () => {
+        window.removeEventListener("mousemove", move);
+        splitter.classList.remove("dragging");
+        if (dock === "left" || dock === "right") prefs.set("actionBarWidth", parseInt(actionBar.style.width, 10));
+        else prefs.set("actionBarHeight", parseInt(actionBar.style.height, 10));
+      };
+      window.addEventListener("mousemove", move);
+      window.addEventListener("mouseup", up, { once: true });
+    });
 
     setDock(prefs.get("actionBarDock", "left"));
     setActionBarCollapsed(prefs.get("actionBarCollapsed", false));

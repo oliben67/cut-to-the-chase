@@ -162,8 +162,8 @@ class TransformRegistry:
                         break
                     if line:
                         break
-            except OSError:
-                pass
+            except OSError as e:
+                logger.debug("could not read transform doc from %s: %s", p, e)
             out.append({"name": p.stem, "doc": doc})
         return out
 
@@ -289,7 +289,8 @@ class LogSource:
         if body.startswith("{") and body.endswith("}"):
             try:
                 fields = jloads(body)
-            except Exception:
+            except Exception as e:
+                logger.debug("log line looked like json but didn't parse: %s", e)
                 fields = {}
             if isinstance(fields, dict) and ts is None:
                 for f in TS_FIELDS:
@@ -405,7 +406,8 @@ class StatsSource:
         if stripped.startswith("["):  # whole-file JSON array (jsonify-stats output)
             try:
                 entries = jloads(stripped)
-            except Exception:
+            except Exception as e:
+                logger.debug("whole-array json didn't parse yet, treating as incomplete: %s", e)
                 self._pending_partial = data
                 return 0
             self._pending_partial = b""
@@ -421,7 +423,8 @@ class StatsSource:
                 continue
             try:
                 e = jloads(bline)
-            except Exception:
+            except Exception as ex:
+                logger.debug("skipping unparseable log line: %s", ex)
                 self.skipped += 1
                 continue
             n += self._ingest_entry(e)
@@ -702,7 +705,8 @@ def list_ssh_keys() -> list[str]:
             try:
                 with open(p, "rb") as f:
                     head = f.read(80)
-            except OSError:
+            except OSError as e:
+                logger.debug("could not read %s while listing ssh keys: %s", p, e)
                 continue
             if b"PRIVATE KEY" in head:
                 keys.append(str(p))
@@ -956,8 +960,8 @@ class DockerStatsSource(StatsSource):
         if self._ssh_client is not None:
             try:
                 self._ssh_client.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("error closing ssh client for %s: %s", self.path, e)
             self._ssh_client = None
 
     def _sample_local(self):
@@ -968,10 +972,11 @@ class DockerStatsSource(StatsSource):
         for c in containers:
             try:
                 raw = c.stats(stream=False)
-            except Exception:
+            except Exception as e:
                 # one container's stats() call failing (removed mid-poll,
                 # a transient connection hiccup, ...) must not blank out
                 # every other container's sample for this tick
+                logger.debug("stats() failed for container %s: %s", c.name, e)
                 continue
             cpu, mem, mem_bytes, net_total = _cpu_mem_net_from_raw(raw)
             rate = self._net_rate(c.name, ts_ms, net_total)
@@ -1020,6 +1025,7 @@ class DockerStatsSource(StatsSource):
             except asyncio.CancelledError:
                 raise
             except Exception as e:
+                logger.debug("stats poll failed for %s: %s", self.path, e)
                 self.error = f"{type(e).__name__}: {e}"[:500]
                 self._close_ssh()  # force a fresh connection next tick
             await asyncio.sleep(max(0.5, self.interval - (time.time() - t_start)))
@@ -1086,6 +1092,7 @@ class HostStatsSource(StatsSource):
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
+                    logger.debug("host stats poll failed for %s: %s", self.path, e)
                     self.error = f"{type(e).__name__}: {e}"[:500]
             await asyncio.sleep(max(0.5, self.interval - (time.time() - t_start)))
 
@@ -1223,13 +1230,13 @@ class DockerLogSource(LogSource):
         if self._channel is not None:
             try:
                 self._channel.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("error closing ssh channel for %s: %s", self.path, e)
         if self._ssh_client is not None:
             try:
                 self._ssh_client.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("error closing ssh client for %s: %s", self.path, e)
         self._task.cancel()
 
     async def _follow(self):
@@ -1253,6 +1260,7 @@ class DockerLogSource(LogSource):
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            logger.debug("log follow failed for %s: %s", self.path, e)
             self.error = f"{type(e).__name__}: {e}"[:500]
 
     async def _start_local(self):
@@ -1680,14 +1688,16 @@ async def tail_loop(state: State, interval: float = 1.0):
                 continue
             try:
                 size = src.path.stat().st_size
-            except OSError:
+            except OSError as e:
+                logger.debug("tail: could not stat %s: %s", src.path, e)
                 continue
             if size < src.offset:  # truncated/rotated: start over
                 src.offset = 0
             if size > src.offset:
                 try:
                     await asyncio.to_thread(read_all, src)
-                except OSError:
+                except OSError as e:
+                    logger.debug("tail: could not read %s: %s", src.path, e)
                     continue
                 state.broadcast({"type": "update", "source": src.id})
 

@@ -327,6 +327,39 @@ body {
 #app-body[data-dock="detached"] { flex-direction: row; }
 #app-body[data-dock="detached"] #action-bar { display: none; }
 
+/* Drag to resize the sidebar -- a thin strip between #action-bar and
+   #main-content, positioned correctly for all four dock directions for
+   free: it's the DOM child right after #action-bar, and row/row-reverse/
+   column/column-reverse (the same trick #action-bar's own placement
+   already relies on) puts it on the correct edge without any extra
+   positioning logic. Negative margin lets it overlap #action-bar's own
+   border by a couple px so the drag target isn't razor-thin. */
+#action-bar-splitter {
+  flex: 0 0 auto;
+  background: transparent;
+  position: relative;
+  z-index: 1;
+}
+#action-bar-splitter:hover, #action-bar-splitter.dragging {
+  background: color-mix(in srgb, var(--accent) 35%, transparent);
+}
+#app-body[data-dock="left"] #action-bar-splitter,
+#app-body[data-dock="right"] #action-bar-splitter {
+  width: 6px;
+  margin: 0 -3px;
+  cursor: col-resize;
+}
+#app-body[data-dock="top"] #action-bar-splitter,
+#app-body[data-dock="bottom"] #action-bar-splitter {
+  height: 6px;
+  margin: -3px 0;
+  cursor: row-resize;
+}
+#app-body[data-dock="detached"] #action-bar-splitter,
+#action-bar[data-collapsed="true"] ~ #action-bar-splitter {
+  display: none;
+}
+
 #main-content {
   flex: 1 1 auto;
   display: flex;

@@ -251,6 +251,56 @@
     eq(state.visible.get(NAME), true, "restored");
   });
 
+  await T("legend click also hides/shows that container's log panel, in place", () => {
+    const logSrc = state.sources.find((s) => s.kind === "log" && s.name === "c3_api");
+    ok(logSrc, "c3_api log source is open in the demo");
+    renderLegend();
+    const item = [...$("legend").querySelectorAll(".legend-item")].find((i) => i.textContent.includes("c3_api"));
+    ok(item, "c3_api legend entry present");
+    const panel = panels.get(logSrc.id);
+    ok(panel, "c3_api has an open panel");
+    const indexBefore = [...panelsEl.children].indexOf(panel.el);
+    try {
+      item.click();
+      eq(panel.el.hidden, true, "panel hidden");
+      item.click();
+      eq(panel.el.hidden, false, "panel visible again");
+      eq([...panelsEl.children].indexOf(panel.el), indexBefore, "same slot as before");
+    } finally {
+      state.visible.delete("c3_api");
+      syncPanels();
+    }
+  });
+
+  await T("panel close button hides (not removes) the source, re-enabled via legend", async () => {
+    const logSrc = state.sources.find((s) => s.kind === "log" && s.name === "c3_worker");
+    ok(logSrc, "c3_worker log source is open in the demo");
+    const panel = panels.get(logSrc.id);
+    ok(panel, "c3_worker has an open panel");
+    const closeBtn = panel.el.querySelector(".close");
+    ok(closeBtn, "close button present");
+    const sourcesBefore = state.sources.length;
+    const realPost = post;
+    const calls = [];
+    post = async (path, body) => { calls.push(path); return realPost(path, body); };
+    try {
+      closeBtn.click();
+      eq(calls.length, 0, "no server call made -- not a real /close");
+      eq(panel.el.hidden, true, "panel hidden after close");
+      eq(state.sources.length, sourcesBefore, "source not removed");
+      ok(state.sources.some((s) => s.id === logSrc.id), "source still tracked (still collecting server-side)");
+      renderLegend();
+      const item = [...$("legend").querySelectorAll(".legend-item")].find((i) => i.textContent.includes("c3_worker"));
+      ok(item, "still listed in legend (dimmed, not removed)");
+      item.click();
+      eq(panel.el.hidden, false, "panel reappears via the legend");
+    } finally {
+      post = realPost;
+      state.visible.delete("c3_worker");
+      syncPanels();
+    }
+  });
+
   await T("legend context menu opens and Escape closes it", async () => {
     renderLegend();
     const item = [...$("legend").querySelectorAll(".legend-item")].find((i) => i.textContent.includes(NAME));
@@ -531,6 +581,42 @@
     } finally {
       post = realPost;
       get = realGet;
+      dlg.close();
+    }
+  });
+
+  await T("Edit Docker Daemon pre-fills and locks host/ssh-key, relabels buttons", () => {
+    const fakeSrc = { id: "__edit_test", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
+    state.sources.push(fakeSrc);
+    dockerHostKeys.set("ssh://u@h", "/path/to/key");
+    try {
+      eq(currentDockerHost(), "ssh://u@h", "host resolved correctly (not truncated to 'ssh:')");
+      $("btn-edit-docker-daemon").click();
+      eq($("docker-host").value, "u@h", "host prefilled (scheme stripped for editing)");
+      eq($("docker-host").disabled, true, "host locked");
+      eq($("docker-ssh-key").value, "/path/to/key", "ssh key prefilled");
+      eq($("docker-ssh-key").disabled, true, "ssh key locked");
+      eq($("docker-ssh-key-browse").disabled, true, "browse locked");
+      eq($("btn-ps-refresh").textContent, "Refresh", "Fetch relabeled Refresh");
+      eq($("dlg-ok").textContent, "Update Docker Daemon", "confirm relabeled");
+    } finally {
+      state.sources = state.sources.filter((s) => s.id !== "__edit_test");
+      dockerHostKeys.delete("ssh://u@h");
+      dlg.close();
+      $("btn-set").click(); // resets host/ssh-key/labels back to create-mode defaults
+      dlg.close();
+    }
+  });
+
+  await T("Set Docker Daemon (create mode) is never left showing edit-mode labels/locks", () => {
+    $("btn-set").click();
+    try {
+      eq($("docker-host").disabled, false, "host unlocked");
+      eq($("docker-ssh-key").disabled, false, "ssh key unlocked");
+      eq($("docker-ssh-key-browse").disabled, false, "browse unlocked");
+      eq($("btn-ps-refresh").textContent, "Fetch", "Fetch label restored");
+      eq($("dlg-ok").textContent, "Set Docker Daemon", "confirm label restored");
+    } finally {
       dlg.close();
     }
   });
@@ -1304,6 +1390,27 @@
       ok(getComputedStyle($("app-body").querySelector(".ab-group")).display !== "none", "groups visible again");
     } finally {
       if (actionBar.dataset.collapsed !== String(before)) $("ab-collapse-toggle").click();
+    }
+  });
+
+  await T("dragging the sidebar splitter resizes it and persists", () => {
+    const actionBar = $("action-bar");
+    const splitter = $("action-bar-splitter");
+    const before = prefs.get("actionBarWidth", 210);
+    const rect = actionBar.getBoundingClientRect();
+    try {
+      splitter.dispatchEvent(new MouseEvent("mousedown", {
+        bubbles: true, cancelable: true, clientX: rect.right, clientY: rect.top + 10,
+      }));
+      ok(splitter.classList.contains("dragging"), "drag started");
+      window.dispatchEvent(new MouseEvent("mousemove", { clientX: rect.right + 40, clientY: rect.top + 10 }));
+      near(actionBar.getBoundingClientRect().width, rect.width + 40, 2, "widened live while dragging");
+      window.dispatchEvent(new MouseEvent("mouseup", {}));
+      ok(!splitter.classList.contains("dragging"), "drag ended");
+      eq(prefs.get("actionBarWidth", null), Math.round(rect.width + 40), "persisted");
+    } finally {
+      prefs.set("actionBarWidth", before);
+      actionBar.style.width = before + "px";
     }
   });
 
