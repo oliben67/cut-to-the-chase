@@ -190,18 +190,33 @@ async function ensureRemoteContainer(cfg, { spawnFn = spawn, sshBin = "ssh", scp
 
   await run(spawnFn, sshBin, [...ssh, `mkdir -p ${remoteDir}`], {}, onLog);
 
+  // Copies the same private key used to reach this host into the container
+  // itself, at ssh's own default identity location (~/.ssh/id_rsa) -- no
+  // per-host ssh_config needed, and it works for every outbound ssh call the
+  // container makes (docker -H ssh://... in "Set Sources", HostStatsSource),
+  // not just ones that happen to pass an explicit ssh_key. Skipped when the
+  // gateway itself was reached via agent/no explicit key -- there's nothing
+  // to copy, and docker-compose.yml's ${CTTC_ID_RSA:-/dev/null} fallback
+  // mounts a harmless no-op instead.
+  let idRsaEnv = "";
+  if (cfg.sshKey) {
+    await run(spawnFn, scpBin, [...scp, cfg.sshKey, `${target}:${remoteDir}/id_rsa`], {}, onLog);
+    await run(spawnFn, sshBin, [...ssh, `chmod 600 ${remoteDir}/id_rsa`], {}, onLog);
+    idRsaEnv = 'CTTC_ID_RSA="$PWD/id_rsa" ';
+  }
+
   if (resolved.kind === "tarball") {
     await run(spawnFn, scpBin, [...scp, resolved.tarballPath, `${target}:${remoteDir}/`], {}, onLog);
     await run(spawnFn, scpBin, [...scp, resolved.composeFile, `${target}:${remoteDir}/docker-compose.yml`], {}, onLog);
     await run(spawnFn, sshBin, [
       ...ssh,
-      `cd ${remoteDir} && docker load -i ${path.basename(resolved.tarballPath)} && docker compose -f docker-compose.yml up -d`,
+      `cd ${remoteDir} && docker load -i ${path.basename(resolved.tarballPath)} && ${idRsaEnv}docker compose -f docker-compose.yml up -d`,
     ], {}, onLog);
   } else {
     await run(spawnFn, scpBin, [...scp, resolved.composeFile, `${target}:${remoteDir}/docker-compose.yml`], {}, onLog);
     await run(spawnFn, sshBin, [
       ...ssh,
-      `cd ${remoteDir} && docker pull ${resolved.ref} && CTTC_IMAGE=${resolved.ref} docker compose -f docker-compose.yml up -d`,
+      `cd ${remoteDir} && docker pull ${resolved.ref} && CTTC_IMAGE=${resolved.ref} ${idRsaEnv}docker compose -f docker-compose.yml up -d`,
     ], {}, onLog);
   }
 

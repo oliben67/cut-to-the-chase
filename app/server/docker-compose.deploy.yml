@@ -24,3 +24,11 @@ services:
       # no SSH_AUTH_SOCK exported, e.g. no agent running: see
       # docs/architecture/remote-server.md.
       - ${SSH_AUTH_SOCK:-/dev/null}:/ssh-agent
+      # The same private key the client used to reach this host, copied
+      # here by server-provision.js's ensureRemoteContainer at deploy time
+      # -- ssh's own default identity location, so it's tried automatically
+      # by every outbound ssh call this container makes (the one above,
+      # HostStatsSource), no per-host ssh_config needed. Falls back to
+      # /dev/null (no-op) when the gateway was reached via agent/no explicit
+      # key -- see docs/architecture/remote-server.md.
+      - ${CTTC_ID_RSA:-/dev/null}:/root/.ssh/id_rsa:ro
