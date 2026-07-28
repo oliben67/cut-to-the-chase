@@ -248,6 +248,10 @@ CTTC can collect, so the dialog splits them into two sections.
   own heading** to select or deselect every checkbox in that group at once
   (a partially-ticked group selects all first, rather than deselecting).
 
+**Set Docker Daemon**/**Update Docker Daemon** stays disabled until at
+least one container or service is actually checked — with nothing
+ticked there's nothing to collect.
+
 An already-followed container or service looks exactly like any other
 entry in the list — same color, still enabled — the only cue is a **✔**
 mark next to it if it's currently ticked. Ticking/unticking toggles that

@@ -2459,7 +2459,6 @@ function setDockerFormEnabled(enabled) {
   dockerFormFetched = enabled;
   $("docker-stats").disabled = !enabled;
   $("docker-interval").disabled = !enabled;
-  $("dlg-ok").disabled = !enabled;
   // "unavailable" checkboxes (renderDockerTargetGroup's `missing`) stay
   // disabled regardless -- they're not something Fetch/Refresh finishing
   // should ever re-enable, since there's nothing left to actually follow.
@@ -2467,6 +2466,18 @@ function setDockerFormEnabled(enabled) {
     if (!cb.closest("label")?.classList.contains("unavailable")) cb.disabled = !enabled;
   }
   for (const cb of $("transforms-list").querySelectorAll("input")) cb.disabled = !enabled;
+  updateDlgOkEnabled();
+}
+
+// Set/Update Docker Daemon submits exactly what's checked (see dlg-ok's
+// onclick) -- with nothing ticked there'd be nothing to collect at all, so
+// it stays disabled until at least one container/service is actually
+// checked, on top of the Fetch/Refresh-gated enabling above. Re-checked
+// on every checkbox change (see renderDockerTargetGroup) and every
+// checklist re-render (see renderDockerTargets), not just once on Fetch.
+function updateDlgOkEnabled() {
+  const anyChecked = $("docker-targets").querySelector("input:checked:not(:disabled)") != null;
+  $("dlg-ok").disabled = !dockerFormFetched || !anyChecked;
 }
 
 // close every open source and forget the remembered last-session containers,
@@ -2935,6 +2946,7 @@ function renderDockerTargetGroup(box, title, items, type, wasChecked, selectedNa
   g.onclick = () => {
     const selectAll = groupBoxes.some(({ cb }) => !cb.checked);
     for (const { cb, mark } of groupBoxes) setCheckedWithMark(cb, mark, selectAll);
+    updateDlgOkEnabled();
   };
   box.appendChild(g);
   for (const it of items) {
@@ -2951,7 +2963,7 @@ function renderDockerTargetGroup(box, title, items, type, wasChecked, selectedNa
     // keeps whatever the user last left it at.
     const startChecked = wasChecked.has(it.name) ? wasChecked.get(it.name) : selectedNames.has(it.name);
     setCheckedWithMark(cb, mark, startChecked);
-    cb.onchange = () => setCheckedWithMark(cb, mark, cb.checked);
+    cb.onchange = () => { setCheckedWithMark(cb, mark, cb.checked); updateDlgOkEnabled(); };
     groupBoxes.push({ cb, mark });
     label.append(cb, mark, ` ${it.name} `);
     const extra = document.createElement("span");
@@ -3026,6 +3038,7 @@ function renderDockerTargets(containers, services, hostKey, { closeMissing = fal
   if (!services.length && !containers.length && !missingServices.length && !missingContainers.length) {
     box.textContent = "nothing running";
   }
+  updateDlgOkEnabled();
   if (closeMissing) {
     // Only ones with an actual open source to close (a selected name with
     // no matching tracked source -- e.g. restored from the file but never

@@ -611,8 +611,11 @@
       $("docker-host").value = ""; // empty -- the gateway/local daemon is used
       await listContainers();
       eq($("docker-stats").disabled, false, "stats enabled after fetch");
-      eq($("dlg-ok").disabled, false, "Set Docker Daemon enabled after fetch");
+      eq($("dlg-ok").disabled, true, "Set Docker Daemon stays disabled -- nothing checked yet, nothing to collect");
       ok($("docker-targets").textContent.includes("demo"), "fetched container listed");
+      $("docker-targets").querySelector('input[value="demo"]').checked = true;
+      $("docker-targets").querySelector('input[value="demo"]').dispatchEvent(new Event("change"));
+      eq($("dlg-ok").disabled, false, "Set Docker Daemon enabled once at least one container is checked");
     } finally {
       post = realPost;
       get = realGet;
@@ -649,6 +652,36 @@
       boxes[0].checked = true;
       group.click();
       ok(boxes.every((cb) => cb.checked), "a mixed group selects all, rather than deselecting");
+    } finally {
+      post = realPost;
+      get = realGet;
+      dlg.close();
+    }
+  });
+
+  await T("Set/Update Docker Daemon stays disabled with nothing checked, including via the group-select-all header", async () => {
+    const realPost = post;
+    const realGet = get;
+    post = async (path, body) => {
+      if (path === "/docker/ps") {
+        return { containers: [{ id: "a", name: "demo-a" }, { id: "b", name: "demo-b" }], services: [], log: [] };
+      }
+      return realPost(path, body);
+    };
+    get = async (path) => (path === "/transforms" ? { transforms: [] } : realGet(path));
+    try {
+      $("btn-set").click();
+      $("docker-host").value = "";
+      await listContainers();
+      eq($("dlg-ok").disabled, true, "nothing checked yet -- nothing to collect");
+      const boxes = [...$("docker-targets").querySelectorAll("input[type=checkbox]")];
+      const group = $("docker-targets").querySelector(".group");
+      group.click(); // selects all via the group header, not an individual checkbox's own change event
+      ok(boxes.every((cb) => cb.checked), "sanity: group click selected everything");
+      eq($("dlg-ok").disabled, false, "enabled once the group header checks everything");
+      group.click(); // deselects all
+      ok(boxes.every((cb) => !cb.checked), "sanity: group click deselected everything");
+      eq($("dlg-ok").disabled, true, "disabled again once the group header unchecks everything");
     } finally {
       post = realPost;
       get = realGet;
