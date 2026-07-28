@@ -2781,9 +2781,13 @@ $("btn-activity-toggle").onclick = () => {
 // ticked/unticked in the checklist *before* this render -- a Refresh must
 // update the list to match the daemon's actual current state (new
 // containers appear, gone ones disappear) without silently re-ticking
-// something the user had just deliberately unchecked.
-function renderDockerTargetGroup(box, open, hostKey, title, items, type, wasChecked) {
-  if (!items.length) return;
+// something the user had just deliberately unchecked. `missing` is the
+// subset that's currently *selected* (plotted) but didn't come back in
+// this fetch/pre-fill at all -- rendered disabled rather than just
+// vanishing, so "it's selected but gone" is visible instead of silently
+// dropped.
+function renderDockerTargetGroup(box, open, hostKey, title, items, type, wasChecked, missing = []) {
+  if (!items.length && !missing.length) return;
   const g = document.createElement("div");
   g.className = "group";
   g.textContent = title;
@@ -2792,7 +2796,8 @@ function renderDockerTargetGroup(box, open, hostKey, title, items, type, wasChec
   // Click the group's own title to select/deselect every checkbox in it at
   // once -- toggles based on current state, same as a tri-state checkbox
   // would: any unchecked box means "select all", all checked means
-  // "deselect all".
+  // "deselect all". Disabled (missing) entries below never join
+  // groupBoxes, so they can't skew what "select all" means for the rest.
   g.onclick = () => {
     const selectAll = groupBoxes.some((cb) => !cb.checked);
     for (const cb of groupBoxes) cb.checked = selectAll;
@@ -2802,11 +2807,12 @@ function renderDockerTargetGroup(box, open, hostKey, title, items, type, wasChec
     const label = document.createElement("label");
     const cb = document.createElement("input");
     cb.type = "checkbox";
-    // Newly seen (never rendered before) starts ticked, matching "every
-    // detected/already-followed container/service starts ticked" -- one
-    // already in the checklist keeps whatever the user last left it at.
+    // Nothing is preselected just for having been *found* -- only an item
+    // already marked "sel" (actually selected/plotted, see state.track)
+    // starts ticked; a fresh discovery starts unticked, and one already in
+    // the checklist keeps whatever the user last left it at.
     const key = `${type}:${it.name}`;
-    cb.checked = wasChecked.has(key) ? wasChecked.get(key) : true;
+    cb.checked = wasChecked.has(key) ? wasChecked.get(key) : state.track[it.name] === "sel";
     cb.value = it.name;
     cb.dataset.type = type;
     groupBoxes.push(cb);
@@ -2825,6 +2831,22 @@ function renderDockerTargetGroup(box, open, hostKey, title, items, type, wasChec
     label.appendChild(extra);
     box.appendChild(label);
   }
+  for (const it of missing) {
+    const label = document.createElement("label");
+    label.classList.add("added", "unavailable");
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = true;
+    cb.disabled = true; // excluded from dlg-ok's submission query on purpose -- see "input:checked:not(:disabled)"
+    cb.value = it.name;
+    cb.dataset.type = type;
+    label.append(cb, ` ${it.name} `);
+    const extra = document.createElement("span");
+    extra.className = "tdoc";
+    extra.textContent = "no longer available — was selected";
+    label.appendChild(extra);
+    box.appendChild(label);
+  }
 }
 
 // Repopulates #docker-targets from a {name, image?, replicas?}[] pair --
@@ -2832,11 +2854,13 @@ function renderDockerTargetGroup(box, open, hostKey, title, items, type, wasChec
 // opening Edit Docker Daemon (before any Refresh), whatever's already being
 // followed for this host (see btn-edit-docker-daemon below). Re-renders
 // are a diff against the checklist's own current state, not a blind wipe:
-// a Refresh that finds a container gone (stopped/removed) drops it, one
-// that's new appears ticked, and anything still there keeps exactly
-// whatever the user last checked/unchecked it to -- "check if anything
-// changed server-side and update the list accordingly" without discarding
-// in-progress edits.
+// a Refresh that finds a container gone (stopped/removed) marks it
+// disabled rather than dropping it outright when it was selected (see
+// renderDockerTargetGroup's `missing`), one that's new appears unticked
+// (nothing is preselected just for having been *found*), and anything
+// still there keeps exactly whatever the user last checked/unchecked it
+// to -- "check if anything changed server-side and update the list
+// accordingly" without discarding in-progress edits.
 function renderDockerTargets(containers, services, hostKey) {
   const box = $("docker-targets");
   const wasChecked = new Map();
@@ -2845,9 +2869,16 @@ function renderDockerTargets(containers, services, hostKey) {
   }
   box.innerHTML = "";
   const open = openPaths();
-  renderDockerTargetGroup(box, open, hostKey, "Swarm services (docker service logs)", services, "service", wasChecked);
-  renderDockerTargetGroup(box, open, hostKey, "Containers (docker logs)", containers, "container", wasChecked);
-  if (!services.length && !containers.length) box.textContent = "nothing running";
+  const selected = selectedTrackedTargets(hostKey);
+  const containerNames = new Set(containers.map((c) => c.name));
+  const serviceNames = new Set(services.map((s) => s.name));
+  const missingContainers = selected.containers.filter((c) => !containerNames.has(c.name));
+  const missingServices = selected.services.filter((s) => !serviceNames.has(s.name));
+  renderDockerTargetGroup(box, open, hostKey, "Swarm services (docker service logs)", services, "service", wasChecked, missingServices);
+  renderDockerTargetGroup(box, open, hostKey, "Containers (docker logs)", containers, "container", wasChecked, missingContainers);
+  if (!services.length && !containers.length && !missingServices.length && !missingContainers.length) {
+    box.textContent = "nothing running";
+  }
 }
 
 // The containers/services already being followed for `hostKey`, derived
@@ -2870,6 +2901,19 @@ function currentlyTrackedTargets(hostKey) {
     else if (rest.startsWith("service/")) services.push({ name: s.name });
   }
   return { containers, services };
+}
+
+// Like currentlyTrackedTargets, but only the ones actually *selected*
+// (state.track[name] === "sel", i.e. plotted/shown in the legend) -- used
+// to detect "was selected, no longer found" on a Refresh/pre-fill (see
+// renderDockerTargets' `missing`), as opposed to every followed container
+// regardless of selection state.
+function selectedTrackedTargets(hostKey) {
+  const { containers, services } = currentlyTrackedTargets(hostKey);
+  return {
+    containers: containers.filter((c) => state.track[c.name] === "sel"),
+    services: services.filter((s) => state.track[s.name] === "sel"),
+  };
 }
 
 async function listContainers() {
@@ -2989,7 +3033,11 @@ $("dlg-ok").onclick = async () => {
     const sshKey = $("docker-ssh-key").value.trim() || null;
     dockerHostKeys.set(host || "local", sshKey);
     const hostKey = host || "local";
-    const logs = [...$("docker-targets").querySelectorAll("input:checked")].map((cb) => ({
+    // :not(:disabled) excludes the "no longer available" entries
+    // (renderDockerTargetGroup's `missing`) -- checked=true there only to
+    // show "this was selected", never meant to actually be (re-)submitted
+    // for a container that doesn't exist anymore.
+    const logs = [...$("docker-targets").querySelectorAll("input:checked:not(:disabled)")].map((cb) => ({
       name: cb.value,
       type: cb.dataset.type,
     }));

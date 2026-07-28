@@ -1285,6 +1285,8 @@ dialog h2 { margin: 0 0 10px; font-size: 15px; }
 #docker-targets { max-height: 180px; overflow-y: auto; margin-top: 8px; }
 #docker-targets label { display: block; padding: 1px 0; }
 #docker-targets label.added { opacity: 0.55; }
+#docker-targets label.unavailable { opacity: 0.75; }
+#docker-targets label.unavailable .tdoc { color: var(--critical); }
 .tdoc { color: var(--muted); }
 #docker-targets .group { font-weight: 600; margin-top: 6px; color: var(--text-secondary); cursor: pointer; user-select: none; }
 #docker-targets .group:hover { color: var(--text-primary); }

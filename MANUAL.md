@@ -218,8 +218,7 @@ follow](docs/images/dlg-set-sources.png)
 **Set Docker Daemon…** attaches to a Docker daemon. Leave the host field
 empty for the local daemon (or the gateway's own host, if you're connected
 to a remote gateway). Telemetry and logs are two independent kinds of data
-CTTC can collect, so the dialog splits them into two sections — **everything
-in both is ticked by default**; untick whatever you don't want.
+CTTC can collect, so the dialog splits them into two sections.
 
 - **📊 Telemetry** — two checkboxes:
   - **collect `docker stats` telemetry** — polls CPU/MEM/NET for *every*
@@ -235,22 +234,21 @@ in both is ticked by default**; untick whatever you don't want.
     itself, shown in its own strip group at the bottom.
 - **📝 Logs** — click **Fetch** to list the running containers and swarm
   services for the entered host, grouped under **"Swarm services"** and
-  **"Containers"** headings. Every item found is ticked by default, which
-  both starts following its logs (`docker logs -f -t`, or
-  `docker service logs -f -t` for swarm services) *and* marks it *selected*
-  so its telemetry plots immediately. Untick anything you don't want
-  followed and plotted yet — you can always right-click it later to track
-  it (see [The container legend](#the-container-legend)). **Click a
-  group's own heading** to select or deselect every checkbox in that group
-  at once (a partially-ticked group selects all first, rather than
-  deselecting).
+  **"Containers"** headings. **Nothing is ticked by default** — pick
+  exactly what you want followed and plotted; ticking an item both starts
+  following its logs (`docker logs -f -t`, or `docker service logs -f -t`
+  for swarm services) *and* marks it *selected* so its telemetry plots
+  immediately. You can always right-click a container later to track it
+  (see [The container legend](#the-container-legend)). **Click a group's
+  own heading** to select or deselect every checkbox in that group at once
+  (a partially-ticked group selects all first, rather than deselecting).
 
-Anything already being collected shows as *already added*, is checked but
-disabled, and cannot be added twice. Ticked transforms (see
-[Transforms](#transforms)) apply to the new log sources. **Set Docker
-Daemon** syncs exactly to what's checked here: unticking an
-already-followed container stops following it, the same as if you'd closed
-its panel.
+Anything already being followed shows as *already added* but stays
+checked/unchecked according to whether it's actually *selected* right
+now, and stays interactive — unticking an already-followed container
+stops following it, the same as if you'd closed its panel. Ticked
+transforms (see [Transforms](#transforms)) apply to the new log sources.
+**Set Docker Daemon** syncs exactly to what's checked here.
 
 **Edit Docker Daemon…** and **Remove Docker Daemon** are only enabled once
 a daemon is actually being watched — nothing to edit or remove otherwise.
@@ -259,14 +257,18 @@ host and SSH key pre-filled and locked, **Fetch** relabelled **Refresh**
 (just re-probes for new containers/services rather than starting over),
 and the bottom button relabelled **Update Docker Daemon**. The checklist
 itself isn't blank while you wait for a Refresh — it starts pre-filled with
-every container/service already being followed, checked and immediately
-interactive, so you can untick something (or just click **Update Docker
-Daemon**) right away. **Refresh** diffs the checklist against the daemon's
-actual current state rather than replacing it wholesale: a container
-that's gone (stopped/removed) drops off the list, a new one appears
-ticked, and anything still there keeps exactly whatever you last
-checked/unchecked it to — Refresh never silently discards an in-progress
-edit.
+every container/service already being followed, immediately interactive,
+with only the ones actually **selected** (plotted) ticked — a container
+you'd previously unselected from the legend stays listed but unticked,
+matching its real state. **Refresh** diffs the checklist against the
+daemon's actual current state rather than replacing it wholesale: a
+container that was never selected and is now gone drops off the list
+silently; one that **was selected** but has since stopped/disappeared
+stays listed, ticked, and **disabled** with a "no longer available" note,
+instead of vanishing without explanation; a genuinely new one appears
+unticked (nothing is preselected just for being found); and anything
+still there and unchanged keeps exactly whatever you last checked/
+unchecked it to — Refresh never silently discards an in-progress edit.
 
 ### Remote hosts over SSH
 

@@ -640,13 +640,13 @@
       await listContainers();
       const boxes = [...$("docker-targets").querySelectorAll("input[type=checkbox]")];
       eq(boxes.length, 2, "both containers listed");
-      ok(boxes.every((cb) => cb.checked), "checked by default");
+      ok(boxes.every((cb) => !cb.checked), "nothing preselected just for having been found");
       const group = $("docker-targets").querySelector(".group");
       group.click();
-      ok(boxes.every((cb) => !cb.checked), "group click deselects all");
+      ok(boxes.every((cb) => cb.checked), "group click (all unchecked) selects all");
       group.click();
-      ok(boxes.every((cb) => cb.checked), "group click re-selects all");
-      boxes[0].checked = false;
+      ok(boxes.every((cb) => !cb.checked), "group click (all checked) deselects all");
+      boxes[0].checked = true;
       group.click();
       ok(boxes.every((cb) => cb.checked), "a mixed group selects all, rather than deselecting");
     } finally {
@@ -690,13 +690,18 @@
     eq($("btn-clear-sources").disabled, true, "Remove disabled");
   });
 
-  await T("Edit Docker Daemon pre-fills the checklist with already-followed containers/services before any Refresh", () => {
+  await T("Edit Docker Daemon pre-fills the checklist with already-followed containers/services before any Refresh, marking only the actually-selected ones checked", () => {
     const fakeStats = { id: "__prefill_stats", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
     const fakeContainer = { id: "__prefill_c", path: "docker://ssh://u@h/container/demo-c", name: "demo-c", kind: "log", live: true };
     const fakeService = { id: "__prefill_s", path: "docker://ssh://u@h/service/demo-svc", name: "demo-svc", kind: "log", live: true };
     state.sources.push(fakeStats, fakeContainer, fakeService);
     syncDockerDaemonButtons();
     dockerHostKeys.set("ssh://u@h", "/path/to/key");
+    // demo-c is actually selected (plotted); demo-svc is merely followed
+    // (e.g. previously unselected from the legend) -- the checklist must
+    // reflect that distinction, not just "is a log source open for it".
+    setTrack("demo-c", "sel");
+    setTrack("demo-svc", "mut");
     try {
       $("btn-edit-docker-daemon").click();
       const text = $("docker-targets").textContent;
@@ -704,13 +709,17 @@
       ok(text.includes("demo-svc"), `service pre-filled: ${text}`);
       const boxes = [...$("docker-targets").querySelectorAll("input[type=checkbox]")];
       eq(boxes.length, 2, "one checkbox per already-followed container/service");
-      ok(boxes.every((cb) => cb.checked), "pre-filled entries start checked");
+      ok(boxes.find((cb) => cb.value === "demo-c").checked, "actually-selected entry starts checked");
+      ok(!boxes.find((cb) => cb.value === "demo-svc").checked, "followed-but-not-selected entry starts unchecked");
       ok(boxes.every((cb) => !cb.disabled), "pre-filled entries are immediately interactive, no Refresh needed");
       ok($("docker-targets").querySelectorAll("label.added").length === 2, "both marked already added");
     } finally {
       state.sources = state.sources.filter((s) => !s.id.startsWith("__prefill_"));
       syncDockerDaemonButtons();
       dockerHostKeys.delete("ssh://u@h");
+      delete state.track["demo-c"];
+      delete state.track["demo-svc"];
+      prefs.set("track", state.track);
       dlg.close();
       $("btn-set").click();
       dlg.close();
@@ -750,12 +759,14 @@
     }
   });
 
-  await T("Refresh diffs against the daemon's real state: gone containers drop, new ones appear checked, unchanged ones keep the user's own tick", async () => {
+  await T("Refresh diffs against the daemon's real state: unselected-and-gone drops silently, new ones appear unchecked, unchanged ones keep the user's own tick", async () => {
     const fakeContainerA = { id: "__diff_a", path: "docker://ssh://u@h/container/demo-a", name: "demo-a", kind: "log", live: true };
     const fakeContainerB = { id: "__diff_b", path: "docker://ssh://u@h/container/demo-b", name: "demo-b", kind: "log", live: true };
     state.sources.push(fakeContainerA, fakeContainerB);
     syncDockerDaemonButtons();
     dockerHostKeys.set("ssh://u@h", "/path/to/key");
+    setTrack("demo-a", "sel"); // actually selected
+    // demo-b left as "mut" (followed but not selected) on purpose
     const realPost = post;
     const realGet = get;
     // The real daemon now only has demo-a (demo-b was removed) plus a
@@ -772,22 +783,62 @@
       // pre-filled immediately from currentlyTrackedTargets, before any Refresh
       let names = [...$("docker-targets").querySelectorAll("input[type=checkbox]")].map((cb) => cb.value);
       eq(names.sort().join(), "demo-a,demo-b", "pre-filled with both already-tracked containers");
-      // the user deliberately unchecks demo-a before refreshing
-      const cbA = [...$("docker-targets").querySelectorAll("input[type=checkbox]")].find((cb) => cb.value === "demo-a");
-      cbA.checked = false;
+      eq($("docker-targets").querySelector('input[value="demo-a"]').checked, true, "demo-a (selected) starts checked");
+      eq($("docker-targets").querySelector('input[value="demo-b"]').checked, false, "demo-b (followed, not selected) starts unchecked");
       $("btn-ps-refresh").click();
       await until(() => $("docker-targets").textContent.includes("demo-c"), "checklist updated after Refresh");
       const boxes = [...$("docker-targets").querySelectorAll("input[type=checkbox]")];
       names = boxes.map((cb) => cb.value);
-      eq(names.sort().join(), "demo-a,demo-c", "demo-b (gone server-side) dropped, demo-c (new) appears");
-      eq(boxes.find((cb) => cb.value === "demo-a").checked, false, "demo-a's deliberate uncheck survives the Refresh");
-      eq(boxes.find((cb) => cb.value === "demo-c").checked, true, "demo-c (newly seen) starts checked");
+      eq(names.sort().join(), "demo-a,demo-c", "demo-b (gone server-side, never selected) drops silently, demo-c (new) appears");
+      eq(boxes.find((cb) => cb.value === "demo-a").checked, true, "demo-a's selected state survives the Refresh");
+      eq(boxes.find((cb) => cb.value === "demo-c").checked, false, "demo-c (newly seen) starts unchecked -- nothing is preselected just for being found");
     } finally {
       post = realPost;
       get = realGet;
       state.sources = state.sources.filter((s) => !s.id.startsWith("__diff_"));
       syncDockerDaemonButtons();
       dockerHostKeys.delete("ssh://u@h");
+      delete state.track["demo-a"];
+      prefs.set("track", state.track);
+      dlg.close();
+      $("btn-set").click();
+      dlg.close();
+    }
+  });
+
+  await T("Refresh marks a selected-but-now-gone container disabled instead of silently dropping it", async () => {
+    const fakeContainerA = { id: "__gone_a", path: "docker://ssh://u@h/container/demo-a", name: "demo-a", kind: "log", live: true };
+    state.sources.push(fakeContainerA);
+    syncDockerDaemonButtons();
+    dockerHostKeys.set("ssh://u@h", "/path/to/key");
+    setTrack("demo-a", "sel"); // actually selected/plotted
+    const realPost = post;
+    const realGet = get;
+    // The real daemon no longer has demo-a at all (stopped/removed).
+    post = async (path, body) => {
+      if (path === "/docker/ps") return { containers: [], services: [], log: [] };
+      return realPost(path, body);
+    };
+    get = async (path) => (path === "/transforms" ? { transforms: [] } : realGet(path));
+    try {
+      $("btn-edit-docker-daemon").click();
+      $("btn-ps-refresh").click();
+      await until(() => $("docker-targets").querySelectorAll("input[type=checkbox]").length > 0, "checklist re-rendered after Refresh");
+      const cb = $("docker-targets").querySelector('input[value="demo-a"]');
+      ok(cb, "demo-a still shown, not silently dropped, since it was selected");
+      eq(cb.disabled, true, "shown disabled -- it can't actually be followed anymore");
+      eq(cb.checked, true, "still shown checked, reflecting that it was selected");
+      ok($("docker-targets").textContent.includes("no longer available"), "explains why it's disabled");
+      // dlg-ok must never submit a disabled/unavailable entry
+      eq($("docker-targets").querySelectorAll("input:checked:not(:disabled)").length, 0, "excluded from what would actually be submitted");
+    } finally {
+      post = realPost;
+      get = realGet;
+      state.sources = state.sources.filter((s) => !s.id.startsWith("__gone_"));
+      syncDockerDaemonButtons();
+      dockerHostKeys.delete("ssh://u@h");
+      delete state.track["demo-a"];
+      prefs.set("track", state.track);
       dlg.close();
       $("btn-set").click();
       dlg.close();
