@@ -699,18 +699,19 @@
     eq($("btn-clear-sources").disabled, true, "Remove disabled");
   });
 
-  await T("Edit Docker Daemon pre-fills immediately, then its automatic Refresh confirms both containers still exist, marking only the actually-selected one checked", async () => {
+  await T("Edit Docker Daemon pre-fills immediately, then its automatic Refresh confirms both containers still exist, marking only the persisted-selected one with a checkmark", async () => {
     const fakeStats = { id: "__prefill_stats", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
     const fakeContainer = { id: "__prefill_c", path: "docker://ssh://u@h/container/demo-c", name: "demo-c", kind: "log", live: true };
     const fakeService = { id: "__prefill_s", path: "docker://ssh://u@h/service/demo-svc", name: "demo-svc", kind: "log", live: true };
     state.sources.push(fakeStats, fakeContainer, fakeService);
     syncDockerDaemonButtons();
     dockerHostKeys.set("ssh://u@h", "/path/to/key");
-    // demo-c is actually selected (plotted); demo-svc is merely followed
-    // (e.g. previously unselected from the legend) -- the checklist must
-    // reflect that distinction, not just "is a log source open for it".
-    setTrack("demo-c", "sel");
-    setTrack("demo-svc", "mut");
+    // demo-c is in the persisted [user]@[gateway]-containers.json (actually
+    // selected); demo-svc is merely followed (e.g. previously unselected
+    // from the legend) -- the checklist must reflect that distinction, not
+    // just "is a log source open for it".
+    const realLoadSelectedTargets = loadSelectedTargets;
+    loadSelectedTargets = async () => ({ containers: new Set(["demo-c"]), services: new Set() });
     const realPost = post;
     const realGet = get;
     // The live daemon still has both -- opening Edit Docker Daemon runs
@@ -730,19 +731,20 @@
       ok(text.includes("demo-svc"), `service pre-filled: ${text}`);
       const boxes = [...$("docker-targets").querySelectorAll("input[type=checkbox]")];
       eq(boxes.length, 2, "one checkbox per already-followed container/service");
-      ok(boxes.find((cb) => cb.value === "demo-c").checked, "actually-selected entry starts checked");
-      ok(!boxes.find((cb) => cb.value === "demo-svc").checked, "followed-but-not-selected entry starts unchecked");
+      ok(boxes.find((cb) => cb.value === "demo-c").checked, "persisted-selected entry starts checked");
+      ok(!boxes.find((cb) => cb.value === "demo-svc").checked, "followed-but-not-persisted-selected entry starts unchecked");
       ok(boxes.every((cb) => !cb.disabled), "still around server-side -- immediately interactive");
-      ok($("docker-targets").querySelectorAll("label.added").length === 2, "both marked already added");
+      const markOf = (name) => boxes.find((cb) => cb.value === name).closest("label").querySelector(".mark").textContent;
+      eq(markOf("demo-c"), "✔", "persisted-selected entry gets a checkmark");
+      eq(markOf("demo-svc"), "", "not-persisted-selected entry gets no mark");
+      ok(!$(`docker-targets`).innerHTML.includes("label.added"), "no dimming/'already added' distinction -- looks like any other entry");
     } finally {
       post = realPost;
       get = realGet;
+      loadSelectedTargets = realLoadSelectedTargets;
       state.sources = state.sources.filter((s) => !s.id.startsWith("__prefill_"));
       syncDockerDaemonButtons();
       dockerHostKeys.delete("ssh://u@h");
-      delete state.track["demo-c"];
-      delete state.track["demo-svc"];
-      prefs.set("track", state.track);
       dlg.close();
       $("btn-set").click();
       dlg.close();
@@ -786,14 +788,17 @@
     }
   });
 
-  await T("Refresh diffs against the daemon's real state: gone entries stay listed disabled (whether or not they were selected), new ones appear unchecked, unchanged ones keep the user's own tick", async () => {
+  await T("Refresh diffs against the daemon's real state: a persisted-selected-but-now-gone entry stays listed disabled, a never-selected-and-now-gone entry is omitted, new ones appear unchecked, unchanged ones keep the user's own tick", async () => {
     const fakeContainerA = { id: "__diff_a", path: "docker://ssh://u@h/container/demo-a", name: "demo-a", kind: "log", live: true };
     const fakeContainerB = { id: "__diff_b", path: "docker://ssh://u@h/container/demo-b", name: "demo-b", kind: "log", live: true };
     state.sources.push(fakeContainerA, fakeContainerB);
     syncDockerDaemonButtons();
     dockerHostKeys.set("ssh://u@h", "/path/to/key");
-    setTrack("demo-a", "sel"); // actually selected
-    // demo-b left as "mut" (followed but not selected) on purpose
+    // demo-a is persisted-selected; demo-b was merely followed, never
+    // persisted-selected -- per spec, if it's gone and NOT in the file, it
+    // must be omitted entirely, not shown disabled.
+    const realLoadSelectedTargets = loadSelectedTargets;
+    loadSelectedTargets = async () => ({ containers: new Set(["demo-a"]), services: new Set() });
     const realPost = post;
     const realGet = get;
     // The real daemon now only has demo-a (demo-b was removed) plus a
@@ -807,42 +812,35 @@
     get = async (path) => (path === "/transforms" ? { transforms: [] } : realGet(path));
     try {
       // Edit Docker Daemon's automatic Refresh on open already runs the
-      // live probe above -- demo-b's now-stale source should already be
-      // closed (closeMissing) by the time the dialog is done opening, not
-      // lingering until some later manual Refresh.
+      // live probe above.
       await $("btn-edit-docker-daemon").onclick();
       await until(() => $("docker-targets").textContent.includes("demo-c"), "checklist reflects the live daemon after opening");
       const boxes = [...$("docker-targets").querySelectorAll("input[type=checkbox]")];
       const names = boxes.map((cb) => cb.value);
-      eq(names.sort().join(), "demo-a,demo-b,demo-c", "demo-b stays listed (disabled) rather than vanishing, demo-c (new) appears");
+      eq(names.sort().join(), "demo-a,demo-c", "demo-b (never persisted-selected, now gone) is omitted entirely; demo-c (new) appears");
       eq(boxes.find((cb) => cb.value === "demo-a").checked, true, "demo-a's selected state survives");
       eq(boxes.find((cb) => cb.value === "demo-a").disabled, false, "demo-a still around server-side -- interactive");
-      const cbB = boxes.find((cb) => cb.value === "demo-b");
-      eq(cbB.disabled, true, "demo-b shown disabled -- no longer available server-side");
-      eq(cbB.checked, false, "demo-b reflects that it was never actually selected, even while disabled");
       eq(boxes.find((cb) => cb.value === "demo-c").checked, false, "demo-c (newly seen) starts unchecked -- nothing is preselected just for being found");
-      await until(() => !state.sources.some((s) => s.id === "__diff_b"), "demo-b's now-stale source was actually closed (removed from the graph), not just flagged in the form");
-      ok(state.sources.some((s) => s.id === "__diff_a"), "demo-a's still-live source is untouched");
     } finally {
       post = realPost;
       get = realGet;
+      loadSelectedTargets = realLoadSelectedTargets;
       state.sources = state.sources.filter((s) => !s.id.startsWith("__diff_"));
       syncDockerDaemonButtons();
-      delete state.track["demo-a"];
       dockerHostKeys.delete("ssh://u@h");
-      prefs.set("track", state.track);
       dlg.close();
       $("btn-set").click();
       dlg.close();
     }
   });
 
-  await T("Refresh marks a selected-but-now-gone container disabled, removes it from the graph, instead of silently dropping it", async () => {
+  await T("Refresh marks a persisted-selected-but-now-gone container disabled with a 🚫 mark, removes it from the graph, instead of silently dropping it", async () => {
     const fakeContainerA = { id: "__gone_a", path: "docker://ssh://u@h/container/demo-a", name: "demo-a", kind: "log", live: true };
     state.sources.push(fakeContainerA);
     syncDockerDaemonButtons();
     dockerHostKeys.set("ssh://u@h", "/path/to/key");
-    setTrack("demo-a", "sel"); // actually selected/plotted
+    const realLoadSelectedTargets = loadSelectedTargets;
+    loadSelectedTargets = async () => ({ containers: new Set(["demo-a"]), services: new Set() });
     const realPost = post;
     const realGet = get;
     // The real daemon no longer has demo-a at all (stopped/removed).
@@ -854,9 +852,10 @@
     try {
       await $("btn-edit-docker-daemon").onclick(); // runs the live probe above immediately
       const cb = $("docker-targets").querySelector('input[value="demo-a"]');
-      ok(cb, "demo-a still shown, not silently dropped, since it was selected");
+      ok(cb, "demo-a still shown, not silently dropped, since it was persisted-selected");
       eq(cb.disabled, true, "shown disabled -- it can't actually be followed anymore");
       eq(cb.checked, true, "still shown checked, reflecting that it was selected");
+      eq(cb.closest("label").querySelector(".mark").textContent, "🚫", "marked with the gone/disabled indicator");
       ok($("docker-targets").textContent.includes("no longer available"), "explains why it's disabled");
       // dlg-ok must never submit a disabled/unavailable entry
       eq($("docker-targets").querySelectorAll("input:checked:not(:disabled)").length, 0, "excluded from what would actually be submitted");
@@ -865,32 +864,28 @@
     } finally {
       post = realPost;
       get = realGet;
+      loadSelectedTargets = realLoadSelectedTargets;
       state.sources = state.sources.filter((s) => !s.id.startsWith("__gone_"));
       syncDockerDaemonButtons();
-      delete state.track["demo-a"];
       dockerHostKeys.delete("ssh://u@h");
-      prefs.set("track", state.track);
       dlg.close();
       $("btn-set").click();
       dlg.close();
     }
   });
 
-  await T("opening Edit Docker Daemon: selected stays selected, a container unselected from the legend (still followed) comes back unchecked, and one no longer returned is removed from the graph but shown disabled", async () => {
+  await T("opening Edit Docker Daemon: persisted-selected stays checked, a followed-but-never-persisted-selected container comes back unchecked, and one no longer returned is removed from the graph but shown disabled only if it was persisted-selected", async () => {
     const stillSelected = { id: "__combo_sel", path: "docker://ssh://u@h/container/still-selected", name: "still-selected", kind: "log", live: true };
     const wasUnselected = { id: "__combo_unsel", path: "docker://ssh://u@h/container/was-unselected", name: "was-unselected", kind: "log", live: true };
     const nowGone = { id: "__combo_gone", path: "docker://ssh://u@h/container/now-gone", name: "now-gone", kind: "log", live: true };
     state.sources.push(stillSelected, wasUnselected, nowGone);
     syncDockerDaemonButtons();
     dockerHostKeys.set("ssh://u@h", "/path/to/key");
-    // Mirrors the real flow: all three were selected once (e.g. ticked in
-    // Set Docker Daemon); "was-unselected" was then explicitly unselected
-    // from the legend (right-click -> Unselect, i.e. setTrack -> "mut"),
-    // same as any real "not selected in the main view" container -- not
-    // simply "never given a track entry".
-    setTrack("still-selected", "sel");
-    setTrack("was-unselected", "mut");
-    setTrack("now-gone", "sel");
+    // Mirrors the real flow: still-selected and now-gone were persisted
+    // (ticked and Set/Updated); was-unselected was followed but never
+    // actually ticked/persisted.
+    const realLoadSelectedTargets = loadSelectedTargets;
+    loadSelectedTargets = async () => ({ containers: new Set(["still-selected", "now-gone"]), services: new Set() });
     const realPost = post;
     const realGet = get;
     // The real daemon still has the first two; now-gone was removed.
@@ -904,12 +899,12 @@
     try {
       await $("btn-edit-docker-daemon").onclick(); // auto-refreshes immediately, no manual Refresh click needed
       const byName = (n) => $("docker-targets").querySelector(`input[value="${n}"]`);
-      eq(byName("still-selected").checked, true, "still selected in the main view -> stays checked");
+      eq(byName("still-selected").checked, true, "persisted-selected -> stays checked");
       eq(byName("still-selected").disabled, false, "still there server-side -> interactive");
-      eq(byName("was-unselected").checked, false, "unselected in the main view (followed, not plotted) -> comes back unchecked, not silently re-checked");
+      eq(byName("was-unselected").checked, false, "followed but never persisted-selected -> comes back unchecked, not silently re-checked");
       eq(byName("was-unselected").disabled, false, "still there server-side -> interactive");
       const goneBox = byName("now-gone");
-      ok(goneBox, "now-gone stays listed rather than vanishing");
+      ok(goneBox, "now-gone stays listed rather than vanishing, since it was persisted-selected");
       eq(goneBox.disabled, true, "no longer returned by the daemon -> disabled");
       ok($("docker-targets").textContent.includes("no longer available"), "explains why it's disabled");
       await until(() => !state.sources.some((s) => s.id === "__combo_gone"), "now-gone's source was actually closed -- removed from the graph");
@@ -918,13 +913,10 @@
     } finally {
       post = realPost;
       get = realGet;
+      loadSelectedTargets = realLoadSelectedTargets;
       state.sources = state.sources.filter((s) => !s.id.startsWith("__combo_"));
       syncDockerDaemonButtons();
-      delete state.track["still-selected"];
-      delete state.track["was-unselected"];
-      delete state.track["now-gone"];
       dockerHostKeys.delete("ssh://u@h");
-      prefs.set("track", state.track);
       dlg.close();
       $("btn-set").click();
       dlg.close();

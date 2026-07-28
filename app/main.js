@@ -21,6 +21,7 @@ const {
   checkStillInstalled,
 } = require("./lib/server-provision");
 const { readGateways, recordGateway, removeGateway, gatewayKey } = require("./lib/gateway-registry");
+const { readSelectedContainers, writeSelectedContainers } = require("./lib/container-selection");
 const { openSshTunnel, closeSshTunnel } = require("./lib/ssh-tunnel");
 const { recordTunnel, removeTunnel, killOrphanedTunnels } = require("./lib/tunnel-registry");
 const {
@@ -1079,6 +1080,16 @@ async function offerRestart(message) {
 // client has ever actually connected to, newest first, with the currently
 // active one flagged so the renderer can highlight it.
 ipcMain.handle("get-gateways", () => listGatewaysWithActiveFlag());
+
+// Set/Edit Docker Daemon's "which containers were actually selected"
+// persistence (see lib/container-selection.js) -- keyed by the same
+// hostKey ("local" or "ssh://user@host[:port]") the renderer already uses
+// for docker:// source paths.
+ipcMain.handle("get-selected-containers", (_e, hostKey) => readSelectedContainers(hostKey));
+ipcMain.handle("set-selected-containers", (_e, hostKey, names) => {
+  writeSelectedContainers(hostKey, names);
+  return { ok: true };
+});
 
 // Backs the status pill's "(tunnel)" suffix and its right-click details
 // popup (see app.js): what kind of connection this actually is right now

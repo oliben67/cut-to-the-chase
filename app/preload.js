@@ -27,6 +27,8 @@ contextBridge.exposeInMainWorld("cttc", {
   getRecordingMarker: () => ipcRenderer.invoke("get-recording-marker"),
   setRecordingMarker: (marker) => ipcRenderer.invoke("set-recording-marker", marker),
   getGateways: () => ipcRenderer.invoke("get-gateways"),
+  getSelectedContainers: (hostKey) => ipcRenderer.invoke("get-selected-containers", hostKey),
+  setSelectedContainers: (hostKey, names) => ipcRenderer.invoke("set-selected-containers", hostKey, names),
   getConnectionInfo: () => ipcRenderer.invoke("get-connection-info"),
   switchGateway: (entry) => ipcRenderer.invoke("switch-gateway", entry),
   checkGateway: (entry) => ipcRenderer.invoke("check-gateway", entry),

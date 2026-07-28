@@ -243,12 +243,16 @@ CTTC can collect, so the dialog splits them into two sections.
   own heading** to select or deselect every checkbox in that group at once
   (a partially-ticked group selects all first, rather than deselecting).
 
-Anything already being followed shows as *already added* but stays
-checked/unchecked according to whether it's actually *selected* right
-now, and stays interactive — unticking an already-followed container
-stops following it, the same as if you'd closed its panel. Ticked
-transforms (see [Transforms](#transforms)) apply to the new log sources.
-**Set Docker Daemon** syncs exactly to what's checked here.
+An already-followed container or service looks exactly like any other
+entry in the list — same color, still enabled — the only cue is a **✔**
+mark next to it if it's currently ticked. Ticking/unticking toggles that
+mark live. Ticked transforms (see [Transforms](#transforms)) apply to the
+new log sources. **Set Docker Daemon** syncs exactly to what's checked
+here, and — on every successful **Set**/**Update Docker Daemon** —
+remembers exactly which containers/services were ticked in a small file
+at `~/.cttc/[user]@[gateway]-containers.json` (one file per Docker daemon
+you connect to), so this daemon's selection survives closing and
+reopening the dialog, and even relaunching CTTC.
 
 **Edit Docker Daemon…** and **Remove Docker Daemon** are only enabled once
 a daemon is actually being watched — nothing to edit or remove otherwise.
@@ -260,22 +264,32 @@ immediately runs that same live probe on its own — you don't have to
 remember to click Refresh yourself for the checklist to reflect what's
 actually running right now.
 
-The checklist reflects the daemon's actual current state, not a blind
-snapshot:
+Opening **Edit Docker Daemon…** reads that daemon's
+`[user]@[gateway]-containers.json` file first, and the checklist is built
+from it, not from whatever happens to be open in this session:
 
-- already-followed and still there — ticked if actually **selected**
-  (plotted), unticked if not (e.g. previously unselected from the legend) —
-  either way, interactive, so unticking stops following it and ticking a
-  not-yet-selected one starts plotting it;
-- **gone** (stopped/removed) — stays **listed and disabled** with a "no
-  longer available" note, checked/unticked to reflect whatever it actually
-  was, instead of silently vanishing; its source is closed automatically,
-  removing it from the graph — Update Docker Daemon isn't needed for that
-  part;
+- anything listed in the file — ticked with a **✔**, indistinguishable
+  otherwise from any other entry; unticking it removes the ✔, ticking it
+  back re-adds it;
+- anything *not* listed in the file — unticked, even if it's still being
+  followed from an earlier session (e.g. previously unselected from the
+  legend) — the file, not "is a log source open for it", is what decides
+  the starting tick;
+- **gone** (stopped/removed) *and* listed in the file — stays **listed,
+  disabled, and marked 🚫**, with a "no longer available" note, instead of
+  silently vanishing; its source is closed automatically, removing it from
+  the graph — Update Docker Daemon isn't needed for that part;
+- **gone** and *not* listed in the file — simply **omitted** from the
+  checklist entirely, nothing to flag;
 - **new** — appears unticked (nothing is preselected just for being found);
 - anything you've since checked/unchecked yourself, still there and
   unchanged server-side, keeps exactly that — Refresh never discards an
   in-progress edit.
+
+Clicking **Set**/**Update Docker Daemon** rewrites
+`[user]@[gateway]-containers.json` to match exactly what's ticked (and
+not disabled) at that moment — this is the "on the way out" save that
+Edit Docker Daemon reads back next time.
 
 ### Remote hosts over SSH
 

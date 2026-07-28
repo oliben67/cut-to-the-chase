@@ -2292,12 +2292,46 @@ function updateDockerDupes() {
 // rather than duplicated per-caller.
 let dockerDaemonEditMode = false;
 
+// The durable "which containers/services were actually selected" record
+// for whatever host is currently open in the dialog -- read from
+// ~/.cttc/[user]@[gateway]-containers.json (see lib/container-selection.js)
+// the moment Edit Docker Daemon opens, and what the checklist's checked
+// defaults/missing-detection are driven by from then on (not state.track,
+// which is a this-session-only, in-memory legend concern). Reset to empty
+// by Set Docker Daemon -- a fresh daemon starts with nothing preselected,
+// never carrying over a stale file from some earlier, unrelated session.
+let selectedTargets = { containers: new Set(), services: new Set() };
+
+// Thin, individually stubbable wrappers around the IPC calls (see
+// preload.js) -- kept as plain reassignable functions, same reasoning as
+// openSeriesPopout/openLogPopout/reloadApp above, so the E2E spec can stub
+// the actual file I/O without writing to a real ~/.cttc/ directory.
+async function loadSelectedTargets(hostKey) {
+  try {
+    const r = await window.cttc?.getSelectedContainers?.(hostKey);
+    return { containers: new Set(r?.containers || []), services: new Set(r?.services || []) };
+  } catch (err) {
+    console.error("loading selected containers failed:", err);
+    return { containers: new Set(), services: new Set() };
+  }
+}
+async function saveSelectedTargets(hostKey, { containers, services }) {
+  try {
+    await window.cttc?.setSelectedContainers?.(hostKey, { containers, services });
+  } catch (err) {
+    console.error("saving selected containers failed:", err);
+  }
+}
+
 // Every control except Docker host / SSH key / Fetch starts empty and
 // disabled -- there's nothing to configure until Fetch has actually shown
 // what's running on the host currently typed in (see setDockerFormEnabled),
 // so nothing here is populated or enabled speculatively.
 $("btn-set").onclick = () => {
   dockerDaemonEditMode = false;
+  // A fresh daemon starts with nothing preselected -- never carries over
+  // some earlier, unrelated host's persisted selection.
+  selectedTargets = { containers: new Set(), services: new Set() };
   $("docker-host").value = "";
   $("docker-host").disabled = false;
   $("docker-ssh-key").value = "";
@@ -2337,6 +2371,11 @@ $("btn-edit-docker-daemon").onclick = async () => {
   $("dlg-ok").textContent = "Update Docker Daemon";
   $("transforms-list").innerHTML = "none found in server/transforms/";
   $("docker-error").textContent = "";
+  // The durable "what was actually selected" record for this daemon --
+  // loaded before anything renders, since it (not state.track) is what
+  // drives the checklist's checked defaults and "gone but was selected"
+  // detection from here on (see renderDockerTargetGroup/renderDockerTargets).
+  selectedTargets = await loadSelectedTargets(hostKey);
   // Pre-fill the checklist immediately from what's already being followed
   // for this daemon -- editing shouldn't start from a blank form while the
   // Refresh below is still in flight.
@@ -2782,76 +2821,85 @@ $("btn-activity-toggle").onclick = () => {
   toggle.textContent = pre.hidden ? "Show activity" : "Hide activity";
 };
 
+// Sets a checkbox's checked state and keeps its ✔/nothing mark in sync --
+// the mark is a deliberately explicit, always-visible cue for "this is in
+// [user]@[gateway]-containers.json" (see selectedTargets) independent of
+// however checkboxes happen to render per OS/theme, shown/hidden on every
+// check/uncheck, whether from a user click or the group-select-all header
+// setting .checked programmatically (which fires no "change" event).
+function setCheckedWithMark(cb, mark, checked) {
+  cb.checked = checked;
+  mark.textContent = checked ? "✔" : "";
+}
+
 // Builds one labelled group of checkboxes (Swarm services / Containers)
 // inside #docker-targets -- shared by listContainers()' live `docker ps`
 // result and btn-edit-docker-daemon's immediate pre-fill from already-open
 // sources (see renderDockerTargets below), so both end up with the exact
-// same look/behavior (group-select-all header, "already added" badge).
-// `wasChecked` (name+type -> bool) carries over whatever the user had
-// ticked/unticked in the checklist *before* this render -- a Refresh must
-// update the list to match the daemon's actual current state (new
-// containers appear, gone ones disappear) without silently re-ticking
-// something the user had just deliberately unchecked. `missing` is
-// whatever was being followed (selected or not) but didn't come back in
-// this fetch/pre-fill at all -- rendered disabled rather than just
-// vanishing, so "this used to be here" is visible instead of silently
-// dropped; still checked/unchecked according to whether it was actually
-// selected, same as any other entry.
-function renderDockerTargetGroup(box, open, hostKey, title, items, type, wasChecked, missing = []) {
+// same look/behavior. `wasChecked` (name -> bool) carries over whatever
+// the user had ticked/unticked in the checklist *before* this render -- a
+// Refresh must update the list to match the daemon's actual current state
+// (new containers appear, gone ones disappear) without silently
+// re-ticking something the user had just deliberately unchecked.
+// `selectedNames` is this type's half of selectedTargets -- the checked
+// default for anything not already touched this session. `missing` is
+// whatever selectedNames says *was* selected but didn't come back in this
+// fetch/pre-fill at all -- rendered disabled with a 🚫 mark rather than
+// just vanishing, so "this was selected and is now gone" stays visible.
+// A followed-but-never-selected container that's gone is never passed in
+// `missing` at all (see renderDockerTargets) -- there's nothing to flag.
+//
+// Deliberately no other visual distinction for a plain, present,
+// checked/unchecked entry (no dimming, no "already added" label, same
+// color/enabled either way) -- the ✔/🚫 marks are the only cue.
+function renderDockerTargetGroup(box, title, items, type, wasChecked, selectedNames, missing = []) {
   if (!items.length && !missing.length) return;
   const g = document.createElement("div");
   g.className = "group";
   g.textContent = title;
   g.title = "Click to select/deselect all of this group";
-  const groupBoxes = [];
-  // Click the group's own title to select/deselect every checkbox in it at
-  // once -- toggles based on current state, same as a tri-state checkbox
-  // would: any unchecked box means "select all", all checked means
-  // "deselect all". Disabled (missing) entries below never join
-  // groupBoxes, so they can't skew what "select all" means for the rest.
+  const groupBoxes = []; // [{cb, mark}], for the group-select-all header below
   g.onclick = () => {
-    const selectAll = groupBoxes.some((cb) => !cb.checked);
-    for (const cb of groupBoxes) cb.checked = selectAll;
+    const selectAll = groupBoxes.some(({ cb }) => !cb.checked);
+    for (const { cb, mark } of groupBoxes) setCheckedWithMark(cb, mark, selectAll);
   };
   box.appendChild(g);
   for (const it of items) {
     const label = document.createElement("label");
     const cb = document.createElement("input");
     cb.type = "checkbox";
-    // Nothing is preselected just for having been *found* -- only an item
-    // already marked "sel" (actually selected/plotted, see state.track)
-    // starts ticked; a fresh discovery starts unticked, and one already in
-    // the checklist keeps whatever the user last left it at.
-    const key = `${type}:${it.name}`;
-    cb.checked = wasChecked.has(key) ? wasChecked.get(key) : state.track[it.name] === "sel";
     cb.value = it.name;
     cb.dataset.type = type;
-    groupBoxes.push(cb);
-    label.append(cb, ` ${it.name} `);
+    const mark = document.createElement("span");
+    mark.className = "mark";
+    // Nothing is preselected just for having been *found* -- only a name
+    // in selectedNames (persisted, see selectedTargets) starts ticked; a
+    // fresh discovery starts unticked, and one already in the checklist
+    // keeps whatever the user last left it at.
+    const startChecked = wasChecked.has(it.name) ? wasChecked.get(it.name) : selectedNames.has(it.name);
+    setCheckedWithMark(cb, mark, startChecked);
+    cb.onchange = () => setCheckedWithMark(cb, mark, cb.checked);
+    groupBoxes.push({ cb, mark });
+    label.append(cb, mark, ` ${it.name} `);
     const extra = document.createElement("span");
     extra.className = "tdoc";
     extra.textContent = it.image || it.replicas || "";
-    // Left checked-but-interactive (not disabled) even when already being
-    // followed: "Set"/"Update" always syncs exactly to what's checked here
-    // (see dlg-ok), so unchecking an already-added item is how you stop
-    // following it, rather than needing to close its panel separately.
-    if (open.has(`docker://${hostKey}/${type}/${it.name}`)) {
-      label.classList.add("added");
-      extra.textContent = "already added";
-    }
     label.appendChild(extra);
     box.appendChild(label);
   }
   for (const it of missing) {
     const label = document.createElement("label");
-    label.classList.add("added", "unavailable");
+    label.classList.add("unavailable");
     const cb = document.createElement("input");
     cb.type = "checkbox";
-    cb.checked = state.track[it.name] === "sel"; // reflects whatever it actually was, same as any other entry
+    cb.checked = true; // it's only ever in `missing` because it WAS selected
     cb.disabled = true; // excluded from dlg-ok's submission query on purpose -- see "input:checked:not(:disabled)"
     cb.value = it.name;
     cb.dataset.type = type;
-    label.append(cb, ` ${it.name} `);
+    const mark = document.createElement("span");
+    mark.className = "mark";
+    mark.textContent = "🚫";
+    label.append(cb, mark, ` ${it.name} `);
     const extra = document.createElement("span");
     extra.className = "tdoc";
     extra.textContent = "no longer available";
@@ -2864,42 +2912,52 @@ function renderDockerTargetGroup(box, open, hostKey, title, items, type, wasChec
 // either a live `docker ps` result (listContainers) or, immediately on
 // opening Edit Docker Daemon (before any Refresh), whatever's already being
 // followed for this host (see btn-edit-docker-daemon below). Re-renders
-// are a diff against the checklist's own current state, not a blind wipe:
-// a Refresh that finds a container gone (stopped/removed) marks it
-// disabled rather than dropping it outright (see renderDockerTargetGroup's
-// `missing`), one that's new appears unticked (nothing is preselected just
-// for having been *found*), and anything still there keeps exactly
-// whatever the user last checked/unchecked it to -- "check if anything
-// changed server-side and update the list accordingly" without discarding
-// in-progress edits.
+// are a diff against selectedTargets (the persisted record, see its own
+// comment), not a blind wipe: a Refresh that finds a *selected* container
+// gone (stopped/removed) marks it disabled rather than dropping it outright
+// (see renderDockerTargetGroup's `missing`) -- one that was never selected
+// and is now gone is simply omitted, nothing to flag; a genuinely new one
+// appears unticked (nothing is preselected just for having been *found*);
+// and anything still there keeps exactly whatever the user last
+// checked/unchecked it to.
 //
 // `closeMissing: true` (only from a real live fetch, i.e. listContainers --
 // never the initial no-live-data pre-fill, which has nothing to diff
-// against yet) also actually closes any now-gone container/service's
-// source, so it stops being tracked/plotted immediately rather than
-// waiting on the user to notice and click Update Docker Daemon: "no longer
-// available" should mean gone from the graph too, not just flagged in
-// this dialog.
+// against yet) also actually closes any now-gone *selected* container/
+// service's source, so it stops being tracked/plotted immediately rather
+// than waiting on the user to notice and click Update Docker Daemon: "no
+// longer available" should mean gone from the graph too, not just flagged
+// in this dialog.
 function renderDockerTargets(containers, services, hostKey, { closeMissing = false } = {}) {
   const box = $("docker-targets");
   const wasChecked = new Map();
-  for (const cb of box.querySelectorAll("input[type=checkbox]")) {
-    wasChecked.set(`${cb.dataset.type}:${cb.value}`, cb.checked);
+  for (const cb of box.querySelectorAll("input[type=checkbox]:not(:disabled)")) {
+    wasChecked.set(cb.value, cb.checked);
   }
   box.innerHTML = "";
-  const open = openPaths();
+  // Only ever used here to find an *id* to close for a gone-but-selected
+  // entry (see below) -- whether something is "missing" is now purely a
+  // selectedTargets question, not "is a log source open for it".
   const tracked = currentlyTrackedTargets(hostKey);
+  const trackedIdByName = new Map([...tracked.containers, ...tracked.services].map((t) => [t.name, t.id]));
   const containerNames = new Set(containers.map((c) => c.name));
   const serviceNames = new Set(services.map((s) => s.name));
-  const missingContainers = tracked.containers.filter((c) => !containerNames.has(c.name));
-  const missingServices = tracked.services.filter((s) => !serviceNames.has(s.name));
-  renderDockerTargetGroup(box, open, hostKey, "Swarm services (docker service logs)", services, "service", wasChecked, missingServices);
-  renderDockerTargetGroup(box, open, hostKey, "Containers (docker logs)", containers, "container", wasChecked, missingContainers);
+  const missingContainers = [...selectedTargets.containers]
+    .filter((name) => !containerNames.has(name))
+    .map((name) => ({ name, id: trackedIdByName.get(name) }));
+  const missingServices = [...selectedTargets.services]
+    .filter((name) => !serviceNames.has(name))
+    .map((name) => ({ name, id: trackedIdByName.get(name) }));
+  renderDockerTargetGroup(box, "Swarm services (docker service logs)", services, "service", wasChecked, selectedTargets.services, missingServices);
+  renderDockerTargetGroup(box, "Containers (docker logs)", containers, "container", wasChecked, selectedTargets.containers, missingContainers);
   if (!services.length && !containers.length && !missingServices.length && !missingContainers.length) {
     box.textContent = "nothing running";
   }
   if (closeMissing) {
-    const gone = [...missingContainers, ...missingServices];
+    // Only ones with an actual open source to close (a selected name with
+    // no matching tracked source -- e.g. restored from the file but never
+    // actually re-opened this session -- has nothing to close).
+    const gone = [...missingContainers, ...missingServices].filter((it) => it.id);
     if (gone.length) {
       const ids = new Set(gone.map((it) => it.id));
       // Closed and removed from state.sources directly (not a full
@@ -3102,6 +3160,18 @@ $("dlg-ok").onclick = async () => {
     prefs.set("lastDockerSessions", sessions);
     // containers picked here are the "selected" set shown in the legend
     for (const l of logs) setTrack(l.name, "sel");
+    // ...and, separately, the durable per-daemon record consulted the next
+    // time Set/Edit Docker Daemon opens for this host (see selectedTargets
+    // / loadSelectedTargets) -- "on the way out" per the spec, on every
+    // successful Set/Update, regardless of edit vs. create mode.
+    selectedTargets = {
+      containers: new Set(logs.filter((l) => l.type === "container").map((l) => l.name)),
+      services: new Set(logs.filter((l) => l.type === "service").map((l) => l.name)),
+    };
+    await saveSelectedTargets(hostKey, {
+      containers: [...selectedTargets.containers],
+      services: [...selectedTargets.services],
+    });
     dlg.close();
     refreshAll();
   } catch (err) {
