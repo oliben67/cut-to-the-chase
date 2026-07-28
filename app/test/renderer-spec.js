@@ -876,6 +876,61 @@
     }
   });
 
+  await T("opening Edit Docker Daemon: selected stays selected, a container unselected from the legend (still followed) comes back unchecked, and one no longer returned is removed from the graph but shown disabled", async () => {
+    const stillSelected = { id: "__combo_sel", path: "docker://ssh://u@h/container/still-selected", name: "still-selected", kind: "log", live: true };
+    const wasUnselected = { id: "__combo_unsel", path: "docker://ssh://u@h/container/was-unselected", name: "was-unselected", kind: "log", live: true };
+    const nowGone = { id: "__combo_gone", path: "docker://ssh://u@h/container/now-gone", name: "now-gone", kind: "log", live: true };
+    state.sources.push(stillSelected, wasUnselected, nowGone);
+    syncDockerDaemonButtons();
+    dockerHostKeys.set("ssh://u@h", "/path/to/key");
+    // Mirrors the real flow: all three were selected once (e.g. ticked in
+    // Set Docker Daemon); "was-unselected" was then explicitly unselected
+    // from the legend (right-click -> Unselect, i.e. setTrack -> "mut"),
+    // same as any real "not selected in the main view" container -- not
+    // simply "never given a track entry".
+    setTrack("still-selected", "sel");
+    setTrack("was-unselected", "mut");
+    setTrack("now-gone", "sel");
+    const realPost = post;
+    const realGet = get;
+    // The real daemon still has the first two; now-gone was removed.
+    post = async (path, body) => {
+      if (path === "/docker/ps") {
+        return { containers: [{ id: "1", name: "still-selected" }, { id: "2", name: "was-unselected" }], services: [], log: [] };
+      }
+      return realPost(path, body);
+    };
+    get = async (path) => (path === "/transforms" ? { transforms: [] } : realGet(path));
+    try {
+      await $("btn-edit-docker-daemon").onclick(); // auto-refreshes immediately, no manual Refresh click needed
+      const byName = (n) => $("docker-targets").querySelector(`input[value="${n}"]`);
+      eq(byName("still-selected").checked, true, "still selected in the main view -> stays checked");
+      eq(byName("still-selected").disabled, false, "still there server-side -> interactive");
+      eq(byName("was-unselected").checked, false, "unselected in the main view (followed, not plotted) -> comes back unchecked, not silently re-checked");
+      eq(byName("was-unselected").disabled, false, "still there server-side -> interactive");
+      const goneBox = byName("now-gone");
+      ok(goneBox, "now-gone stays listed rather than vanishing");
+      eq(goneBox.disabled, true, "no longer returned by the daemon -> disabled");
+      ok($("docker-targets").textContent.includes("no longer available"), "explains why it's disabled");
+      await until(() => !state.sources.some((s) => s.id === "__combo_gone"), "now-gone's source was actually closed -- removed from the graph");
+      ok(state.sources.some((s) => s.id === "__combo_sel"), "still-selected's source untouched");
+      ok(state.sources.some((s) => s.id === "__combo_unsel"), "was-unselected's source untouched (still followed, just not plotted)");
+    } finally {
+      post = realPost;
+      get = realGet;
+      state.sources = state.sources.filter((s) => !s.id.startsWith("__combo_"));
+      syncDockerDaemonButtons();
+      delete state.track["still-selected"];
+      delete state.track["was-unselected"];
+      delete state.track["now-gone"];
+      dockerHostKeys.delete("ssh://u@h");
+      prefs.set("track", state.track);
+      dlg.close();
+      $("btn-set").click();
+      dlg.close();
+    }
+  });
+
   await T("dockerHostKeys persists across restarts (regression: was in-memory only, lost the ssh key on relaunch)", () => {
     try {
       dockerHostKeys.set("ssh://persist-test@h", "/some/key/path");
