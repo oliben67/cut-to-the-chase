@@ -255,20 +255,27 @@ a daemon is actually being watched — nothing to edit or remove otherwise.
 Once one is set, **Edit Docker Daemon…** re-opens this same form with the
 host and SSH key pre-filled and locked, **Fetch** relabelled **Refresh**
 (just re-probes for new containers/services rather than starting over),
-and the bottom button relabelled **Update Docker Daemon**. The checklist
-itself isn't blank while you wait for a Refresh — it starts pre-filled with
-every container/service already being followed, immediately interactive,
-with only the ones actually **selected** (plotted) ticked — a container
-you'd previously unselected from the legend stays listed but unticked,
-matching its real state. **Refresh** diffs the checklist against the
-daemon's actual current state rather than replacing it wholesale: a
-container that was never selected and is now gone drops off the list
-silently; one that **was selected** but has since stopped/disappeared
-stays listed, ticked, and **disabled** with a "no longer available" note,
-instead of vanishing without explanation; a genuinely new one appears
-unticked (nothing is preselected just for being found); and anything
-still there and unchanged keeps exactly whatever you last checked/
-unchecked it to — Refresh never silently discards an in-progress edit.
+and the bottom button relabelled **Update Docker Daemon**. Opening it
+immediately runs that same live probe on its own — you don't have to
+remember to click Refresh yourself for the checklist to reflect what's
+actually running right now.
+
+The checklist reflects the daemon's actual current state, not a blind
+snapshot:
+
+- already-followed and still there — ticked if actually **selected**
+  (plotted), unticked if not (e.g. previously unselected from the legend) —
+  either way, interactive, so unticking stops following it and ticking a
+  not-yet-selected one starts plotting it;
+- **gone** (stopped/removed) — stays **listed and disabled** with a "no
+  longer available" note, checked/unticked to reflect whatever it actually
+  was, instead of silently vanishing; its source is closed automatically,
+  removing it from the graph — Update Docker Daemon isn't needed for that
+  part;
+- **new** — appears unticked (nothing is preselected just for being found);
+- anything you've since checked/unchecked yourself, still there and
+  unchanged server-side, keeps exactly that — Refresh never discards an
+  in-progress edit.
 
 ### Remote hosts over SSH
 

@@ -2323,7 +2323,7 @@ $("btn-set").onclick = () => {
 // new one. Submitting still goes through the same dlg-ok handler as the
 // create flow -- disabled inputs' .value reads normally, so nothing there
 // needs to branch on which button opened the dialog.
-$("btn-edit-docker-daemon").onclick = () => {
+$("btn-edit-docker-daemon").onclick = async () => {
   dockerDaemonEditMode = true;
   const host = currentDockerHost();
   const hostKey = host || "local";
@@ -2338,16 +2338,21 @@ $("btn-edit-docker-daemon").onclick = () => {
   $("transforms-list").innerHTML = "none found in server/transforms/";
   $("docker-error").textContent = "";
   // Pre-fill the checklist immediately from what's already being followed
-  // for this daemon -- editing shouldn't start from a blank form; Refresh
-  // still re-probes the live daemon for anything new/gone, but every
-  // already-tracked container/service is right there, checked, from the
-  // moment the dialog opens.
+  // for this daemon -- editing shouldn't start from a blank form while the
+  // Refresh below is still in flight.
   const { containers, services } = currentlyTrackedTargets(hostKey);
   renderDockerTargets(containers, services, hostKey);
   setDockerFormEnabled(true);
   updateDockerDupes();
   renderActivityLog(null);
   dlg.showModal();
+  // Edit Docker Daemon always opens onto the daemon's *actual* current
+  // state, not a snapshot from whenever it was last set -- run the same
+  // live probe Refresh does immediately, so a container that's since
+  // disappeared is caught (and disabled in the list, see
+  // renderDockerTargets' closeMissing) right away rather than only after
+  // the user remembers to click Refresh themselves.
+  await listContainers();
 };
 
 // Toggles every "what to collect" control except Docker host/SSH key/Fetch
@@ -2359,7 +2364,12 @@ function setDockerFormEnabled(enabled) {
   $("docker-stats").disabled = !enabled;
   $("docker-interval").disabled = !enabled;
   $("dlg-ok").disabled = !enabled;
-  for (const cb of $("docker-targets").querySelectorAll("input")) cb.disabled = !enabled;
+  // "unavailable" checkboxes (renderDockerTargetGroup's `missing`) stay
+  // disabled regardless -- they're not something Fetch/Refresh finishing
+  // should ever re-enable, since there's nothing left to actually follow.
+  for (const cb of $("docker-targets").querySelectorAll("input")) {
+    if (!cb.closest("label")?.classList.contains("unavailable")) cb.disabled = !enabled;
+  }
   for (const cb of $("transforms-list").querySelectorAll("input")) cb.disabled = !enabled;
 }
 
@@ -2781,11 +2791,12 @@ $("btn-activity-toggle").onclick = () => {
 // ticked/unticked in the checklist *before* this render -- a Refresh must
 // update the list to match the daemon's actual current state (new
 // containers appear, gone ones disappear) without silently re-ticking
-// something the user had just deliberately unchecked. `missing` is the
-// subset that's currently *selected* (plotted) but didn't come back in
+// something the user had just deliberately unchecked. `missing` is
+// whatever was being followed (selected or not) but didn't come back in
 // this fetch/pre-fill at all -- rendered disabled rather than just
-// vanishing, so "it's selected but gone" is visible instead of silently
-// dropped.
+// vanishing, so "this used to be here" is visible instead of silently
+// dropped; still checked/unchecked according to whether it was actually
+// selected, same as any other entry.
 function renderDockerTargetGroup(box, open, hostKey, title, items, type, wasChecked, missing = []) {
   if (!items.length && !missing.length) return;
   const g = document.createElement("div");
@@ -2836,14 +2847,14 @@ function renderDockerTargetGroup(box, open, hostKey, title, items, type, wasChec
     label.classList.add("added", "unavailable");
     const cb = document.createElement("input");
     cb.type = "checkbox";
-    cb.checked = true;
+    cb.checked = state.track[it.name] === "sel"; // reflects whatever it actually was, same as any other entry
     cb.disabled = true; // excluded from dlg-ok's submission query on purpose -- see "input:checked:not(:disabled)"
     cb.value = it.name;
     cb.dataset.type = type;
     label.append(cb, ` ${it.name} `);
     const extra = document.createElement("span");
     extra.className = "tdoc";
-    extra.textContent = "no longer available — was selected";
+    extra.textContent = "no longer available";
     label.appendChild(extra);
     box.appendChild(label);
   }
@@ -2855,13 +2866,21 @@ function renderDockerTargetGroup(box, open, hostKey, title, items, type, wasChec
 // followed for this host (see btn-edit-docker-daemon below). Re-renders
 // are a diff against the checklist's own current state, not a blind wipe:
 // a Refresh that finds a container gone (stopped/removed) marks it
-// disabled rather than dropping it outright when it was selected (see
-// renderDockerTargetGroup's `missing`), one that's new appears unticked
-// (nothing is preselected just for having been *found*), and anything
-// still there keeps exactly whatever the user last checked/unchecked it
-// to -- "check if anything changed server-side and update the list
-// accordingly" without discarding in-progress edits.
-function renderDockerTargets(containers, services, hostKey) {
+// disabled rather than dropping it outright (see renderDockerTargetGroup's
+// `missing`), one that's new appears unticked (nothing is preselected just
+// for having been *found*), and anything still there keeps exactly
+// whatever the user last checked/unchecked it to -- "check if anything
+// changed server-side and update the list accordingly" without discarding
+// in-progress edits.
+//
+// `closeMissing: true` (only from a real live fetch, i.e. listContainers --
+// never the initial no-live-data pre-fill, which has nothing to diff
+// against yet) also actually closes any now-gone container/service's
+// source, so it stops being tracked/plotted immediately rather than
+// waiting on the user to notice and click Update Docker Daemon: "no longer
+// available" should mean gone from the graph too, not just flagged in
+// this dialog.
+function renderDockerTargets(containers, services, hostKey, { closeMissing = false } = {}) {
   const box = $("docker-targets");
   const wasChecked = new Map();
   for (const cb of box.querySelectorAll("input[type=checkbox]")) {
@@ -2869,15 +2888,36 @@ function renderDockerTargets(containers, services, hostKey) {
   }
   box.innerHTML = "";
   const open = openPaths();
-  const selected = selectedTrackedTargets(hostKey);
+  const tracked = currentlyTrackedTargets(hostKey);
   const containerNames = new Set(containers.map((c) => c.name));
   const serviceNames = new Set(services.map((s) => s.name));
-  const missingContainers = selected.containers.filter((c) => !containerNames.has(c.name));
-  const missingServices = selected.services.filter((s) => !serviceNames.has(s.name));
+  const missingContainers = tracked.containers.filter((c) => !containerNames.has(c.name));
+  const missingServices = tracked.services.filter((s) => !serviceNames.has(s.name));
   renderDockerTargetGroup(box, open, hostKey, "Swarm services (docker service logs)", services, "service", wasChecked, missingServices);
   renderDockerTargetGroup(box, open, hostKey, "Containers (docker logs)", containers, "container", wasChecked, missingContainers);
   if (!services.length && !containers.length && !missingServices.length && !missingContainers.length) {
     box.textContent = "nothing running";
+  }
+  if (closeMissing) {
+    const gone = [...missingContainers, ...missingServices];
+    if (gone.length) {
+      const ids = new Set(gone.map((it) => it.id));
+      // Closed and removed from state.sources directly (not a full
+      // refreshAll() round-trip) -- we already know exactly which ids just
+      // got confirmed gone, no need to wait on and reconcile against an
+      // entire fresh /sources list just to reflect that. Logged, not
+      // thrown, on failure: the checklist already shows it disabled either
+      // way, and a close failing here (already gone server-side too, most
+      // likely) shouldn't block the rest of the dialog from working.
+      Promise.all(gone.map((it) => post("/close", { id: it.id }).catch((err) => console.error("close (missing container/service) failed:", err))))
+        .then(() => {
+          state.sources = state.sources.filter((s) => !ids.has(s.id));
+          assignColorSlots();
+          syncPanels();
+          renderLegend();
+          drawAll();
+        });
+    }
   }
 }
 
@@ -2897,23 +2937,10 @@ function currentlyTrackedTargets(hostKey) {
     const path = s.path || "";
     if (!path.startsWith(prefix)) continue;
     const rest = path.slice(prefix.length);
-    if (rest.startsWith("container/")) containers.push({ name: s.name });
-    else if (rest.startsWith("service/")) services.push({ name: s.name });
+    if (rest.startsWith("container/")) containers.push({ name: s.name, id: s.id });
+    else if (rest.startsWith("service/")) services.push({ name: s.name, id: s.id });
   }
   return { containers, services };
-}
-
-// Like currentlyTrackedTargets, but only the ones actually *selected*
-// (state.track[name] === "sel", i.e. plotted/shown in the legend) -- used
-// to detect "was selected, no longer found" on a Refresh/pre-fill (see
-// renderDockerTargets' `missing`), as opposed to every followed container
-// regardless of selection state.
-function selectedTrackedTargets(hostKey) {
-  const { containers, services } = currentlyTrackedTargets(hostKey);
-  return {
-    containers: containers.filter((c) => state.track[c.name] === "sel"),
-    services: services.filter((s) => state.track[s.name] === "sel"),
-  };
 }
 
 async function listContainers() {
@@ -2954,19 +2981,18 @@ async function listContainers() {
     status.textContent = "";
     renderActivityLog(r.log);
 
-    // A successful fetch means "here's what's actually running now" -- any
-    // container/service still tracked from a previous fetch (this host or
-    // a different one) no longer reflects that and must go, not linger
-    // alongside the fresh list. Host-level telemetry (docker://.../stats,
-    // docker://.../host) is not a container and is deliberately left alone
-    // here -- it's the host we just fetched from, not something to drop.
-    const stale = state.sources.filter((s) => /^docker:\/\/[^/]+\/(container|service)\//.test(s.path || ""));
-    if (stale.length) {
-      await Promise.all(stale.map((s) => post("/close", { id: s.id })));
-      await refreshAll();
-    }
-
-    renderDockerTargets(r.containers, r.services, host || "local");
+    // Closing anything no longer wanted happens in one of two targeted
+    // ways, not by wiping every previously-tracked container/service on
+    // any successful fetch (that used to run here, and directly fought
+    // renderDockerTargets' own diff -- it would close and refreshAll()
+    // *before* the diff ever saw the pre-fetch state, so a still-selected
+    // container could never be told apart from one that's actually gone):
+    // dlg-ok's own submit-time `toClose` closes whatever's unticked for
+    // *this* host once the user actually confirms Set/Update Docker
+    // Daemon, and renderDockerTargets' `closeMissing` below closes only
+    // what this live fetch just proved is actually gone from the daemon
+    // itself.
+    renderDockerTargets(r.containers, r.services, host || "local", { closeMissing: true });
 
     const t = await get("/transforms").catch(() => ({ transforms: [] }));
     const tbox = $("transforms-list");
