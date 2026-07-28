@@ -1021,6 +1021,89 @@
     eq(normalizeDockerHost("tcp://1.2.3.4:2375"), "tcp://1.2.3.4:2375", "other schemes left alone too");
   });
 
+  await T("setLiveTrackSecs clamps to zero/negative -- the future has no data to simulate a click on", () => {
+    try {
+      setLiveTrackSecs(-7);
+      eq(liveTrackSecs, -7, "negative accepted");
+      eq($("live-track-secs").value, "-7", "toolbar field reflects it");
+      eq($("live-track-secs-sidebar").value, "-7", "Settings field kept in sync");
+      setLiveTrackSecs(5);
+      eq(liveTrackSecs, 0, "positive clamped down to 0 -- can't track into the future");
+      setLiveTrackSecs(0);
+      eq(liveTrackSecs, 0, "zero accepted as-is");
+    } finally {
+      setLiveTrackSecs(0);
+      prefs.set("liveTrackSecs", 0);
+    }
+  });
+
+  await T("liveTrackTick simulates a click at now + liveTrackSecs while live, marked as a live-tracking cursor -- and does nothing once the user has panned away from live", () => {
+    const realLive = state.live;
+    const realNow = Date.now;
+    try {
+      Date.now = () => 1_700_000_000_000;
+      state.live = true;
+      setLiveTrackSecs(-10);
+      liveTrackTick();
+      eq(state.cursorT, 1_700_000_000_000 - 10_000, "cursor moved to now + offset");
+      eq(state.liveTrackCursor, true, "flagged as a live-tracking cursor, not a manual click");
+
+      state.cursorT = null;
+      state.liveTrackCursor = false;
+      state.live = false; // user panned away
+      liveTrackTick();
+      eq(state.cursorT, null, "no-op once no longer following live -- doesn't yank the user's view back");
+      eq(state.liveTrackCursor, false, "still not flagged");
+    } finally {
+      Date.now = realNow;
+      state.live = realLive;
+      setLiveTrackSecs(0);
+      prefs.set("liveTrackSecs", 0);
+    }
+  });
+
+  await T("the Live tracking switch turns it off entirely, independent of the seconds offset, and disables the seconds field", () => {
+    const realLive = state.live;
+    try {
+      setLiveTrackEnabled(false);
+      eq($("live-track-toggle").checked, false, "toolbar switch off");
+      eq($("live-track-toggle-sidebar").checked, false, "Settings switch kept in sync");
+      eq($("live-track-secs").disabled, true, "seconds field disabled while off");
+      eq($("live-track-secs-sidebar").disabled, true, "Settings seconds field disabled too");
+
+      setLiveTrackSecs(-5);
+      state.cursorT = null;
+      state.liveTrackCursor = false;
+      state.live = true;
+      liveTrackTick();
+      eq(state.cursorT, null, "no-op while the switch is off, even though state.live is true and the offset is set");
+
+      setLiveTrackEnabled(true);
+      eq($("live-track-secs").disabled, false, "seconds field re-enabled once back on");
+      liveTrackTick();
+      eq(state.liveTrackCursor, true, "resumes simulating the click once switched back on");
+    } finally {
+      state.live = realLive;
+      state.cursorT = null;
+      state.liveTrackCursor = false;
+      setLiveTrackSecs(0);
+      setLiveTrackEnabled(true);
+      prefs.set("liveTrackSecs", 0);
+      prefs.set("liveTrackEnabled", true);
+    }
+  });
+
+  await T("a manual click clears the live-tracking cursor flag -- only liveTrackTick's own auto-click sets it", () => {
+    state.liveTrackCursor = true; // simulate a preceding live-tracking auto-click
+    try {
+      setCursor(123456789);
+      eq(state.liveTrackCursor, false, "a plain setCursor call (manual click) is never flagged as live-tracking");
+    } finally {
+      state.cursorT = null;
+      state.liveTrackCursor = false;
+    }
+  });
+
   await T("openPaths reflects open sources", () => {
     const paths = openPaths();
     for (const s of state.sources) ok(paths.has(s.path), s.path);

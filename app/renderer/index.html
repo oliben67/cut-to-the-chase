@@ -153,6 +153,17 @@
       <label class="ctl" title="Frequency: size of the ± highlight window around the selected time -- not a data-polling rate (see Set/Edit Docker Daemon's own poll interval for that)"><input id="win-secs" type="number" min="1" step="1" value="5" /> s</label>
     </div>
 
+    <div class="toolbar-section" id="section-live-track">
+      <label class="ctl switch-row" title="Turn Live tracking on/off">
+        <span class="switch">
+          <input id="live-track-toggle" type="checkbox" checked />
+          <span class="switch-track"><span class="switch-thumb"></span></span>
+        </span>
+      </label>
+      <span class="ts-label">Live tracking</span>
+      <label class="ctl" title="While following live, automatically moves the cursor to now + this many seconds on every refresh -- 0 tracks exactly now, negative looks slightly into the past (never positive: the future has no data to show yet)."><input id="live-track-secs" type="number" max="0" step="1" value="0" /> s</label>
+    </div>
+
     <div class="toolbar-section" id="section-graph">
       <span class="ts-label">View as</span>
       <!-- a segmented control, not a switch: this picks one of two chart
@@ -402,6 +413,13 @@
       </span>
     </fieldset>
     <fieldset class="keys-box">
+      <legend>Live tracking</legend>
+      <p class="dlg-section-help muted">The bar marking where Live tracking has moved the cursor to, and the matching highlight on log entries around it.</p>
+      <label class="ctl block">
+        <input id="theme-live-track-color" type="color" value="#22c55e" />
+      </label>
+    </fieldset>
+    <fieldset class="keys-box">
       <legend>Status bar</legend>
       <p class="dlg-section-help muted">A slim bar at the bottom of the window reporting when an event is created or fires.</p>
       <label class="ctl switch-row">
@@ -426,6 +444,20 @@
       <p class="dlg-section-help muted">Size of the ± highlight window around the selected time -- not a data-polling rate (see Set/Edit Docker Daemon's own poll interval for that).</p>
       <label class="ctl">
         <input id="win-secs-sidebar" type="number" min="1" step="1" value="5" /> s
+      </label>
+    </fieldset>
+    <fieldset class="keys-box">
+      <legend>Live tracking</legend>
+      <p class="dlg-section-help muted">While following live, automatically moves the cursor to now + this many seconds on every refresh -- 0 tracks exactly now, negative looks slightly into the past (never positive: the future has no data to show yet).</p>
+      <label class="ctl switch-row">
+        <span class="switch">
+          <input id="live-track-toggle-sidebar" type="checkbox" checked />
+          <span class="switch-track"><span class="switch-thumb"></span></span>
+        </span>
+        <span>Enable Live tracking</span>
+      </label>
+      <label class="ctl">
+        <input id="live-track-secs-sidebar" type="number" max="0" step="1" value="0" /> s
       </label>
     </fieldset>
     <fieldset class="keys-box" id="fieldset-log-collector">

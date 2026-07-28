@@ -456,6 +456,26 @@ as you adjust them.
 ![The Appearance dialog's "Now" line section: a color swatch and a
 Dotted/Dashed/Solid switch](docs/images/dlg-appearance.png)
 
+### Live tracking
+
+Enabled by default (toolbar and Settings both have a switch to turn it
+off), **Live tracking** simulates a click on the graph at *now + N
+seconds* on every refresh, but only while the view is actually following
+live — panning away to look at history leaves it alone rather than
+yanking your view back. *N* defaults to 0 (track exactly now) and is
+never positive — the future has no data to show yet — so it only ever
+looks at now or slightly behind it, e.g. `-5` to allow for a bit of
+log-shipping delay. Set it in the toolbar's **Live tracking** field or
+**Settings → Live tracking**.
+
+Unlike a manual click, a Live-tracking-driven cursor renders as a soft
+**green bar** on the charts (not the usual thin accent line), and log
+entries within the frequency window around it are highlighted in the same
+color instead of the ordinary highlight color — both a visual cue that
+this position was picked automatically, not by you. That color is
+configurable in **Preferences → Appearance → "Live tracking"**, right
+after the "Now" line section, the same way as the now-line's own color.
+
 ### The cursor and the frequency window
 
 Click any chart or lane to place the **cursor** at that time: every log

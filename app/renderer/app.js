@@ -87,6 +87,11 @@ const state = {
   // "fit all data" and "keep following now" are different intents.
   live: true,
   cursorT: null,          // clicked time
+  // whether cursorT above was set by Live tracking's own auto-click
+  // (liveTrackTick) rather than a manual click -- drawn/highlighted in
+  // liveTrackColor instead of the normal accent/hl color, see drawVerticals
+  // and Panel.render.
+  liveTrackCursor: false,
   hoverX: null,           // crosshair pixel x (plot coords) or null
   hoverStrip: null,
   windowMs: 5000,
@@ -143,6 +148,26 @@ const DEFAULT_NOW_STYLE = "dotted";
 const NOW_LINE_DASHES = { dotted: [2, 4], dashed: [8, 5], solid: [] };
 let nowLineColor = prefs.get("nowLineColor", DEFAULT_NOW_COLOR);
 let nowLineStyle = prefs.get("nowLineStyle", DEFAULT_NOW_STYLE);
+
+// Live tracking (Preferences > Appearance > "Live tracking", and the
+// toolbar/Settings "Live tracking" seconds field): while the view is
+// following live (state.live), every refresh simulates a click at
+// now + this many seconds (negative looks slightly into the past instead
+// of ahead) -- see liveTrackTick(), called from refreshAll(). Rendered as
+// a green bar (see drawVerticals) distinct from a manual click's thin
+// accent cursor line, and the same color highlights matching log rows
+// (see Panel.render's "hl-live" class) -- distinct from the ordinary
+// selection highlight color so an auto-tracked position reads differently
+// from one the user picked themselves.
+const DEFAULT_LIVE_TRACK_COLOR = "#22c55e";
+let liveTrackColor = prefs.get("liveTrackColor", DEFAULT_LIVE_TRACK_COLOR);
+// Offset (seconds, never positive -- see setLiveTrackSecs) added to
+// Date.now() on every refresh while live; see liveTrackTick() in
+// the refresh/SSE section below.
+let liveTrackSecs = prefs.get("liveTrackSecs", 0);
+// On by default (per the feature's own spec) -- the toolbar/Settings
+// switch turns it off entirely, independent of the seconds offset above.
+let liveTrackEnabled = prefs.get("liveTrackEnabled", true);
 
 // bytes/sec -> the largest unit (GB/MB/kB/B) that keeps the number >= 1,
 // one decimal place -- used for the NET strip's axis labels and tooltip.
@@ -653,7 +678,18 @@ function drawVerticals(ctx, h) {
   if (state.cursorT != null && state.view) {
     const x = tToX(state.cursorT);
     if (x >= MARGIN_L && x <= MARGIN_L + plotWidth()) {
-      ctx.strokeStyle = themeVar("--accent");
+      if (state.liveTrackCursor) {
+        // Live tracking's own auto-click: a soft filled bar, not just a
+        // thin line -- visually distinct from a manual click's accent
+        // cursor line, see setCursor's liveTrack option / liveTrackTick.
+        ctx.fillStyle = liveTrackColor;
+        ctx.globalAlpha = 0.25;
+        ctx.fillRect(x - 3, 0, 6, h);
+        ctx.globalAlpha = 1;
+        ctx.strokeStyle = liveTrackColor;
+      } else {
+        ctx.strokeStyle = themeVar("--accent");
+      }
       ctx.lineWidth = 1.5;
       ctx.beginPath();
       ctx.moveTo(x, 0);
@@ -1735,10 +1771,11 @@ function assignColorSlots() {
 
 async function setCursor(t, opts = {}) {
   state.cursorT = t;
+  state.liveTrackCursor = !!opts.liveTrack;
   $("cursor-label-text").textContent = "t = " + new Date(t).toISOString().replace("T", " ").replace("Z", " UTC");
   drawAll();
   for (const p of panels.values()) p.jumpTo(t);
-  if (opts.broadcast !== false) window.cttc?.broadcastSync?.({ type: "cursor", t });
+  if (opts.broadcast !== false) window.cttc?.broadcastSync?.({ type: "cursor", t, liveTrack: !!opts.liveTrack });
 }
 
 /* ── log panels (virtual scroll) ────────────────────────────────────────── */
@@ -1969,7 +2006,11 @@ class Panel {
       div.style.top = i * ROWH + "px";
       const isHl = state.cursorT != null && Math.abs(row.ts - state.cursorT) <= state.windowMs;
       if (isHl) {
-        div.classList.add("hl");
+        // Live tracking's auto-click highlights rows in liveTrackColor
+        // instead of the normal selection highlight color -- see
+        // setCursor's liveTrack option / the "Live tracking" Appearance
+        // section.
+        div.classList.add(state.liveTrackCursor ? "hl-live" : "hl");
         if (!prevHl) div.classList.add("hl-top");
       } else if (prevHl) {
         prevDiv.classList.add("hl-bottom");
@@ -2202,10 +2243,22 @@ async function refreshAll() {
       }
     }
     await fetchSeries();
+    liveTrackTick();
     setStatus(src.json_impl === "orjson" ? "" : "server running without orjson (slow parse)");
   } catch (err) {
     setStatus("server unreachable: " + err.message);
   }
+}
+
+// Live tracking (see the toolbar/Settings "Live tracking" seconds field):
+// on every refresh while the view is following live, simulates a click at
+// now + liveTrackSecs (never positive -- the future has no data to show
+// yet, see setLiveTrackSecs's clamp). Deliberately gated on state.live
+// (not "always"): a user who's panned away to look at history shouldn't
+// have their cursor yanked back to the live edge by a background refresh.
+function liveTrackTick() {
+  if (!state.live || !liveTrackEnabled) return;
+  setCursor(Date.now() + liveTrackSecs * 1000, { liveTrack: true });
 }
 
 // Opens the server's /events stream (see route_events in server.py): every
@@ -2708,6 +2761,16 @@ function applyHlColor(color) {
 }
 applyHlColor(prefs.get("hlColor", DEFAULT_HL_COLOR));
 
+// Live tracking's color drives both the canvas-drawn bar (liveTrackColor,
+// a plain JS variable -- canvas needs an actual color string, see
+// drawVerticals) and the log row highlight (the --live-track-color CSS
+// var, see .hl-live in style.css) -- kept in sync by always setting both.
+function applyLiveTrackColor(color) {
+  liveTrackColor = color;
+  document.documentElement.style.setProperty("--live-track-color", color);
+}
+applyLiveTrackColor(liveTrackColor);
+
 // Light/Dark/System: unlike the highlight color, this takes effect (and
 // persists) the moment you click it rather than waiting on Save/Cancel --
 // nativeTheme.themeSource (see main.js) is process-wide, so it's set from
@@ -2742,6 +2805,7 @@ function openThemeDialog() {
   $("theme-status-bar-toggle").checked = statusBarEnabled;
   $("theme-now-color").value = prefs.get("nowLineColor", DEFAULT_NOW_COLOR);
   syncNowStyleButtons(prefs.get("nowLineStyle", DEFAULT_NOW_STYLE));
+  $("theme-live-track-color").value = prefs.get("liveTrackColor", DEFAULT_LIVE_TRACK_COLOR);
   dlgTheme.showModal();
 }
 $("theme-hl-color").oninput = (e) => applyHlColor(e.target.value); // live preview
@@ -2749,6 +2813,7 @@ $("theme-now-color").oninput = (e) => { nowLineColor = e.target.value; drawAll()
 for (const b of $("theme-now-style-switch").querySelectorAll("button")) {
   b.onclick = () => { syncNowStyleButtons(b.dataset.style); nowLineStyle = b.dataset.style; drawAll(); };
 }
+$("theme-live-track-color").oninput = (e) => { applyLiveTrackColor(e.target.value); drawAll(); }; // live preview
 $("dlg-theme-reset").onclick = () => {
   $("theme-hl-color").value = DEFAULT_HL_COLOR;
   applyHlColor(DEFAULT_HL_COLOR);
@@ -2757,6 +2822,8 @@ $("dlg-theme-reset").onclick = () => {
   nowLineColor = DEFAULT_NOW_COLOR;
   syncNowStyleButtons(DEFAULT_NOW_STYLE);
   nowLineStyle = DEFAULT_NOW_STYLE;
+  $("theme-live-track-color").value = DEFAULT_LIVE_TRACK_COLOR;
+  applyLiveTrackColor(DEFAULT_LIVE_TRACK_COLOR);
   drawAll();
 };
 $("dlg-theme-save").onclick = () => {
@@ -2765,12 +2832,14 @@ $("dlg-theme-save").onclick = () => {
   applyHlColor(color);
   prefs.set("nowLineColor", nowLineColor);
   prefs.set("nowLineStyle", nowLineStyle);
+  prefs.set("liveTrackColor", liveTrackColor);
   dlgTheme.close();
 };
 $("dlg-theme-close").onclick = () => {
   applyHlColor(prefs.get("hlColor", DEFAULT_HL_COLOR)); // discard live preview
   nowLineColor = prefs.get("nowLineColor", DEFAULT_NOW_COLOR); // discard live preview
   nowLineStyle = prefs.get("nowLineStyle", DEFAULT_NOW_STYLE);
+  applyLiveTrackColor(prefs.get("liveTrackColor", DEFAULT_LIVE_TRACK_COLOR)); // discard live preview
   drawAll();
   dlgTheme.close();
 };
@@ -3215,6 +3284,35 @@ function setWindowSecs(v) {
 $("win-secs").oninput = (e) => setWindowSecs(e.target.value);
 $("win-secs-sidebar").oninput = (e) => setWindowSecs(e.target.value);
 if (!POPOUT_KIND) window.cttc?.onSetPollInterval?.((secs) => setWindowSecs(secs));
+
+// Live tracking's own seconds field -- never positive (the future has no
+// data to show yet, see liveTrackTick), persisted so it survives restarts.
+function setLiveTrackSecs(v) {
+  const secs = Math.min(0, Math.floor(Number(v)) || 0);
+  liveTrackSecs = secs;
+  prefs.set("liveTrackSecs", secs);
+  $("live-track-secs").value = secs;
+  $("live-track-secs-sidebar").value = secs;
+}
+setLiveTrackSecs(liveTrackSecs); // apply the persisted value to both fields on load
+$("live-track-secs").oninput = (e) => setLiveTrackSecs(e.target.value);
+$("live-track-secs-sidebar").oninput = (e) => setLiveTrackSecs(e.target.value);
+
+// The switch turns Live tracking off entirely (liveTrackTick becomes a
+// no-op) independent of whatever seconds offset is dialed in -- disabling
+// the seconds field alongside it makes that "off" state visible, not just
+// functionally inert.
+function setLiveTrackEnabled(enabled) {
+  liveTrackEnabled = enabled;
+  prefs.set("liveTrackEnabled", enabled);
+  $("live-track-toggle").checked = enabled;
+  $("live-track-toggle-sidebar").checked = enabled;
+  $("live-track-secs").disabled = !enabled;
+  $("live-track-secs-sidebar").disabled = !enabled;
+}
+setLiveTrackEnabled(liveTrackEnabled); // apply the persisted value to both fields on load
+$("live-track-toggle").onchange = (e) => setLiveTrackEnabled(e.target.checked);
+$("live-track-toggle-sidebar").onchange = (e) => setLiveTrackEnabled(e.target.checked);
 
 // Settings: a real dialog (like Appearance), not an inline foldout --
 // opened via the shared data-action dispatch (see RENDERER_ACTIONS'
@@ -4153,7 +4251,7 @@ window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", dra
 // stay in sync with other windows (popped-out telemetry/log panels): mirror
 // cursor moves and pan/zoom without re-broadcasting (avoids echo loops).
 window.cttc?.onSync?.((msg) => {
-  if (msg.type === "cursor") setCursor(msg.t, { broadcast: false });
+  if (msg.type === "cursor") setCursor(msg.t, { broadcast: false, liveTrack: !!msg.liveTrack });
   else if (msg.type === "view") setView(msg.t0, msg.t1, { broadcast: false });
 });
 

@@ -16,6 +16,9 @@
   /* user-configurable via File > Preferences > Theme (see app.js prefs.hlColor) */
   --hl-color: #eaff00;
   --hl: color-mix(in srgb, var(--hl-color) 30%, transparent);
+  /* user-configurable via Preferences > Appearance > "Live tracking" */
+  --live-track-color: #22c55e;
+  --live-track: color-mix(in srgb, var(--live-track-color) 30%, transparent);
   --critical: #d03b3b;
   --warning: #fab219;
   --series-1: #2a78d6;
@@ -48,6 +51,8 @@
     --accent: #4a90f0;
     --hl-color: #eaff00;
     --hl: color-mix(in srgb, var(--hl-color) 40%, transparent);
+    --live-track-color: #22c55e;
+    --live-track: color-mix(in srgb, var(--live-track-color) 40%, transparent);
     --critical: #e35454;
     --warning: #fab219;
     --series-1: #3987e5;
@@ -1230,10 +1235,16 @@ body.popout-host #btn-popout-telemetry {
 }
 .log-row:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
 .log-row.hl { background: var(--hl); }
+/* Live tracking's own auto-click highlight (see setCursor's liveTrack
+   option) -- same shape as .hl above, but liveTrackColor instead of the
+   ordinary selection highlight color, so it reads as distinct. */
+.log-row.hl-live { background: var(--live-track); }
 /* dotted boundary marking the top/bottom edge of a contiguous run of
    highlighted log entries (see the .hl-top/.hl-bottom logic in app.js) */
 .log-row.hl-top { border-top: 2px dashed var(--hl-color); }
 .log-row.hl-bottom { border-bottom: 2px dashed var(--hl-color); }
+.log-row.hl-live.hl-top { border-top: 2px dashed var(--live-track-color); }
+.log-row.hl-live.hl-bottom { border-bottom: 2px dashed var(--live-track-color); }
 .log-row.cursor-row { border-left-color: var(--accent); }
 .log-row.selected { outline: 1px solid var(--accent); outline-offset: -1px; background: color-mix(in srgb, var(--accent) 14%, transparent); }
 .log-row .ts { color: var(--muted); margin-right: 6px; }
