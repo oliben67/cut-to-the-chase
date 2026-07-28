@@ -1084,6 +1084,10 @@ function syncDockerDaemonButtons() {
   const active = hasDockerDaemon();
   $("btn-edit-docker-daemon").disabled = !active;
   $("btn-clear-sources").disabled = !active;
+  // Only one Docker daemon can be watched at a time -- Set Docker Daemon
+  // is for defining the first one; once one exists, use Edit Docker
+  // Daemon (or Remove it first) instead of starting a second one.
+  $("btn-set").disabled = active;
 }
 
 const dlgExport = $("dlg-export");
@@ -3158,8 +3162,15 @@ $("dlg-ok").onclick = async () => {
     const sessions = prefs.get("lastDockerSessions", []);
     sessions.push(collectReq);
     prefs.set("lastDockerSessions", sessions);
-    // containers picked here are the "selected" set shown in the legend
-    for (const l of logs) setTrack(l.name, "sel");
+    // Every entry actually present in the checklist (checked or not, minus
+    // the disabled/gone ones) gets its legend track state set explicitly to
+    // match -- not just the checked ones. Only ever promoting to "sel" and
+    // never demoting back to "mut" left a just-unchecked container stuck
+    // showing as selected (still plotted/still in the legend's selected
+    // group) even though it was no longer in `logs` at all.
+    for (const cb of $("docker-targets").querySelectorAll("input[type=checkbox]:not(:disabled)")) {
+      setTrack(cb.value, cb.checked ? "sel" : "mut");
+    }
     // ...and, separately, the durable per-daemon record consulted the next
     // time Set/Edit Docker Daemon opens for this host (see selectedTargets
     // / loadSelectedTargets) -- "on the way out" per the spec, on every
@@ -3173,6 +3184,11 @@ $("dlg-ok").onclick = async () => {
       services: [...selectedTargets.services],
     });
     dlg.close();
+    // Legend/graph must reflect the just-saved selection immediately, not
+    // just after the next SSE-driven refresh -- refreshAll() re-derives
+    // both from state.track (see trackStateOf/allSvcSeries) and the fresh
+    // /sources list, which is also the moment a brand-new container's
+    // panel/telemetry actually appears.
     refreshAll();
   } catch (err) {
     alert(String(err.message || err));

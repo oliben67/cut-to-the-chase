@@ -215,6 +215,11 @@ reconnects — no action needed on your part.
 poll interval, and the Fetch button that lists containers/services to
 follow](docs/images/dlg-set-sources.png)
 
+Only one Docker daemon can be watched at a time, so **Set Docker
+Daemon…** is only enabled while none is defined yet — once one's set, use
+**Edit Docker Daemon…** (or **Remove Docker Daemon** first) instead of
+starting a second one.
+
 **Set Docker Daemon…** attaches to a Docker daemon. Leave the host field
 empty for the local daemon (or the gateway's own host, if you're connected
 to a remote gateway). Telemetry and logs are two independent kinds of data
@@ -252,7 +257,11 @@ here, and — on every successful **Set**/**Update Docker Daemon** —
 remembers exactly which containers/services were ticked in a small file
 at `~/.cttc/[user]@[gateway]-containers.json` (one file per Docker daemon
 you connect to), so this daemon's selection survives closing and
-reopening the dialog, and even relaunching CTTC.
+reopening the dialog, and even relaunching CTTC. That same submit also
+updates every entry's legend/graph tracking state to match exactly
+what's ticked — a newly-ticked container starts plotting immediately,
+and one you just unticked stops being selected right away, rather than
+staying stuck in the graph until separately unselected from the legend.
 
 **Edit Docker Daemon…** and **Remove Docker Daemon** are only enabled once
 a daemon is actually being watched — nothing to edit or remove otherwise.

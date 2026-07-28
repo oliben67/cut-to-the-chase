@@ -946,6 +946,58 @@
     }
   });
 
+  await T("Set Docker Daemon is enabled only when no daemon is currently being watched", () => {
+    ok(!hasDockerDaemon(), "no docker:// source open in this suite's baseline state");
+    eq($("btn-set").disabled, false, "enabled -- nothing set yet");
+    const fakeSrc = { id: "__setbtn_test", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
+    state.sources.push(fakeSrc);
+    syncDockerDaemonButtons(); // a real app calls this via refreshAll() whenever state.sources changes
+    try {
+      eq($("btn-set").disabled, true, "disabled once a daemon is already being watched -- use Edit/Remove instead");
+    } finally {
+      state.sources = state.sources.filter((s) => s.id !== "__setbtn_test");
+      syncDockerDaemonButtons();
+      eq($("btn-set").disabled, false, "re-enabled once that daemon is gone");
+    }
+  });
+
+  await T("Set/Update Docker Daemon syncs the legend's track state to exactly what's checked -- a newly checked entry becomes selected (plotted), a just-unchecked one is demoted, not left stuck selected", async () => {
+    setTrack("was-selected", "sel"); // simulates a prior Set/Update that had this one checked
+    const realPost = post;
+    const realGet = get;
+    post = async (path, body) => {
+      if (path === "/docker/ps") {
+        return { containers: [{ id: "a", name: "was-selected" }, { id: "b", name: "newly-selected" }], services: [], log: [] };
+      }
+      if (path === "/docker/collect") return { ok: true };
+      return realPost(path, body);
+    };
+    get = async (path) => (path === "/transforms" ? { transforms: [] } : realGet(path));
+    const realSaveSelectedTargets = saveSelectedTargets;
+    saveSelectedTargets = async () => {};
+    try {
+      $("btn-set").click();
+      $("docker-host").value = "";
+      await listContainers();
+      const boxes = [...$("docker-targets").querySelectorAll("input[type=checkbox]")];
+      // was-selected starts unticked here (nothing preselected just for
+      // being found by Fetch) -- untick it to mirror "the user unchecked a
+      // previously-selected container", then tick the other one.
+      boxes.find((cb) => cb.value === "newly-selected").checked = true;
+      await $("dlg-ok").onclick();
+      eq(state.track["newly-selected"], "sel", "just-checked entry is promoted to selected -- shows in the graph/legend");
+      eq(state.track["was-selected"], "mut", "just-unchecked entry is demoted back to muted, not left stuck as selected");
+    } finally {
+      post = realPost;
+      get = realGet;
+      saveSelectedTargets = realSaveSelectedTargets;
+      delete state.track["was-selected"];
+      delete state.track["newly-selected"];
+      prefs.set("track", state.track);
+      dlg.close();
+    }
+  });
+
   await T("activity log toggle reflects the last docker/ps call", async () => {
     renderActivityLog(null);
     eq($("btn-activity-toggle").hidden, true, "hidden with no activity");
