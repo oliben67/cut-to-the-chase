@@ -271,16 +271,9 @@
     </div>
 
     <p class="dlg-intro muted">
-      CTTC tracks two independent kinds of data per host — set up each one below.
+      CPU/MEM/NET telemetry (per container and for the host) is always
+      collected once a daemon is set — pick which logs to follow below.
     </p>
-
-    <fieldset class="dlg-section">
-      <legend>📊 Telemetry</legend>
-      <p class="dlg-section-help muted">CPU / memory / network, one live feed for the whole host.</p>
-      <label class="ctl"><input id="docker-stats" type="checkbox" checked /> collect <code>docker stats</code> telemetry <span id="docker-stats-note" class="tdoc"></span></label>
-      <p class="ctl muted">Host telemetry (CPU/MEM/NET of this host) is always collected alongside it <span id="docker-host-stats-note" class="tdoc"></span></p>
-      <label class="ctl block">poll interval <input id="docker-interval" type="number" min="1" value="5" /> s</label>
-    </fieldset>
 
     <fieldset class="dlg-section">
       <legend>📝 Logs</legend>

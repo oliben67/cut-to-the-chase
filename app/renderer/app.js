@@ -2324,22 +2324,9 @@ function openPaths() {
 
 // Whether Fetch has successfully listed the host currently typed into
 // Docker host -- until it has, every control it would otherwise toggle
-// (see updateDockerDupes below) must stay disabled regardless of duplicate
-// state, since typing alone (docker-host's oninput -> updateDockerDupes)
-// must never re-enable a control ahead of an actual fetch.
+// must stay disabled regardless, since nothing meaningful can be set until
+// Fetch has shown what's actually on the host.
 let dockerFormFetched = false;
-
-function updateDockerDupes() {
-  const hostKey = normalizeDockerHost($("docker-host").value) || "local";
-  const paths = openPaths();
-  const statsDup = paths.has(`docker://${hostKey}/stats`);
-  $("docker-stats").disabled = statsDup || !dockerFormFetched;
-  if (statsDup) $("docker-stats").checked = false;
-  $("docker-stats-note").textContent = statsDup ? "— already collecting" : "";
-  // host telemetry is always requested now (no checkbox to disable) -- the
-  // note just says so when it's already open for this host.
-  $("docker-host-stats-note").textContent = paths.has(`docker://${hostKey}/host`) ? "— already collecting" : "";
-}
 
 // Whether the dialog is currently in "Edit Docker Daemon" mode -- listContainers()'s
 // finally-block needs this so a Refresh doesn't unlock the host/ssh-key
@@ -2348,6 +2335,10 @@ function updateDockerDupes() {
 // listContainers() function, so the difference has to be tracked here
 // rather than duplicated per-caller.
 let dockerDaemonEditMode = false;
+
+// No dedicated telemetry section/poll-interval field in Set/Edit Docker
+// Daemon anymore -- collection is always on, at this fixed rate.
+const DEFAULT_DOCKER_POLL_INTERVAL = 5;
 
 // The durable "which containers/services were actually selected" record
 // for whatever host is currently open in the dialog -- read from
@@ -2401,7 +2392,6 @@ $("btn-set").onclick = () => {
   $("transforms-list").innerHTML = "none found in server/transforms/";
   $("docker-error").textContent = "";
   setDockerFormEnabled(false);
-  updateDockerDupes();
   renderActivityLog(null);
   dlg.showModal();
 };
@@ -2439,7 +2429,6 @@ $("btn-edit-docker-daemon").onclick = async () => {
   const { containers, services } = currentlyTrackedTargets(hostKey);
   renderDockerTargets(containers, services, hostKey);
   setDockerFormEnabled(true);
-  updateDockerDupes();
   renderActivityLog(null);
   dlg.showModal();
   // Edit Docker Daemon always opens onto the daemon's *actual* current
@@ -2457,8 +2446,6 @@ $("btn-edit-docker-daemon").onclick = async () => {
 // after it changed) means the previous answer no longer applies either.
 function setDockerFormEnabled(enabled) {
   dockerFormFetched = enabled;
-  $("docker-stats").disabled = !enabled;
-  $("docker-interval").disabled = !enabled;
   // "unavailable" checkboxes (renderDockerTargetGroup's `missing`) stay
   // disabled regardless -- they're not something Fetch/Refresh finishing
   // should ever re-enable, since there's nothing left to actually follow.
@@ -3186,7 +3173,6 @@ async function listContainers() {
 }
 
 $("btn-ps-refresh").onclick = () => listContainers();
-$("docker-host").oninput = () => updateDockerDupes();
 $("docker-host").addEventListener("keydown", (e) => {
   if (e.key === "Enter") {
     e.preventDefault();
@@ -3230,14 +3216,14 @@ $("dlg-ok").onclick = async () => {
     });
     for (const s of toClose) await post("/close", { id: s.id });
 
-    const stats = $("docker-stats").checked;
-    // Host telemetry (CPU/MEM/NET) is always requested once a source's host
-    // is set -- no separate opt-in checkbox to forget to tick.
+    // Telemetry (per-container docker stats and host CPU/MEM/NET) is
+    // always collected once a daemon is set -- no dedicated section/toggle
+    // for it in this dialog anymore, just the fixed default poll interval.
     const collectReq = {
-      host, stats, logs, transforms,
+      host, stats: true, logs, transforms,
       host_stats: true,
       ssh_key: sshKey,
-      interval: Number($("docker-interval").value) || 5,
+      interval: DEFAULT_DOCKER_POLL_INTERVAL,
     };
     await post("/docker/collect", collectReq);
     // remember this collection request so it can be restored on next launch

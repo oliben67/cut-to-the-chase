@@ -135,10 +135,9 @@ From top to bottom:
 
 1. **Toolbar** — recording transport (⏺/⏸/⏹/⏏, see
    [Automating with events](#automating-with-events)), the **frequency**
-   control (labelled *Frequency* — not to be confused with the *poll
-   interval* field in Set/Edit Docker Daemon, which is the one that
-   actually changes how often the server polls Docker; this one only sizes
-   the ± highlight window, see
+   control (labelled *Frequency* — not to be confused with how often the
+   server polls Docker for telemetry, which is a fixed rate, not
+   configurable here; this one only sizes the ± highlight window, see
    [The cursor and the frequency window](#the-cursor-and-the-frequency-window)),
    the 〜/▤ chart-style switch, the current **view range**, and the
    cursor's UTC readout — see [The status bar](#the-status-bar).
@@ -211,9 +210,8 @@ reconnects — no action needed on your part.
 
 ### Collecting from Docker
 
-![The Set Docker Daemon dialog: docker host field, telemetry checkboxes,
-poll interval, and the Fetch button that lists containers/services to
-follow](docs/images/dlg-set-sources.png)
+![The Set Docker Daemon dialog: docker host field and the Fetch button
+that lists containers/services to follow](docs/images/dlg-set-sources.png)
 
 Only one Docker daemon can be watched at a time, so **Set Docker
 Daemon…** is only enabled while none is defined yet — once one's set, use
@@ -222,31 +220,23 @@ starting a second one.
 
 **Set Docker Daemon…** attaches to a Docker daemon. Leave the host field
 empty for the local daemon (or the gateway's own host, if you're connected
-to a remote gateway). Telemetry and logs are two independent kinds of data
-CTTC can collect, so the dialog splits them into two sections.
+to a remote gateway). CPU/MEM/NET telemetry — both per-container
+(`docker stats`) and for the host machine itself — is always collected
+once a daemon is set, on a fixed poll interval; there's no separate
+opt-in for it. Only *selected* containers (see below) are actually
+*plotted*; the rest wait in the legend's *others* group (see
+[The container legend](#the-container-legend)).
 
-- **📊 Telemetry** — two checkboxes:
-  - **collect `docker stats` telemetry** — polls CPU/MEM/NET for *every*
-    container on the host on the chosen **poll interval** (in seconds —
-    this is the control that actually changes how often the server polls
-    Docker, unlike the toolbar's *frequency* control). Only *selected*
-    containers (see below) are actually *plotted*; the rest wait in the
-    legend's *others* group (see [The container legend](#the-container-legend)).
-    Changing it in **Edit Docker Daemon…** and clicking **Update Docker
-    Daemon** takes effect immediately on the already-running collector, not
-    just on a fresh one.
-  - **collect host telemetry** — CPU/MEM/NET of the docker host machine
-    itself, shown in its own strip group at the bottom.
-- **📝 Logs** — click **Fetch** to list the running containers and swarm
-  services for the entered host, grouped under **"Swarm services"** and
-  **"Containers"** headings. **Nothing is ticked by default** — pick
-  exactly what you want followed and plotted; ticking an item both starts
-  following its logs (`docker logs -f -t`, or `docker service logs -f -t`
-  for swarm services) *and* marks it *selected* so its telemetry plots
-  immediately. You can always right-click a container later to track it
-  (see [The container legend](#the-container-legend)). **Click a group's
-  own heading** to select or deselect every checkbox in that group at once
-  (a partially-ticked group selects all first, rather than deselecting).
+Click **Fetch** to list the running containers and swarm services for the
+entered host, grouped under **"Swarm services"** and **"Containers"**
+headings. **Nothing is ticked by default** — pick exactly what you want
+followed and plotted; ticking an item both starts following its logs
+(`docker logs -f -t`, or `docker service logs -f -t` for swarm services)
+*and* marks it *selected* so its telemetry plots immediately. You can
+always right-click a container later to track it (see
+[The container legend](#the-container-legend)). **Click a group's own
+heading** to select or deselect every checkbox in that group at once (a
+partially-ticked group selects all first, rather than deselecting).
 
 **Set Docker Daemon**/**Update Docker Daemon** stays disabled until at
 least one container or service is actually checked — with nothing

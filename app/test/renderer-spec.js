@@ -558,34 +558,10 @@
 
   /* ── set-sources dialog logic ─────────────────────────────────────────── */
 
-  await T("updateDockerDupes disables already-collected stats", () => {
-    // dup-checking only matters once Fetch has actually run -- otherwise
-    // every "what to collect" control stays disabled regardless (see
-    // setDockerFormEnabled/dockerFormFetched), so simulate that precondition.
-    setDockerFormEnabled(true);
-    state.sources.push({ id: "__dup", path: "docker://local/stats", kind: "stats", live: true });
-    try {
-      $("docker-host").value = "";
-      updateDockerDupes();
-      eq($("docker-stats").disabled, true, "stats disabled");
-      ok($("docker-stats-note").textContent.includes("already"), "note shown");
-      // host telemetry has no checkbox to disable (always requested) -- just
-      // a note when it's already open for this host, which it isn't here.
-      eq($("docker-host-stats-note").textContent, "", "host stats note empty");
-    } finally {
-      state.sources = state.sources.filter((s) => s.id !== "__dup");
-      updateDockerDupes();
-      eq($("docker-stats").disabled, false, "re-enabled");
-      setDockerFormEnabled(false);
-    }
-  });
-
   await T("Set Docker Daemon dialog opens with the form empty and disabled", () => {
     $("btn-set").click();
     try {
       eq($("docker-targets").innerHTML, "", "targets empty");
-      eq($("docker-stats").disabled, true, "stats disabled");
-      eq($("docker-interval").disabled, true, "interval disabled");
       eq($("dlg-ok").disabled, true, "Set Docker Daemon disabled");
       // only Docker host / SSH key / Fetch stay usable up front
       eq($("docker-host").disabled, false, "host stays enabled");
@@ -610,7 +586,6 @@
       $("btn-set").click();
       $("docker-host").value = ""; // empty -- the gateway/local daemon is used
       await listContainers();
-      eq($("docker-stats").disabled, false, "stats enabled after fetch");
       eq($("dlg-ok").disabled, true, "Set Docker Daemon stays disabled -- nothing checked yet, nothing to collect");
       ok($("docker-targets").textContent.includes("demo"), "fetched container listed");
       $("docker-targets").querySelector('input[value="demo"]').checked = true;
