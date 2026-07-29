@@ -651,8 +651,13 @@ def transform(record):   # {"ts": epoch_ms, "text": str, "fields": dict, "source
 
 Shipped examples: `parse_level` (tags `fields["level"]`),
 `drop_healthchecks` (drops noisy probe lines), `json_message` (renders JSON
-log lines as `LEVEL logger: message`). A crashing transform never kills
-ingestion — the error is recorded on the affected record instead.
+log lines as `LEVEL logger: message`). **`json_message` and `parse_level`
+are ticked by default** — turning raw JSON lines and bare level tagging
+into something readable is the common case, not an opt-in; everything
+else (like `drop_healthchecks`) stays opt-in. A Refresh preserves
+whatever you've actually ticked/unticked yourself, rather than resetting
+back to those defaults. A crashing transform never kills ingestion — the
+error is recorded on the affected record instead.
 
 ## Interactions reference
 

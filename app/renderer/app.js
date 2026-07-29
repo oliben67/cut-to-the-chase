@@ -2340,6 +2340,10 @@ let dockerDaemonEditMode = false;
 // Daemon anymore -- collection is always on, at this fixed rate.
 const DEFAULT_DOCKER_POLL_INTERVAL = 5;
 
+// Transform names (see server/transforms/*.py) ticked by default in the
+// transforms checklist -- see listContainers()'s Fetch/Refresh handler.
+const DEFAULT_ON_TRANSFORMS = new Set(["json_message", "parse_level"]);
+
 // The durable "which containers/services were actually selected" record
 // for whatever host is currently open in the dialog -- read from
 // ~/.cttc/[user]@[gateway]-containers.json (see lib/container-selection.js)
@@ -3127,12 +3131,23 @@ async function listContainers() {
 
     const t = await get("/transforms").catch(() => ({ transforms: [] }));
     const tbox = $("transforms-list");
+    // A Refresh rebuilds this list from scratch (the set of installed
+    // transforms could have changed) -- carry over whatever the user had
+    // already ticked, same as the docker-targets checklist's own
+    // wasChecked, so a Refresh never silently discards a deliberate pick.
+    const wasChecked = new Map();
+    for (const cb of tbox.querySelectorAll("input[type=checkbox]")) wasChecked.set(cb.value, cb.checked);
     tbox.innerHTML = t.transforms.length ? "" : "none found in server/transforms/";
     for (const tr of t.transforms) {
       const label = document.createElement("label");
       const cb = document.createElement("input");
       cb.type = "checkbox";
       cb.value = tr.name;
+      // json_message and parse_level are on by default -- turning raw JSON
+      // log lines and bare level tagging into something readable is the
+      // common case, not an opt-in; anything else (e.g. drop_healthchecks)
+      // stays opt-in as before.
+      cb.checked = wasChecked.has(tr.name) ? wasChecked.get(tr.name) : DEFAULT_ON_TRANSFORMS.has(tr.name);
       label.append(cb, ` ${tr.name} `);
       const doc = document.createElement("span");
       doc.className = "tdoc";

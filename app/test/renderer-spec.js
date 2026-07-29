@@ -598,6 +598,46 @@
     }
   });
 
+  await T("json_message and parse_level transforms are ticked by default, others aren't, and Refresh preserves the user's own picks", async () => {
+    const realPost = post;
+    const realGet = get;
+    post = async (path, body) => {
+      if (path === "/docker/ps") return { containers: [], services: [], log: [] };
+      return realPost(path, body);
+    };
+    get = async (path) => (
+      path === "/transforms"
+        ? { transforms: [
+            { name: "json_message", doc: "" },
+            { name: "parse_level", doc: "" },
+            { name: "drop_healthchecks", doc: "" },
+          ] }
+        : realGet(path)
+    );
+    try {
+      $("btn-set").click();
+      $("docker-host").value = "";
+      await listContainers();
+      const byName = (n) => $("transforms-list").querySelector(`input[value="${n}"]`);
+      eq(byName("json_message").checked, true, "json_message on by default");
+      eq(byName("parse_level").checked, true, "parse_level on by default");
+      eq(byName("drop_healthchecks").checked, false, "others stay opt-in");
+
+      // deliberately deviate from the defaults, then Refresh (re-fetch) --
+      // the user's own picks must survive, not silently reset
+      byName("json_message").checked = false;
+      byName("drop_healthchecks").checked = true;
+      await listContainers();
+      eq(byName("json_message").checked, false, "user's un-tick of a default-on transform survives a Refresh");
+      eq(byName("drop_healthchecks").checked, true, "user's tick of a default-off transform survives a Refresh");
+      eq(byName("parse_level").checked, true, "untouched default-on transform still ticked");
+    } finally {
+      post = realPost;
+      get = realGet;
+      dlg.close();
+    }
+  });
+
   await T("clicking a group title in the Docker Daemon checklist toggles every checkbox in that group", async () => {
     const realPost = post;
     const realGet = get;
