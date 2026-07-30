@@ -63,8 +63,6 @@
     <aside id="action-bar">
       <div class="ab-dock-controls">
         <button type="button" id="ab-collapse-toggle" class="ab-dock-btn" title="Hide sidebar">◂</button>
-        <button type="button" class="ab-dock-btn" data-dock-to="top" title="Dock top">⬒</button>
-        <button type="button" class="ab-dock-btn" data-dock-to="bottom" title="Dock bottom">⬓</button>
         <button type="button" class="ab-dock-btn" data-dock-to="left" title="Dock left">◧</button>
         <button type="button" class="ab-dock-btn" data-dock-to="right" title="Dock right">◨</button>
         <button type="button" class="ab-dock-btn ab-dock-popout" data-dock-to="detached" title="Detach into its own window">⧉</button>
@@ -252,7 +250,7 @@
     <h2 id="dlg-set-title">Set Docker Daemon</h2>
 
     <div>
-      <label class="ctl block">Docker host
+      <label class="ctl block">Daemon host ssh connection string
         <input id="docker-host" type="text" placeholder="empty = gateway Docker daemon, or user@host (ssh:// optional)" />
       </label>
       <label class="ctl block">SSH key <span class="tdoc">(optional — leave empty to use the gateway host's ssh-agent/default identity)</span>
@@ -451,6 +449,10 @@
       </label>
       <label class="ctl">
         <input id="live-track-secs-sidebar" type="number" max="0" step="1" value="0" /> s
+      </label>
+      <p class="dlg-section-help muted">Double-clicking the chart recenters it on that point in time, which pauses live tracking (like any other pan/zoom). This many seconds later, live tracking resumes on its own. Set to 0 to stay paused until you click "now" yourself.</p>
+      <label class="ctl">
+        <input id="dblclick-resume-secs-sidebar" type="number" min="0" step="1" value="30" /> s
       </label>
     </fieldset>
     <fieldset class="keys-box" id="fieldset-log-collector">

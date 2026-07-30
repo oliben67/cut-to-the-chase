@@ -224,7 +224,7 @@ async function ensureRemoteContainer(cfg, { spawnFn = spawn, sshBin = "ssh", scp
   try {
     await waitForHttpOk(`http://${host}:${cfg.remotePort}/health`, { timeoutMs: 30000 });
   } catch (err) {
-    onLog?.(`  → not reachable directly yet (${err.message || err}) -- caller will decide on an ssh tunnel`);
+    onLog?.(`  → not reachable directly yet (${err.message || err}) -- setting ssh tunnel instead`);
   }
   return { host, port: cfg.remotePort, imageRef: resolved.imageRef };
 }

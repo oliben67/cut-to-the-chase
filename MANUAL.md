@@ -296,7 +296,8 @@ Edit Docker Daemon reads back next time.
 
 ### Remote hosts over SSH
 
-Enter `ssh://user@host` (optionally `:port`) as the Docker host. An **SSH
+Enter `ssh://user@host` (optionally `:port`) as the **Daemon host ssh
+connection string**. An **SSH
 key** selector appears listing the private keys found in `~/.ssh` — pick one,
 choose *default* to use your ssh config / agent, or *browse…* for a key file
 elsewhere. The choice is remembered per host.

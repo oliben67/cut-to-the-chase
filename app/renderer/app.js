@@ -79,8 +79,8 @@ const state = {
   range: null,            // {min_ts, max_ts} global
   view: null,             // {t0, t1} visible window (ms)
   // Whether the view auto-follows real time (see followNow()/goLive()) --
-  // true by default; any user-initiated pan/zoom (drag, wheel, nav thumb,
-  // double-click recenter, right-click zoom) turns it off via setView's own
+  // true by default; any user-initiated pan/zoom (drag, nav thumb,
+  // right-click zoom) turns it off via setView's own
   // default behavior, since at that point the user is deliberately looking
   // at a fixed window, not "now". Explicitly turned back on by goLive()
   // (the nav's "now" label) and resetZoom() staying off on purpose --
@@ -168,6 +168,10 @@ let liveTrackSecs = prefs.get("liveTrackSecs", 0);
 // On by default (per the feature's own spec) -- the toolbar/Settings
 // switch turns it off entirely, independent of the seconds offset above.
 let liveTrackEnabled = prefs.get("liveTrackEnabled", true);
+// How long a double-click recenter pauses live-follow before it resumes on
+// its own (seconds). 0 disables auto-resume -- stays paused until the user
+// clicks "now" themselves, matching drag/context-menu zoom.
+let dblclickResumeSecs = prefs.get("dblclickResumeSecs", 30);
 
 // bytes/sec -> the largest unit (GB/MB/kB/B) that keeps the number >= 1,
 // one decimal place -- used for the NET strip's axis labels and tooltip.
@@ -447,7 +451,7 @@ function buildStrips() {
       c.className = "strip";
       c.dataset.strip = i;
       c.dataset.group = group;
-      c.title = "Click: move cursor  ·  Drag: zoom to selection  ·  Wheel: zoom in/out  ·  Ctrl/Cmd+wheel: scroll page";
+      c.title = "Click: move cursor  ·  Drag: zoom to selection  ·  Right-click: zoom menu";
       parent.appendChild(c);
       arr.push(c);
     });
@@ -775,7 +779,7 @@ function drawLane(c) {
 }
 
 // double-click anywhere on the timeline (strips or lanes) re-centers every
-// panel on that point in time, keeping the current zoom span
+// panel on that point in time, keeping the current zoom span (no zoom change)
 function timelineDblclick(c, e) {
   const rect = c.getBoundingClientRect();
   const x = e.clientX - rect.left;
@@ -798,7 +802,6 @@ function attachLaneEvents(c) {
     state.hoverX = null;
     drawAll();
   });
-  c.addEventListener("wheel", (e) => handleWheelZoom(c, e), { passive: false });
 }
 
 /* ── legend ─────────────────────────────────────────────────────────────── */
@@ -1482,7 +1485,6 @@ function attachChartEvents() {
       if (x < MARGIN_L || !state.view) return;
       timeContextMenu(e, xToT(x));
     });
-    c.addEventListener("wheel", (e) => handleWheelZoom(c, e), { passive: false });
   }
 }
 
@@ -1557,12 +1559,44 @@ function setView(t0, t1, opts = {}) {
   state.view = { t0, t1 };
   // Any caller *except* the live-follow ticker itself (opts._follow) is a
   // deliberate pan/zoom -- the user just chose to look at a fixed window,
-  // so stop auto-advancing it out from under them.
-  if (!opts._follow) state.live = false;
+  // so stop auto-advancing it out from under them. Also cancels any pending
+  // double-click auto-resume (see recenterOn) -- a further pan/zoom after
+  // the recenter means the user is still looking around, not waiting to
+  // snap back to live.
+  if (!opts._follow) { state.live = false; state.liveResumeAt = null; }
   scheduleSeriesFetch();
   drawAll();
   updateViewRangeLabel();
+  updateLiveResumeUI();
   if (opts.broadcast !== false) window.cttc?.broadcastSync?.({ type: "view", t0, t1 });
+}
+
+// Reflects a pending double-click auto-resume (state.liveResumeAt, see
+// recenterOn) in the UI: the Live tracking switches read as off (matching
+// the actual paused state, not the underlying liveTrackEnabled preference)
+// and the status bar shows a countdown. The switches stay clickable while
+// paused (see the onchange handlers below) so flipping one back on resumes
+// live-follow early instead of waiting out the countdown. Restores the
+// normal switch state and clears that status message once the pause ends,
+// whether by expiring, being cancelled (further pan/zoom), or an early
+// manual resume.
+function updateLiveResumeUI() {
+  const paused = !state.live && !!state.liveResumeAt;
+  $("live-track-toggle").checked = paused ? false : liveTrackEnabled;
+  $("live-track-toggle-sidebar").checked = paused ? false : liveTrackEnabled;
+  $("live-track-secs").disabled = paused || !liveTrackEnabled;
+  $("live-track-secs-sidebar").disabled = paused || !liveTrackEnabled;
+  // The bottom app-status-bar (see notifyEvent, "Appearance > Status bar"),
+  // not the toolbar's #status -- that one's for ordinary action feedback,
+  // this is the persistent background-state bar.
+  if (paused) {
+    const remaining = Math.max(0, Math.ceil((state.liveResumeAt - Date.now()) / 1000));
+    $("app-status-bar-text").textContent = `Live tracking disabled — resuming in ${remaining}s (clicking "now" will resume live tracking)`;
+    state.liveResumeStatusShown = true;
+  } else if (state.liveResumeStatusShown) {
+    $("app-status-bar-text").textContent = "No event activity yet";
+    state.liveResumeStatusShown = false;
+  }
 }
 
 // Recenters the view on (now - FOLLOW_LAG), keeping the current span --
@@ -1581,16 +1615,22 @@ function followNow() {
 // click elsewhere, which only recenters once and leaves live off).
 function goLive() {
   state.live = true;
+  state.liveResumeAt = null;
   followNow();
   setCursor(Date.now());
 }
 
 // Keeps the view sliding forward while live, and always redraws so the
 // "now" line advances even when the view is a fixed (non-live) window.
+// Also resumes live-follow on its own once a pending double-click pause
+// (state.liveResumeAt, see recenterOn) expires.
 setInterval(() => {
   if (!state.view) return;
   if (state.live) followNow();
-  else drawAll();
+  else {
+    if (state.liveResumeAt && Date.now() >= state.liveResumeAt) goLive();
+    else { updateLiveResumeUI(); drawAll(); }
+  }
 }, 1000);
 
 function resetZoom() {
@@ -1608,7 +1648,16 @@ function resetZoom() {
 function recenterOn(t) {
   if (!state.view) return;
   const span = state.view.t1 - state.view.t0;
+  const wasLive = state.live;
   setView(t - span / 2, t + span / 2);
+  // If this recenter interrupted live-follow, resume it automatically after
+  // a short grace period instead of either staying paused indefinitely or
+  // snapping straight back to "now" (which would erase the recenter within
+  // the next 1s tick). 0s means "stay paused until the user clicks now".
+  if (wasLive && dblclickResumeSecs > 0) {
+    state.liveResumeAt = Date.now() + dblclickResumeSecs * 1000;
+    updateLiveResumeUI();
+  }
 }
 
 // zoom in/out around a given point in time (from the chart's right-click
@@ -1617,31 +1666,6 @@ function zoomAt(t, factor) {
   if (!state.view) return;
   const span = (state.view.t1 - state.view.t0) * factor;
   setView(t - span / 2, t + span / 2);
-}
-
-// zoom in/out around `t`, keeping `t` itself fixed at the same point in the
-// view rather than re-centering on it -- what a wheel/trackpad zoom needs so
-// the spot under the cursor doesn't jump on every notch (mirrors zoomAt(),
-// which recenters instead, for the right-click menu's "Zoom in/out here").
-function zoomAtAnchored(t, factor) {
-  if (!state.view) return;
-  const { t0, t1 } = state.view;
-  setView(t - (t - t0) * factor, t + (t1 - t) * factor);
-}
-
-// mouse-wheel / trackpad zoom over a chart or density lane: scroll down
-// (deltaY > 0) zooms out, scroll up zooms in, anchored on the point under
-// the cursor. ctrl/meta+wheel is left alone (trackpad pinch-zoom sends wheel
-// events with ctrlKey set on most platforms -- browsers reserve that
-// gesture for page zoom, and hijacking it would fight the OS).
-const WHEEL_ZOOM_FACTOR = 1.15;
-function handleWheelZoom(c, e) {
-  if (!state.view || e.ctrlKey || e.metaKey) return;
-  e.preventDefault();
-  const rect = c.getBoundingClientRect();
-  const x = e.clientX - rect.left;
-  const t = x >= MARGIN_L ? xToT(x) : (state.view.t0 + state.view.t1) / 2;
-  zoomAtAnchored(t, e.deltaY > 0 ? WHEEL_ZOOM_FACTOR : 1 / WHEEL_ZOOM_FACTOR);
 }
 
 const DEFAULT_SPAN = 10 * 60 * 1000; // initial window: now ± 5 min
@@ -1681,9 +1705,15 @@ function updateTimelineNav(nav) {
   nav.thumb.style.left = `${Math.max(0, x0)}px`;
   nav.thumb.style.width = `${Math.max(8, x1 - x0)}px`;
   nav.nowLabel.dataset.live = String(!!state.live);
-  nav.nowLabel.title = state.live
-    ? "Following the present -- click to jump anyway"
-    : "Jump back to the present and resume following it";
+  // The countdown itself lives only in the status bar (see
+  // updateLiveResumeUI) -- this label just says whether we're following now.
+  nav.nowLabel.textContent = "now";
+  nav.nowLabel.title =
+    !state.live && state.liveResumeAt
+      ? "Live tracking paused -- see the status bar for the resume countdown, or click to jump now"
+      : state.live
+      ? "Following the present -- click to jump anyway"
+      : "Jump back to the present and resume following it";
 }
 
 function attachTimelineNav(navEl) {
@@ -3325,8 +3355,44 @@ function setLiveTrackEnabled(enabled) {
   $("live-track-secs-sidebar").disabled = !enabled;
 }
 setLiveTrackEnabled(liveTrackEnabled); // apply the persisted value to both fields on load
-$("live-track-toggle").onchange = (e) => setLiveTrackEnabled(e.target.checked);
-$("live-track-toggle-sidebar").onchange = (e) => setLiveTrackEnabled(e.target.checked);
+
+// Shows a message in the bottom app-status-bar for a fixed duration, then
+// reverts it -- unlike notifyEvent's normal callers (one-off background
+// events), this one expires on its own. Only reverts if nothing else has
+// since overwritten it.
+function flashStatus(msg, ms) {
+  $("app-status-bar-text").textContent = msg;
+  setTimeout(() => {
+    if ($("app-status-bar-text").textContent === msg) $("app-status-bar-text").textContent = "No event activity yet";
+  }, ms);
+}
+
+// Flipping the switch back on while a double-click pause is still counting
+// down (see recenterOn/updateLiveResumeUI) resumes live-follow immediately
+// instead of waiting out the rest of the countdown; otherwise it's just the
+// ordinary Live tracking on/off preference.
+function onLiveTrackToggle(checked) {
+  if (checked && !state.live && state.liveResumeAt) {
+    goLive();
+    flashStatus("Live tracking resuming", 5000);
+  } else {
+    setLiveTrackEnabled(checked);
+  }
+}
+$("live-track-toggle").onchange = (e) => onLiveTrackToggle(e.target.checked);
+$("live-track-toggle-sidebar").onchange = (e) => onLiveTrackToggle(e.target.checked);
+
+// How long a double-click recenter (see recenterOn) pauses live-follow
+// before it resumes on its own. Never negative; 0 means "stay paused until
+// the user clicks now themselves".
+function setDblclickResumeSecs(v) {
+  const secs = Math.max(0, Math.floor(Number(v)) || 0);
+  dblclickResumeSecs = secs;
+  prefs.set("dblclickResumeSecs", secs);
+  $("dblclick-resume-secs-sidebar").value = secs;
+}
+setDblclickResumeSecs(dblclickResumeSecs); // apply the persisted value on load
+$("dblclick-resume-secs-sidebar").oninput = (e) => setDblclickResumeSecs(e.target.value);
 
 // Settings: a real dialog (like Appearance), not an inline foldout --
 // opened via the shared data-action dispatch (see RENDERER_ACTIONS'
@@ -4376,7 +4442,7 @@ if (!POPOUT_KIND) {
   if (!POPOUT_KIND) window.cttc?.onRunAction?.(runMenuAction);
 
   /* ── dockable action bar (File/Edit/View/Window/Help as buttons,
-     left/right/top/bottom/detached) -- main window only: popouts hide the
+     left/right/detached) -- main window only: popouts hide the
      bar entirely (see body[class*="popout-"] in style.css) and have no
      business opening/closing the shared detached-bar window themselves. */
   const appBody = $("app-body");
@@ -4387,7 +4453,15 @@ if (!POPOUT_KIND) {
       if (btn) runMenuAction(btn.dataset.action);
     });
 
+    // Top/bottom docking has been removed (left/right/detached only) --
+    // clamps any dock value left over from before that change (persisted
+    // prefs, or a redock request) so it doesn't get stuck referencing a
+    // position with no button to reach it anymore.
+    function clampDock(dock) {
+      return dock === "top" || dock === "bottom" ? "left" : dock;
+    }
     function setDock(dock) {
+      dock = clampDock(dock);
       prefs.set("actionBarDock", dock);
       // Remembers the last real (non-detached) position separately, so
       // Redock can restore it -- "actionBarDock" alone would just say
@@ -4485,7 +4559,7 @@ if (!POPOUT_KIND) {
 
     setDock(prefs.get("actionBarDock", "left"));
     setActionBarCollapsed(prefs.get("actionBarCollapsed", false));
-    window.cttc?.onActionBarRedock?.(() => setDock(prefs.get("actionBarLastDock", "left")));
+    window.cttc?.onActionBarRedock?.(() => setDock(clampDock(prefs.get("actionBarLastDock", "left"))));
 
     // Collapsible sidebar sections (Gateway/Sources/Metrics/Preferences):
     // each starts collapsed (see index.html's .ab-group-body[hidden]) and
