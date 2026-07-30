@@ -10,8 +10,8 @@
 <body>
   <main id="gateway-setup">
     <div id="new-intro">
-      <h1>Create a new CTTC Gateway</h1>
-      <p class="muted">
+      <h2>Create a new CTTC Gateway</h2>
+      <p class="dlg-intro muted">
         This machine can't act as its own CTTC server (either Docker or an ssh
         client is missing locally). Point CTTC at a separate host that has both
         installed instead -- it'll run the server there and reach whichever
@@ -19,18 +19,18 @@
       </p>
     </div>
 
-    <label id="gateway-select-row" hidden>CTTC Gateways
+    <label id="gateway-select-row" class="ctl block" hidden>CTTC Gateways
       <select id="gateway-select"></select>
     </label>
 
     <form id="form">
-      <label>SSH username
+      <label class="ctl block">SSH username
         <input id="ssh-user" type="text" required autocomplete="off" />
       </label>
-      <label>Remote SSH host
+      <label class="ctl block">Remote SSH host
         <input id="ssh-host" type="text" required autocomplete="off" placeholder="docker-host.example.com" />
       </label>
-      <label>SSH port
+      <label class="ctl block">SSH port
         <input id="ssh-port" type="number" min="1" max="65535" value="22" required />
       </label>
 
@@ -38,7 +38,7 @@
         <legend>SSH private key</legend>
         <label class="radio-row"><input type="radio" name="key-mode" value="path" checked /> Use a key file already on this machine</label>
 
-        <div id="key-path-row">
+        <div id="key-path-row" class="ctl">
           <input id="key-path" type="text" readonly placeholder="No file selected" />
           <button type="button" id="btn-browse">Browse…</button>
         </div>

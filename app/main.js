@@ -18,33 +18,116 @@ const {
   ensureRemoteContainer,
   uninstallLocalContainer,
   uninstallRemoteContainer,
+  checkStillInstalled,
 } = require("./lib/server-provision");
 const { readGateways, recordGateway, removeGateway, gatewayKey } = require("./lib/gateway-registry");
+const { readSelectedContainers, writeSelectedContainers } = require("./lib/container-selection");
+const { openSshTunnel, closeSshTunnel } = require("./lib/ssh-tunnel");
+const { recordTunnel, removeTunnel, killOrphanedTunnels } = require("./lib/tunnel-registry");
 const {
   readSettings: readLogCollectorSettings,
   writeSettings: writeLogCollectorSettings,
   logFileName,
 } = require("./lib/log-collector");
 const { saveArtifact, listArtifacts, sweepArtifacts } = require("./lib/event-artifacts");
+const { buildZip } = require("./lib/zip-writer");
 
 const SERVER_DIR = path.join(__dirname, "server");
 const APP_ICON = path.join(__dirname, "assets", "icon.png");
 // one-liner as published on GitHub (kept in sync with package.json's "description")
 const APP_TAGLINE = "Correlate container telemetry with service logs on a shared clickable timeline";
-// in-app "?" help buttons link here, one anchor per User Manual section
+// in-app "?" help buttons and About > User Manual open this -- a local,
+// self-contained copy bundled next to the app (see package.json's
+// extraResources and build/build-manual.js, which generates it from
+// MANUAL.md) so the manual works offline and doesn't depend on GitHub being
+// reachable. Falls back to the GitHub copy only if that file is somehow
+// missing (e.g. an unpackaged dev checkout that never ran build:manual).
 const HELP_URL = "https://github.com/oliben67/cut-to-the-chase/blob/main/MANUAL.md";
 const HELP_TOPICS = {
   frequency: "#the-cursor-and-the-frequency-window",
 };
+function localManualPath() {
+  const p = app.isPackaged
+    ? path.join(process.resourcesPath, "CTTC-Manual.html")
+    : path.join(__dirname, "build", "CTTC-Manual.html");
+  return fs.existsSync(p) ? p : null;
+}
+function helpUrl(anchor) {
+  const local = localManualPath();
+  return local ? `file://${local}${anchor}` : HELP_URL + anchor;
+}
 let serverProc = null;
+// serverHost/serverPort are the actual address the client (renderer + this
+// process's own fetch calls) talks to -- 127.0.0.1 for embedded/local *and*
+// for a tunneled remote gateway (see connectRemoteGateway), the real
+// host:port for a directly-reachable one. activeGateway{Host,Port} are the
+// gateway's *logical* identity (always its real host:port, even while
+// tunneled) -- what the registry keys entries by and what the dropdown
+// matches "is this the active one" against; kept separate from
+// serverHost/serverPort so a tunneled connection (client address
+// 127.0.0.1, real identity elsewhere) doesn't get misidentified as "This
+// machine" or fail to match its own registry entry.
 let serverHost = "127.0.0.1";
 let serverPort = null;
+let activeGatewayHost = "127.0.0.1";
+let activeGatewayPort = null;
+let serverConnectionType = "local";
+// The ssh -N -L child process backing a "remote-tunnel" connection, if any
+// -- see connectRemoteGateway/lib/ssh-tunnel.js. Tracked here (not just
+// left to whatever called openSshTunnel) so switching or disconnecting from
+// a tunneled gateway can always find and kill the right process.
+let currentTunnel = null;
+let currentTunnelPort = null; // the local port currentTunnel forwards -- see setCurrentTunnel/clearCurrentTunnel
+
+// Every currentTunnel = await openSshTunnel(...) must be paired with
+// recordTunnel() (so a crash/force-quit before the next clearCurrentTunnel()
+// leaves a pid behind that the *next* launch's killOrphanedTunnels() can
+// still find and clean up -- see lib/tunnel-registry.js), and every closing
+// path must be paired with removeTunnel(). Centralized here rather than
+// duplicated at each of the several places currentTunnel is set/cleared.
+function setCurrentTunnel(handle, containerPort, sshTarget) {
+  currentTunnel = handle;
+  currentTunnelPort = containerPort;
+  recordTunnel({ pid: handle.proc.pid, containerPort, sshTarget });
+  mainLog(`[tunnel] now active: pid ${handle.proc.pid}, 127.0.0.1:${containerPort} -> ${sshTarget}`);
+}
+function clearCurrentTunnel() {
+  if (!currentTunnel) return;
+  mainLog(`[tunnel] clearing active tunnel: pid ${currentTunnel.proc.pid}, port ${currentTunnelPort}`);
+  closeSshTunnel(currentTunnel, { onLog: mainLog });
+  removeTunnel(currentTunnelPort);
+  currentTunnel = null;
+  currentTunnelPort = null;
+}
+// The ssh target/port behind the *current* remote connection (tunneled or
+// direct) -- null for local. Exists purely for get-connection-info's
+// right-click detail popup (see app.js's status pill); nothing else needs
+// it, since the actual ssh args live in connection.json/the registry entry.
+let activeSshTarget = null;
+let activeSshPort = undefined;
 
 // Shared by get-gateways (flagging the active one for the dropdown) and
 // gateway-manage-uninstall (deciding whether the uninstalled gateway was the
-// one currently in use).
+// one currently in use). Compares against the gateway's logical identity,
+// not serverHost/serverPort -- see the comment above.
 function isActiveGateway(g) {
-  return g.mode === "embedded" ? serverHost === "127.0.0.1" : g.host === serverHost && g.port === serverPort;
+  return g.mode === "embedded"
+    ? activeGatewayHost === "127.0.0.1" && serverConnectionType === "local"
+    : g.host === activeGatewayHost && g.port === activeGatewayPort;
+}
+
+// Refreshes the registry entry for whichever gateway is currently active,
+// including its connectionType -- called right before switching away from
+// it (see switch-gateway) so the "ssh-tunnel-gateways" list always reflects
+// how the client was actually last talking to it, not just whether it was
+// ever reached at all.
+function recordCurrentGateway() {
+  if (serverConnectionType === "local") {
+    recordGateway({ mode: "embedded", host: "127.0.0.1", port: activeGatewayPort, label: "This machine", connectionType: "local" });
+    return;
+  }
+  const existing = readGateways().find((g) => gatewayKey(g) === gatewayKey({ host: activeGatewayHost, port: activeGatewayPort }));
+  if (existing) recordGateway({ ...existing, connectionType: serverConnectionType });
 }
 
 // Shared by get-gateways and switch-gateway's failure message (which needs
@@ -94,10 +177,42 @@ function broadcastLog(level, text) {
 // covers the server subprocess's own logging too (see mainError below),
 // since serverProc's stderr is already piped through mainError, not just
 // this process's own messages.
+// Where "Collect CTTC Own Logs" writes by default, the first time this app
+// has ever run on this machine (see app.whenReady() below) -- next to the
+// app itself, same folder the executable/AppImage lives in, rather than
+// some separate profile directory nobody thinks to look in. Falls back to
+// the writable userData dir if that folder turns out not to be writable
+// (e.g. a per-machine Program Files install, or a read-only AppImage mount)
+// -- see startLogCollector's error handling below, which is what actually
+// detects that and falls back live.
+function defaultLogCollectorDir() {
+  return app.isPackaged ? path.dirname(process.execPath) : app.getAppPath();
+}
+
 let logCollectorStream = null;
 function startLogCollector(dir) {
   stopLogCollector();
   logCollectorStream = fs.createWriteStream(path.join(dir, logFileName()), { flags: "a" });
+  // Without this, a write failure (most likely: `dir` isn't writable --
+  // Program Files without admin, a macOS .app bundle, a read-only AppImage
+  // mount) would be an unhandled 'error' on the stream, crashing the whole
+  // process instead of just leaving this one optional feature off.
+  logCollectorStream.on("error", (err) => {
+    const failedDir = dir;
+    stopLogCollector();
+    const settings = readLogCollectorSettings();
+    if (failedDir !== app.getPath("userData")) {
+      // Only retried once, into a directory Electron guarantees is
+      // writable -- if *that* somehow also fails, give up rather than loop.
+      const fallbackDir = app.getPath("userData");
+      mainError(`[log-collector] couldn't write to ${failedDir} (${err.message}) -- falling back to ${fallbackDir}`);
+      writeLogCollectorSettings({ ...settings, dir: fallbackDir });
+      startLogCollector(fallbackDir);
+    } else {
+      mainError(`[log-collector] couldn't write to ${failedDir} (${err.message}) -- turning log collection off`);
+      writeLogCollectorSettings({ ...settings, enabled: false });
+    }
+  });
 }
 function stopLogCollector() {
   if (logCollectorStream) {
@@ -148,6 +263,11 @@ function startServer(extraArgs) {
         // default only applies once, at first launch).
         serverHost = "127.0.0.1";
         serverPort = info.port;
+        activeGatewayHost = "127.0.0.1";
+        activeGatewayPort = info.port;
+        serverConnectionType = "local";
+        activeSshTarget = null;
+        activeSshPort = undefined;
         mainLog(`[server] listening on ${info.port} (json: ${info.json})`);
         resolve(info.port);
       } catch {
@@ -161,7 +281,7 @@ function startServer(extraArgs) {
   });
 }
 
-function showAboutDialog() {
+async function showAboutDialog() {
   const stack = [
     `Electron ${process.versions.electron}`,
     `Chromium ${process.versions.chrome}`,
@@ -170,7 +290,7 @@ function showAboutDialog() {
     "orjson >=3.10",
     "psutil >=5.9",
   ];
-  dialog.showMessageBox({
+  const { response } = await dialog.showMessageBox({
     type: "info",
     icon: APP_ICON,
     title: `About ${app.name}`,
@@ -181,9 +301,11 @@ function showAboutDialog() {
       `\u00A9 ${new Date().getFullYear()} Olivier Steck\n\n` +
       `Built with:\n${stack.map((s) => `  \u2022 ${s}`).join("\n")}\n\n` +
       `Icons by Flaticon (flaticon.com)`,
-    buttons: ["OK"],
+    buttons: ["OK", "User Manual"],
+    defaultId: 0,
     noLink: true,
   });
+  if (response === 1) await shell.openExternal(helpUrl(""));
 }
 
 // menu items that just trigger something in the renderer (open a dialog,
@@ -266,9 +388,21 @@ function showSplash() {
     // the instant it's constructed, which is the "blank background" flash
     // this window exists to avoid in the first place.
     show: false,
-    webPreferences: { contextIsolation: true, nodeIntegration: false },
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      preload: path.join(__dirname, "preload.js"),
+    },
   });
   splashWindow.once("ready-to-show", () => splashWindow?.show());
+  // Re-delivers whatever the latest narrate()/splashStatus() call already
+  // was (see splashStatus's own comment on why sends before this can be
+  // lost) the moment the page is actually able to receive it -- so
+  // whatever's on screen once it's shown is always real status, never the
+  // static "Loading CTTC…" placeholder baked into splash.html.
+  splashWindow.webContents.once("did-finish-load", () => {
+    if (lastSplashStatus != null) splashStatus(lastSplashStatus);
+  });
   splashWindow.loadFile(path.join(__dirname, "renderer", "splash.html"));
   return splashWindow;
 }
@@ -276,6 +410,34 @@ function showSplash() {
 function closeSplash() {
   if (splashWindow && !splashWindow.isDestroyed()) splashWindow.destroy();
   splashWindow = null;
+}
+
+// A short, human-readable status line for the splash window -- deliberately
+// NOT the same firehose as mainLog/"main-log" (the main window's activity
+// log): that channel also carries raw command echoes ("$ ssh ...", "$
+// docker ..." -- see server-provision.js's run()) and unfiltered subprocess
+// stdout/stderr (progress bars, ssh warnings, multi-line dumps), which read
+// as garbled noise squeezed into a single-line status widget. Callers pair
+// this with their own mainLog() call for the full-detail line -- narrate()
+// below does exactly that for the common case of "one plain-English
+// sentence, nothing more.
+// Tracked here (not just fired-and-forgotten) so splash.html's static
+// "Loading CTTC…" placeholder never actually lingers on screen: the very
+// first narrate() calls in app.whenReady() below fire essentially
+// synchronously with showSplash(), which is well before the splash
+// window's own page has loaded far enough to have attached its
+// "splash-status" listener (loadFile() is async) -- webContents.send() to a
+// not-yet-listening renderer is simply lost, not queued, so without this
+// the window would sit on the placeholder text until whichever later
+// narrate() call happens to land after the page finishes loading.
+let lastSplashStatus = null;
+function splashStatus(text) {
+  lastSplashStatus = text;
+  if (splashWindow && !splashWindow.isDestroyed()) splashWindow.webContents.send("splash-status", text);
+}
+function narrate(text) {
+  mainLog(`$ ${text}`);
+  splashStatus(text);
 }
 
 let mainWindow = null;
@@ -403,7 +565,7 @@ ipcMain.handle("pick-files", async (_e, title) => {
 
 ipcMain.handle("open-help", async (_e, topic) => {
   const anchor = HELP_TOPICS[topic] || "";
-  await shell.openExternal(HELP_URL + anchor);
+  await shell.openExternal(helpUrl(anchor));
 });
 
 // phase 3 of docs/architecture/remote-server.md: the renderer fetches a
@@ -585,13 +747,20 @@ async function connectToServer(fileArgs) {
   const cfg = loadConnectionConfig();
   if (cfg.mode === "embedded") {
     if (app.isPackaged && (await hasLocalDocker())) {
-      const { port } = await ensureLocalContainer({ resourcesDir: resourcesDirForApp() });
+      narrate("starting the local gateway container...");
+      const { port } = await ensureLocalContainer({ resourcesDir: resourcesDirForApp(), onLog: mainLog });
       serverHost = "127.0.0.1";
       serverPort = port;
+      activeGatewayHost = "127.0.0.1";
+      activeGatewayPort = port;
+      serverConnectionType = "local";
+      activeSshTarget = null;
+      activeSshPort = undefined;
       mainLog(`[docker] server container running locally — port ${serverPort}`);
-      recordGateway({ mode: "embedded", host: serverHost, port: serverPort, label: "This machine" });
+      recordGateway({ mode: "embedded", host: serverHost, port: serverPort, label: "This machine", connectionType: "local" });
       return;
     }
+    narrate("starting the server...");
     await startServer(fileArgs);
     return;
   }
@@ -600,24 +769,31 @@ async function connectToServer(fileArgs) {
     // remote server, so they're ignored rather than silently mis-sent
     mainError(`[remote] ignoring command-line files in remote mode: ${fileArgs.join(", ")}`);
   }
-  // CTTC_SSH_BIN overrides the ssh binary (verification hook, same idea as
-  // CTTC_TEST/CTTC_EVAL/CTTC_SCREENSHOT below): lets tests point provisioning
-  // at a fake ssh instead of a real ssh + remote host.
-  const remote = await ensureRemoteContainer(cfg, {
-    sshBin: process.env.CTTC_SSH_BIN || "ssh",
-    resourcesDir: resourcesDirForApp(),
-  });
-  serverHost = remote.host;
-  serverPort = remote.port;
-  mainLog(`[remote] connected to ${cfg.sshTarget} — http://${serverHost}:${serverPort}`);
+  // First-time connect to a deployed gateway (see connectRemoteGateway):
+  // tries direct HTTP first, falling back to an ssh tunnel if that times
+  // out/fails.
+  narrate(`connecting to ${cfg.sshTarget}...`);
+  const result = await connectRemoteGateway(cfg, { onLog: mainLog });
+  serverHost = result.host;
+  serverPort = result.port;
+  activeGatewayHost = result.gatewayHost;
+  activeGatewayPort = result.gatewayPort;
+  serverConnectionType = result.connectionType;
+  activeSshTarget = cfg.sshTarget;
+  activeSshPort = cfg.sshPort;
+  mainLog(
+    `[remote] connected to ${cfg.sshTarget} via ${result.connectionType} — http://${serverHost}:${serverPort}`
+  );
   recordGateway({
     mode: "remote",
-    host: serverHost,
-    port: serverPort,
+    host: activeGatewayHost,
+    port: activeGatewayPort,
     label: cfg.sshTarget,
     sshTarget: cfg.sshTarget,
     sshKey: cfg.sshKey,
     ...(cfg.sshPort ? { sshPort: cfg.sshPort } : {}),
+    connectionType: result.connectionType,
+    imageRef: result.imageRef,
   });
 }
 
@@ -678,13 +854,91 @@ async function provisionRemoteGateway(payload, onLog) {
     sshPort: payload.sshPort,
     remotePort: 8765, // the CTTC server's fixed container port; see docker-compose.yml
   };
+  // First-time connect to this gateway -- direct HTTP first, ssh tunnel
+  // fallback if that times out/fails (see connectRemoteGateway).
+  const result = await connectRemoteGateway({ ...cfg, imageSource: payload.imageSource || undefined }, { onLog });
+  return { remote: result, cfg };
+}
+
+// Connects to a remote gateway, choosing plain direct HTTP or an ssh -L
+// tunnel as the transport:
+//   - always (re-)installs the container over ssh first (idempotent --
+//     `docker compose up -d` is a no-op if it's already running at the
+//     right image), so both a first-time connect and a reconnect to a
+//     known gateway are guaranteed to have something listening before any
+//     reachability check runs.
+//   - closes whatever tunnel this client currently has open, if any --
+//     only one gateway is ever connected to at a time, so a stale tunnel to
+//     the *previous* gateway must never linger once this one takes over.
+//   - forceTunnel skips the direct-HTTP attempt and goes straight to a
+//     tunnel: used when switching to a gateway this client already has
+//     recorded (see switch-gateway) -- if it's known at all, use its
+//     last-known-good transport info directly rather than re-probing.
+//     Left false, direct HTTP is tried first (10s), falling back to a
+//     tunnel only if that times out/fails -- the path for a first-time
+//     connect to a freshly deployed gateway (see connectToServer,
+//     gateway-setup-submit, gateway-add-submit).
+// Returns the *client-facing* host/port (what serverHost/serverPort should
+// become -- 127.0.0.1 when tunneled) separately from the gateway's logical
+// identity (gatewayHost/gatewayPort -- always its real address, tunneled or
+// not), plus imageRef for the registry.
+async function connectRemoteGateway(cfg, { onLog, forceTunnel = false } = {}) {
+  const sshBin = process.env.CTTC_SSH_BIN || "ssh";
   const remote = await ensureRemoteContainer(cfg, {
-    sshBin: process.env.CTTC_SSH_BIN || "ssh",
+    sshBin,
     resourcesDir: resourcesDirForApp(),
-    source: payload.imageSource || undefined,
+    source: cfg.imageSource || undefined,
     onLog,
   });
-  return { remote, cfg };
+
+  clearCurrentTunnel();
+
+  if (!forceTunnel) {
+    try {
+      const r = await fetch(`http://${remote.host}:${remote.port}/health`, { signal: AbortSignal.timeout(10000) });
+      if (r.ok) {
+        return {
+          host: remote.host,
+          port: remote.port,
+          gatewayHost: remote.host,
+          gatewayPort: remote.port,
+          connectionType: "remote",
+          imageRef: remote.imageRef,
+        };
+      }
+    } catch {
+      /* not reachable directly -- fall through to the tunnel below */
+    }
+  }
+
+  onLog?.(`$ ${remote.host}:${remote.port} not reachable directly -- opening an ssh tunnel instead...`);
+  const tunnel = await openSshTunnel(
+    { sshTarget: cfg.sshTarget, sshKey: cfg.sshKey, sshPort: cfg.sshPort, containerPort: remote.port },
+    {
+      sshBin,
+      onLog,
+      // Only clear global state if this handle is *still* the active
+      // tunnel -- switching gateways in the meantime already replaced it
+      // with a newer one, whose own exit this must not be mistaken for.
+      onUnexpectedExit: () => {
+        if (currentTunnel === tunnel) {
+          mainError(`[tunnel] the active ssh tunnel to ${cfg.sshTarget} died unexpectedly -- reconnect to restore it`);
+          removeTunnel(currentTunnelPort);
+          currentTunnel = null;
+          currentTunnelPort = null;
+        }
+      },
+    }
+  );
+  setCurrentTunnel(tunnel, remote.port, cfg.sshTarget);
+  return {
+    host: "127.0.0.1",
+    port: remote.port,
+    gatewayHost: remote.host,
+    gatewayPort: remote.port,
+    connectionType: "remote-tunnel",
+    imageRef: remote.imageRef,
+  };
 }
 
 let wizardWindow = null;
@@ -723,6 +977,15 @@ function runSetupWizard() {
     attachEditContextMenu(wizardWindow);
     wizardWindow.loadFile(path.join(__dirname, "renderer", "gateway-setup.html"), { search: "mode=new" });
     wizardWindow.on("closed", () => {
+      // The splash was already closed once this window's own 'ready-to-show'
+      // fired, so this window closing (successfully submitted, or
+      // cancelled) always drops to zero open windows for a moment -- without
+      // a window up before that happens, window-all-closed fires and quits
+      // the whole app right here, before the success path ever reaches
+      // createWindow() or the cancel path's local-fallback retry gets a
+      // chance to run. Re-showing it (idempotent, a no-op once the real main
+      // window is already up) bridges that gap either way.
+      showSplash();
       wizardWindow = null;
       if (!settled) {
         ipcMain.removeHandler("gateway-setup-submit");
@@ -737,15 +1000,22 @@ function runSetupWizard() {
         );
         serverHost = remote.host;
         serverPort = remote.port;
+        activeGatewayHost = remote.gatewayHost;
+        activeGatewayPort = remote.gatewayPort;
+        serverConnectionType = remote.connectionType;
+        activeSshTarget = cfg.sshTarget;
+        activeSshPort = cfg.sshPort;
         saveConnectionConfig(cfg);
         recordGateway({
           mode: "remote",
-          host: remote.host,
-          port: remote.port,
+          host: remote.gatewayHost,
+          port: remote.gatewayPort,
           label: cfg.sshTarget,
           sshTarget: cfg.sshTarget,
           sshKey: cfg.sshKey,
           ...(cfg.sshPort ? { sshPort: cfg.sshPort } : {}),
+          connectionType: remote.connectionType,
+          imageRef: remote.imageRef,
         });
         await checkServerHostDocker(remote.host, remote.port, (line) => wizardWindow?.webContents.send("setup-log", line));
         settled = true;
@@ -780,10 +1050,20 @@ async function reconnectMainWindow() {
   } else {
     await createWindow();
   }
+  // Closes whatever splash the caller showed while getting here (e.g.
+  // switch-gateway's "Restarting, please wait…" during ssh tunnel setup) --
+  // a no-op if none was ever shown for this particular reconnect.
+  closeSplash();
 }
-// Still confirmed for Run Setup / Update Image / uninstall -- those are
-// deliberate settings-screen actions, not the quick status-pill switcher
-// (see switch-gateway below, which reconnects immediately with no prompt).
+// Still confirmed for Run Setup / Update Image / connection-settings changes
+// -- those are deliberate settings-screen actions with a gateway still
+// there to reconnect to either way, unlike uninstalling the *active*
+// gateway (see gateway-manage-uninstall above), which reconnects
+// immediately with no prompt: there's nothing left to "reconnect to" but
+// this same machine, and every open form is already stale the moment it
+// succeeds. Also unlike the quick status-pill switcher (see switch-gateway
+// below, which reconnects immediately with no prompt for a different
+// reason -- it's not a destructive action).
 async function offerRestart(message) {
   const r = await dialog.showMessageBox({
     type: "info",
@@ -801,37 +1081,76 @@ async function offerRestart(message) {
 // active one flagged so the renderer can highlight it.
 ipcMain.handle("get-gateways", () => listGatewaysWithActiveFlag());
 
+// Set/Edit Docker Daemon's "which containers were actually selected"
+// persistence (see lib/container-selection.js) -- keyed by the same
+// hostKey ("local" or "ssh://user@host[:port]") the renderer already uses
+// for docker:// source paths.
+ipcMain.handle("get-selected-containers", (_e, hostKey) => readSelectedContainers(hostKey));
+ipcMain.handle("set-selected-containers", (_e, hostKey, names) => {
+  writeSelectedContainers(hostKey, names);
+  return { ok: true };
+});
+
+// Backs the status pill's "(tunnel)" suffix and its right-click details
+// popup (see app.js): what kind of connection this actually is right now
+// (local/remote/remote-tunnel), plus the ssh target/forwarded port behind
+// it when tunneled -- info the URL main.js loaded the page with
+// (host=&port=) can't carry, since that's just the client-facing address
+// (127.0.0.1 either way, embedded or tunneled).
+ipcMain.handle("get-connection-info", () => ({
+  connectionType: serverConnectionType,
+  host: serverHost,
+  port: serverPort,
+  gatewayHost: activeGatewayHost,
+  gatewayPort: activeGatewayPort,
+  sshTarget: activeSshTarget,
+  sshPort: activeSshPort,
+}));
+
 // Read-only: lets the dropdown flag a gateway as unreachable without
 // switching to it or changing anything -- purely informational, including
 // for the currently-active entry (see switch-gateway's own health check for
 // the one place a failed probe actually blocks an action).
 ipcMain.handle("check-gateway", (_e, entry) => checkGatewayReachable(entry));
 
-// Switching gateways doesn't re-provision anything -- these are all
-// gateways already confirmed running at some point; a quick /health check
-// just confirms it's still up before committing to it, since reconnecting
-// into a dead gateway would be a worse experience than an upfront error
-// here. "embedded" means point back at this machine (clears
-// connection.json, same as Run Setup's "Revert to Local"); anything else
-// writes a "remote" connection.json from the saved ssh fields. The
-// never-provisioned "This machine" placeholder (see get-gateways -- no
-// real port yet) has nothing to health-check; switching to it just falls
-// back to the ordinary embedded-mode startup path (with or without local
-// Docker) the same as if no gateway had ever been configured. No
-// confirmation dialog here (unlike Run Setup/Update Image/uninstall) --
-// this is the quick status-pill switcher, meant to feel immediate; the
-// renderer shows its own "Switching to X…" status message while this runs.
+// Switching to "This machine" doesn't re-provision anything -- it's already
+// confirmed running at some point; a quick /health check just confirms it's
+// still up before committing to it, since reconnecting into a dead gateway
+// would be a worse experience than an upfront error here. Switching to a
+// *remote* gateway is different (see connectRemoteGateway): the container is
+// always (re-)installed over ssh first, then connected to either directly
+// or over an ssh tunnel --
+//   - not already in the registry: direct HTTP is tried first, falling
+//     back to a tunnel only if that fails (same as a first-time connect).
+//   - already in the registry: skip straight to a tunnel using its saved
+//     ssh fields, rather than re-probing direct HTTP every time.
+// Either way, whatever gateway is active *before* the switch gets its
+// registry entry refreshed first (recordCurrentGateway) so the connection
+// type it was actually last reached by isn't lost. "embedded" means point
+// back at this machine (clears connection.json, same as Run Setup's "Revert
+// to Local"); anything else writes a "remote" connection.json from the ssh
+// fields used to (re-)connect. The never-provisioned "This machine"
+// placeholder (see get-gateways -- no real port yet) has nothing to
+// health-check; switching to it just falls back to the ordinary
+// embedded-mode startup path (with or without local Docker) the same as if
+// no gateway had ever been configured. No confirmation dialog here (unlike
+// Run Setup/Update Image/uninstall) -- this is the quick status-pill
+// switcher, meant to feel immediate; the renderer shows its own "Switching
+// to X…" status message while this runs.
 ipcMain.handle("switch-gateway", async (_e, entry) => {
   const isUnprovisionedLocal = entry.mode === "embedded" && entry.port == null;
-  if (!isUnprovisionedLocal && !(await checkGatewayReachable(entry))) {
-    const current = listGatewaysWithActiveFlag().find((g) => g.active);
-    const currentLabel = current?.label || (serverHost === "127.0.0.1" ? "This machine" : serverHost);
-    return {
-      ok: false,
-      error: `Failed to reach ${entry.label || entry.host} (${entry.host}:${entry.port}) — staying on ${currentLabel}.`,
-    };
-  }
+
   if (entry.mode === "embedded") {
+    if (!isUnprovisionedLocal && !(await checkGatewayReachable(entry))) {
+      const current = listGatewaysWithActiveFlag().find((g) => g.active);
+      const currentLabel = current?.label || (activeGatewayHost === "127.0.0.1" ? "This machine" : activeGatewayHost);
+      return {
+        ok: false,
+        error: `Failed to reach ${entry.label || entry.host} (${entry.host}:${entry.port}) — staying on ${currentLabel}.`,
+      };
+    }
+    recordCurrentGateway();
+    clearCurrentTunnel();
     clearConnectionConfig();
     if (isUnprovisionedLocal) {
       // never actually provisioned -- same startup path a fresh launch
@@ -841,16 +1160,59 @@ ipcMain.handle("switch-gateway", async (_e, entry) => {
     } else {
       serverHost = "127.0.0.1";
       serverPort = entry.port;
+      activeGatewayHost = "127.0.0.1";
+      activeGatewayPort = entry.port;
+      serverConnectionType = "local";
+      activeSshTarget = null;
+      activeSshPort = undefined;
     }
-  } else {
-    saveConnectionConfig({
-      sshTarget: entry.sshTarget,
-      sshKey: entry.sshKey,
-      remotePort: entry.port,
-      ...(entry.sshPort ? { sshPort: entry.sshPort } : {}),
+    await reconnectMainWindow();
+    return { ok: true };
+  }
+
+  recordCurrentGateway();
+  const alreadyKnown = readGateways().some((g) => gatewayKey(g) === gatewayKey({ host: entry.host, port: entry.port }));
+  const cfg = {
+    sshTarget: entry.sshTarget,
+    sshKey: entry.sshKey,
+    sshPort: entry.sshPort,
+    remotePort: entry.port,
+  };
+  // Shown up front: a fallback-to-tunnel reconnect can take several seconds
+  // (ssh provisioning, waiting for the forwarded port) with nothing else in
+  // view once switch-gateway starts, since it reconnects immediately with
+  // no confirmation dialog of its own (unlike offerRestart's callers).
+  // reconnectMainWindow() closes this once the new page has loaded; the
+  // catch below closes it on failure, since that path never reaches there.
+  showSplash();
+  splashStatus("Restarting, please wait…");
+  try {
+    const result = await connectRemoteGateway(cfg, {
+      onLog: (line) => mainWindow?.webContents.send("setup-log", line),
+      forceTunnel: alreadyKnown,
     });
-    serverHost = entry.host;
-    serverPort = entry.port;
+    saveConnectionConfig(cfg);
+    serverHost = result.host;
+    serverPort = result.port;
+    activeGatewayHost = result.gatewayHost;
+    activeGatewayPort = result.gatewayPort;
+    serverConnectionType = result.connectionType;
+    activeSshTarget = cfg.sshTarget;
+    activeSshPort = cfg.sshPort;
+    recordGateway({
+      mode: "remote",
+      host: result.gatewayHost,
+      port: result.gatewayPort,
+      label: entry.label || cfg.sshTarget,
+      sshTarget: cfg.sshTarget,
+      sshKey: cfg.sshKey,
+      ...(cfg.sshPort ? { sshPort: cfg.sshPort } : {}),
+      connectionType: result.connectionType,
+      imageRef: result.imageRef,
+    });
+  } catch (err) {
+    closeSplash();
+    return { ok: false, error: `Failed to switch to ${entry.label || entry.host}: ${err.message || err}` };
   }
   await reconnectMainWindow();
   return { ok: true };
@@ -872,15 +1234,22 @@ ipcMain.handle("gateway-add-submit", async (_e, payload) => {
     );
     serverHost = remote.host;
     serverPort = remote.port;
+    activeGatewayHost = remote.gatewayHost;
+    activeGatewayPort = remote.gatewayPort;
+    serverConnectionType = remote.connectionType;
+    activeSshTarget = cfg.sshTarget;
+    activeSshPort = cfg.sshPort;
     saveConnectionConfig(cfg);
     recordGateway({
       mode: "remote",
-      host: remote.host,
-      port: remote.port,
+      host: remote.gatewayHost,
+      port: remote.gatewayPort,
       label: cfg.sshTarget,
       sshTarget: cfg.sshTarget,
       sshKey: cfg.sshKey,
       ...(cfg.sshPort ? { sshPort: cfg.sshPort } : {}),
+      connectionType: remote.connectionType,
+      imageRef: remote.imageRef,
     });
     await checkServerHostDocker(remote.host, remote.port, (line) => mainWindow?.webContents.send("setup-log", line));
   } catch (err) {
@@ -968,18 +1337,83 @@ ipcMain.handle("set-log-collector-enabled", async (_e, enabled) => {
     writeLogCollectorSettings({ ...settings, enabled: false });
     return { ok: true, enabled: false };
   }
-  let dir = settings.dir;
-  if (!dir) {
-    const r = await dialog.showOpenDialog({
-      title: "Choose a folder for CTTC's own logs",
-      properties: ["openDirectory", "createDirectory"],
-    });
-    if (r.canceled || !r.filePaths[0]) return { ok: false, enabled: false };
-    dir = r.filePaths[0];
-  }
+  // Always asks, every time it's turned on -- rather than only the first
+  // time -- so switching it on always means "collect here", not "collect
+  // wherever it was last pointed". Defaults to the previous folder (if
+  // any) so re-confirming the same location is just Enter/Choose, not a
+  // fresh navigation each time.
+  const r = await dialog.showOpenDialog({
+    title: "Choose a folder for CTTC's own logs",
+    defaultPath: settings.dir || undefined,
+    properties: ["openDirectory", "createDirectory"],
+  });
+  if (r.canceled || !r.filePaths[0]) return { ok: false, enabled: false };
+  const dir = r.filePaths[0];
   startLogCollector(dir);
   writeLogCollectorSettings({ enabled: true, dir });
   return { ok: true, enabled: true, dir };
+});
+
+// "Ship logs" (Settings > Collect CTTC Own Logs, far-right icon button):
+// bundles every local .cttc-log file with the gateway's own `docker logs`
+// output (GET /mlog -- server.py's gather_own_container_logs) into one
+// zip, then offers to erase the local .cttc-log files now that they're
+// safely archived. Silent no-op (not an error) if log collection was never
+// turned on -- there's nothing local to ship, only the gateway's own log.
+ipcMain.handle("ship-logs", async () => {
+  const settings = readLogCollectorSettings();
+  const dir = settings.dir;
+  const localFiles = dir
+    ? fs
+        .readdirSync(dir)
+        .filter((f) => f.endsWith(".cttc-log"))
+        .map((f) => path.join(dir, f))
+    : [];
+
+  const entries = localFiles.map((p) => ({ name: path.basename(p), data: fs.readFileSync(p) }));
+
+  try {
+    const res = await fetch(`http://${serverHost}:${serverPort}/mlog`, { signal: AbortSignal.timeout(20000) });
+    const gatewayName = res.headers.get("X-CTTC-Gateway-Name") || "gateway";
+    const bytes = Buffer.from(await res.arrayBuffer());
+    entries.push({ name: `${gatewayName}.log`, data: bytes });
+  } catch (err) {
+    entries.push({ name: "gateway.log", data: Buffer.from(`could not reach the gateway: ${err.message || err}\n`) });
+  }
+
+  if (!entries.length) return { ok: false, error: "Nothing to ship -- no local .cttc-log files and no gateway log." };
+
+  const zip = buildZip(entries);
+  const r = await dialog.showSaveDialog({
+    title: "Save shipped logs",
+    defaultPath: `cttc-logs-${new Date().toISOString().slice(0, 19).replace(/[T:]/g, "-")}.zip`,
+    filters: [{ name: "Zip archive", extensions: ["zip"] }],
+  });
+  if (r.canceled || !r.filePath) return { ok: false, canceled: true };
+  await fs.promises.writeFile(r.filePath, zip);
+
+  let erased = false;
+  if (localFiles.length) {
+    const confirmed = await dialog.showMessageBox({
+      type: "question",
+      message: `Erase the ${localFiles.length} local .cttc-log file${localFiles.length === 1 ? "" : "s"} now that they're zipped?`,
+      detail: r.filePath,
+      buttons: ["Erase", "Keep"],
+      defaultId: 1,
+      cancelId: 1,
+    });
+    if (confirmed.response === 0) {
+      for (const p of localFiles) {
+        try {
+          fs.unlinkSync(p);
+        } catch {
+          /* best-effort */
+        }
+      }
+      erased = true;
+    }
+  }
+  return { ok: true, path: r.filePath, fileCount: entries.length, erased };
 });
 
 // Re-provisions a gateway at (possibly new) ssh settings and updates its
@@ -997,10 +1431,12 @@ ipcMain.handle("gateway-manage-save", async (_e, payload) => {
       const { port } = await ensureLocalContainer({
         source: payload.imageSource || undefined,
         resourcesDir: resourcesDirForApp(),
+        onLog: mainLog,
       });
-      recordGateway({ mode: "embedded", host: "127.0.0.1", port, label: "This machine" });
-      if (serverHost === "127.0.0.1") {
+      recordGateway({ mode: "embedded", host: "127.0.0.1", port, label: "This machine", connectionType: "local" });
+      if (activeGatewayHost === "127.0.0.1" && serverConnectionType === "local") {
         serverPort = port;
+        activeGatewayPort = port;
         await offerRestart("Reconnect CTTC to apply the updated image?");
       }
       return { ok: true };
@@ -1016,27 +1452,42 @@ ipcMain.handle("gateway-manage-save", async (_e, payload) => {
       sshKey,
       sshPort: payload.sshPort,
       remotePort: 8765,
+      imageSource: payload.imageSource || undefined,
     };
-    const remote = await ensureRemoteContainer(cfg, {
-      sshBin: process.env.CTTC_SSH_BIN || "ssh",
-      source: payload.imageSource || undefined,
-      onLog: (line) => mainWindow?.webContents.send("setup-log", line),
-    });
-    const wasActive = payload.key === `${serverHost}:${serverPort}`;
+    const wasActive = payload.key === gatewayKey({ host: activeGatewayHost, port: activeGatewayPort });
+    // Only reconnects the transport (direct vs tunnel) if this is the
+    // *active* gateway -- otherwise it's just re-provisioned in place,
+    // same as before, with nothing to reconnect.
+    const result = wasActive
+      ? await connectRemoteGateway(cfg, { onLog: (line) => mainWindow?.webContents.send("setup-log", line) })
+      : await ensureRemoteContainer(cfg, {
+          sshBin: process.env.CTTC_SSH_BIN || "ssh",
+          source: cfg.imageSource,
+          onLog: (line) => mainWindow?.webContents.send("setup-log", line),
+        });
+    const gatewayHost = result.gatewayHost || result.host;
+    const gatewayPort = result.gatewayPort || result.port;
     recordGateway({
       mode: "remote",
-      host: remote.host,
-      port: remote.port,
+      host: gatewayHost,
+      port: gatewayPort,
       label: cfg.sshTarget,
       sshTarget: cfg.sshTarget,
       sshKey: cfg.sshKey,
       ...(cfg.sshPort ? { sshPort: cfg.sshPort } : {}),
+      connectionType: result.connectionType || existing.connectionType || "remote",
+      imageRef: result.imageRef,
     });
-    if (gatewayKey({ host: remote.host, port: remote.port }) !== payload.key) removeGateway(payload.key);
+    if (gatewayKey({ host: gatewayHost, port: gatewayPort }) !== payload.key) removeGateway(payload.key);
     if (wasActive) {
       saveConnectionConfig(cfg);
-      serverHost = remote.host;
-      serverPort = remote.port;
+      serverHost = result.host;
+      serverPort = result.port;
+      activeGatewayHost = gatewayHost;
+      activeGatewayPort = gatewayPort;
+      serverConnectionType = result.connectionType;
+      activeSshTarget = cfg.sshTarget;
+      activeSshPort = cfg.sshPort;
       await offerRestart("Reconnect CTTC to apply the updated gateway settings?");
     }
     return { ok: true };
@@ -1045,33 +1496,61 @@ ipcMain.handle("gateway-manage-save", async (_e, payload) => {
   }
 });
 
-// Stops and removes the gateway's container (locally, or over ssh for a
-// remote one), then drops it from the recorded list. Uninstalling the
-// *currently active* gateway reverts connection.json to embedded mode
-// (nothing else left to point at) and offers a restart.
+// Stops and removes the gateway's container *and* image (locally, or over
+// ssh for a remote one), then drops it from the recorded list. Uninstalling
+// the *currently active* gateway reverts connection.json to embedded mode
+// (nothing else left to point at) and offers a restart. Streams progress to
+// the same activity log New/Edit Gateway use (see gw-activity/onSetupLog in
+// app.js) rather than uninstalling silently; on failure, also checks (and
+// logs) whether the container is actually still there -- `docker compose
+// down` can exit non-zero after partially succeeding, so the raw error
+// alone doesn't tell you whether anything's left to clean up by hand.
 ipcMain.handle("gateway-manage-uninstall", async (_e, entry) => {
+  const onLog = (line) => mainWindow?.webContents.send("setup-log", line);
   try {
     if (entry.mode === "embedded") {
-      await uninstallLocalContainer({ resourcesDir: resourcesDirForApp() });
+      await uninstallLocalContainer({ resourcesDir: resourcesDirForApp(), onLog });
     } else {
       await uninstallRemoteContainer(
         { sshTarget: entry.sshTarget, sshKey: entry.sshKey, sshPort: entry.sshPort },
-        { sshBin: process.env.CTTC_SSH_BIN || "ssh" }
+        { sshBin: process.env.CTTC_SSH_BIN || "ssh", onLog }
       );
     }
     removeGateway(gatewayKey(entry));
     const wasActive = isActiveGateway(entry);
     if (wasActive) {
+      // stopServer() (not just clearCurrentTunnel()) so a bare `uv run
+      // server.py` dev fallback (see startServer -- the embedded/Docker
+      // path just reuses its already-running, restart:unless-stopped
+      // container instead) doesn't leak its old process, still holding
+      // whatever .cttc-metric/.cttc-record samples were loaded into it, as
+      // an orphan alongside the fresh one connectToServer is about to spawn.
+      stopServer();
       clearConnectionConfig();
       // reverts to embedded mode, same as switch-gateway's isUnprovisionedLocal
       // path -- there's nothing left running locally to just point at, so
       // this goes through the ordinary embedded startup (re-provision or
       // start local) rather than assuming a stale host/port still works.
+      // A brand-new embedded server process starts with zero sources, so
+      // this is also what guarantees no .cttc-metric/.cttc-record sample
+      // data lingers from the just-uninstalled gateway.
       await connectToServer([]);
-      await offerRestart("This gateway was uninstalled. Reconnect CTTC to switch back to this machine?");
+      // No confirmation here (unlike offerRestart's other callers, e.g.
+      // Update Image/Save changes) -- the gateway this window was actually
+      // talking to no longer exists the moment uninstall succeeds, so every
+      // open dialog/form and all renderer state is already stale. Reconnect
+      // immediately: reconnectMainWindow() reloads index.html from scratch,
+      // which closes every popout and every open dialog (Edit Gateway
+      // included) and resets all renderer state back to a fresh launch.
+      await reconnectMainWindow();
     }
     return { ok: true };
   } catch (err) {
+    await checkStillInstalled(entry, {
+      resourcesDir: resourcesDirForApp(),
+      sshBin: process.env.CTTC_SSH_BIN || "ssh",
+      onLog,
+    });
     return { ok: false, error: err.message || String(err) };
   }
 });
@@ -1083,22 +1562,43 @@ app.whenReady().then(async () => {
   // against a slow/starting daemon or a plain "no docker on PATH" miss. The
   // gateway setup path closes this itself once its own window is ready to show (see
   // runSetupWizard()'s 'ready-to-show' handler) instead of stacking a
-  // second loading window on top of it.
+  // second loading window on top of it. Created before killOrphanedTunnels()
+  // below so its window exists to actually receive that step's status line
+  // (see splash.js/splash-status "main-log" mirroring) -- mainLog calls
+  // before a window exists have nothing to reach.
   showSplash();
+  // Kill any ssh -N -L tunnel left running by a previous session that never
+  // exited cleanly (crash, force quit, killed by an installer/uninstaller)
+  // -- otherwise it just sits on its forwarded port forever, and every
+  // future connect attempt to that gateway fails ssh-tunnel.js's own
+  // "something is already listening" guard with no obvious cause (see
+  // lib/tunnel-registry.js).
+  narrate("cleaning up any leftover connections from a previous session...");
+  killOrphanedTunnels({ onLog: mainLog });
   installMenu();
   // the window `icon` option is ignored on macOS; the running app's Dock icon
   // must be set explicitly (only affects unpackaged runs — packaged apps use .icns)
   if (process.platform === "darwin") app.dock.setIcon(APP_ICON);
   // "Collect CTTC Own Logs" was left on from a previous run -- a fresh
   // timestamped file for this launch, same as toggling it on mid-session.
+  // A completely unconfigured install (no dir ever saved, never explicitly
+  // turned on or off) defaults to *on*, writing next to the app itself --
+  // once the user's touched the setting either way, that choice sticks.
   {
     const logSettings = readLogCollectorSettings();
-    if (logSettings.enabled && logSettings.dir) startLogCollector(logSettings.dir);
+    if (logSettings.dir == null && !logSettings.enabled) {
+      const dir = defaultLogCollectorDir();
+      writeLogCollectorSettings({ enabled: true, dir });
+      startLogCollector(dir);
+    } else if (logSettings.enabled && logSettings.dir) {
+      startLogCollector(logSettings.dir);
+    }
   }
   try {
     // files passed on the command line open at startup: npm start -- file1 file2
     const fileArgs = process.argv.slice(app.isPackaged ? 1 : 2).filter((a) => !a.startsWith("-"));
     const cfg = loadConnectionConfig();
+    narrate("checking for a local Docker installation...");
     if (cfg.mode === "embedded" && !(await canBeServerLocally())) {
       try {
         await runSetupWizard();
@@ -1109,10 +1609,18 @@ app.whenReady().then(async () => {
         // still starting up; only fall back to the bare, docker-less
         // embedded server if that attempt itself fails.
         try {
-          const { port } = await ensureLocalContainer({ resourcesDir: resourcesDirForApp() });
+          narrate("starting the local gateway container...");
+          const { port } = await ensureLocalContainer({ resourcesDir: resourcesDirForApp(), onLog: mainLog });
+          serverHost = "127.0.0.1";
           serverPort = port;
+          activeGatewayHost = "127.0.0.1";
+          activeGatewayPort = port;
+          serverConnectionType = "local";
+          activeSshTarget = null;
+          activeSshPort = undefined;
           mainLog(`[docker] server container running locally — port ${serverPort}`);
         } catch {
+          narrate("starting the server...");
           await startServer(fileArgs);
         }
       }
@@ -1136,6 +1644,13 @@ app.whenReady().then(async () => {
 });
 
 function stopServer() {
+  // An ssh -N -L tunnel *is* this process's own child (unlike the remote
+  // server/local container it forwards to -- see the comment below), so it
+  // never outlives the app quitting *on an orderly exit*. A crash/force-quit
+  // still leaves it running with nothing left to close it -- see
+  // lib/tunnel-registry.js's killOrphanedTunnels(), called once at the next
+  // launch to clean up exactly that case.
+  clearCurrentTunnel();
   // A remote server (or a local Docker container -- see ensureLocalContainer's
   // `restart: unless-stopped`) is shared/persistent infrastructure, not this
   // process's own child: there's nothing local to tear down, and this

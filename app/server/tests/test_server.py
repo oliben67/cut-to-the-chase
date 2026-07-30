@@ -734,6 +734,92 @@ def raw_stats(cpu_pct=10.0, mem_bytes=1024 * 1024, mem_limit=4 * 1024 * 1024, ne
     }
 
 
+class FakeSSHClient:
+    """Stand-in for paramiko.SSHClient -- tests patch server._connect_ssh to
+    return one of these instead of ever opening a real ssh connection."""
+
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class FakeChannel:
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+
+    def set_combine_stderr(self, v):
+        pass
+
+    def recv(self, n):
+        return self._chunks.pop(0) if self._chunks else b""
+
+    def close(self):
+        pass
+
+
+class FakeSSHClientStreaming(FakeSSHClient):
+    """FakeSSHClient whose exec_command() drives a FakeChannel -- for
+    DockerLogSource's remote (paramiko-streaming) path."""
+
+    def __init__(self, chunks):
+        super().__init__()
+        self.channel = FakeChannel(chunks)
+        self.last_cmd = None
+
+    def exec_command(self, cmd, timeout=None):
+        self.last_cmd = cmd
+        stdout = types.SimpleNamespace(channel=self.channel)
+        return None, stdout, None
+
+
+class TestSshParamikoHelpers:
+    def test_parse_ssh_target_full(self):
+        assert server._parse_ssh_target("ssh://user@host:2222") == ("host", "user", 2222)
+
+    def test_parse_ssh_target_no_user_default_port(self):
+        assert server._parse_ssh_target("ssh://host") == ("host", None, 22)
+
+    def test_parse_docker_size_binary_and_decimal_units(self):
+        assert server._parse_docker_size("648B") == 648.0
+        assert server._parse_docker_size("12.3MiB") == pytest.approx(12.3 * 1024**2)
+        assert server._parse_docker_size("1.9GB") == pytest.approx(1.9 * 1000**3)
+
+    def test_parse_docker_size_garbage_is_zero(self):
+        assert server._parse_docker_size("--") == 0.0
+
+    def test_exec_remote_docker_logs_the_command_and_a_clean_exit_at_debug(self, caplog):
+        class FakeExecClient:
+            def exec_command(self, cmd, timeout=None):
+                stdout = types.SimpleNamespace(
+                    read=lambda: b"ok\n", channel=types.SimpleNamespace(recv_exit_status=lambda: 0)
+                )
+                stderr = types.SimpleNamespace(read=lambda: b"")
+                return None, stdout, stderr
+
+        with caplog.at_level("DEBUG", logger="cttc"):
+            out, err, rc = server._exec_remote_docker(FakeExecClient(), ["ps"], timeout=5)
+        assert (out, err, rc) == ("ok\n", "", 0)
+        messages = [r.message for r in caplog.records if r.name == "cttc"]
+        assert any("sudo docker ps" in m and "exit 0" in m for m in messages), messages
+
+    def test_exec_remote_docker_logs_a_nonzero_exit_at_info_with_stderr(self, caplog):
+        class FakeExecClient:
+            def exec_command(self, cmd, timeout=None):
+                stdout = types.SimpleNamespace(
+                    read=lambda: b"", channel=types.SimpleNamespace(recv_exit_status=lambda: 1)
+                )
+                stderr = types.SimpleNamespace(read=lambda: b"permission denied")
+                return None, stdout, stderr
+
+        with caplog.at_level("INFO", logger="cttc"):
+            _out, err, rc = server._exec_remote_docker(FakeExecClient(), ["ps"], timeout=5)
+        assert rc == 1 and err == "permission denied"
+        messages = [r.message for r in caplog.records if r.name == "cttc"]
+        assert any("exit 1" in m and "permission denied" in m for m in messages), messages
+
+
 class TestNormalizeDockerHost:
     def test_none_and_empty(self):
         assert server.normalize_docker_host(None) is None
@@ -754,17 +840,20 @@ class TestDockerPs:
     ssh host) -- so it can genuinely kill a hung invocation on timeout."""
 
     async def test_normalizes_bare_user_at_host(self, monkeypatch):
+        client = FakeSSHClient()
+        monkeypatch.setattr(server, "_connect_ssh", lambda host, key: client)
         captured = []
 
-        async def fake_exec(*args, **k):
-            captured.append(args)
+        def fake_exec_remote(c, args, timeout):
+            captured.append(list(args))
             if args[-1] == "{{.Server.Version}}":
-                return FakeAsyncProc(communicate_result=(b"27.0.0\n", b""))
-            return FakeAsyncProc(communicate_result=(b"", b""))
+                return "27.0.0\n", "", 0
+            return "", "", 0
 
-        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(server, "_exec_remote_docker", fake_exec_remote)
         await server.docker_ps("u@h")
-        assert list(captured[0][:3]) == ["docker", "-H", "ssh://u@h"]
+        assert captured[0] == ["version", "--format", "{{.Server.Version}}"]
+        assert client.closed  # docker_ps always closes the ssh connection it opened
 
     async def test_ok_with_services(self, monkeypatch):
         ps_line = json.dumps({"ID": "1" * 20, "Names": "web", "Image": "nginx"}).encode()
@@ -805,6 +894,32 @@ class TestDockerPs:
         got = await server.docker_ps(None)
         assert got["containers"] == [{"id": "1" * 12, "name": "web", "image": "nginx"}]
 
+    async def test_does_not_exclude_cttc_gateway_image_on_a_remote_host(self, monkeypatch):
+        # a remote ssh:// source is, by definition, a *different* machine --
+        # a container there that merely happens to share the "cttc-gateway"
+        # image/tag has nothing to do with this gateway and must be shown,
+        # unlike the local-daemon case above.
+        web_line = json.dumps({"ID": "1" * 20, "Names": "web", "Image": "nginx"}).encode()
+        gw_line = json.dumps(
+            {"ID": "2" * 20, "Names": "some-gateway", "Image": "cttc-gateway:latest"}
+        ).encode()
+        client = FakeSSHClient()
+        monkeypatch.setattr(server, "_connect_ssh", lambda host, key: client)
+
+        def fake_exec_remote(c, args, timeout):
+            if args[0] == "version":
+                return "27.0.0\n", "", 0
+            if args[0] == "service":
+                return "", "not a swarm manager", 1
+            return (web_line + b"\n" + gw_line + b"\n").decode(), "", 0
+
+        monkeypatch.setattr(server, "_exec_remote_docker", fake_exec_remote)
+        got = await server.docker_ps("ssh://u@h")
+        assert got["containers"] == [
+            {"id": "1" * 12, "name": "web", "image": "nginx"},
+            {"id": "2" * 12, "name": "some-gateway", "image": "cttc-gateway:latest"},
+        ]
+
     async def test_service_ls_failure_tolerated(self, monkeypatch):
         ps_line = json.dumps({"ID": "1" * 20, "Names": "web", "Image": "nginx"}).encode()
 
@@ -819,13 +934,19 @@ class TestDockerPs:
         assert (await server.docker_ps(None))["services"] == []
 
     async def test_preflight_reports_missing_docker(self, monkeypatch):
-        async def fake_exec(*args, **k):
-            return FakeAsyncProc(
-                returncode=1, communicate_result=(b"", b"command not found: docker")
-            )
-
-        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(server, "_connect_ssh", lambda host, key: FakeSSHClient())
+        monkeypatch.setattr(
+            server, "_exec_remote_docker", lambda c, a, t: ("", "command not found: docker", 1)
+        )
         with pytest.raises(server.DockerPsError, match="not installed"):
+            await server.docker_ps("ssh://u@h")
+
+    async def test_ssh_connect_failure_reported(self, monkeypatch):
+        def boom(host, key):
+            raise OSError("Connection refused")
+
+        monkeypatch.setattr(server, "_connect_ssh", boom)
+        with pytest.raises(server.DockerPsError, match="could not ssh to"):
             await server.docker_ps("ssh://u@h")
 
     async def test_failure_raises_and_carries_log(self, monkeypatch):
@@ -853,6 +974,67 @@ class TestDockerPs:
         monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
         with pytest.raises(server.DockerPsError, match="timed out"):
             await server.docker_ps(None)
+
+
+class TestGatherOwnContainerLogs:
+    """/mlog (Ship Logs): finds the gateway's own running container by
+    image basename -- same filtering logic docker_ps() uses to hide it from
+    the monitorable-target list -- then `docker logs` it."""
+
+    async def test_finds_and_logs_own_container(self, monkeypatch):
+        gw_line = json.dumps(
+            {"ID": "2" * 20, "Names": "cttc-gateway-cttc-gateway-1", "Image": "cttc-gateway:latest"}
+        ).encode()
+        web_line = json.dumps({"ID": "1" * 20, "Names": "web", "Image": "nginx"}).encode()
+
+        async def fake_exec(*args, **k):
+            if args[1] == "ps":
+                return FakeAsyncProc(communicate_result=(web_line + b"\n" + gw_line + b"\n", b""))
+            assert args[1] == "logs"
+            assert args[2] == "2" * 20
+            return FakeAsyncProc(communicate_result=(b"log line 1\nlog line 2\n", b""))
+
+        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+        name, data = await server.gather_own_container_logs()
+        assert name == "cttc-gateway-cttc-gateway-1"
+        assert data == b"log line 1\nlog line 2\n"
+
+    async def test_no_own_container_found(self, monkeypatch):
+        web_line = json.dumps({"ID": "1" * 20, "Names": "web", "Image": "nginx"}).encode()
+
+        async def fake_exec(*args, **k):
+            return FakeAsyncProc(communicate_result=(web_line + b"\n", b""))
+
+        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+        name, data = await server.gather_own_container_logs()
+        assert name == "gateway"
+        assert b"could not find" in data
+
+    async def test_docker_unreachable(self, monkeypatch):
+        async def fake_exec(*args, **k):
+            raise OSError("docker not found")
+
+        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+        name, data = await server.gather_own_container_logs()
+        assert name == "gateway"
+        assert b"could not find" in data
+
+    async def test_docker_logs_itself_times_out(self, monkeypatch):
+        gw_line = json.dumps({"ID": "2" * 20, "Names": "gw", "Image": "cttc-gateway"}).encode()
+
+        class HangingProc(FakeAsyncProc):
+            async def communicate(self):
+                await asyncio.sleep(3600)
+
+        async def fake_exec(*args, **k):
+            if args[1] == "ps":
+                return FakeAsyncProc(communicate_result=(gw_line + b"\n", b""))
+            return HangingProc()
+
+        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+        name, data = await server.gather_own_container_logs(timeout=0.05)
+        assert name == "gw"
+        assert b"could not gather gateway logs" in data
 
 
 class FakeState:
@@ -914,6 +1096,54 @@ class TestDockerStatsSource:
                 await asyncio.sleep(0.02)
             assert "good" in src.series
             assert "bad" not in src.series
+        finally:
+            src.stop()
+
+    async def test_remote_polls_via_ssh_sudo_docker_stats(self, docker_cli, monkeypatch):
+        client = FakeSSHClient()
+        monkeypatch.setattr(server, "_connect_ssh", lambda host, key: client)
+        row = {
+            "Name": "web",
+            "CPUPerc": "12.50%",
+            "MemPerc": "3.00%",
+            "MemUsage": "12.3MiB / 1.907GiB",
+            "NetIO": "648B / 1.2kB",
+        }
+        captured = []
+
+        def fake_exec(c, args, timeout):
+            captured.append(list(args))
+            return json.dumps(row) + "\n", "", 0
+
+        monkeypatch.setattr(server, "_exec_remote_docker", fake_exec)
+        src = server.DockerStatsSource("d4", "stats@h", "ssh://u@h", 0.05, FakeState())
+        try:
+            deadline = time.time() + 3
+            while not src.series and time.time() < deadline:
+                await asyncio.sleep(0.02)
+            assert "web" in src.series
+            assert captured[0] == ["stats", "--no-stream", "--format", "{{json .}}"]
+            assert src.path == "docker://ssh://u@h/stats"
+        finally:
+            src.stop()
+        assert client.closed  # stop() closes the persistent ssh connection
+
+    async def test_remote_stats_failure_reconnects_next_tick(self, docker_cli, monkeypatch):
+        clients = [FakeSSHClient(), FakeSSHClient()]
+        monkeypatch.setattr(server, "_connect_ssh", lambda host, key: clients.pop(0))
+        monkeypatch.setattr(server, "_exec_remote_docker", lambda c, a, **kw: ("", "boom", 1))
+        src = server.DockerStatsSource("d5", "stats@h", "ssh://u@h", 0.05, FakeState())
+        try:
+            deadline = time.time() + 3
+            while src.error is None and time.time() < deadline:
+                await asyncio.sleep(0.02)
+            assert "boom" in src.error
+            # the failed connection should have been closed and cleared, so
+            # the next tick reconnects (draining the second fake client too)
+            deadline = time.time() + 3
+            while clients and time.time() < deadline:
+                await asyncio.sleep(0.02)
+            assert not clients
         finally:
             src.stop()
 
@@ -986,20 +1216,40 @@ class TestDockerLogSource:
         src.stop()
 
     async def test_service_target_uses_service_logs(self, docker_cli, monkeypatch):
-        captured = {}
-
-        async def fake_exec(*args, **k):
-            captured["cmd"] = args
-            return FakeAsyncProc([])
-
-        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+        client = FakeSSHClientStreaming([b"2026-01-02T03:04:05Z hello\n"])
+        monkeypatch.setattr(server, "_connect_ssh", lambda host, key: client)
         src = server.DockerLogSource(
             "l2", "api", "ssh://u@h", "service", "api", [], FakeState(), ssh_key="/tmp/k"
         )
         deadline = time.time() + 3
+        while src.total() < 1 and time.time() < deadline:
+            await asyncio.sleep(0.02)
+        assert src.total() == 1
+        assert src.path == "docker://ssh://u@h/service/api"
+        assert client.last_cmd.startswith("sudo docker service logs")
+        src.stop()
+        assert client.closed  # stop() closes the ssh connection it opened
+
+    async def test_remote_log_stream_ends(self, docker_cli, monkeypatch):
+        client = FakeSSHClientStreaming([b"one line\n"])
+        monkeypatch.setattr(server, "_connect_ssh", lambda host, key: client)
+        src = server.DockerLogSource("l5", "web", "ssh://u@h", "container", "web", [], FakeState())
+        deadline = time.time() + 3
         while src.error is None and time.time() < deadline:
             await asyncio.sleep(0.02)
-        assert list(captured["cmd"][:4]) == ["docker", "-H", "ssh://u@h", "service"]
+        assert src.error == "log stream ended"
+        src.stop()
+
+    async def test_remote_ssh_connect_failure_recorded(self, docker_cli, monkeypatch):
+        def boom(host, key):
+            raise OSError("Connection refused")
+
+        monkeypatch.setattr(server, "_connect_ssh", boom)
+        src = server.DockerLogSource("l6", "web", "ssh://u@h", "container", "web", [], FakeState())
+        deadline = time.time() + 3
+        while src.error is None and time.time() < deadline:
+            await asyncio.sleep(0.02)
+        assert "Connection refused" in src.error
         src.stop()
 
     async def test_spawn_failure_recorded(self, docker_cli, monkeypatch):
@@ -1303,18 +1553,42 @@ class TestState:
         for sid in ids:
             state.close_source(sid)
 
-    async def test_collect_docker_reuse_ignores_the_second_call_s_settings(
+    async def test_collect_docker_reuse_applies_a_new_poll_interval_but_ignores_other_settings(
+        self, state, docker_cli, monkeypatch
+    ):
+        """A reused stats/host-stats collector picks up a *changed* poll
+        interval from the new call (see _update_poll_interval) -- Edit
+        Docker Daemon's poll interval field must actually take effect even
+        when collection for that daemon is already running, not silently
+        no-op forever until you close and reopen it by hand. Everything
+        else about the reused source (here: nothing else varies for stats,
+        but see the log-source-side reuse tests for transforms/ssh_key)
+        still follows the original documented reuse semantics."""
+        _no_op_docker(monkeypatch)
+        first = state.collect_docker(
+            None, stats=True, logs=[], transforms=[], interval=1.0, host_stats=False
+        )
+        second = state.collect_docker(
+            None, stats=True, logs=[], transforms=[], interval=99.0, host_stats=False
+        )  # different interval, same target
+        assert second == first  # still the exact same collector, not a second one
+        src = state.sources[first[0]]
+        assert src.interval == 99.0  # the new call's interval was applied
+        state.close_source(first[0])
+
+    async def test_collect_docker_reuse_is_a_no_op_when_the_interval_is_unchanged(
         self, state, docker_cli, monkeypatch
     ):
         _no_op_docker(monkeypatch)
         first = state.collect_docker(
             None, stats=True, logs=[], transforms=[], interval=1.0, host_stats=False
         )
-        state.collect_docker(
-            None, stats=True, logs=[], transforms=[], interval=99.0, host_stats=False
-        )  # different interval, same target
         src = state.sources[first[0]]
-        assert src.interval == 1.0  # untouched by the second, reused call
+        src.interval = 1.0  # sanity: still what we started it with
+        state.collect_docker(
+            None, stats=True, logs=[], transforms=[], interval=1.0, host_stats=False
+        )
+        assert src.interval == 1.0
         state.close_source(first[0])
 
     async def test_collect_docker_repeated_calls_for_the_same_target_start_only_one(
@@ -1593,6 +1867,35 @@ class TestHttpApi:
         code, j = get(base, "/range")
         assert j["min_ts"] == ms(2026, 1, 2, 3, 0, 0)
         assert j["max_ts"] == ms(2026, 1, 2, 3, 0, 10)
+
+    def test_every_request_is_access_logged_in_detail(self, api, caplog):
+        base, _ = api
+        with caplog.at_level("INFO", logger="cttc"):
+            code, _ = get(base, "/sources")
+        assert code == 200
+        lines = [r.message for r in caplog.records if r.name == "cttc"]
+        match = next((m for m in lines if "/sources" in m), None)
+        assert match, lines
+        assert match.startswith("GET /sources")
+        assert "200" in match
+        assert "ms)" in match  # timing recorded
+
+    def test_access_log_includes_query_string_and_client(self, api, caplog):
+        base, st = api
+        sid = next(s.id for s in st.sources.values() if s.kind == "log")
+        with caplog.at_level("INFO", logger="cttc"):
+            get(base, f"/logs?source={sid}&start=0&count=10")
+        match = next((r.message for r in caplog.records if r.name == "cttc" and "/logs" in r.message), None)
+        assert match
+        assert f"?source={sid}&start=0&count=10" in match
+        assert "127.0.0.1" in match
+
+    def test_access_log_reflects_error_status_codes(self, api, caplog):
+        base, _ = api
+        with caplog.at_level("INFO", logger="cttc"):
+            get(base, "/logs?source=nope")
+        match = next((r.message for r in caplog.records if r.name == "cttc" and "/logs" in r.message), None)
+        assert match and " 400 " in match
 
     def test_range_empty(self, tmp_path):
         base, srv, t = boot_server(server.State(tmp_path))
@@ -2066,6 +2369,21 @@ class TestEventsEndpoints:
 
 
 # ── /files/* (phase 3: upload/download, docs/architecture/remote-server.md) ──
+
+
+class TestMlogEndpoint:
+    async def test_returns_logs_with_name_header(self, api, monkeypatch):
+        base, _ = api
+
+        async def fake_gather(timeout=15.0):
+            return "my-gateway", b"hello from the gateway\n"
+
+        monkeypatch.setattr(server, "gather_own_container_logs", fake_gather)
+        code, headers, data = get_raw(base, "/mlog")
+        assert code == 200
+        assert data == b"hello from the gateway\n"
+        assert headers["X-CTTC-Gateway-Name"] == "my-gateway"
+        assert 'filename="my-gateway.log"' in headers["Content-Disposition"]
 
 
 class TestFilesEndpoints:

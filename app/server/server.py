@@ -31,6 +31,7 @@ import io
 import logging
 import os
 import re
+import shlex
 import sys
 import time
 import zipfile
@@ -41,6 +42,7 @@ from typing import Literal
 
 import docker
 import orjson
+import paramiko
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
@@ -160,8 +162,8 @@ class TransformRegistry:
                         break
                     if line:
                         break
-            except OSError:
-                pass
+            except OSError as e:
+                logger.debug("could not read transform doc from %s: %s", p, e)
             out.append({"name": p.stem, "doc": doc})
         return out
 
@@ -287,7 +289,8 @@ class LogSource:
         if body.startswith("{") and body.endswith("}"):
             try:
                 fields = jloads(body)
-            except Exception:
+            except Exception as e:
+                logger.debug("log line looked like json but didn't parse: %s", e)
                 fields = {}
             if isinstance(fields, dict) and ts is None:
                 for f in TS_FIELDS:
@@ -403,7 +406,8 @@ class StatsSource:
         if stripped.startswith("["):  # whole-file JSON array (jsonify-stats output)
             try:
                 entries = jloads(stripped)
-            except Exception:
+            except Exception as e:
+                logger.debug("whole-array json didn't parse yet, treating as incomplete: %s", e)
                 self._pending_partial = data
                 return 0
             self._pending_partial = b""
@@ -419,7 +423,8 @@ class StatsSource:
                 continue
             try:
                 e = jloads(bline)
-            except Exception:
+            except Exception as ex:
+                logger.debug("skipping unparseable log line: %s", ex)
                 self.skipped += 1
                 continue
             n += self._ingest_entry(e)
@@ -583,13 +588,15 @@ def normalize_docker_host(host: str | None) -> str | None:
     return host if _HOST_SCHEME_RE.match(host) else f"ssh://{host}"
 
 
-def docker_client(host: str | None) -> docker.DockerClient:
-    """use_ssh_client=True shells out to the system `ssh` binary (same as
-    the docker CLI) instead of docker-py's own paramiko-based transport --
-    that's what makes this respect the same ssh-agent (SSH_AUTH_SOCK) and
-    accept-new host-key policy the rest of the app already relies on."""
-    if host:
-        return docker.DockerClient(base_url=host, use_ssh_client=True, timeout=15)
+def docker_client(host: str | None = None) -> docker.DockerClient:
+    """Local daemon only -- a remote ssh:// source goes through
+    _connect_ssh()/_exec_remote_docker() instead (see their docstrings for
+    why): docker-py's own use_ssh_client transport (and the docker CLI's
+    -H ssh://... equivalent) has no way to run the remote docker command as
+    `sudo`, which many hosts require since the account CTTC connects as often
+    isn't in that host's docker group. Kept as its own function (rather than
+    inlining docker.from_env() at each call site) purely so tests can
+    substitute a fake client the way they always have."""
     return docker.from_env(timeout=15)
 
 
@@ -603,6 +610,111 @@ def ssh_host_and_port(host: str) -> tuple[list[str], str]:
     return extra, rest
 
 
+def _parse_ssh_target(host: str) -> tuple[str, str | None, int]:
+    """ssh://[user@]hostname[:port] -> (hostname, username_or_None, port)."""
+    rest = host[len("ssh://") :]
+    user = None
+    if "@" in rest:
+        user, rest = rest.split("@", 1)
+    port = 22
+    if ":" in rest:
+        rest, port_s = rest.rsplit(":", 1)
+        port = int(port_s)
+    return rest, user, port
+
+
+def _connect_ssh(host: str, ssh_key: str | None) -> paramiko.SSHClient:
+    """Opens a paramiko connection to an ssh:// Docker/telemetry host.
+    AutoAddPolicy matches the same TOFU trust model the rest of the app uses
+    (StrictHostKeyChecking=accept-new -- see Dockerfile); this container's
+    filesystem is ephemeral, so there's no persistent known_hosts to violate
+    across restarts either way. With no ssh_key given, falls back to
+    paramiko's own default identity discovery (~/.ssh/id_rsa, id_ed25519,
+    etc. + any running ssh-agent) -- ~/.ssh/id_rsa is populated at gateway
+    deploy time for the *gateway's own* host (see docker-compose.yml's
+    CTTC_ID_RSA mount / app/lib/server-provision.js), which is exactly what a
+    source with no key of its own should try."""
+    hostname, username, port = _parse_ssh_target(host)
+    identity = ssh_key or "ssh-agent/default identity discovery"
+    logger.info("ssh: connecting to %s@%s:%d (key: %s)", username or "<default user>", hostname, port, identity)
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    kwargs: dict = {"hostname": hostname, "port": port, "timeout": 10, "banner_timeout": 10, "auth_timeout": 10}
+    if username:
+        kwargs["username"] = username
+    if ssh_key:
+        kwargs["key_filename"] = ssh_key
+    t0 = time.monotonic()
+    try:
+        client.connect(**kwargs)
+    except Exception as e:
+        logger.warning("ssh: connect to %s:%d failed after %.1fms: %s: %s", hostname, port, (time.monotonic() - t0) * 1000, type(e).__name__, e)
+        raise
+    transport = client.get_transport()
+    logger.info(
+        "ssh: connected to %s:%d in %.1fms (server: %s, cipher: %s)",
+        hostname, port, (time.monotonic() - t0) * 1000,
+        transport.remote_version if transport else "?",
+        transport.local_cipher if transport else "?",
+    )
+    return client
+
+
+def _exec_remote_docker(client: paramiko.SSHClient, args: list[str], timeout: float) -> tuple[str, str, int]:
+    """Runs `sudo docker <args>` over an already-open ssh connection and
+    returns (stdout, stderr, returncode). Always blocking (paramiko has no
+    asyncio support) -- callers must run this via asyncio.to_thread. sudo is
+    the whole reason this exists as a separate path from docker-py/the
+    docker CLI's own -H ssh://... transport: reaching a *third* machine this
+    way is exactly the case where the account CTTC connects as often isn't
+    in that host's docker group, and -H ssh://... has no way to inject sudo
+    before the remote `docker system dial-stdio` it runs -- so this shells
+    out the equivalent of `ssh user@host sudo docker <args>` explicitly."""
+    cmd = "sudo docker " + " ".join(shlex.quote(a) for a in args)
+    t0 = time.monotonic()
+    logger.debug("ssh: exec `%s` (timeout=%.1fs)", cmd, timeout)
+    _stdin, stdout, stderr = client.exec_command(cmd, timeout=timeout)
+    out = stdout.read().decode(errors="replace")
+    err = stderr.read().decode(errors="replace").strip()
+    rc = stdout.channel.recv_exit_status()
+    elapsed_ms = (time.monotonic() - t0) * 1000
+    if rc == 0:
+        logger.debug("ssh: `%s` -> exit 0 in %.1fms (%d bytes stdout)", cmd, elapsed_ms, len(out))
+    else:
+        logger.info("ssh: `%s` -> exit %d in %.1fms: %s", cmd, rc, elapsed_ms, err or "(no stderr)")
+    return out, err, rc
+
+
+_DOCKER_SIZE_UNITS = {
+    "": 1,
+    "b": 1,
+    "kb": 1000,
+    "mb": 1000**2,
+    "gb": 1000**3,
+    "tb": 1000**4,
+    "kib": 1024,
+    "mib": 1024**2,
+    "gib": 1024**3,
+    "tib": 1024**4,
+}
+_SIZE_RE = re.compile(r"^([\d.]+)\s*([a-zA-Z]*)$")
+
+
+def _parse_docker_size(s: str) -> float:
+    """"12.3MiB" / "648B" / "1.9GB" -> bytes. The only place these human-
+    formatted units come from is `docker stats`' own MemUsage/NetIO columns
+    (binary KiB/MiB/GiB for memory, decimal kB/MB/GB for network -- matching
+    Docker's own units.BytesSize/units.HumanSize) -- used for a remote
+    ssh:// source's stats, where docker-py's structured raw stats API isn't
+    reachable without the -H ssh://... transport this module deliberately
+    avoids (see _exec_remote_docker)."""
+    m = _SIZE_RE.match(s.strip())
+    if not m:
+        return 0.0
+    val, unit = m.groups()
+    return float(val) * _DOCKER_SIZE_UNITS.get(unit.lower(), 1)
+
+
 def list_ssh_keys() -> list[str]:
     """Private keys under ~/.ssh (files whose header says so)."""
     keys = []
@@ -614,7 +726,8 @@ def list_ssh_keys() -> list[str]:
             try:
                 with open(p, "rb") as f:
                     head = f.read(80)
-            except OSError:
+            except OSError as e:
+                logger.debug("could not read %s while listing ssh keys: %s", p, e)
                 continue
             if b"PRIVATE KEY" in head:
                 keys.append(str(p))
@@ -668,58 +781,135 @@ async def _run_docker_cli(desc: str, args: list[str], log: list, timeout: float)
     return stdout.decode(errors="replace")
 
 
+async def _find_own_container() -> tuple[str, str] | None:
+    """(id, name) of the gateway's own running container -- the one whose
+    image basename is "cttc-gateway" (see docker-compose.yml), same
+    filtering logic docker_ps() already uses to hide it from the
+    monitorable-target list. None if this server isn't running
+    containerized at all (the embedded/bare-process fallback -- see
+    main.js), or docker itself isn't reachable."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "docker",
+            "ps",
+            "--format",
+            "{{json .}}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+    except (TimeoutError, OSError):
+        return None
+    for line in out.decode(errors="replace").splitlines():
+        if not line.strip():
+            continue
+        row = jloads(line)
+        if row["Image"].split(":")[0].rsplit("/", 1)[-1] == "cttc-gateway":
+            return row["ID"], row["Names"]
+    return None
+
+
+async def gather_own_container_logs(timeout: float = 15.0) -> tuple[str, bytes]:
+    """(name, log bytes) for `docker logs` on the gateway's own container --
+    "Ship Logs" (Settings > Collect CTTC Own Logs) bundles this alongside
+    the client's own .cttc-log files. Falls back to an explanatory message
+    (not an error) when there's no own container to find."""
+    found = await _find_own_container()
+    if found is None:
+        return (
+            "gateway",
+            b"could not find this gateway's own container "
+            b"(docker ps found nothing running the cttc-gateway image -- "
+            b"this server may not be running containerized)\n",
+        )
+    container_id, name = found
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "docker",
+            "logs",
+            container_id,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except (TimeoutError, OSError) as e:
+        out = f"could not gather gateway logs: {e}".encode()
+    return name, out
+
+
 async def docker_ps(host: str | None, ssh_key: str | None = None) -> dict:
-    """List containers (and swarm services, when the daemon is a manager)."""
+    """List containers (and swarm services, when the daemon is a manager).
+    Local daemon: plain `docker <args>` as an asyncio subprocess. A remote
+    ssh:// host: `ssh user@host sudo docker <args>` over paramiko instead --
+    see _exec_remote_docker's docstring for why sudo."""
     host = normalize_docker_host(host)
     where = host or "local"
     logger.info("docker_ps: host=%s", where)
     log: list = []
-    base = ["docker"] + (["-H", host] if host else [])
     t_left = DOCKER_PS_TIMEOUT
+    client = None
+    if host:
+        try:
+            client = await asyncio.to_thread(_connect_ssh, host, ssh_key)
+        except Exception as e:
+            raise DockerPsError(f"could not ssh to {host}: {e}", log)
 
     async def run(desc, args):
         nonlocal t_left
         t0 = time.monotonic()
         try:
-            return await _run_docker_cli(desc, args, log, max(0.01, t_left))
+            if client is None:
+                return await _run_docker_cli(desc, ["docker", *args], log, max(0.01, t_left))
+            out, err, rc = await asyncio.to_thread(_exec_remote_docker, client, args, max(0.01, t_left))
+            log.append({"cmd": desc, "returncode": rc, "ms": round((time.monotonic() - t0) * 1000), "stderr": err})
+            if rc != 0:
+                raise DockerPsError(err or f"{desc} failed", log)
+            return out
         finally:
             t_left -= time.monotonic() - t0
 
     try:
-        await run(
-            f"docker version @ {where}", base + ["version", "--format", "{{.Server.Version}}"]
-        )
-    except DockerPsError as e:
-        raise DockerPsError(
-            f"docker is not installed (or not reachable) on {host or 'the local daemon'}: {e}",
-            log,
-        )
+        try:
+            await run(f"docker version @ {where}", ["version", "--format", "{{.Server.Version}}"])
+        except DockerPsError as e:
+            raise DockerPsError(
+                f"docker is not installed (or not reachable) on {host or 'the local daemon'}: {e}",
+                log,
+            )
 
-    ps_out = await run(f"docker ps @ {where}", base + ["ps", "--format", "{{json .}}"])
-    ps_rows = [jloads(line) for line in ps_out.splitlines() if line.strip()]
-    containers = [
-        {"id": r["ID"][:12], "name": r["Names"], "image": r["Image"]}
-        for r in ps_rows
-        # the gateway's own container (image "cttc-gateway[:tag]", see
-        # docker-compose.yml) is infrastructure CTTC runs itself, not
-        # something to offer up as a monitorable target
-        if r["Image"].split(":")[0].rsplit("/", 1)[-1] != "cttc-gateway"
-    ]
-
-    services = []
-    try:
-        svc_out = await run(
-            f"docker service ls @ {where}", base + ["service", "ls", "--format", "{{json .}}"]
-        )
-        services = [
-            {"id": (r := jloads(line))["ID"][:12], "name": r["Name"], "replicas": r["Replicas"]}
-            for line in svc_out.splitlines()
-            if line.strip()
+        ps_out = await run(f"docker ps @ {where}", ["ps", "--format", "{{json .}}"])
+        ps_rows = [jloads(line) for line in ps_out.splitlines() if line.strip()]
+        containers = [
+            {"id": r["ID"][:12], "name": r["Names"], "image": r["Image"]}
+            for r in ps_rows
+            # Only ever hide this on the gateway's own daemon (host=None --
+            # server.py's own /var/run/docker.sock, wherever it's actually
+            # running: local, remote, or remote-tunnel all resolve here the
+            # same way). This container (image "cttc-gateway[:tag]", see
+            # docker-compose.yml) is infrastructure CTTC runs itself there,
+            # not something to offer up as a monitorable target -- but a
+            # remote ssh:// source is by definition a *different* machine
+            # (that's the whole point of Set Sources), so a container that
+            # merely happens to share that image name/tag there has nothing
+            # to do with this gateway and must never be hidden.
+            if host or r["Image"].split(":")[0].rsplit("/", 1)[-1] != "cttc-gateway"
         ]
-    except DockerPsError:
-        pass  # not a swarm manager -- same tolerance the old `docker service ls` had
 
-    return {"containers": containers, "services": services, "log": log}
+        services = []
+        try:
+            svc_out = await run(f"docker service ls @ {where}", ["service", "ls", "--format", "{{json .}}"])
+            services = [
+                {"id": (r := jloads(line))["ID"][:12], "name": r["Name"], "replicas": r["Replicas"]}
+                for line in svc_out.splitlines()
+                if line.strip()
+            ]
+        except DockerPsError:
+            pass  # not a swarm manager -- same tolerance the old `docker service ls` had
+
+        return {"containers": containers, "services": services, "log": log}
+    finally:
+        if client is not None:
+            await asyncio.to_thread(client.close)
 
 
 def now_iso() -> str:
@@ -760,7 +950,9 @@ def _cpu_mem_net_from_raw(
 
 
 class DockerStatsSource(StatsSource):
-    """Polls per-container stats snapshots (docker-py) on an interval."""
+    """Polls per-container stats snapshots on an interval: docker-py for the
+    local daemon, `sudo docker stats --no-stream` over paramiko for a remote
+    ssh:// source (see _exec_remote_docker's docstring for why sudo)."""
 
     def __init__(
         self,
@@ -774,46 +966,89 @@ class DockerStatsSource(StatsSource):
         super().__init__(sid, name, path=None, live=True)
         self.path = f"docker://{host or 'local'}/stats"
         self.host = host
+        self.ssh_key = ssh_key
         self.interval = interval
         self._state = state
         self.error: str | None = None
+        self._ssh_client: paramiko.SSHClient | None = None
         self._task = asyncio.ensure_future(self._loop())
 
     def stop(self):
         self._task.cancel()
+        self._close_ssh()
 
-    def _sample_once(self):
-        client = docker_client(self.host)
+    def _close_ssh(self):
+        if self._ssh_client is not None:
+            try:
+                self._ssh_client.close()
+            except Exception as e:
+                logger.debug("error closing ssh client for %s: %s", self.path, e)
+            self._ssh_client = None
+
+    def _sample_local(self):
+        client = docker_client(None)
         containers = client.containers.list()
-        ts = now_iso()
         ts_ms = time.time() * 1000.0
         n = 0
         for c in containers:
             try:
                 raw = c.stats(stream=False)
-            except Exception:
+            except Exception as e:
                 # one container's stats() call failing (removed mid-poll,
                 # a transient connection hiccup, ...) must not blank out
                 # every other container's sample for this tick
+                logger.debug("stats() failed for container %s: %s", c.name, e)
                 continue
             cpu, mem, mem_bytes, net_total = _cpu_mem_net_from_raw(raw)
             rate = self._net_rate(c.name, ts_ms, net_total)
             self.ingest_row(c.name, ts_ms, cpu, mem, mem_bytes, rate)
             n += 1
-        return n, ts
+        return n
+
+    def _sample_remote(self):
+        assert self.host is not None  # only ever called from _sample_once's own `if self.host` guard
+        if self._ssh_client is None:
+            self._ssh_client = _connect_ssh(self.host, self.ssh_key)
+        out, err, rc = _exec_remote_docker(
+            self._ssh_client, ["stats", "--no-stream", "--format", "{{json .}}"], timeout=15
+        )
+        if rc != 0:
+            raise RuntimeError(err or "docker stats failed")
+        ts_ms = time.time() * 1000.0
+        n = 0
+        for line in out.splitlines():
+            if not line.strip():
+                continue
+            row = jloads(line)
+            name = row.get("Name") or row.get("Container") or "?"
+            cpu = float(row["CPUPerc"].rstrip("%")) if row.get("CPUPerc") else None
+            mem_pct = float(row["MemPerc"].rstrip("%")) if row.get("MemPerc") else None
+            mem_bytes = _parse_docker_size(row["MemUsage"].split("/")[0]) if row.get("MemUsage") else None
+            net_total = (
+                sum(_parse_docker_size(p) for p in row["NetIO"].split("/")) if row.get("NetIO") else None
+            )
+            rate = self._net_rate(name, ts_ms, net_total) if net_total is not None else None
+            self.ingest_row(name, ts_ms, cpu, mem_pct, mem_bytes, rate)
+            n += 1
+        return n
+
+    def _sample_once(self):
+        return self._sample_remote() if self.host else self._sample_local()
 
     async def _loop(self):
         while True:
             t_start = time.time()
             try:
-                n, _ts = await asyncio.to_thread(self._sample_once)
+                n = await asyncio.to_thread(self._sample_once)
                 self.error = None
                 if n:
                     self._state.broadcast({"type": "update", "source": self.id})
             except asyncio.CancelledError:
                 raise
             except Exception as e:
+                logger.debug("stats poll failed for %s: %s", self.path, e)
                 self.error = f"{type(e).__name__}: {e}"[:500]
+                self._close_ssh()  # force a fresh connection next tick
             await asyncio.sleep(max(0.5, self.interval - (time.time() - t_start)))
 
 
@@ -850,6 +1085,7 @@ class HostStatsSource(StatsSource):
                     "-o",
                     "ConnectTimeout=10",
                     *extra,
+                    *(["-i", ssh_key, "-o", "IdentitiesOnly=yes"] if ssh_key else []),
                     target,
                 ]
             else:
@@ -877,6 +1113,7 @@ class HostStatsSource(StatsSource):
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
+                    logger.debug("host stats poll failed for %s: %s", self.path, e)
                     self.error = f"{type(e).__name__}: {e}"[:500]
             await asyncio.sleep(max(0.5, self.interval - (time.time() - t_start)))
 
@@ -975,10 +1212,13 @@ class HostStatsSource(StatsSource):
 
 
 class DockerLogSource(LogSource):
-    """Follows `docker logs -f -t` (or `docker service logs -f -t`) via an
-    asyncio subprocess -- not docker-py: its log-follow is a blocking
-    generator with no clean way to abort from another coroutine/thread,
-    whereas an asyncio subprocess can just be terminated on stop()."""
+    """Follows `docker logs -f -t` (or `docker service logs -f -t`) -- an
+    asyncio subprocess for the local daemon (not docker-py: its log-follow
+    is a blocking generator with no clean way to abort from another
+    coroutine/thread, whereas an asyncio subprocess can just be terminated
+    on stop()), or `sudo docker logs -f -t ...` over a persistent paramiko
+    channel for a remote ssh:// source (see _exec_remote_docker's docstring
+    for why sudo)."""
 
     def __init__(
         self,
@@ -994,35 +1234,41 @@ class DockerLogSource(LogSource):
     ):
         super().__init__(sid, name, path=None, live=True, transforms=transforms)
         self.path = f"docker://{host or 'local'}/{target_type}/{target}"
+        self.host = host
+        self.ssh_key = ssh_key
         self._state = state
         self.error: str | None = None
         self._proc: asyncio.subprocess.Process | None = None
-        exe = "docker"
-        base = [exe] + (["-H", host] if host else [])
+        self._ssh_client: paramiko.SSHClient | None = None
+        self._channel: paramiko.Channel | None = None
         sub = ["service", "logs"] if target_type == "service" else ["logs"]
-        self._cmd = base + sub + ["-f", "-t", "--tail", str(tail), target]
+        self._args = sub + ["-f", "-t", "--tail", str(tail), target]
         self._task = asyncio.ensure_future(self._follow())
 
     def stop(self):
         if self._proc is not None and self._proc.returncode is None:
             self._proc.terminate()
+        if self._channel is not None:
+            try:
+                self._channel.close()
+            except Exception as e:
+                logger.debug("error closing ssh channel for %s: %s", self.path, e)
+        if self._ssh_client is not None:
+            try:
+                self._ssh_client.close()
+            except Exception as e:
+                logger.debug("error closing ssh client for %s: %s", self.path, e)
         self._task.cancel()
 
     async def _follow(self):
         try:
-            self._proc = await asyncio.create_subprocess_exec(
-                *self._cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-            assert self._proc.stdout is not None  # guaranteed by stdout=PIPE above
+            read_chunk = await (self._start_remote() if self.host else self._start_local())
             last_emit = 0.0
             pending = 0
             while True:
-                # StreamReader.read() blocks until data or true EOF -- unlike
-                # the old blocking subprocess.Popen + read1() it replaces,
-                # it never returns b"" while the stream is merely idle.
-                chunk = await self._proc.stdout.read(65536)
+                # blocks until data or true EOF -- never returns b"" while
+                # the stream is merely idle (docker logs -f between lines)
+                chunk = await read_chunk()
                 if not chunk:
                     self.error = "log stream ended"
                     self._state.broadcast({"type": "update", "source": self.id})
@@ -1035,8 +1281,38 @@ class DockerLogSource(LogSource):
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            logger.debug("log follow failed for %s: %s", self.path, e)
             self.error = f"{type(e).__name__}: {e}"[:500]
-            self._state.broadcast({"type": "update", "source": self.id})
+
+    async def _start_local(self):
+        self._proc = await asyncio.create_subprocess_exec(
+            "docker",
+            *self._args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout = self._proc.stdout
+        assert stdout is not None  # guaranteed by stdout=PIPE above
+
+        async def read_chunk():
+            return await stdout.read(65536)
+
+        return read_chunk
+
+    async def _start_remote(self):
+        assert self.host is not None  # only ever called from _follow's own `if self.host` guard
+        self._ssh_client = await asyncio.to_thread(_connect_ssh, self.host, self.ssh_key)
+        cmd = "sudo docker " + " ".join(shlex.quote(a) for a in self._args)
+        logger.info("ssh: starting persistent log follow for %s: `%s`", self.path, cmd)
+        _stdin, stdout_f, _stderr = await asyncio.to_thread(self._ssh_client.exec_command, cmd)
+        channel = stdout_f.channel
+        self._channel = channel
+        channel.set_combine_stderr(True)
+
+        async def read_chunk():
+            return await asyncio.to_thread(channel.recv, 65536)
+
+        return read_chunk
 
 
 # ── state, tailing, SSE ──────────────────────────────────────────────────────
@@ -1115,6 +1391,25 @@ class State:
         self.sources[sid] = make(sid)
         return sid
 
+    def _update_poll_interval(self, sid: str, interval: float):
+        """Applies a *changed* poll interval to an already-running stats/host
+        collector reused by _open_or_reuse (whose own docstring otherwise
+        says differing settings on reuse are silently ignored) -- Edit
+        Docker Daemon's whole point is to let you change the poll interval
+        for a daemon you're already collecting from, so silently discarding
+        it there would make that control a no-op the moment anything is
+        already running. Safe to mutate in place with no lock: this runs on
+        the single-threaded event loop with no `await` before the source's
+        own poll loop next reads self.interval (see DockerStatsSource/
+        HostStatsSource's asyncio.sleep(self.interval - ...) below), and
+        transforms/ssh_key still follow the documented reuse-keeps-original
+        behavior -- only the interval, since that's the one thing the UI
+        that triggers this (Update Docker Daemon) actually claims to change."""
+        src = self.sources.get(sid)
+        if src is not None and getattr(src, "interval", None) != interval:
+            logger.info("collect_docker: updating poll interval for %s: %s -> %s", src.path, src.interval, interval)
+            src.interval = interval
+
     def collect_docker(
         self,
         host: str | None,
@@ -1138,23 +1433,23 @@ class State:
         hostname = (host or "local").split("@")[-1]
         hostkey = host or "local"
         if stats:
-            opened.append(
-                self._open_or_reuse(
-                    f"docker://{hostkey}/stats",
-                    lambda sid: DockerStatsSource(
-                        sid, f"stats@{hostname}", host, interval, self, ssh_key=ssh_key
-                    ),
-                )
+            sid = self._open_or_reuse(
+                f"docker://{hostkey}/stats",
+                lambda sid: DockerStatsSource(
+                    sid, f"stats@{hostname}", host, interval, self, ssh_key=ssh_key
+                ),
             )
+            self._update_poll_interval(sid, interval)
+            opened.append(sid)
         if host_stats:
-            opened.append(
-                self._open_or_reuse(
-                    f"docker://{hostkey}/host",
-                    lambda sid: HostStatsSource(
-                        sid, f"host@{hostname}", host, interval, self, ssh_key=ssh_key
-                    ),
-                )
+            sid = self._open_or_reuse(
+                f"docker://{hostkey}/host",
+                lambda sid: HostStatsSource(
+                    sid, f"host@{hostname}", host, interval, self, ssh_key=ssh_key
+                ),
             )
+            self._update_poll_interval(sid, interval)
+            opened.append(sid)
         for item in logs:
             target = item["name"]
             ttype = item.get("type", "container")
@@ -1434,14 +1729,16 @@ async def tail_loop(state: State, interval: float = 1.0):
                 continue
             try:
                 size = src.path.stat().st_size
-            except OSError:
+            except OSError as e:
+                logger.debug("tail: could not stat %s: %s", src.path, e)
                 continue
             if size < src.offset:  # truncated/rotated: start over
                 src.offset = 0
             if size > src.offset:
                 try:
                     await asyncio.to_thread(read_all, src)
-                except OSError:
+                except OSError as e:
+                    logger.debug("tail: could not read %s: %s", src.path, e)
                     continue
                 state.broadcast({"type": "update", "source": src.id})
 
@@ -1533,6 +1830,33 @@ async def _unhandled_error_handler(request: Request, exc: Exception):
 
 
 @app.middleware("http")
+async def _access_log(request: Request, call_next):
+    # Detailed REST activity log for every request this server handles --
+    # uvicorn's own access log is disabled (see main()'s access_log=False,
+    # which just prints a bare "METHOD path HTTP/1.1" 200 OK" line with no
+    # timing/client/size) in favor of this single, consistent line covering
+    # every route including the ones handled by the exception handlers
+    # above (their response status code comes back through call_next()
+    # like any other, no separate logging needed there). Deliberately never
+    # logs request/response *bodies* -- those can be arbitrarily large
+    # (file uploads, log/metric payloads) or sensitive (ssh keys, private
+    # key PEMs) -- just method/path/query/client/status/size/timing.
+    start = time.monotonic()
+    client = request.client.host if request.client else "?"
+    query = f"?{request.url.query}" if request.url.query else ""
+    try:
+        response = await call_next(request)
+    except Exception as e:
+        elapsed_ms = (time.monotonic() - start) * 1000
+        logger.info("%s %s%s from %s -> unhandled exception after %.1fms: %s", request.method, request.url.path, query, client, elapsed_ms, e)
+        raise
+    elapsed_ms = (time.monotonic() - start) * 1000
+    size = response.headers.get("content-length", "?")
+    logger.info("%s %s%s from %s -> %d (%s bytes, %.1fms)", request.method, request.url.path, query, client, response.status_code, size, elapsed_ms)
+    return response
+
+
+@app.middleware("http")
 async def _options_preflight(request: Request, call_next):
     # CORSMiddleware only answers OPTIONS itself when the request looks like
     # a real browser CORS preflight (Origin + Access-Control-Request-Method
@@ -1571,6 +1895,26 @@ async def route_health():
     """Cheap liveness probe -- no state/docker/disk access, just confirms the
     process is up and answering HTTP, for the renderer's status indicator."""
     return {"ok": True}
+
+
+@app.get("/mlog")
+async def route_mlog():
+    """Ship Logs (Settings > Collect CTTC Own Logs, main.js's "ship-logs"):
+    `docker logs` on the gateway's own container, named after it -- see
+    gather_own_container_logs(). The filename travels in a header (like
+    /sample/record's segment index) since a plain download response has no
+    other structured place to carry it."""
+    name, data = await gather_own_container_logs()
+    return Response(
+        content=data,
+        media_type="text/plain",
+        headers={
+            "X-CTTC-Gateway-Name": name,
+            "Content-Disposition": f'attachment; filename="{name}.log"',
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Expose-Headers": "X-CTTC-Gateway-Name",
+        },
+    )
 
 
 @app.get("/sources")
@@ -2106,21 +2450,25 @@ async def route_events_cancel(event_id: str, request: Request):
 @app.post("/docker/ps")
 async def route_docker_ps(request: Request):
     body = await request.json() if await request.body() else {}
-    return await docker_ps(body.get("host") or None, body.get("ssh_key") or None)
+    host = body.get("host") or None
+    ssh_key = body.get("ssh_key") or None
+    return await docker_ps(host, ssh_key)
 
 
 @app.post("/docker/collect")
 async def route_docker_collect(request: Request):
     body = await request.json()
     st = get_state(request)
+    host = body.get("host") or None
+    ssh_key = body.get("ssh_key") or None
     opened = st.collect_docker(
-        body.get("host") or None,
+        host,
         bool(body.get("stats", True)),
         body.get("logs", []),
         body.get("transforms", []),
         float(body.get("interval", 5)),
         bool(body.get("host_stats", True)),
-        body.get("ssh_key") or None,
+        ssh_key,
     )
     st.broadcast({"type": "sources"})
     return {"opened": opened, "sources": st.describe()}

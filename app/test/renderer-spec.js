@@ -72,11 +72,20 @@
     ok(fmtIso(0).endsWith(" UTC"));
   });
 
-  await T("colorFor assigns stable slots and folds past 8", () => {
+  await T("colorFor assigns stable slots and never folds to gray past 8", () => {
     const c1 = colorFor("__test_series_1");
     eq(colorFor("__test_series_1"), c1, "stable on repeat");
-    for (let i = 2; i <= 10; i++) colorFor("__test_series_" + i);
-    eq(colorFor("__test_series_10"), themeVar("--muted"), "9th+ folds to muted");
+    const colors = [];
+    for (let i = 1; i <= 12; i++) colors.push(colorFor("__test_series_" + i));
+    // every one of the first 12 concurrent series gets its own distinct
+    // color -- none of them (not just the first 8) may ever fold to the
+    // shared --muted gray, which is reserved for actually disabled/
+    // not-selected containers, not "the 9th+ live one".
+    const muted = themeVar("--muted");
+    ok(colors.every((c) => c !== muted), `no live series color may equal --muted: ${colors}`);
+    ok(new Set(colors).size === colors.length, `every color must be distinct: ${colors}`);
+    // stable on repeat past the 8-color curated palette too
+    eq(colorFor("__test_series_10"), colors[9], "9th+ slot color stable on repeat");
   });
 
   /* ── view management ──────────────────────────────────────────────────── */
@@ -153,6 +162,31 @@
     near((state.view.t0 + state.view.t1) / 2, Date.now(), 2000);
   });
 
+  await T("setView turns state.live off unless called with _follow", () => {
+    state.live = true;
+    setView(MID, MID + 60000);
+    ok(!state.live, "manual setView clears live");
+    state.live = false;
+    setView(MID, MID + 60000, { _follow: true });
+    ok(!state.live, "_follow doesn't itself turn live on");
+  });
+
+  await T("followNow recenters ~5s behind now, keeping the span", () => {
+    setView(MID, MID + 60000);
+    const span = state.view.t1 - state.view.t0;
+    followNow();
+    near(state.view.t1 - state.view.t0, span, 5, "span preserved");
+    near((state.view.t0 + state.view.t1) / 2, Date.now() - 5000, 2000, "centered ~5s behind now");
+  });
+
+  await T("goLive turns state.live on and jumps to the present", () => {
+    state.live = false;
+    setView(MID, MID + 60000);
+    goLive();
+    ok(state.live, "goLive sets state.live");
+    near((state.view.t0 + state.view.t1) / 2, Date.now() - 5000, 2000, "centered ~5s behind now");
+  });
+
   await T("resetZoom fits the data and places the cursor on now", () => {
     state.cursorT = null;
     resetZoom();
@@ -185,10 +219,11 @@
     drawAll();
   });
 
-  await T("timeline-nav 'now' label centers on the present", () => {
+  await T("timeline-nav 'now' label jumps live, centered 5s behind the present", () => {
     setView(MID, MID + 60000);
     document.querySelector("#chart-nav .tl-now-label").click();
-    near((state.view.t0 + state.view.t1) / 2, Date.now(), 2000, "centered on now");
+    near((state.view.t0 + state.view.t1) / 2, Date.now() - 5000, 2000, "centered ~5s behind now");
+    if (!state.live) throw new Error("expected state.live to be true after clicking 'now'");
   });
 
   await T("timeline-nav track click re-centers, keeping the span", () => {
@@ -249,6 +284,56 @@
     eq(n, names.length - 1, "hidden from plots");
     [...$("legend").querySelectorAll(".legend-item")].find((i) => i.textContent.includes(NAME)).click();
     eq(state.visible.get(NAME), true, "restored");
+  });
+
+  await T("legend click also hides/shows that container's log panel, in place", () => {
+    const logSrc = state.sources.find((s) => s.kind === "log" && s.name === "c3_api");
+    ok(logSrc, "c3_api log source is open in the demo");
+    renderLegend();
+    const item = [...$("legend").querySelectorAll(".legend-item")].find((i) => i.textContent.includes("c3_api"));
+    ok(item, "c3_api legend entry present");
+    const panel = panels.get(logSrc.id);
+    ok(panel, "c3_api has an open panel");
+    const indexBefore = [...panelsEl.children].indexOf(panel.el);
+    try {
+      item.click();
+      eq(panel.el.hidden, true, "panel hidden");
+      item.click();
+      eq(panel.el.hidden, false, "panel visible again");
+      eq([...panelsEl.children].indexOf(panel.el), indexBefore, "same slot as before");
+    } finally {
+      state.visible.delete("c3_api");
+      syncPanels();
+    }
+  });
+
+  await T("panel close button hides (not removes) the source, re-enabled via legend", async () => {
+    const logSrc = state.sources.find((s) => s.kind === "log" && s.name === "c3_worker");
+    ok(logSrc, "c3_worker log source is open in the demo");
+    const panel = panels.get(logSrc.id);
+    ok(panel, "c3_worker has an open panel");
+    const closeBtn = panel.el.querySelector(".close");
+    ok(closeBtn, "close button present");
+    const sourcesBefore = state.sources.length;
+    const realPost = post;
+    const calls = [];
+    post = async (path, body) => { calls.push(path); return realPost(path, body); };
+    try {
+      closeBtn.click();
+      eq(calls.length, 0, "no server call made -- not a real /close");
+      eq(panel.el.hidden, true, "panel hidden after close");
+      eq(state.sources.length, sourcesBefore, "source not removed");
+      ok(state.sources.some((s) => s.id === logSrc.id), "source still tracked (still collecting server-side)");
+      renderLegend();
+      const item = [...$("legend").querySelectorAll(".legend-item")].find((i) => i.textContent.includes("c3_worker"));
+      ok(item, "still listed in legend (dimmed, not removed)");
+      item.click();
+      eq(panel.el.hidden, false, "panel reappears via the legend");
+    } finally {
+      post = realPost;
+      state.visible.delete("c3_worker");
+      syncPanels();
+    }
   });
 
   await T("legend context menu opens and Escape closes it", async () => {
@@ -473,18 +558,491 @@
 
   /* ── set-sources dialog logic ─────────────────────────────────────────── */
 
-  await T("updateDockerDupes disables already-collected stats", () => {
-    state.sources.push({ id: "__dup", path: "docker://local/stats", kind: "stats", live: true });
+  await T("Set Docker Daemon dialog opens with the form empty and disabled", () => {
+    $("btn-set").click();
     try {
-      $("docker-host").value = "";
-      updateDockerDupes();
-      eq($("docker-stats").disabled, true, "stats disabled");
-      ok($("docker-stats-note").textContent.includes("already"), "note shown");
-      eq($("docker-host-stats").disabled, false, "host stats still allowed");
+      eq($("docker-targets").innerHTML, "", "targets empty");
+      eq($("dlg-ok").disabled, true, "Set Docker Daemon disabled");
+      // only Docker host / SSH key / Fetch stay usable up front
+      eq($("docker-host").disabled, false, "host stays enabled");
+      eq($("docker-ssh-key").disabled, false, "ssh key stays enabled");
+      eq($("btn-ps-refresh").disabled, false, "fetch stays enabled");
     } finally {
-      state.sources = state.sources.filter((s) => s.id !== "__dup");
-      updateDockerDupes();
-      eq($("docker-stats").disabled, false, "re-enabled");
+      dlg.close();
+    }
+  });
+
+  await T("Fetch lists only the current host's containers and enables the form", async () => {
+    const realPost = post;
+    const realGet = get;
+    post = async (path, body) => {
+      if (path === "/docker/ps") {
+        return { containers: [{ id: "abc123", name: "demo", image: "nginx" }], services: [], log: [] };
+      }
+      return realPost(path, body);
+    };
+    get = async (path) => (path === "/transforms" ? { transforms: [] } : realGet(path));
+    try {
+      $("btn-set").click();
+      $("docker-host").value = ""; // empty -- the gateway/local daemon is used
+      await listContainers();
+      eq($("dlg-ok").disabled, true, "Set Docker Daemon stays disabled -- nothing checked yet, nothing to collect");
+      ok($("docker-targets").textContent.includes("demo"), "fetched container listed");
+      $("docker-targets").querySelector('input[value="demo"]').checked = true;
+      $("docker-targets").querySelector('input[value="demo"]').dispatchEvent(new Event("change"));
+      eq($("dlg-ok").disabled, false, "Set Docker Daemon enabled once at least one container is checked");
+    } finally {
+      post = realPost;
+      get = realGet;
+      dlg.close();
+    }
+  });
+
+  await T("json_message and parse_level transforms are ticked by default, others aren't, and Refresh preserves the user's own picks", async () => {
+    const realPost = post;
+    const realGet = get;
+    post = async (path, body) => {
+      if (path === "/docker/ps") return { containers: [], services: [], log: [] };
+      return realPost(path, body);
+    };
+    get = async (path) => (
+      path === "/transforms"
+        ? { transforms: [
+            { name: "json_message", doc: "" },
+            { name: "parse_level", doc: "" },
+            { name: "drop_healthchecks", doc: "" },
+          ] }
+        : realGet(path)
+    );
+    try {
+      $("btn-set").click();
+      $("docker-host").value = "";
+      await listContainers();
+      const byName = (n) => $("transforms-list").querySelector(`input[value="${n}"]`);
+      eq(byName("json_message").checked, true, "json_message on by default");
+      eq(byName("parse_level").checked, true, "parse_level on by default");
+      eq(byName("drop_healthchecks").checked, false, "others stay opt-in");
+
+      // deliberately deviate from the defaults, then Refresh (re-fetch) --
+      // the user's own picks must survive, not silently reset
+      byName("json_message").checked = false;
+      byName("drop_healthchecks").checked = true;
+      await listContainers();
+      eq(byName("json_message").checked, false, "user's un-tick of a default-on transform survives a Refresh");
+      eq(byName("drop_healthchecks").checked, true, "user's tick of a default-off transform survives a Refresh");
+      eq(byName("parse_level").checked, true, "untouched default-on transform still ticked");
+    } finally {
+      post = realPost;
+      get = realGet;
+      dlg.close();
+    }
+  });
+
+  await T("clicking a group title in the Docker Daemon checklist toggles every checkbox in that group", async () => {
+    const realPost = post;
+    const realGet = get;
+    post = async (path, body) => {
+      if (path === "/docker/ps") {
+        return {
+          containers: [{ id: "a", name: "demo-a", image: "nginx" }, { id: "b", name: "demo-b", image: "nginx" }],
+          services: [],
+          log: [],
+        };
+      }
+      return realPost(path, body);
+    };
+    get = async (path) => (path === "/transforms" ? { transforms: [] } : realGet(path));
+    try {
+      $("btn-set").click();
+      $("docker-host").value = "";
+      await listContainers();
+      const boxes = [...$("docker-targets").querySelectorAll("input[type=checkbox]")];
+      eq(boxes.length, 2, "both containers listed");
+      ok(boxes.every((cb) => !cb.checked), "nothing preselected just for having been found");
+      const group = $("docker-targets").querySelector(".group");
+      group.click();
+      ok(boxes.every((cb) => cb.checked), "group click (all unchecked) selects all");
+      group.click();
+      ok(boxes.every((cb) => !cb.checked), "group click (all checked) deselects all");
+      boxes[0].checked = true;
+      group.click();
+      ok(boxes.every((cb) => cb.checked), "a mixed group selects all, rather than deselecting");
+    } finally {
+      post = realPost;
+      get = realGet;
+      dlg.close();
+    }
+  });
+
+  await T("Set/Update Docker Daemon stays disabled with nothing checked, including via the group-select-all header", async () => {
+    const realPost = post;
+    const realGet = get;
+    post = async (path, body) => {
+      if (path === "/docker/ps") {
+        return { containers: [{ id: "a", name: "demo-a" }, { id: "b", name: "demo-b" }], services: [], log: [] };
+      }
+      return realPost(path, body);
+    };
+    get = async (path) => (path === "/transforms" ? { transforms: [] } : realGet(path));
+    try {
+      $("btn-set").click();
+      $("docker-host").value = "";
+      await listContainers();
+      eq($("dlg-ok").disabled, true, "nothing checked yet -- nothing to collect");
+      const boxes = [...$("docker-targets").querySelectorAll("input[type=checkbox]")];
+      const group = $("docker-targets").querySelector(".group");
+      group.click(); // selects all via the group header, not an individual checkbox's own change event
+      ok(boxes.every((cb) => cb.checked), "sanity: group click selected everything");
+      eq($("dlg-ok").disabled, false, "enabled once the group header checks everything");
+      group.click(); // deselects all
+      ok(boxes.every((cb) => !cb.checked), "sanity: group click deselected everything");
+      eq($("dlg-ok").disabled, true, "disabled again once the group header unchecks everything");
+    } finally {
+      post = realPost;
+      get = realGet;
+      dlg.close();
+    }
+  });
+
+  await T("Edit Docker Daemon pre-fills and locks host/ssh-key, relabels buttons", async () => {
+    const fakeSrc = { id: "__edit_test", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
+    state.sources.push(fakeSrc);
+    syncDockerDaemonButtons(); // a real app calls this via refreshAll() whenever state.sources changes
+    dockerHostKeys.set("ssh://u@h", "/path/to/key");
+    // Opening Edit Docker Daemon now always runs an immediate live Refresh
+    // (see btn-edit-docker-daemon's onclick) -- mocked here since this test
+    // isn't about that probe itself, just the form's fields/labels.
+    const realPost = post;
+    const realGet = get;
+    post = async (path, body) => (path === "/docker/ps" ? { containers: [], services: [], log: [] } : realPost(path, body));
+    get = async (path) => (path === "/transforms" ? { transforms: [] } : realGet(path));
+    try {
+      eq(currentDockerHost(), "ssh://u@h", "host resolved correctly (not truncated to 'ssh:')");
+      eq($("btn-edit-docker-daemon").disabled, false, "Edit enabled once a daemon is being watched");
+      eq($("btn-clear-sources").disabled, false, "Remove enabled once a daemon is being watched");
+      await $("btn-edit-docker-daemon").onclick();
+      eq($("docker-host").value, "u@h", "host prefilled (scheme stripped for editing)");
+      eq($("docker-host").disabled, true, "host locked");
+      eq($("docker-ssh-key").value, "/path/to/key", "ssh key prefilled");
+      eq($("docker-ssh-key").disabled, true, "ssh key locked");
+      eq($("docker-ssh-key-browse").disabled, true, "browse locked");
+      eq($("btn-ps-refresh").textContent, "Refresh", "Fetch relabeled Refresh");
+      eq($("dlg-ok").textContent, "Update Docker Daemon", "confirm relabeled");
+      eq($("dlg-set-title").textContent, "Edit Docker Daemon", "dialog titled for editing, not creating");
+    } finally {
+      post = realPost;
+      get = realGet;
+      state.sources = state.sources.filter((s) => s.id !== "__edit_test");
+      syncDockerDaemonButtons();
+      dockerHostKeys.delete("ssh://u@h");
+      dlg.close();
+      $("btn-set").click(); // resets host/ssh-key/labels back to create-mode defaults
+      dlg.close();
+    }
+  });
+
+  await T("Edit/Remove Docker Daemon are disabled when no daemon is being watched", () => {
+    ok(!hasDockerDaemon(), "no docker:// source open in this suite's baseline state");
+    eq($("btn-edit-docker-daemon").disabled, true, "Edit disabled");
+    eq($("btn-clear-sources").disabled, true, "Remove disabled");
+  });
+
+  await T("Edit Docker Daemon pre-fills immediately, then its automatic Refresh confirms both containers still exist, marking only the persisted-selected one with a checkmark", async () => {
+    const fakeStats = { id: "__prefill_stats", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
+    const fakeContainer = { id: "__prefill_c", path: "docker://ssh://u@h/container/demo-c", name: "demo-c", kind: "log", live: true };
+    const fakeService = { id: "__prefill_s", path: "docker://ssh://u@h/service/demo-svc", name: "demo-svc", kind: "log", live: true };
+    state.sources.push(fakeStats, fakeContainer, fakeService);
+    syncDockerDaemonButtons();
+    dockerHostKeys.set("ssh://u@h", "/path/to/key");
+    // demo-c is in the persisted [user]@[gateway]-containers.json (actually
+    // selected); demo-svc is merely followed (e.g. previously unselected
+    // from the legend) -- the checklist must reflect that distinction, not
+    // just "is a log source open for it".
+    const realLoadSelectedTargets = loadSelectedTargets;
+    loadSelectedTargets = async () => ({ containers: new Set(["demo-c"]), services: new Set() });
+    const realPost = post;
+    const realGet = get;
+    // The live daemon still has both -- opening Edit Docker Daemon runs
+    // this automatically (see btn-edit-docker-daemon), so the pre-fill and
+    // the confirmed post-Refresh state should agree.
+    post = async (path, body) => {
+      if (path === "/docker/ps") {
+        return { containers: [{ id: "c", name: "demo-c" }], services: [{ id: "s", name: "demo-svc" }], log: [] };
+      }
+      return realPost(path, body);
+    };
+    get = async (path) => (path === "/transforms" ? { transforms: [] } : realGet(path));
+    try {
+      await $("btn-edit-docker-daemon").onclick();
+      const text = $("docker-targets").textContent;
+      ok(text.includes("demo-c"), `container pre-filled: ${text}`);
+      ok(text.includes("demo-svc"), `service pre-filled: ${text}`);
+      const boxes = [...$("docker-targets").querySelectorAll("input[type=checkbox]")];
+      eq(boxes.length, 2, "one checkbox per already-followed container/service");
+      ok(boxes.find((cb) => cb.value === "demo-c").checked, "persisted-selected entry starts checked");
+      ok(!boxes.find((cb) => cb.value === "demo-svc").checked, "followed-but-not-persisted-selected entry starts unchecked");
+      ok(boxes.every((cb) => !cb.disabled), "still around server-side -- immediately interactive");
+      const markOf = (name) => boxes.find((cb) => cb.value === name).closest("label").querySelector(".mark").textContent;
+      eq(markOf("demo-c"), "✔", "persisted-selected entry gets a checkmark");
+      eq(markOf("demo-svc"), "", "not-persisted-selected entry gets no mark");
+      ok(!$(`docker-targets`).innerHTML.includes("label.added"), "no dimming/'already added' distinction -- looks like any other entry");
+    } finally {
+      post = realPost;
+      get = realGet;
+      loadSelectedTargets = realLoadSelectedTargets;
+      state.sources = state.sources.filter((s) => !s.id.startsWith("__prefill_"));
+      syncDockerDaemonButtons();
+      dockerHostKeys.delete("ssh://u@h");
+      dlg.close();
+      $("btn-set").click();
+      dlg.close();
+    }
+  });
+
+  await T("Refresh in Edit Docker Daemon re-fetches, leaves checkboxes selectable, and keeps host/ssh-key locked", async () => {
+    const fakeSrc = { id: "__edit_test2", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
+    state.sources.push(fakeSrc);
+    syncDockerDaemonButtons();
+    dockerHostKeys.set("ssh://u@h", "/path/to/key");
+    const realPost = post;
+    const realGet = get;
+    post = async (path, body) => {
+      if (path === "/docker/ps") return { containers: [{ id: "x", name: "demo-x", image: "nginx" }], services: [], log: [] };
+      return realPost(path, body);
+    };
+    get = async (path) => (path === "/transforms" ? { transforms: [] } : realGet(path));
+    try {
+      // opening Edit Docker Daemon already runs this live probe automatically
+      await $("btn-edit-docker-daemon").onclick();
+      let cb = $("docker-targets").querySelector("input[type=checkbox]");
+      ok(cb, "checkbox rendered from the automatic Refresh on open");
+      eq(cb.disabled, false, "checkbox is selectable, not locked, in edit mode");
+      eq($("docker-host").disabled, true, "host stays locked after a Refresh in edit mode");
+      eq($("docker-ssh-key").disabled, true, "ssh key stays locked after a Refresh in edit mode");
+      // clicking Refresh again is idempotent
+      $("btn-ps-refresh").click();
+      await until(() => $("docker-targets").textContent.includes("demo-x"), "checklist still populated after an explicit Refresh");
+      cb = $("docker-targets").querySelector("input[type=checkbox]");
+      eq(cb.disabled, false, "still selectable");
+    } finally {
+      post = realPost;
+      get = realGet;
+      state.sources = state.sources.filter((s) => s.id !== "__edit_test2");
+      syncDockerDaemonButtons();
+      dockerHostKeys.delete("ssh://u@h");
+      dlg.close();
+      $("btn-set").click();
+      dlg.close();
+    }
+  });
+
+  await T("Refresh diffs against the daemon's real state: a persisted-selected-but-now-gone entry stays listed disabled, a never-selected-and-now-gone entry is omitted, new ones appear unchecked, unchanged ones keep the user's own tick", async () => {
+    const fakeContainerA = { id: "__diff_a", path: "docker://ssh://u@h/container/demo-a", name: "demo-a", kind: "log", live: true };
+    const fakeContainerB = { id: "__diff_b", path: "docker://ssh://u@h/container/demo-b", name: "demo-b", kind: "log", live: true };
+    state.sources.push(fakeContainerA, fakeContainerB);
+    syncDockerDaemonButtons();
+    dockerHostKeys.set("ssh://u@h", "/path/to/key");
+    // demo-a is persisted-selected; demo-b was merely followed, never
+    // persisted-selected -- per spec, if it's gone and NOT in the file, it
+    // must be omitted entirely, not shown disabled.
+    const realLoadSelectedTargets = loadSelectedTargets;
+    loadSelectedTargets = async () => ({ containers: new Set(["demo-a"]), services: new Set() });
+    const realPost = post;
+    const realGet = get;
+    // The real daemon now only has demo-a (demo-b was removed) plus a
+    // brand-new demo-c that was never tracked before.
+    post = async (path, body) => {
+      if (path === "/docker/ps") {
+        return { containers: [{ id: "a", name: "demo-a" }, { id: "c", name: "demo-c" }], services: [], log: [] };
+      }
+      return realPost(path, body);
+    };
+    get = async (path) => (path === "/transforms" ? { transforms: [] } : realGet(path));
+    try {
+      // Edit Docker Daemon's automatic Refresh on open already runs the
+      // live probe above.
+      await $("btn-edit-docker-daemon").onclick();
+      await until(() => $("docker-targets").textContent.includes("demo-c"), "checklist reflects the live daemon after opening");
+      const boxes = [...$("docker-targets").querySelectorAll("input[type=checkbox]")];
+      const names = boxes.map((cb) => cb.value);
+      eq(names.sort().join(), "demo-a,demo-c", "demo-b (never persisted-selected, now gone) is omitted entirely; demo-c (new) appears");
+      eq(boxes.find((cb) => cb.value === "demo-a").checked, true, "demo-a's selected state survives");
+      eq(boxes.find((cb) => cb.value === "demo-a").disabled, false, "demo-a still around server-side -- interactive");
+      eq(boxes.find((cb) => cb.value === "demo-c").checked, false, "demo-c (newly seen) starts unchecked -- nothing is preselected just for being found");
+    } finally {
+      post = realPost;
+      get = realGet;
+      loadSelectedTargets = realLoadSelectedTargets;
+      state.sources = state.sources.filter((s) => !s.id.startsWith("__diff_"));
+      syncDockerDaemonButtons();
+      dockerHostKeys.delete("ssh://u@h");
+      dlg.close();
+      $("btn-set").click();
+      dlg.close();
+    }
+  });
+
+  await T("Refresh marks a persisted-selected-but-now-gone container disabled with a 🚫 mark, removes it from the graph, instead of silently dropping it", async () => {
+    const fakeContainerA = { id: "__gone_a", path: "docker://ssh://u@h/container/demo-a", name: "demo-a", kind: "log", live: true };
+    state.sources.push(fakeContainerA);
+    syncDockerDaemonButtons();
+    dockerHostKeys.set("ssh://u@h", "/path/to/key");
+    const realLoadSelectedTargets = loadSelectedTargets;
+    loadSelectedTargets = async () => ({ containers: new Set(["demo-a"]), services: new Set() });
+    const realPost = post;
+    const realGet = get;
+    // The real daemon no longer has demo-a at all (stopped/removed).
+    post = async (path, body) => {
+      if (path === "/docker/ps") return { containers: [], services: [], log: [] };
+      return realPost(path, body);
+    };
+    get = async (path) => (path === "/transforms" ? { transforms: [] } : realGet(path));
+    try {
+      await $("btn-edit-docker-daemon").onclick(); // runs the live probe above immediately
+      const cb = $("docker-targets").querySelector('input[value="demo-a"]');
+      ok(cb, "demo-a still shown, not silently dropped, since it was persisted-selected");
+      eq(cb.disabled, true, "shown disabled -- it can't actually be followed anymore");
+      eq(cb.checked, true, "still shown checked, reflecting that it was selected");
+      eq(cb.closest("label").querySelector(".mark").textContent, "🚫", "marked with the gone/disabled indicator");
+      ok($("docker-targets").textContent.includes("no longer available"), "explains why it's disabled");
+      // dlg-ok must never submit a disabled/unavailable entry
+      eq($("docker-targets").querySelectorAll("input:checked:not(:disabled)").length, 0, "excluded from what would actually be submitted");
+      // "remove it from the graph": its source is actually closed, not just flagged here
+      await until(() => !state.sources.some((s) => s.id === "__gone_a"), "demo-a's source was closed");
+    } finally {
+      post = realPost;
+      get = realGet;
+      loadSelectedTargets = realLoadSelectedTargets;
+      state.sources = state.sources.filter((s) => !s.id.startsWith("__gone_"));
+      syncDockerDaemonButtons();
+      dockerHostKeys.delete("ssh://u@h");
+      dlg.close();
+      $("btn-set").click();
+      dlg.close();
+    }
+  });
+
+  await T("opening Edit Docker Daemon: persisted-selected stays checked, a followed-but-never-persisted-selected container comes back unchecked, and one no longer returned is removed from the graph but shown disabled only if it was persisted-selected", async () => {
+    const stillSelected = { id: "__combo_sel", path: "docker://ssh://u@h/container/still-selected", name: "still-selected", kind: "log", live: true };
+    const wasUnselected = { id: "__combo_unsel", path: "docker://ssh://u@h/container/was-unselected", name: "was-unselected", kind: "log", live: true };
+    const nowGone = { id: "__combo_gone", path: "docker://ssh://u@h/container/now-gone", name: "now-gone", kind: "log", live: true };
+    state.sources.push(stillSelected, wasUnselected, nowGone);
+    syncDockerDaemonButtons();
+    dockerHostKeys.set("ssh://u@h", "/path/to/key");
+    // Mirrors the real flow: still-selected and now-gone were persisted
+    // (ticked and Set/Updated); was-unselected was followed but never
+    // actually ticked/persisted.
+    const realLoadSelectedTargets = loadSelectedTargets;
+    loadSelectedTargets = async () => ({ containers: new Set(["still-selected", "now-gone"]), services: new Set() });
+    const realPost = post;
+    const realGet = get;
+    // The real daemon still has the first two; now-gone was removed.
+    post = async (path, body) => {
+      if (path === "/docker/ps") {
+        return { containers: [{ id: "1", name: "still-selected" }, { id: "2", name: "was-unselected" }], services: [], log: [] };
+      }
+      return realPost(path, body);
+    };
+    get = async (path) => (path === "/transforms" ? { transforms: [] } : realGet(path));
+    try {
+      await $("btn-edit-docker-daemon").onclick(); // auto-refreshes immediately, no manual Refresh click needed
+      const byName = (n) => $("docker-targets").querySelector(`input[value="${n}"]`);
+      eq(byName("still-selected").checked, true, "persisted-selected -> stays checked");
+      eq(byName("still-selected").disabled, false, "still there server-side -> interactive");
+      eq(byName("was-unselected").checked, false, "followed but never persisted-selected -> comes back unchecked, not silently re-checked");
+      eq(byName("was-unselected").disabled, false, "still there server-side -> interactive");
+      const goneBox = byName("now-gone");
+      ok(goneBox, "now-gone stays listed rather than vanishing, since it was persisted-selected");
+      eq(goneBox.disabled, true, "no longer returned by the daemon -> disabled");
+      ok($("docker-targets").textContent.includes("no longer available"), "explains why it's disabled");
+      await until(() => !state.sources.some((s) => s.id === "__combo_gone"), "now-gone's source was actually closed -- removed from the graph");
+      ok(state.sources.some((s) => s.id === "__combo_sel"), "still-selected's source untouched");
+      ok(state.sources.some((s) => s.id === "__combo_unsel"), "was-unselected's source untouched (still followed, just not plotted)");
+    } finally {
+      post = realPost;
+      get = realGet;
+      loadSelectedTargets = realLoadSelectedTargets;
+      state.sources = state.sources.filter((s) => !s.id.startsWith("__combo_"));
+      syncDockerDaemonButtons();
+      dockerHostKeys.delete("ssh://u@h");
+      dlg.close();
+      $("btn-set").click();
+      dlg.close();
+    }
+  });
+
+  await T("dockerHostKeys persists across restarts (regression: was in-memory only, lost the ssh key on relaunch)", () => {
+    try {
+      dockerHostKeys.set("ssh://persist-test@h", "/some/key/path");
+      eq(prefs.get("dockerHostKeys", {})["ssh://persist-test@h"], "/some/key/path", "written to prefs, not just kept in memory");
+    } finally {
+      dockerHostKeys.delete("ssh://persist-test@h");
+    }
+  });
+
+  await T("Set Docker Daemon (create mode) is never left showing edit-mode labels/locks", () => {
+    $("btn-set").click();
+    try {
+      eq($("docker-host").disabled, false, "host unlocked");
+      eq($("docker-ssh-key").disabled, false, "ssh key unlocked");
+      eq($("docker-ssh-key-browse").disabled, false, "browse unlocked");
+      eq($("btn-ps-refresh").textContent, "Fetch", "Fetch label restored");
+      eq($("dlg-ok").textContent, "Set Docker Daemon", "confirm label restored");
+      eq($("dlg-set-title").textContent, "Set Docker Daemon", "dialog re-titled for creating, not editing");
+    } finally {
+      dlg.close();
+    }
+  });
+
+  await T("Set Docker Daemon is enabled only when no daemon is currently being watched", () => {
+    ok(!hasDockerDaemon(), "no docker:// source open in this suite's baseline state");
+    eq($("btn-set").disabled, false, "enabled -- nothing set yet");
+    const fakeSrc = { id: "__setbtn_test", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
+    state.sources.push(fakeSrc);
+    syncDockerDaemonButtons(); // a real app calls this via refreshAll() whenever state.sources changes
+    try {
+      eq($("btn-set").disabled, true, "disabled once a daemon is already being watched -- use Edit/Remove instead");
+    } finally {
+      state.sources = state.sources.filter((s) => s.id !== "__setbtn_test");
+      syncDockerDaemonButtons();
+      eq($("btn-set").disabled, false, "re-enabled once that daemon is gone");
+    }
+  });
+
+  await T("Set/Update Docker Daemon syncs the legend's track state to exactly what's checked -- a newly checked entry becomes selected (plotted), a just-unchecked one is demoted, not left stuck selected", async () => {
+    setTrack("was-selected", "sel"); // simulates a prior Set/Update that had this one checked
+    const realPost = post;
+    const realGet = get;
+    post = async (path, body) => {
+      if (path === "/docker/ps") {
+        return { containers: [{ id: "a", name: "was-selected" }, { id: "b", name: "newly-selected" }], services: [], log: [] };
+      }
+      if (path === "/docker/collect") return { ok: true };
+      return realPost(path, body);
+    };
+    get = async (path) => (path === "/transforms" ? { transforms: [] } : realGet(path));
+    const realSaveSelectedTargets = saveSelectedTargets;
+    saveSelectedTargets = async () => {};
+    try {
+      $("btn-set").click();
+      $("docker-host").value = "";
+      await listContainers();
+      const boxes = [...$("docker-targets").querySelectorAll("input[type=checkbox]")];
+      // was-selected starts unticked here (nothing preselected just for
+      // being found by Fetch) -- untick it to mirror "the user unchecked a
+      // previously-selected container", then tick the other one.
+      boxes.find((cb) => cb.value === "newly-selected").checked = true;
+      await $("dlg-ok").onclick();
+      eq(state.track["newly-selected"], "sel", "just-checked entry is promoted to selected -- shows in the graph/legend");
+      eq(state.track["was-selected"], "mut", "just-unchecked entry is demoted back to muted, not left stuck as selected");
+    } finally {
+      post = realPost;
+      get = realGet;
+      saveSelectedTargets = realSaveSelectedTargets;
+      delete state.track["was-selected"];
+      delete state.track["newly-selected"];
+      prefs.set("track", state.track);
+      dlg.close();
     }
   });
 
@@ -509,6 +1067,89 @@
     eq(normalizeDockerHost("user@other-server"), "ssh://user@other-server", "bare user@host gets ssh://");
     eq(normalizeDockerHost("ssh://user@other-server"), "ssh://user@other-server", "already-schemed left alone");
     eq(normalizeDockerHost("tcp://1.2.3.4:2375"), "tcp://1.2.3.4:2375", "other schemes left alone too");
+  });
+
+  await T("setLiveTrackSecs clamps to zero/negative -- the future has no data to simulate a click on", () => {
+    try {
+      setLiveTrackSecs(-7);
+      eq(liveTrackSecs, -7, "negative accepted");
+      eq($("live-track-secs").value, "-7", "toolbar field reflects it");
+      eq($("live-track-secs-sidebar").value, "-7", "Settings field kept in sync");
+      setLiveTrackSecs(5);
+      eq(liveTrackSecs, 0, "positive clamped down to 0 -- can't track into the future");
+      setLiveTrackSecs(0);
+      eq(liveTrackSecs, 0, "zero accepted as-is");
+    } finally {
+      setLiveTrackSecs(0);
+      prefs.set("liveTrackSecs", 0);
+    }
+  });
+
+  await T("liveTrackTick simulates a click at now + liveTrackSecs while live, marked as a live-tracking cursor -- and does nothing once the user has panned away from live", () => {
+    const realLive = state.live;
+    const realNow = Date.now;
+    try {
+      Date.now = () => 1_700_000_000_000;
+      state.live = true;
+      setLiveTrackSecs(-10);
+      liveTrackTick();
+      eq(state.cursorT, 1_700_000_000_000 - 10_000, "cursor moved to now + offset");
+      eq(state.liveTrackCursor, true, "flagged as a live-tracking cursor, not a manual click");
+
+      state.cursorT = null;
+      state.liveTrackCursor = false;
+      state.live = false; // user panned away
+      liveTrackTick();
+      eq(state.cursorT, null, "no-op once no longer following live -- doesn't yank the user's view back");
+      eq(state.liveTrackCursor, false, "still not flagged");
+    } finally {
+      Date.now = realNow;
+      state.live = realLive;
+      setLiveTrackSecs(0);
+      prefs.set("liveTrackSecs", 0);
+    }
+  });
+
+  await T("the Live tracking switch turns it off entirely, independent of the seconds offset, and disables the seconds field", () => {
+    const realLive = state.live;
+    try {
+      setLiveTrackEnabled(false);
+      eq($("live-track-toggle").checked, false, "toolbar switch off");
+      eq($("live-track-toggle-sidebar").checked, false, "Settings switch kept in sync");
+      eq($("live-track-secs").disabled, true, "seconds field disabled while off");
+      eq($("live-track-secs-sidebar").disabled, true, "Settings seconds field disabled too");
+
+      setLiveTrackSecs(-5);
+      state.cursorT = null;
+      state.liveTrackCursor = false;
+      state.live = true;
+      liveTrackTick();
+      eq(state.cursorT, null, "no-op while the switch is off, even though state.live is true and the offset is set");
+
+      setLiveTrackEnabled(true);
+      eq($("live-track-secs").disabled, false, "seconds field re-enabled once back on");
+      liveTrackTick();
+      eq(state.liveTrackCursor, true, "resumes simulating the click once switched back on");
+    } finally {
+      state.live = realLive;
+      state.cursorT = null;
+      state.liveTrackCursor = false;
+      setLiveTrackSecs(0);
+      setLiveTrackEnabled(true);
+      prefs.set("liveTrackSecs", 0);
+      prefs.set("liveTrackEnabled", true);
+    }
+  });
+
+  await T("a manual click clears the live-tracking cursor flag -- only liveTrackTick's own auto-click sets it", () => {
+    state.liveTrackCursor = true; // simulate a preceding live-tracking auto-click
+    try {
+      setCursor(123456789);
+      eq(state.liveTrackCursor, false, "a plain setCursor call (manual click) is never flagged as live-tracking");
+    } finally {
+      state.cursorT = null;
+      state.liveTrackCursor = false;
+    }
   });
 
   await T("openPaths reflects open sources", () => {
@@ -755,6 +1396,41 @@
     eq(metricsGroup.dataset.expanded, "true");
     header.click();
     eq(body.hidden, true, "collapses again on a second click");
+  });
+
+  /* ── Ship logs (Settings > Collect CTTC Own Logs) ─────────────────────── */
+
+  await T("ship-logs button is icon-only (no visible text) with a hover title", () => {
+    const btn = $("btn-ship-logs");
+    ok(btn, "button exists");
+    eq(btn.title, "Ship logs");
+    eq(btn.textContent.trim(), "", "no visible label -- icon only");
+    ok(btn.querySelector("svg"), "has an icon");
+  });
+
+  await T("clicking ship-logs invokes the shipLogs wrapper and reports the result", async () => {
+    const real = shipLogsViaMain;
+    let called = false;
+    shipLogsViaMain = async () => { called = true; return { ok: true, path: "/tmp/x.zip", fileCount: 2, erased: true }; };
+    try {
+      $("btn-ship-logs").click();
+      await until(() => called, "shipLogs invoked");
+      await until(() => $("status").textContent.includes("/tmp/x.zip"), "status reflects the result");
+      ok($("status").textContent.includes("erased"));
+    } finally {
+      shipLogsViaMain = real;
+    }
+  });
+
+  await T("ship-logs reports a cancel without claiming success", async () => {
+    const real = shipLogsViaMain;
+    shipLogsViaMain = async () => ({ canceled: true });
+    try {
+      $("btn-ship-logs").click();
+      await until(() => $("status").textContent.includes("canceled"), "status reflects the cancel");
+    } finally {
+      shipLogsViaMain = real;
+    }
   });
 
   /* ── status bar (event notifications) ─────────────────────────────────── */
@@ -1113,10 +1789,54 @@
     }
   });
 
+  await T("editableGateways excludes 'This machine' -- never updatable/uninstallable", () => {
+    const input = [
+      { mode: "embedded", host: "127.0.0.1", port: null, label: "This machine" },
+      { mode: "ssh", host: "remote-host", port: 2222, label: "remote-host", sshTarget: "u@remote-host", active: false },
+    ];
+    const out = editableGateways(input);
+    ok(!out.some((g) => g.mode === "embedded"), "'This machine' filtered out");
+    eq(out.length, 1, "real gateway kept");
+    eq(out[0].label, "remote-host", "the right one kept");
+  });
+
+  await T("Edit Gateways dropdown reflects editableGateways' filtering", async () => {
+    await openEditGatewaysDialog();
+    try {
+      const labels = [...$("gw-select").options].map((o) => o.textContent);
+      ok(!labels.some((l) => l.includes("This machine")), `"This machine" must not be selectable here: ${JSON.stringify(labels)}`);
+    } finally {
+      dlgGatewaySetup.close();
+    }
+  });
+
   await T("gw-btn-cancel closes the dialog without submitting", () => {
     openNewGatewayDialog();
     $("gw-btn-cancel").click();
     eq(dlgGatewaySetup.open, false);
+  });
+
+  await T("gateway connection failure notifies the status bar, not just the pill's tooltip", async () => {
+    // capture notifyEvent's own calls rather than reading the DOM after the
+    // fact -- other concurrent background notifiers (uiEventTick, etc.)
+    // share the same status bar text and could overwrite a one-time
+    // "restored" message before a DOM poll ever samples it.
+    const realNotify = notifyEvent;
+    const calls = [];
+    notifyEvent = (msg) => { calls.push(msg); realNotify(msg); };
+    const realGet = get;
+    get = async (path) => { if (path === "/health") throw new Error("boom"); return realGet(path); };
+    try {
+      await until(() => $("server-status").dataset.state === "down", "went down", 100);
+      ok(calls.some((m) => m.includes("Gateway connection failed")), JSON.stringify(calls));
+      eq($("server-status-btn").title, "Switch gateway…", "pill tooltip stays generic, no error text");
+      get = realGet;
+      await until(() => $("server-status").dataset.state === "up", "recovered", 100);
+      ok(calls.some((m) => m.includes("Gateway connection restored")), JSON.stringify(calls));
+    } finally {
+      get = realGet;
+      notifyEvent = realNotify;
+    }
   });
 
   /* ── gateway dropdown ──────────────────────────────────────────────────── */
@@ -1142,7 +1862,7 @@
     ok(!$("server-status").classList.contains("open"), "wrapper no longer marked open");
   });
 
-  await T("host block shows the loading state before first host sample", () => {
+  await T("host block shows the loading state before first host sample, titled for the local machine", () => {
     state.sources.push({ id: "__hload", kind: "stats", is_host: true,
                          path: "docker://local/host", live: true, name: "host@local" });
     try {
@@ -1150,10 +1870,23 @@
       eq(hostBlockEl.hidden, false, "host block appears");
       eq($("host-loading").hidden, false, "loading indicator shown");
       eq(hostChartsEl.hidden, true, "charts hidden while loading");
+      eq($("host-title").textContent, "Host telemetry — this machine", "titled for the local daemon");
     } finally {
       state.sources = state.sources.filter((s) => s.id !== "__hload");
       drawAll();
       eq(hostBlockEl.hidden, true, "host block gone again");
+    }
+  });
+
+  await T("host block is titled with the remote docker daemon's hostname", () => {
+    state.sources.push({ id: "__hremote", kind: "stats", is_host: true,
+                         path: "docker://ssh://u@example.com/host", live: true, name: "host@example.com" });
+    try {
+      drawAll();
+      eq($("host-title").textContent, "Host telemetry — example.com", "titled with the bare hostname, no user@");
+    } finally {
+      state.sources = state.sources.filter((s) => s.id !== "__hremote");
+      drawAll();
     }
   });
 
@@ -1174,6 +1907,30 @@
     eq(p.reversed, startReversed, "restored");
   });
 
+  await T("log panels default to newest-first and land pinned to the very top on the boot-time cursor sync (goLive -> setCursor(now))", async () => {
+    // fresh panels (see Panel's constructor) always default to reversed --
+    // regression guard in case a stale localStorage value from a prior
+    // toggle elsewhere ever leaked into a brand new panel's own default.
+    for (const p of panels.values()) ok(p.reversed, "reversed (newest-first) by default");
+    const beforeCursor = state.cursorT;
+    try {
+      // the actual real-world path: goLive() calls setCursor(Date.now()),
+      // which jumps every panel's cursor to "now" -- for a reversed panel
+      // that lands on index_at's clamped last (newest) row, and centering
+      // that row instead of pinning it to the top could leave the newest
+      // entries scrolled just out of view above the fold. Confirmed
+      // separately against the real /index_at endpoint that a far-future t
+      // clamps to total-1 (visualIndexOf(total-1) === 0 when reversed), so
+      // this must resolve to scrollTop 0, not some centered positive offset.
+      await setCursor(Date.now());
+      for (const p of panels.values()) {
+        eq(p.body.scrollTop, 0, `${p.src.name}: newest entries visible at the very top after the boot cursor sync`);
+      }
+    } finally {
+      if (beforeCursor != null) await setCursor(beforeCursor);
+    }
+  });
+
   await T("container list refresh button re-lists docker targets", () => {
     const real = listContainers;
     let calls = 0;
@@ -1183,6 +1940,62 @@
       eq(calls, 1, "refresh re-lists");
     } finally {
       listContainers = real;
+    }
+  });
+
+  await T("sidebar collapse toggle hides the groups and shrinks the rail, restore brings them back", () => {
+    const actionBar = $("action-bar");
+    const before = prefs.get("actionBarCollapsed", false);
+    try {
+      $("ab-collapse-toggle").click();
+      eq(actionBar.dataset.collapsed, "true", "collapsed");
+      eq(getComputedStyle($("app-body").querySelector(".ab-group")).display, "none", "groups hidden");
+      eq(prefs.get("actionBarCollapsed", null), true, "persisted");
+      ok(actionBar.getBoundingClientRect().width < 40, "rail actually shrinks, not just hides its contents");
+      $("ab-collapse-toggle").click();
+      eq(actionBar.dataset.collapsed, "false", "restored");
+      ok(getComputedStyle($("app-body").querySelector(".ab-group")).display !== "none", "groups visible again");
+    } finally {
+      if (actionBar.dataset.collapsed !== String(before)) $("ab-collapse-toggle").click();
+    }
+  });
+
+  await T("collapsing after a manual sidebar resize still shrinks the rail (regression: inline width from the splitter used to stick)", () => {
+    const actionBar = $("action-bar");
+    const beforeCollapsed = prefs.get("actionBarCollapsed", false);
+    const beforeWidth = prefs.get("actionBarWidth", 210);
+    try {
+      actionBar.style.width = "300px"; // simulate a prior splitter drag
+      prefs.set("actionBarWidth", 300);
+      $("ab-collapse-toggle").click();
+      ok(actionBar.getBoundingClientRect().width < 40, "collapsed rail ignores the leftover inline width");
+      $("ab-collapse-toggle").click();
+      near(actionBar.getBoundingClientRect().width, 300, 2, "restores the resized width");
+    } finally {
+      if (actionBar.dataset.collapsed !== String(beforeCollapsed)) $("ab-collapse-toggle").click();
+      prefs.set("actionBarWidth", beforeWidth);
+      actionBar.style.width = "";
+    }
+  });
+
+  await T("dragging the sidebar splitter resizes it and persists", () => {
+    const actionBar = $("action-bar");
+    const splitter = $("action-bar-splitter");
+    const before = prefs.get("actionBarWidth", 210);
+    const rect = actionBar.getBoundingClientRect();
+    try {
+      splitter.dispatchEvent(new MouseEvent("mousedown", {
+        bubbles: true, cancelable: true, clientX: rect.right, clientY: rect.top + 10,
+      }));
+      ok(splitter.classList.contains("dragging"), "drag started");
+      window.dispatchEvent(new MouseEvent("mousemove", { clientX: rect.right + 40, clientY: rect.top + 10 }));
+      near(actionBar.getBoundingClientRect().width, rect.width + 40, 2, "widened live while dragging");
+      window.dispatchEvent(new MouseEvent("mouseup", {}));
+      ok(!splitter.classList.contains("dragging"), "drag ended");
+      eq(prefs.get("actionBarWidth", null), Math.round(rect.width + 40), "persisted");
+    } finally {
+      prefs.set("actionBarWidth", before);
+      actionBar.style.width = before + "px";
     }
   });
 
@@ -1214,6 +2027,90 @@
     }
   });
 
+  const dragDrop = (fromEl, toEl) => {
+    const dt = new DataTransfer();
+    fromEl.dispatchEvent(new DragEvent("dragstart", { bubbles: true, cancelable: true, dataTransfer: dt }));
+    toEl.dispatchEvent(new DragEvent("dragover", { bubbles: true, cancelable: true, dataTransfer: dt }));
+    toEl.dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: dt }));
+    fromEl.dispatchEvent(new DragEvent("dragend", { bubbles: true, cancelable: true, dataTransfer: dt, screenX: window.screenX + 10, screenY: window.screenY + 10 }));
+  };
+
+  await T("dragging a legend entry reorders it and its matching log panel to match", () => {
+    const before = { ...state.panelOrder };
+    try {
+      const items = () => [...$("legend").querySelectorAll(".legend-item")].filter((i) => !i.className.includes("disabled"));
+      const all = items();
+      ok(all.length >= 3, "at least 3 selected entries to make the reorder unambiguous");
+      const dragged = all[0], target = all[2];
+      const nameA = dragged.textContent, nameC = target.textContent;
+      dragDrop(dragged, target);
+      const after = items().map((i) => i.textContent);
+      eq(after.indexOf(nameA), after.indexOf(nameC) - 1, "dragged entry now sits right before its drop target");
+      // the matching log panels reordered in #panels the same way
+      const panelNames = [...panelsEl.querySelectorAll(".panel .name")].map((n) => n.textContent);
+      const ia = panelNames.indexOf(names.find((n) => nameA.includes(n)));
+      const ic = panelNames.indexOf(names.find((n) => nameC.includes(n)));
+      if (ia !== -1 && ic !== -1) eq(ia, ic - 1, "log panels reordered to match the legend");
+    } finally {
+      state.panelOrder = before;
+      prefs.set("panelOrder", before);
+      renderLegend();
+      syncPanels();
+    }
+  });
+
+  await T("dragging a log panel header out past the window's edge pops it out", () => {
+    const sid = [...panels.keys()][0];
+    const panel = panels.get(sid);
+    const real = openLogPopout;
+    const calls = [];
+    openLogPopout = (id) => calls.push(id);
+    try {
+      const head = panel.el.querySelector(".panel-head");
+      const dt = new DataTransfer();
+      head.dispatchEvent(new DragEvent("dragstart", { bubbles: true, cancelable: true, dataTransfer: dt }));
+      head.dispatchEvent(new DragEvent("dragend", {
+        bubbles: true, cancelable: true, dataTransfer: dt,
+        screenX: window.screenX - 500, screenY: window.screenY - 500,
+      }));
+      eq(calls.length, 1, "popout requested when dropped outside the window");
+      eq(calls[0], sid, "for the dragged panel's source id");
+    } finally {
+      openLogPopout = real;
+    }
+  });
+
+  await T("dragging a log panel's header shows the whole panel (header + body) as the drag ghost", () => {
+    const sid = [...panels.keys()][0];
+    const panel = panels.get(sid);
+    const realSetDragImage = DataTransfer.prototype.setDragImage;
+    const calls = [];
+    DataTransfer.prototype.setDragImage = function (...args) { calls.push(args); };
+    try {
+      const head = panel.el.querySelector(".panel-head");
+      const dt = new DataTransfer();
+      head.dispatchEvent(new DragEvent("dragstart", { bubbles: true, cancelable: true, dataTransfer: dt, clientX: 10, clientY: 10 }));
+      eq(calls.length, 1, "setDragImage called");
+      eq(calls[0][0], panel.el, "drag image is the whole panel (header + body), not just the header");
+    } finally {
+      DataTransfer.prototype.setDragImage = realSetDragImage;
+    }
+  });
+
+  await T("dragging a legend entry uses the entry itself as the drag ghost (no body to include)", () => {
+    const item = [...$("legend").querySelectorAll(".legend-item")].find((i) => !i.className.includes("disabled"));
+    const realSetDragImage = DataTransfer.prototype.setDragImage;
+    let called = false;
+    DataTransfer.prototype.setDragImage = function () { called = true; };
+    try {
+      const dt = new DataTransfer();
+      item.dispatchEvent(new DragEvent("dragstart", { bubbles: true, cancelable: true, dataTransfer: dt }));
+      ok(!called, "no custom drag image needed -- the browser's default (the entry itself) is already right");
+    } finally {
+      DataTransfer.prototype.setDragImage = realSetDragImage;
+    }
+  });
+
   await T("export dialog resolves host choice", async () => {
     const p = askExportOptions();
     await until(() => dlgExport.open, "export dialog open");
@@ -1223,10 +2120,31 @@
     eq(opts.includeHost, false, "host choice returned");
   });
 
+  await T("Hard Reset asks for confirmation first, and does nothing if declined", () => {
+    const realConfirm = window.confirm;
+    let asked = null;
+    window.confirm = (msg) => { asked = msg; return false; };
+    try {
+      const before = state.sources.length;
+      $("btn-hard-reset").click();
+      ok(asked && asked.includes("cannot be undone"), "confirm() shown, warns it's irreversible");
+      eq(state.sources.length, before, "declining leaves sources untouched");
+    } finally {
+      window.confirm = realConfirm;
+    }
+  });
+
   await T("clear-sources asks for confirmation first, and does nothing if declined", () => {
     const realConfirm = window.confirm;
     let asked = null;
     window.confirm = (msg) => { asked = msg; return false; };
+    // Only enabled while a docker daemon is being watched (see
+    // syncDockerDaemonButtons) -- this test is about the confirm/decline
+    // behavior of the click handler itself, exercised directly regardless
+    // of whether the demo's file-only sources would otherwise leave it
+    // disabled.
+    const wasDisabled = $("btn-clear-sources").disabled;
+    $("btn-clear-sources").disabled = false;
     try {
       const before = state.sources.length;
       $("btn-clear-sources").click();
@@ -1234,6 +2152,7 @@
       eq(state.sources.length, before, "declining leaves sources untouched");
     } finally {
       window.confirm = realConfirm;
+      $("btn-clear-sources").disabled = wasDisabled;
     }
   });
 
@@ -1246,16 +2165,46 @@
     ok(files.length >= 2, "have demo files to restore");
     const realConfirm = window.confirm;
     window.confirm = () => true;
+    const wasDisabled = $("btn-clear-sources").disabled;
+    $("btn-clear-sources").disabled = false;
     try {
       $("btn-clear-sources").click();
       await until(() => state.sources.length === 0, "all sources closed");
     } finally {
       window.confirm = realConfirm;
+      $("btn-clear-sources").disabled = wasDisabled;
     }
     eq($("empty-state").hidden, false, "empty state visible again");
     await post("/open", { files });
     await refreshAll();
     ok(state.sources.length >= 2, "demo files restored");
+  });
+
+  // destructive and wipes localStorage -- must stay the very last test.
+  await T("Hard Reset (confirmed) closes every source, clears localStorage, and reloads", async () => {
+    const realConfirm = window.confirm;
+    const realReload = reloadApp;
+    const realPost = post;
+    const closedIds = [];
+    let reloaded = false;
+    window.confirm = () => true;
+    reloadApp = () => { reloaded = true; };
+    post = async (path, body) => {
+      if (path === "/close") { closedIds.push(body.id); return {}; }
+      return realPost(path, body);
+    };
+    prefs.set("hardResetCanary", "should not survive");
+    try {
+      const expectedIds = state.sources.map((s) => s.id);
+      $("btn-hard-reset").click();
+      await until(() => reloaded, "reloadApp called");
+      eq(closedIds.sort().join(), expectedIds.sort().join(), "every open source was closed");
+      eq(prefs.get("hardResetCanary", null), null, "localStorage wiped");
+    } finally {
+      window.confirm = realConfirm;
+      reloadApp = realReload;
+      post = realPost;
+    }
   });
 
   localStorage.clear();

@@ -16,6 +16,9 @@
   /* user-configurable via File > Preferences > Theme (see app.js prefs.hlColor) */
   --hl-color: #eaff00;
   --hl: color-mix(in srgb, var(--hl-color) 30%, transparent);
+  /* user-configurable via Preferences > Appearance > "Live tracking" */
+  --live-track-color: #22c55e;
+  --live-track: color-mix(in srgb, var(--live-track-color) 30%, transparent);
   --critical: #d03b3b;
   --warning: #fab219;
   --series-1: #2a78d6;
@@ -48,6 +51,8 @@
     --accent: #4a90f0;
     --hl-color: #eaff00;
     --hl: color-mix(in srgb, var(--hl-color) 40%, transparent);
+    --live-track-color: #22c55e;
+    --live-track: color-mix(in srgb, var(--live-track-color) 40%, transparent);
     --critical: #e35454;
     --warning: #fab219;
     --series-1: #3987e5;
@@ -256,6 +261,31 @@ body {
 }
 .gateway-dropdown .gateway-empty { padding: 6px 8px; font-size: 12px; color: var(--muted); }
 
+/* Right-click the status pill: connection type + (when tunneled) the ssh
+   details behind it -- see app.js's connection-info-popup block. Same
+   floating-card look as .gateway-dropdown, but read-only (no buttons/hover
+   state) since there's nothing to click here. */
+.connection-info-popup {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  position: absolute;
+  top: 100%;
+  right: 0;
+  min-width: 220px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+  padding: 8px 10px;
+  z-index: 50;
+  font-size: 12px;
+}
+.connection-info-popup .cip-row { display: flex; justify-content: space-between; gap: 12px; }
+.connection-info-popup .cip-label { color: var(--muted); }
+.connection-info-popup .cip-val { font-variant-numeric: tabular-nums; text-align: right; }
+.connection-info-popup .cip-sep { border-top: 1px solid var(--border); margin: 2px 0; }
+
 /* Record toolbar button's own status dot -- hidden (no dot) when idle,
    red+pulsing while actively recording, yellow steady while paused. */
 .recording-dot {
@@ -302,6 +332,39 @@ body {
 #app-body[data-dock="detached"] { flex-direction: row; }
 #app-body[data-dock="detached"] #action-bar { display: none; }
 
+/* Drag to resize the sidebar -- a thin strip between #action-bar and
+   #main-content, positioned correctly for all four dock directions for
+   free: it's the DOM child right after #action-bar, and row/row-reverse/
+   column/column-reverse (the same trick #action-bar's own placement
+   already relies on) puts it on the correct edge without any extra
+   positioning logic. Negative margin lets it overlap #action-bar's own
+   border by a couple px so the drag target isn't razor-thin. */
+#action-bar-splitter {
+  flex: 0 0 auto;
+  background: transparent;
+  position: relative;
+  z-index: 1;
+}
+#action-bar-splitter:hover, #action-bar-splitter.dragging {
+  background: color-mix(in srgb, var(--accent) 35%, transparent);
+}
+#app-body[data-dock="left"] #action-bar-splitter,
+#app-body[data-dock="right"] #action-bar-splitter {
+  width: 6px;
+  margin: 0 -3px;
+  cursor: col-resize;
+}
+#app-body[data-dock="top"] #action-bar-splitter,
+#app-body[data-dock="bottom"] #action-bar-splitter {
+  height: 6px;
+  margin: -3px 0;
+  cursor: row-resize;
+}
+#app-body[data-dock="detached"] #action-bar-splitter,
+#action-bar[data-collapsed="true"] ~ #action-bar-splitter {
+  display: none;
+}
+
 #main-content {
   flex: 1 1 auto;
   display: flex;
@@ -346,6 +409,44 @@ body {
 #app-body[data-dock="right"] #action-bar {
   border-right: none;
   border-left: 1px solid var(--border);
+}
+
+/* Collapsed: shrinks to a thin rail along the dock's own axis (width for
+   left/right, height for top/bottom) -- the cross axis (height/width) still
+   spans the full app-body automatically, same as expanded, since neither
+   state sets it explicitly and flex's default align-items:stretch already
+   does that. Only #ab-collapse-toggle stays visible; everything else
+   (.ab-group sections, the other dock buttons) is hidden outright rather
+   than just scrolled out of view, so there's nothing to accidentally tab
+   into while collapsed. */
+#action-bar[data-collapsed="true"] .ab-group,
+#action-bar[data-collapsed="true"] .ab-dock-btn[data-dock-to] {
+  display: none;
+}
+#action-bar[data-collapsed="true"] {
+  overflow: visible;
+  padding: 3px;
+}
+/* .ab-dock-controls normally bleeds past #action-bar's own side padding to
+   sit flush edge-to-edge (see its own comment) -- that negative-margin trick
+   assumes the wider expanded padding, so it has to be reset here or it'd
+   overshoot the much narrower collapsed rail. */
+#action-bar[data-collapsed="true"] .ab-dock-controls {
+  margin: 0;
+  padding: 0;
+  border-bottom: none;
+  background: none;
+  justify-content: center;
+}
+#app-body[data-dock="left"] #action-bar[data-collapsed="true"],
+#app-body[data-dock="right"] #action-bar[data-collapsed="true"] {
+  width: 28px;
+}
+#app-body[data-dock="top"] #action-bar[data-collapsed="true"],
+#app-body[data-dock="bottom"] #action-bar[data-collapsed="true"] {
+  width: 100%;
+  height: 28px;
+  flex-wrap: nowrap;
 }
 
 /* The row itself is the thing that shrinks (50% less padding around it) --
@@ -425,6 +526,9 @@ body {
 .ab-group-header {
   width: 100%;
   justify-content: flex-start;
+  height: 32px; /* matches the main content's panel heads (#chart-head etc) */
+  padding-top: 3px;
+  padding-bottom: 3px;
 }
 .ab-group-title {
   font-size: 11.5px;
@@ -451,6 +555,11 @@ body {
   font-size: 24.75px; /* 175% bigger than the original 9px */
   color: var(--muted);
   transition: transform 0.15s ease;
+  /* The ▾ glyph sits low in its own em box (most of the glyph's ink is in
+     the bottom half), which reads as "too low" next to the icon/title it's
+     lined up with -- nudge it up rather than fight the glyph's own metrics. */
+  position: relative;
+  top: -3px;
 }
 .ab-group[data-expanded="true"] .ab-chevron { transform: rotate(180deg); }
 .ab-group-body {
@@ -475,6 +584,31 @@ body {
   display: flex !important;
   flex-direction: row;
 }
+/* thin, unobtrusive divider between related sub-items in a group body --
+   a hairline rather than a labeled section, so it reads as a soft grouping
+   hint rather than a hard boundary. */
+.ab-sep {
+  background: var(--border);
+  margin: 4px 10px;
+  height: 1px;
+}
+#app-body[data-dock="top"] .ab-sep,
+#app-body[data-dock="bottom"] .ab-sep {
+  width: 1px;
+  height: auto;
+  margin: 4px 0;
+}
+.ab-sep--dotted {
+  background: none;
+  border-top: 1px dotted var(--border);
+  height: 0;
+}
+#app-body[data-dock="top"] .ab-sep--dotted,
+#app-body[data-dock="bottom"] .ab-sep--dotted {
+  border-top: none;
+  border-left: 1px dotted var(--border);
+  width: 0;
+}
 /* the left-shift only reads as "nested under a header" in the vertical
    sidebar layout -- in the horizontal dock every button sits in one flat
    row already, so the indent (and the header it'd be relative to) has no
@@ -492,8 +626,21 @@ body {
   border: 1px solid transparent;
   border-radius: var(--radius-sm);
   padding: 6px 10px;
-  white-space: nowrap;
 }
+/* Sub-items (Set Docker Daemon, Remove Docker Daemon, etc.) can carry a
+   longer label than a section header or the flat About/Quit buttons ever
+   do -- those wrap onto a second line rather than clipping or forcing the
+   whole sidebar wider (widening it instead shrinks the chart area, which in
+   a narrow window can push a drag's pixel distance under the 6px
+   zoom-vs-click threshold in timelineUp()). Scoped to .ab-group-body button
+   alone so single-line buttons keep their icon vertically centered against
+   the label instead of top-aligned against a line that never wraps. */
+.ab-group-body button {
+  align-items: flex-start;
+  white-space: normal;
+  text-wrap: balance;
+}
+.ab-group-body button .ab-icon { margin-top: 1px; } /* keeps the icon aligned with the label's first line now that this row start-aligns instead of center */
 .ab-group button:hover { background: var(--surface-3); }
 /* Click feedback: reverse fg/bg instead of the usual accent-tinted hover --
    applies uniformly to every sidebar button (section headers, their
@@ -508,7 +655,21 @@ body {
 }
 .ab-group button:active .ab-icon,
 .ab-group button:active .ab-group-icon svg,
-.ab-group button:active .ab-chevron {
+.ab-group button:active .ab-chevron,
+.ab-group button:active .ab-group-title {
+  color: var(--page);
+}
+/* An open section's header stays reversed for as long as it's expanded
+   (not just the momentary :active flash above) -- same fg/bg swap, same
+   child-color overrides, so an open dropdown reads as "open" at a glance. */
+.ab-group[data-expanded="true"] .ab-group-header {
+  background: var(--text-primary);
+  color: var(--page);
+}
+.ab-group[data-expanded="true"] .ab-group-header .ab-icon,
+.ab-group[data-expanded="true"] .ab-group-header .ab-group-icon svg,
+.ab-group[data-expanded="true"] .ab-group-header .ab-chevron,
+.ab-group[data-expanded="true"] .ab-group-header .ab-group-title {
   color: var(--page);
 }
 .ab-icon {
@@ -519,12 +680,6 @@ body {
   flex: 0 0 auto;
   color: var(--muted);
   font-size: 22.5px;
-  /* most of these are still plain Unicode glyphs (⚙🗑📂⚡ etc., not New
-     Gateway's own now-inlined SVG) -- several have a default *color* emoji
-     presentation (the trash can, the folder, the lightning bolt) that a
-     flat monochrome sidebar shouldn't have alongside the flattened SVG
-     icons. font-variant-emoji forces the monochrome "text" glyph for every
-     character here that has one. */
   font-variant-emoji: text;
 }
 .ab-icon svg { width: 1em; height: 1em; }
@@ -698,7 +853,8 @@ body.sample-armed .strip { cursor: cell; }
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 2px 12px 4px;
+  height: 32px; /* matches the sidebar's .ab-group-header */
+  padding: 0 12px;
   font-size: 11px;
   font-weight: 600;
   color: var(--text-secondary);
@@ -807,12 +963,15 @@ body.sample-armed .strip { cursor: cell; }
   user-select: none;
   pointer-events: auto;
 }
+.tl-now-label[data-live="true"] { color: var(--accent); }
+.tl-now-label[data-live="false"]::after { content: " \25c0"; }
 
 #lanes-head {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 4px 12px 2px;
+  height: 32px; /* matches the sidebar's .ab-group-header */
+  padding: 0 12px;
   border-top: 1px solid var(--border);
   margin-top: 4px;
   font-size: 11px;
@@ -831,7 +990,8 @@ body.sample-armed .strip { cursor: cell; }
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 4px 12px 2px;
+  height: 32px; /* matches the sidebar's .ab-group-header */
+  padding: 0 12px;
   border-top: 1px solid var(--border);
   margin-top: 4px;
   font-size: 11px;
@@ -957,10 +1117,20 @@ body.popout-host #btn-popout-telemetry {
 }
 .panel-head {
   display: flex;
-  align-items: baseline;
-  gap: 8px;
+  flex-direction: column;
+  gap: 4px;
   padding: 6px 10px;
   border-bottom: 1px solid var(--border);
+}
+.panel-head-top {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.panel-head-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 .panel-head .name { font-weight: 600; }
 .sample-badge {
@@ -1038,6 +1208,18 @@ body.popout-host #btn-popout-telemetry {
   font-size: 11px;
 }
 .panel-spacer { position: absolute; inset: 0 auto auto 0; width: 1px; }
+.panel-empty-state {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 16px;
+  color: var(--critical);
+  font-size: 12px;
+  white-space: pre-wrap;
+}
 .log-row {
   position: absolute;
   left: 0;
@@ -1053,10 +1235,16 @@ body.popout-host #btn-popout-telemetry {
 }
 .log-row:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
 .log-row.hl { background: var(--hl); }
+/* Live tracking's own auto-click highlight (see setCursor's liveTrack
+   option) -- same shape as .hl above, but liveTrackColor instead of the
+   ordinary selection highlight color, so it reads as distinct. */
+.log-row.hl-live { background: var(--live-track); }
 /* dotted boundary marking the top/bottom edge of a contiguous run of
    highlighted log entries (see the .hl-top/.hl-bottom logic in app.js) */
 .log-row.hl-top { border-top: 2px dashed var(--hl-color); }
 .log-row.hl-bottom { border-bottom: 2px dashed var(--hl-color); }
+.log-row.hl-live.hl-top { border-top: 2px dashed var(--live-track-color); }
+.log-row.hl-live.hl-bottom { border-bottom: 2px dashed var(--live-track-color); }
 .log-row.cursor-row { border-left-color: var(--accent); }
 .log-row.selected { outline: 1px solid var(--accent); outline-offset: -1px; background: color-mix(in srgb, var(--accent) 14%, transparent); }
 .log-row .ts { color: var(--muted); margin-right: 6px; }
@@ -1107,9 +1295,12 @@ dialog::backdrop { background: rgba(0, 0, 0, 0.35); }
 dialog h2 { margin: 0 0 10px; font-size: 15px; }
 #docker-targets { max-height: 180px; overflow-y: auto; margin-top: 8px; }
 #docker-targets label { display: block; padding: 1px 0; }
-#docker-targets label.added { opacity: 0.55; }
+#docker-targets label.unavailable { opacity: 0.75; }
+#docker-targets label.unavailable .tdoc { color: var(--critical); }
+#docker-targets .mark { display: inline-block; width: 1.4em; text-align: center; }
 .tdoc { color: var(--muted); }
-#docker-targets .group { font-weight: 600; margin-top: 6px; color: var(--text-secondary); }
+#docker-targets .group { font-weight: 600; margin-top: 6px; color: var(--text-secondary); cursor: pointer; user-select: none; }
+#docker-targets .group:hover { color: var(--text-primary); }
 #transforms-box { border: 1px solid var(--border); border-radius: var(--radius-md); margin: 8px 0; }
 #transforms-box legend { font-size: 12px; color: var(--text-secondary); padding: 0 4px; }
 .dlg-intro { margin: 10px 0 6px; font-size: 12px; }
@@ -1172,9 +1363,21 @@ pre.snapshot-body {
 
 /* settings dialog fieldsets (remote connection, update server image) */
 .keys-box { border: 1px solid var(--border); border-radius: var(--radius-md); margin: 8px 0; }
+/* "Ship logs" (Settings > Collect CTTC Own Logs): icon-only button, aligned
+   with the toggle/status row, no label text -- title="Ship logs" on hover is
+   the only affordance, same as the frequency "?" help button elsewhere. */
+.log-collect-row { display: flex; width: 100%; justify-content: space-between; }
 .keys-box .radio-row { display: flex; align-items: center; gap: 6px; font-size: 13px; margin: 4px 0; }
 .keys-box .radio-row input { width: auto; }
 .keys-box legend { font-size: 12px; color: var(--text-secondary); padding: 0 4px; }
+.danger-zone { border-color: var(--critical); }
+.danger-zone legend { color: var(--critical); }
+.btn-danger {
+  background: var(--critical);
+  color: #fff;
+  border: 1px solid var(--critical);
+}
+.btn-danger:hover { background: color-mix(in srgb, var(--critical) 85%, black); }
 .keys-box input[type="text"] { flex: 1; min-width: 200px; }
 .keys-box textarea {
   width: 100%;
@@ -1185,69 +1388,22 @@ pre.snapshot-body {
 
 /* gateway-setup.html (New Gateway / Edit Gateways -- a standalone page, not
    a <dialog>, so it needs its own top-level layout) -- everything else
-   (buttons, .keys-box fieldsets, .radio-row, .muted/.error/.linklike/
-   .activity-log, .dlg-actions) reuses the same rules as the main window's
-   dialogs above rather than duplicating them with hardcoded colors, so
-   this page respects the same light/dark theme instead of always being
-   dark regardless of it. */
+   (labels/inputs via .ctl/.ctl.block, .keys-box fieldsets, .radio-row,
+   .muted/.error/.linklike/.activity-log, .dlg-actions, h2/.dlg-intro) reuses
+   the exact same rules as #dlg-gateway-setup (index.html's in-app version of
+   this same form) so the two look and behave identically -- this page is
+   just that dialog's content poured into a standalone window instead of a
+   <dialog> element, for the pre-main-window first-run case. */
 /* Scroll safety net, scoped to only this page (never the main window,
    which manages its own internal scroll regions) via :has() -- a taller
    form, a larger OS font scale, or a small display can still reach content
    via scroll instead of silently clipping it. */
-body:has(#gateway-setup) { overflow-y: auto; }
-#gateway-setup { margin: 22px 0; padding: 0 20px 48px; }
-/* .keys-box has no explicit padding elsewhere -- the browser's UA default
-   fieldset padding (~0.75em sides) narrows its controls more than the
-   surrounding page padding does; tightened here so gateway-setup's inputs
-   use closer to the same width as the plain (non-fieldset) ones above them,
-   without changing #gateway-setup's own max-width. */
-#gateway-setup .keys-box { padding: 4px 10px 10px; }
-#gateway-setup h1 { font-size: 19px; font-weight: 600; letter-spacing: -0.01em; }
-#gateway-setup label { display: block; margin-top: 14px; font-size: 13px; color: var(--text-secondary); }
-#gateway-setup input[type="text"],
-#gateway-setup input[type="number"],
-#gateway-setup textarea,
-#gateway-setup select {
-  background: var(--surface-2);
-  border: 1px solid var(--border-strong);
-  color: var(--text-primary);
-  border-radius: var(--radius-sm);
-  padding: 6px 9px;
-  font-size: 13px;
-  box-sizing: border-box;
-  transition: border-color 0.1s ease;
-}
-#gateway-setup input[type="text"]:focus,
-#gateway-setup input[type="number"]:focus,
-#gateway-setup textarea:focus,
-#gateway-setup select:focus {
-  outline: none;
-  border-color: var(--accent);
-}
-/* stacked label-above-control layout (ssh user/host/port, the gateway
-   picker) -- scoped to a direct child of a bare <label> so it doesn't
-   fight the flex-row layouts below (.ctl's own inputs, #key-path-row's),
-   which size themselves. select needs this too -- without it,
-   #gateway-select-row's dropdown sat inline next to its "CTTC Gateways"
-   label instead of stacked like every other field, with a large gap. */
-#gateway-setup label > input[type="text"],
-#gateway-setup label > input[type="number"],
-#gateway-setup label > select {
-  display: block;
-  width: 100%;
-  margin-top: 4px;
-}
-/* the port number is at most 5 digits -- stretching it to the same width
-   as the hostname/username fields above it left a wide mostly-empty box
-   that read as an unfinished layout rather than a small numeric field */
-#gateway-setup label > input[type="number"]#ssh-port {
-  width: 100px;
-}
-/* indented to line up under the radio option's text (not the radio dot),
-   so these read as that option's own sub-fields rather than a separate row */
-#key-path-row { display: flex; gap: 8px; align-items: center; margin-left: 22px; }
-#key-path-row input { flex: 1; }
-#key-paste { margin-left: 22px; width: calc(100% - 22px); }
+body:has(#gateway-setup) { overflow-y: auto; background: var(--surface-1); }
+/* same card tone and width as the dialog it mirrors (dialog's own
+   min/max-width above), centered rather than left-edge-anchored since there's
+   no surrounding page chrome here to anchor against. */
+#gateway-setup { margin: 22px auto; padding: 0 20px 48px; max-width: 620px; }
+#gateway-setup h2 { margin: 0 0 10px; font-size: 15px; }
 .wait { text-align: center; margin-top: 40px; }
 .spinner {
   width: 32px; height: 32px; margin: 0 auto 12px;

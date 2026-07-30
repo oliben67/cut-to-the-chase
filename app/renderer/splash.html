@@ -2,13 +2,14 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self'; img-src 'self'" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self'; img-src 'self'; script-src 'self'" />
   <title>CTTC</title>
   <link rel="stylesheet" href="splash.css" />
 </head>
 <body>
   <img src="../assets/icon.png" alt="" width="64" height="64" />
   <div class="spinner"></div>
-  <p>Loading CTTC…</p>
+  <p id="status" title="Loading CTTC…">Loading CTTC…</p>
+  <script src="splash.js"></script>
 </body>
 </html>
