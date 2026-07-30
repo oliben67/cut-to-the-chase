@@ -1117,8 +1117,9 @@ body.popout-host #btn-popout-telemetry {
 }
 .panel-head {
   display: flex;
-  flex-direction: column;
-  gap: 4px;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
   padding: 6px 10px;
   border-bottom: 1px solid var(--border);
 }
@@ -1126,13 +1127,20 @@ body.popout-host #btn-popout-telemetry {
   display: flex;
   align-items: baseline;
   gap: 8px;
+  min-width: 0; /* lets the name ellipsis/wrap instead of pushing controls off */
 }
 .panel-head-controls {
   display: flex;
   align-items: center;
   gap: 8px;
+  margin-left: auto; /* keeps the icon buttons lined up with the title, flush right on the same row */
 }
-.panel-head .name { font-weight: 600; }
+.panel-head .name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .sample-badge {
   font-size: 10px;
   padding: 1px 6px;

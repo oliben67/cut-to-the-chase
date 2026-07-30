@@ -452,7 +452,7 @@
       </label>
       <p class="dlg-section-help muted">Double-clicking the chart recenters it on that point in time, which pauses live tracking (like any other pan/zoom). This many seconds later, live tracking resumes on its own. Set to 0 to stay paused until you click "now" yourself.</p>
       <label class="ctl">
-        <input id="dblclick-resume-secs-sidebar" type="number" min="0" step="1" value="30" /> s
+        <input id="dblclick-resume-secs-sidebar" type="number" min="0" step="1" value="10" /> s
       </label>
     </fieldset>
     <fieldset class="keys-box" id="fieldset-log-collector">
@@ -553,10 +553,6 @@
   <dialog id="dlg-snapshot">
     <h2>Snapshot</h2>
     <div id="snapshot-meta" class="muted"></div>
-    <label class="ctl block">
-      <input id="snap-all-sources" type="checkbox" checked />
-      Include all open containers/hosts (not just the selected ones)
-    </label>
     <label class="ctl">
       <input id="snap-logs" type="checkbox" checked />
       Include nearby log entries

@@ -53,6 +53,7 @@ import files  # local sibling module (server/files.py) -- upload/download endpoi
 from cttc_format import RECORD_EXT, is_cttc_archive
 from events import Action, EventManager, InvalidEvent, LogCondition, MetricCondition, UnknownEvent
 from recording_session import RecordingSessionManager, UnknownSession
+from redis_log import RedisLog
 from rolling_buffer import RollingBufferManager, UnknownBuffer
 from scheduler import InvalidSchedule, Scheduler, UnknownSchedule
 
@@ -268,6 +269,10 @@ class LogSource:
             else:
                 for row in new:
                     bisect.insort(self.rows, row)
+            redis_log = getattr(getattr(self, "_state", None), "redis_log", None)
+            if redis_log is not None:
+                for ts, _seq, uid, text in new:
+                    redis_log.record(self.name, ts, {"uid": uid, "text": text})
         return len(new)
 
     def _next_seq(self) -> int:
@@ -486,6 +491,9 @@ class StatsSource:
         else:
             bisect.insort(lst, row)
         self.count += 1
+        redis_log = getattr(getattr(self, "_state", None), "redis_log", None)
+        if redis_log is not None:
+            redis_log.record(name, ts, {"cpu": cpu, "mem": mem, "mem_bytes": mem_bytes, "net": rate})
 
     def _net_rate(self, container: str, ts: float, net_total: float | None) -> float | None:
         if net_total is None:
@@ -1342,6 +1350,7 @@ class State:
         )
         self.scheduler = Scheduler(self.recording_sessions)
         self.events = EventManager(self, self.rolling_buffers, self.recording_sessions)
+        self.redis_log = RedisLog()
 
     def broadcast(self, event: dict):
         for q in list(self.listeners):
@@ -1460,6 +1469,27 @@ class State:
                     lambda sid, t=target, ty=ttype, f=fns: DockerLogSource(
                         sid, t, host, ty, t, f, self, ssh_key=ssh_key
                     ),
+                )
+            )
+        if host:
+            # Remembered so the gateway can reconnect this remote daemon on
+            # its own restart (see redis_log.RedisLog.known_daemons, read at
+            # startup in lifespan()) -- no new secret involved: ssh_key here
+            # is only ever a path that must already resolve inside this
+            # container's own filesystem (see _connect_ssh's docstring), not
+            # key content transmitted over HTTP.
+            asyncio.ensure_future(
+                self.redis_log.remember_daemon(
+                    host,
+                    {
+                        "host": host,
+                        "ssh_key": ssh_key,
+                        "stats": stats,
+                        "logs": logs,
+                        "transforms": transforms,
+                        "interval": interval,
+                        "host_stats": host_stats,
+                    },
                 )
             )
         return opened
@@ -1766,7 +1796,37 @@ def bad_request(msg: str) -> ValueError:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    state: State = app.state.cttc
+    await state.redis_log.start()
+    # Always-on collection: local Docker + local host telemetry start the
+    # moment the gateway boots, no client/Set Docker Daemon action needed.
+    # Remote hosts previously configured (see collect_docker's
+    # remember_daemon call) are replayed too, so the gateway can reconnect
+    # them on its own restart -- harmless if a client's own auto-reconnect
+    # (app.js) also calls /docker/collect for the same host moments later,
+    # since _open_or_reuse already dedupes by path. Gated on --auto-collect
+    # (see main()'s help text): off by default so the bare/embedded process
+    # and the test suite don't get an unprompted background collector.
+    if getattr(app.state, "auto_collect", False):
+        try:
+            state.collect_docker(None, True, [], [], 5.0, True, None)
+        except Exception as e:
+            logger.warning("lifespan: local auto-collect failed: %s", e)
+        for daemon in await state.redis_log.known_daemons():
+            try:
+                state.collect_docker(
+                    daemon.get("host"),
+                    daemon.get("stats", True),
+                    daemon.get("logs", []),
+                    daemon.get("transforms", []),
+                    daemon.get("interval", 5.0),
+                    daemon.get("host_stats", True),
+                    daemon.get("ssh_key"),
+                )
+            except Exception as e:
+                logger.warning("lifespan: auto-collect for remembered daemon %s failed: %s", daemon.get("host"), e)
     yield
+    await state.redis_log.stop()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -2262,6 +2322,18 @@ async def route_session_ttl(request: Request):
     return {"ok": True}
 
 
+@app.post("/logs/ttl")
+async def route_logs_ttl(request: Request):
+    """Set the gateway's retention TTL (seconds) for the durable Redis-backed
+    log/telemetry store (see redis_log.py) -- default 3 days. Applies to
+    future writes *and* re-applies to every already-stored entry (a no-op,
+    like the rest of redis_log, when the durable store is disabled)."""
+    body = await request.json()
+    st = get_state(request)
+    await st.redis_log.set_ttl(float(body["seconds"]))
+    return {"ok": True}
+
+
 @app.post("/scheduler/create")
 async def route_scheduler_create(request: Request):
     """Register a schedule -- give exactly one of `start_at` (epoch ms,
@@ -2543,6 +2615,16 @@ def main():
         help="timezone assumed for timestamps that carry no offset",
     )
     ap.add_argument("--static", action="store_true", help="open files without tailing")
+    ap.add_argument(
+        "--auto-collect",
+        action="store_true",
+        help="start collecting local Docker + local host telemetry immediately on boot "
+        "(and reconnect any remote hosts remembered in the Redis-backed daemon registry, "
+        "see redis_log.py), instead of waiting for a client's /docker/collect. Set by the "
+        "containerized gateway image's own entrypoint; off by default for the bare/embedded "
+        "process (see main.js) and for tests, where an unprompted background collector "
+        "would be a surprise.",
+    )
     ap.add_argument("files", nargs="*")
     args = ap.parse_args()
 
@@ -2558,6 +2640,7 @@ async def _run(args):
 
     state = State(Path(args.transforms_dir), Path(args.sessions_dir))
     app.state.cttc = state
+    app.state.auto_collect = args.auto_collect
 
     for f in args.files:
         try:

@@ -393,6 +393,61 @@ to only ever have one client because nothing else could reach it.
   through different tunnels still get one consistent, correlatable
   timeline, not two skewed ones.
 
+## Always-on collection + durable log/telemetry store (Redis)
+
+Two related gaps in everything above: collection only ever starts because
+a client asked (`POST /docker/collect`), and everything collected lives only
+in unbounded process RAM (`Source.rows`/`series`) — a gateway restart loses
+all of it, and nothing bounds how much piles up over days of uptime.
+
+**Redis is a write-through side store, not a replacement.** The live read
+path this whole document describes (`/series`, `/logs`, `/range`, `/ticks`,
+rolling buffers, event conditions, recording-session exports) is entirely
+unchanged and still reads straight out of RAM — Redis exists only to (a)
+survive a restart and (b) bound retention, default 3 days, live-configurable
+via `POST /logs/ttl` (mirrors the existing `POST /session/ttl` pattern).
+
+- **Bundled, not a separate container** (for now): `redis-server` (7.4+, for
+  per-hash-field TTL — `HEXPIRE`/`HTTL`) runs as a plain subprocess of
+  `server.py` inside the same gateway container, bound to a unix socket only
+  (the image runs `network_mode: host`, so a TCP loopback bind would
+  actually be reachable from the real host, not just this container). The
+  binary is copied from the official `redis:7.4-alpine` image in the
+  Dockerfile rather than relying on Alpine's own `apk` package version.
+  `--save ""`: deliberately ephemeral, same as RAM has always been — a
+  redeploy losing it is an accepted trade-off, not a regression.
+- **Schema**: one hash + one sorted-set index per entity (container name, or
+  `host@<hostname>`) — `cttc:log:<id>` (field=timestamp, value=orjson
+  record) and `cttc:idx:<id>` (member=same field, score=timestamp), so a
+  range query is an indexed `ZRANGEBYSCORE` instead of an `HKEYS` scan of
+  one giant shared hash. Queried via a Redis Function
+  (`server/logs.lua`, `FUNCTION LOAD`ed at startup) rather than hand-rolled
+  client-side scanning.
+- **Always-on collection**, gated behind `--auto-collect` (only the
+  containerized gateway's `ENTRYPOINT` passes it — off for the bare/embedded
+  process `main.js` launches locally, and for tests, where an unprompted
+  background collector would be a surprise): on boot, the gateway starts
+  local Docker + local host collection itself, and replays a small
+  Redis-backed daemon registry (`cttc:daemons`, written to on every
+  successful remote `/docker/collect`) to reconnect remote SSH hosts too —
+  without needing any client to launch first. This needs no new secret
+  transfer: `ssh_key` in `/docker/collect` was always just a path that has
+  to already resolve inside the gateway's own filesystem (see
+  `_connect_ssh`'s docstring), never key content sent over HTTP, so
+  replaying a remembered `{host, ssh_key path, ...}` tuple on restart uses
+  exactly the access the gateway already had. Existing collector loops
+  (`DockerStatsSource`/`HostStatsSource`/`DockerLogSource`) already run
+  independent of any client connection's lifetime once started, so "keeps
+  pulling at all times" falls out of this for free — nothing changed in the
+  loops themselves.
+- **No new secrets, effectively no API surface change** beyond the one TTL
+  endpoint: `/docker/collect`, `/series`, `/logs`, `/range` etc. all keep
+  their exact existing request/response shapes.
+
+See `server/redis_log.py` for the implementation (`record`/`set_ttl`/
+`read_range`, all no-ops when `redis-server` isn't present, so the bare/
+embedded deployment mode is entirely unaffected by this).
+
 ## File transfer (upload / download) — implemented
 
 Shipped as designed below, with a few concrete decisions made along the

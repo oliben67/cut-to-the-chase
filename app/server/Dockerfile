@@ -55,6 +55,15 @@ FROM python:3.14-alpine
 RUN apk add --no-cache ca-certificates openssh-client
 COPY --from=builder /usr/local/bin/docker /usr/local/bin/docker
 
+# Bundled Redis (see redis_log.py) -- the durable, TTL-bounded side store
+# for logs/telemetry, running as a plain subprocess of server.py inside this
+# same container (no separate container/volume, for now). Needs 7.4+ for
+# per-hash-field TTL (HEXPIRE/HTTL), which is why the binary is copied
+# straight from the official image instead of relying on whatever version
+# Alpine's own `apk add redis` happens to carry -- both images are Alpine
+# (musl), so the binary runs here unmodified.
+COPY --from=redis:7.4-alpine /usr/local/bin/redis-server /usr/local/bin/redis-server
+
 # `docker -H ssh://...` (Set Sources with an ssh:// host, e.g. to reach a
 # *third* machine from this container) execs plain ssh with no flags of its
 # own, so without this it either hangs on an interactive host-key prompt (no
@@ -83,4 +92,8 @@ EXPOSE 8765
 # --network=host (see docker-compose.yml) means this *is* the host's own
 # network stack, so binding 0.0.0.0 here exposes it exactly as if the port
 # were opened directly on the host.
-ENTRYPOINT ["python", "server.py", "--host", "0.0.0.0", "--port", "8765"]
+# --auto-collect: this is the one place the gateway runs as a standing
+# service rather than something main.js launches bare/embedded alongside a
+# single client -- so it's the one place always-on collection (see
+# lifespan() in server.py) should default on.
+ENTRYPOINT ["python", "server.py", "--host", "0.0.0.0", "--port", "8765", "--auto-collect"]

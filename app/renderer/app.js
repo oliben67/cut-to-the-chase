@@ -171,7 +171,7 @@ let liveTrackEnabled = prefs.get("liveTrackEnabled", true);
 // How long a double-click recenter pauses live-follow before it resumes on
 // its own (seconds). 0 disables auto-resume -- stays paused until the user
 // clicks "now" themselves, matching drag/context-menu zoom.
-let dblclickResumeSecs = prefs.get("dblclickResumeSecs", 30);
+let dblclickResumeSecs = prefs.get("dblclickResumeSecs", 10);
 
 // bytes/sec -> the largest unit (GB/MB/kB/B) that keeps the number >= 1,
 // one decimal place -- used for the NET strip's axis labels and tooltip.
@@ -1206,11 +1206,11 @@ async function exportSample(t0, t1) {
 }
 
 /* ── snapshots: telemetry + nearby log entries at one point in time ──────
-   Right-click a chart -> "Take snapshot at this time". /point already
-   aggregates every currently open stats source (all containers *and* all
-   docker hosts), so "all the other servers at the same time" comes for
-   free; the dialog's checkbox only narrows it back down to the currently
-   selected series if unchecked. */
+   Right-click a chart -> "Take snapshot at this time". /point aggregates
+   every currently open stats source, but a snapshot only ever shows the
+   currently tracked/selected containers -- host telemetry is always
+   included (it isn't a per-container track state), same as everywhere
+   else the legend's selection applies. */
 
 const dlgSnapshot = $("dlg-snapshot");
 let currentSnapshot = null;
@@ -1242,13 +1242,11 @@ async function takeSnapshot(t) {
 // a single point-in-time slice: telemetry (via /point) + nearby log entries
 // (via /index_at + /logs). Reused for the center time and, when a panorama
 // is requested, for the "before"/"after" times too.
-async function computeSlice(t, { includeAll, includeLogs, ctxLines }) {
+async function computeSlice(t, { includeLogs, ctxLines }) {
   const r = await get(`/point?t=${t}`);
   let services = Object.entries(r.services || {}).map(([name, v]) => ({ name, ...v }));
-  if (!includeAll) {
-    const selected = new Set(allSvcSeries().filter((s) => trackStateOf(s) === "sel").map((s) => s.name));
-    services = services.filter((s) => s.host || selected.has(s.name));
-  }
+  const selected = new Set(allSvcSeries().filter((s) => trackStateOf(s) === "sel").map((s) => s.name));
+  services = services.filter((s) => s.host || selected.has(s.name));
   services.sort((a, b) => (b.host - a.host) || a.name.localeCompare(b.name));
 
   let logs = [];
@@ -1270,14 +1268,13 @@ async function computeSlice(t, { includeAll, includeLogs, ctxLines }) {
 }
 
 async function refreshSnapshot(t) {
-  const includeAll = $("snap-all-sources").checked;
   const includeLogs = $("snap-logs").checked;
   const panOn = $("snap-panorama-on").checked;
   const panUnit = $("snap-panorama-unit").value; // "entries" | "seconds"
   const panValue = panOn ? Math.max(0, Number($("snap-panorama-value").value) || 0) : 0;
   const ctxLines = panUnit === "entries" ? panValue : 0;
   const panSec = panUnit === "seconds" ? panValue : 0;
-  const opts = { includeAll, includeLogs, ctxLines };
+  const opts = { includeLogs, ctxLines };
 
   // a "panorama" enlarges the snapshot around the selected time: either by
   // widening the per-slice log context (n nearby entries), or by adding two
@@ -1410,7 +1407,6 @@ $("snap-view-json").onclick = () => {
   $("dlg-snapshot-save-txt").hidden = true;
   $("dlg-snapshot-save").hidden = false;
 };
-$("snap-all-sources").onchange = () => currentSnapshot && refreshSnapshot(currentSnapshot.t);
 $("snap-logs").onchange = () => currentSnapshot && refreshSnapshot(currentSnapshot.t);
 $("snap-panorama-on").onchange = () => {
   $("snap-panorama-value").disabled = !$("snap-panorama-on").checked;
@@ -1624,7 +1620,17 @@ function goLive() {
 // "now" line advances even when the view is a fixed (non-live) window.
 // Also resumes live-follow on its own once a pending double-click pause
 // (state.liveResumeAt, see recenterOn) expires.
+//
+// liveTrackTick() runs from this same local, wall-clock-driven heartbeat
+// rather than only from refreshAll() (itself only triggered by an SSE
+// "something changed" push, see connectSSE) -- otherwise a lull in new
+// telemetry/log data (nothing for any collector to broadcast) silently
+// stalls the Live tracking cursor even though nothing about live-follow
+// itself turned off: no data change means no SSE message means
+// refreshAll() never re-runs. Advancing the cursor doesn't depend on the
+// server having anything new to say, so it shouldn't wait on that.
 setInterval(() => {
+  liveTrackTick();
   if (!state.view) return;
   if (state.live) followNow();
   else {

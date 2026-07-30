@@ -1,6 +1,6 @@
 {
   "name": "cttc-timeline",
-  "version": "0.0.3",
+  "version": "0.1.0",
   "description": "Correlate container telemetry with service logs on a shared clickable timeline",
   "main": "main.js",
   "scripts": {
