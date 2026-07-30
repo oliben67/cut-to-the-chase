@@ -1,6 +1,27 @@
 # Running the CTTC server remotely (no local Docker required)
 
-**Status:** exploration / design proposal — not implemented.
+**Status:** superseded in part -- see below. Phases 2-3 (collector
+de-duplication; file transfer) are implemented as described. Phase 1 as
+originally designed (**option A: SSH tunnel**, below) was swapped out before
+shipping: the client now connects to the remote server container directly
+over plain HTTP (`http://<host>:<port>`, no ssh tunnel/local port-forward at
+all), a deliberate product decision to keep the ongoing client<->server
+traffic path simple, with ssh used only once, to *provision* the container
+(see `lib/server-provision.js`'s `ensureRemoteContainer`). This is option B
+below, minus its token/TLS proposal -- an explicit choice to accept
+trusted-network-only exposure rather than add auth machinery. `server.py`'s
+`--host` flag (default `127.0.0.1`, `0.0.0.0` in the container) and the
+relaxed `connect-src http://*` CSP are the two changes B's design predicted
+would be needed. Phases 4-5 are still design only.
+
+Neither the SSH tunnel nor auth/TLS is a closed door -- both are explicitly
+**future options**, not permanently abandoned: auth/TLS (see phase 5 below)
+if the network trust model ever changes, and the tunnel transport itself if
+some environment needs it back (e.g. inbound HTTP blocked but SSH egress
+allowed) -- `lib/ssh-tunnel.js`/its tests existed and worked before removal;
+see git history on this file if reviving that path.
+
+See [Using it today](#using-it-today) for how to actually run it.
 
 ## Product context this design has to preserve
 
@@ -72,7 +93,7 @@ design:
 2. **File transfer needs real upload/download endpoints**, designed as a
    separable module from day one so it can be split into its own
    container later if it needs to scale independently. See
-   [File transfer](#file-transfer-upload--download). This also surfaced a
+   [File transfer](#file-transfer-upload--download--implemented). This also surfaced a
    real security gap in the *existing* encryption-key design that needs
    fixing as part of this work — see
    [Encryption keys need to move client-side](#encryption-keys-need-to-move-client-side).
@@ -139,24 +160,28 @@ implement it only if a real deployment needs it.
 ## Containerizing the server
 
 Either architecture needs the server running as a long-lived container on
-the Docker-enabled host, independent of any Electron process. Sketch:
+the Docker-enabled host, independent of any Electron process. Implemented
+as [server/Dockerfile](../../app/server/Dockerfile) and
+[server/docker-compose.yml](../../app/server/docker-compose.yml) — a
+distilled version:
 
 ```dockerfile
 FROM python:3.12-slim
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      docker-ce-cli openssh-client && rm -rf /var/lib/apt/lists/*
-RUN pip install uv
-COPY app/server /srv/cttc-server
-WORKDIR /srv/cttc-server
-RUN uv sync --frozen
+# docker CLI only (static binary, arch-matched via $TARGETARCH) + openssh-client
+RUN ... curl -fsSL https://download.docker.com/linux/static/stable/${arch}/docker-*.tgz | tar -xz ...
+RUN pip install --no-cache-dir uv
+WORKDIR /srv/cttc-gateway
+COPY pyproject.toml ./
+RUN uv sync --no-dev   # uv treats "dev" as included by default; exclude it explicitly
+COPY server.py transforms ./
 EXPOSE 8765
-ENTRYPOINT ["uv", "run", "server.py", "--port", "8765"]
+ENTRYPOINT ["uv", "run", "--no-sync", "server.py", "--port", "8765"]
 ```
 
 ```yaml
 # docker-compose.yml (on the Docker-enabled host)
 services:
-  cttc-server:
+  cttc-gateway:
     build: .
     pid: host          # psutil sees the real host, not the container's cgroup
     network_mode: host  # NET counters match the host's interfaces, not veth0
@@ -168,20 +193,144 @@ volumes:
   cttc-keys:
 ```
 
-Two things worth calling out because they're easy to get wrong silently:
+Things worth calling out because they're easy to get wrong silently:
 
-- **`docker-ce-cli` only, not the full engine** — the container needs the
-  CLI binary and the mounted socket, never its own nested daemon.
+- **Static `docker` binary, not `docker-ce-cli` via apt** — Debian slim has
+  no clean `docker-ce-cli`-only package without adding Docker's apt repo;
+  downloading the static binary from `download.docker.com` and discarding
+  `curl` afterward keeps the image lean and avoids pulling in package
+  manager machinery for a full engine install this container never needs
+  (it only ever talks to the *mounted* socket, never runs its own dockerd).
+- **`uv sync --no-dev` is required, not optional** — verified by actually
+  building the image: plain `uv sync` pulled in `pytest`/`pytest-cov`/
+  `coverage` because uv treats a group literally named `dev` as included
+  by default. Without `--no-dev` the "production" image silently ships
+  test tooling.
+- **`server.py` needed zero changes for this** — it still hardcodes a
+  `127.0.0.1` bind. With `network_mode: host`, that loopback *is* the
+  host's loopback, so the host's ssh tunnel reaches it exactly as if this
+  were a same-machine embedded server. No `--bind 0.0.0.0` flag was added
+  (there's deliberately nowhere for one to go).
 - **Host telemetry accuracy.** `HostStatsSource._sample_local()` uses
   `psutil`, which by default reports the *container's* view (its cgroup
   limits, its network namespace), not the physical host's — exactly the gap
   `pid: host` + `network_mode: host` closes (the same technique
   node-exporter/cAdvisor-style agents use). Without both, host telemetry
   will silently report container-scoped numbers that look plausible but are
-  wrong. Worth a loud comment in the compose file, and probably a startup
-  self-check in `HostStatsSource` that warns if `/proc/1/comm` doesn't look
-  like host `init` (a `pid: host` giveaway) when host-telemetry is
-  requested.
+  wrong.
+- **`.dockerignore` matters here more than usual** — without one, `.venv/`,
+  `tests/`, `.pytest_cache/`, and `uv.lock` (all present in a normal dev
+  checkout of `server/`) get sent to the docker daemon as build context
+  even though nothing COPYs them in. Added
+  [server/.dockerignore](../../app/server/.dockerignore); confirmed it
+  drops the transferred context from megabytes to a few hundred bytes.
+
+### Using it today
+
+On the Docker-enabled host:
+
+```sh
+cd app/server
+docker compose up -d --build
+```
+
+On the client machine, `~/.cttc/connection.json` (the gateway setup writes
+this for you; shown here for scripted/MDM deployment):
+
+```json
+{
+  "mode": "remote",
+  "ssh_target": "deploy@docker-host.internal",
+  "ssh_key": "~/.ssh/cttc_deploy",
+  "remote_port": 8765
+}
+```
+
+`ssh_target`/`ssh_key`/`ssh_port` are only ever used to provision (or
+re-provision, via File > Gateways > Edit Gateways) the container -- the
+client's own ongoing traffic goes straight to
+`http://<host-from-ssh_target>:<remote_port>`, derived by
+`hostFromTarget()` in
+[lib/connection-config.js](../../app/lib/connection-config.js). Then
+`npm start` as usual — nothing else changes. (Env vars `CTTC_MODE`,
+`CTTC_SSH_TARGET`, `CTTC_SSH_KEY`, `CTTC_REMOTE_PORT` override the file, for
+scripted deployment.)
+
+**Verified, not just built:** the whole pipeline was validated for real, not
+only unit-tested — a standalone `server.py` instance was started, Electron
+was launched in `ssh-tunnel` mode (the design at the time) pointed at it
+through a fake-ssh test fixture (a real subprocess proxying real sockets,
+not a mock), and the renderer loaded real telemetry and log data over that
+tunnel with a UI pixel-identical to embedded mode. Separately, the container
+image itself was built and run
+against a real Docker daemon: `docker ps` from inside the container
+correctly matched the host's actual container list through the mounted
+socket, the `/docker/ps` and `/sources` HTTP endpoints responded correctly
+from within the container's network namespace, and host-telemetry sampling
+produced real readings with `pid: host` + `network_mode: host` in place.
+
+That first pass had one gap, specific to the *test* environment rather than
+the design: on Docker Desktop for Mac, `network_mode: host` joins the
+container to the LinuxKit VM's network namespace, not literally macOS's, so
+external reachability from outside the VM couldn't be exercised there.
+
+**That gap is now closed.** The full path was validated against a real,
+separate Linux Docker host reached over the network (not Docker Desktop):
+`server/` was `rsync`'d over, `docker compose up -d --build` run for real,
+and Electron on a different machine connected to it purely by ssh'ing in —
+no fake-ssh fixture this time, the actual `ssh` binary. Every layer was
+real: an actual `docker exec ... docker ps` inside the deployed container
+matched that host's real containers (itself plus two unrelated ones already
+running there), and the app displayed real telemetry (including host CPU/
+MEM/**NET numbers that reflected genuine network activity on that
+physical machine**, the exact thing Docker Desktop's VM networking
+couldn't prove) and 71 real log entries from a container on that host, all
+over a real SSH tunnel across a real LAN.
+
+This is also where a real bug turned up: `files.py` (added in phase 3) was
+never added to the Dockerfile's `COPY` list, so the built image ran fine
+locally (nothing in the build graph needed it) but crash-looped on start
+with `ModuleNotFoundError` the moment `server.py`'s `import files` executed
+— invisible to `docker build` succeeding, only visible once something
+actually tried to *run* the container. Fixed by adding `files.py` to the
+`COPY` line; re-verified with the same real-host deployment. Worth noting
+as a general lesson for this Dockerfile going forward: a successful `docker
+build` doesn't prove the image runs, only that the copied files were
+syntactically fine to package — a fresh `docker compose up` (or at minimum
+checking `docker logs` after one) is the actual test, and it's worth
+re-running after any new local module lands, not just after the first one.
+
+## The container's host doesn't have to be the monitored host — validated
+
+Nothing above requires the machine running the CTTC server *container* to be
+the same machine whose Docker daemon it's watching. That decoupling already
+existed in the code before this remote-server work started —
+`docker_cmd(host)` builds `[docker, -H, host]`, and `host` can be
+`ssh://user@another-machine` just as easily as `None` (the local socket) —
+but it had never actually been exercised with the CTTC server itself running
+in a container, so it was worth proving rather than assuming.
+
+Validated for real, across two genuinely separate physical machines: a CTTC
+container built and run on one host (**no Docker socket mounted into it at
+all** — just a single SSH private key), asked via `/docker/collect` to
+monitor `ssh://user@a-completely-different-host`. Every layer of data came
+back correctly from the *other* machine: `docker ps`-equivalent listing,
+`docker stats` telemetry (6 samples), host telemetry over the existing
+`HostStatsSource._sample_ssh()` path (2 samples — this is the *ssh-to-a-
+different-host* sampler, not the `psutil`/`pid: host` one, and it's the one
+that actually ran here), and real log entries (71) — all while the
+container itself had zero local Docker awareness.
+
+Practical implication for `docker-compose.yml`: the `/var/run/docker.sock`
+mount there is only for the common case (container host *is* the Docker
+host, the default in this repo's compose file). It's not required for this
+topology — a deployment where the CTTC container runs somewhere lightweight
+and only reaches out over `ssh://` to the real Docker host(s) needs no
+socket mount at all, just an SSH private key made available to it (e.g. a
+volume mount) and that key's path passed as `ssh_key` in `/docker/collect`
+requests. Worth a follow-up compose variant if this topology turns out to be
+common in practice, rather than everyone hand-rolling their own `docker run`
+for it.
 
 ## Single collector, multiple viewers
 
@@ -205,7 +354,7 @@ to only ever have one client because nothing else could reach it.
 - **The shared, de-duplicated part is exactly what `State.sources` already
   is** — one `DockerStatsSource`/`DockerLogSource`/`HostStatsSource` per
   collected target, visible identically to every client via `/sources` and
-  `/series`. A second client's *"Add sources"* dialog already calls
+  `/series`. A second client's *"Set sources"* dialog already calls
   `/docker/ps` + checks `openPaths()` against the live `/sources` list and
   marks already-open containers *"already added"* ([app.js
   `updateDockerDupes`/`listContainers`](../../app/renderer/app.js)) — so
@@ -244,7 +393,56 @@ to only ever have one client because nothing else could reach it.
   through different tunnels still get one consistent, correlatable
   timeline, not two skewed ones.
 
-## File transfer (upload / download)
+## File transfer (upload / download) — implemented
+
+Shipped as designed below, with a few concrete decisions made along the
+way:
+
+- `POST /files/upload` takes the raw file bytes as the request body (not
+  multipart) plus three headers: `X-CTTC-Filename` (required),
+  `X-CTTC-Private-Key` (optional, **base64-encoded** — a raw header can't
+  safely carry a multi-line PEM's newlines), `X-CTTC-Transforms`
+  (optional, comma-separated). Response shape matches `/open`'s
+  `{opened, errors}` exactly, `errors[].encrypted` included, so the
+  renderer's existing "locked file, prompt for a key and retry" logic
+  needed no new branches, just a different fetch underneath it.
+- `GET /files/download?from&to&public_key&include_host` returns the zip
+  (or encrypted blob) as the response body, plus a
+  `X-CTTC-Source-Count` header (cross-origin `fetch()` can't read
+  response headers unless the server explicitly
+  `Access-Control-Expose-Headers`s them — easy to miss, would have shown
+  up as `undefined` in the status line silently) so the client can still
+  say "saved: N sources" without the server needing to return JSON.
+- `State.export_sample()`'s zip-building was split into
+  `State.build_sample_bytes() -> (data, meta)`, with `export_sample()`
+  reduced to "build, then write to a path" — a pure refactor, the
+  existing path-based `/sample/export` endpoint (still used by
+  `--static`/CLI flows) is untouched and its tests passed unmodified.
+- An uploaded source's `.path` is set to a synthetic `upload://<filename>`
+  after opening (the scratch temp file is deleted immediately after — both
+  `open_file`/`load_sample` fully consume their input into memory, and a
+  non-live source's `.path` is never read again afterward). This is a
+  display-only change with one real consequence: the renderer's
+  already-open check for "Load metrics" compares against
+  `upload://<basename>` now, not the picked local path.
+- On the client, **`window.cttc.saveFile` (path-only, no write) was
+  removed**, not left dead — `saveBinary(name, bytes)` replaced its one
+  caller. `readFile(path)` was added alongside it so the renderer (which
+  has no fs access) can hand local bytes to `/files/upload` itself; per
+  the existing "main.js is thin glue" pattern, `main.js` still never talks
+  to the CTTC server API — it only reads/writes local files and shows
+  native dialogs, same division of responsibility as everywhere else in
+  the app.
+- A real, non-obvious test-infrastructure finding:
+  `contextBridge.exposeInMainWorld`-exposed objects (`window.cttc.*`) are
+  **not configurable** — `delete window.cttc.readFile` throws in strict
+  mode. An E2E test attempting to simulate a degraded environment that way
+  had to be dropped rather than worked around; the equivalent
+  `saveBinaryFile` fallback (plain-browser `Blob` download when
+  `window.cttc` is entirely absent) has the same untestable-in-Electron
+  property and was left unverified at the E2E layer for the same reason —
+  both are simple enough by inspection that this was judged an acceptable
+  gap rather than worth restructuring production code around.
 
 Two flows in the current UI assume the Electron client and `server.py`
 share a filesystem — true today (same machine), false once the server
@@ -294,7 +492,7 @@ Proposed change: give sample export/import the same shape.
   existing endpoint handlers. That's what makes "spin it off into its own
   container later" a refactor instead of a rewrite — the day file traffic
   needs to scale independently of the telemetry/log collectors (large
-  `.cttc` files, many concurrent uploads), it lifts out behind the same
+  `.cttc-metric`/`.cttc-record` files, many concurrent uploads), it lifts out behind the same
   route prefix on a different port/container without the collector code
   ever noticing.
 - **Uploaded sources stay first-class, not a side view.** Once opened, a
@@ -357,34 +555,39 @@ currently promises (documented in
 [MANUAL.md](../../MANUAL.md#encryption-keys): *"the private key never
 leaves this machine"* — true today, false under naive shared-server reuse).
 
-## What changes in Electron for the SSH-tunnel path
+## What changes in Electron for the remote path (as shipped)
 
-`main.js` gains a second `startServer`-shaped function alongside the
-existing one, selected by config (see below), not by any new UI:
+`main.js`'s `connectToServer()` handles "remote" mode by calling
+`ensureRemoteContainer()` (see
+[lib/server-provision.js](../../app/lib/server-provision.js)), which
+provisions the container over ssh (mkdir/scp/`docker load`-or-`pull` +
+`docker compose up`) and, once its `/health` endpoint responds, returns
+`{host, port}` directly — no local ssh process, no port-forward:
 
 ```js
-async function startTunnel({ sshTarget, sshKey, remotePort }) {
-  const localPort = await getFreeLocalPort(); // bind :0, read it, close it
-  const args = ["-N", "-L", `127.0.0.1:${localPort}:127.0.0.1:${remotePort}`,
-                ...(sshKey ? ["-i", sshKey, "-o", "IdentitiesOnly=yes"] : []),
-                sshTarget];
-  sshProc = spawn("ssh", args, { stdio: ["ignore", "pipe", "pipe"] });
-  await waitForPortOpen("127.0.0.1", localPort, { timeoutMs: 15000 });
-  serverPort = localPort;
+async function connectToServer(fileArgs) {
+  const cfg = loadConnectionConfig();
+  // ...embedded-mode branches elided...
+  const remote = await ensureRemoteContainer(cfg, { ... });
+  serverHost = remote.host;
+  serverPort = remote.port;
 }
 ```
 
-- `app.whenReady()` picks `startServer(fileArgs)` (today's behavior) or
-  `startTunnel(cfg)` based on config presence — everything downstream
-  (`createWindow`, popout windows, `/events`) is unaware which one ran.
-- **`/shutdown` on quit must not fire in tunnel/remote mode** — that server
-  is shared infrastructure, not this process's child. `stopServer()` needs
-  a mode check; in tunnel mode it should just kill the local `ssh` process
-  and leave the remote container running.
+- `createWindow`/popout windows load `index.html` with both `host` and
+  `port` query params now (`renderer/app.js` builds
+  `API = http://${HOST}:${PORT}` from them) — previously only `port` was
+  passed, since embedded mode was always `127.0.0.1`.
+- **`/shutdown` on quit must not fire in remote mode** — that server is
+  shared infrastructure, not this process's child, and there's no local
+  process (ssh or otherwise) to stop either. `stopServer()` only ever acts
+  on `serverProc` (a bare `uv run server.py`); remote mode and the local-
+  container case are both left running (`restart: unless-stopped`).
 - Startup failure UX reuses the existing `dialog.showErrorBox` path (today:
-  *"could not start server via uv"*); the tunnel path's equivalent failure
-  ("could not reach `docker-host` via ssh") slots into the same dialog with
-  a different message — no new dialog needed.
+  *"could not start server via uv"*); the remote path's equivalent failure
+  ("could not reach `docker-host` via ssh", or the post-provision `/health`
+  wait timing out) slots into the same dialog with a different message —
+  no new dialog needed.
 
 ## Configuration surface (keeps the default flow untouched)
 
@@ -394,7 +597,7 @@ read once at startup, e.g.:
 ```jsonc
 // ~/.cttc/connection.json  (absent = today's embedded/local behavior)
 {
-  "mode": "ssh-tunnel",
+  "mode": "remote",
   "ssh_target": "deploy@docker-host.internal",
   "ssh_key": "~/.ssh/cttc_deploy",
   "remote_port": 8765
@@ -405,6 +608,20 @@ or the equivalent as environment variables (`CTTC_MODE`, `CTTC_SSH_TARGET`,
 …) for scripted/MDM-pushed deployment. This mirrors how the app already
 treats `CTTC_TEST`/`CTTC_SCREENSHOT`/`CTTC_EVAL` as environment-driven,
 invisible-by-default switches (see [main.js](../../app/main.js)).
+
+**Windows note, found while building a Windows client test bundle:**
+`connection.json` needs to be plain, BOM-less UTF-8. Windows PowerShell's
+`Set-Content -Encoding UTF8` (the obvious way to write this file from a
+setup script) prepends a byte-order-mark, and `JSON.parse()` treats a
+leading BOM as invalid syntax — `loadConnectionConfig()` failed with
+"invalid JSON in connection config" on a file that looked completely
+correct opened in a text editor. Two fixes landed together:
+`readConfigFile()` now strips a leading BOM defensively (so *any* tool that
+writes this file, not just one setup script, can't reintroduce this), and
+the reference PowerShell setup script writes the file via
+`[System.IO.File]::WriteAllText(..., (New-Object System.Text.UTF8Encoding
+$false))` instead of `Set-Content` to avoid emitting one in the first
+place.
 
 ## Open questions still needing a decision
 
@@ -428,25 +645,69 @@ for path B:
 
 ## Suggested phasing
 
-1. **SSH-tunnel transport.** `main.js` gains the tunnel manager and a
-   config loader; `server.py`/`index.html`/`renderer/app.js` untouched.
-   Ship the Dockerfile/compose file for the remote host (`pid: host`,
-   `network_mode: host`, docker socket mount).
-2. **Collector de-duplication.** The small server-side guard in
-   `State.collect_docker()` described in
-   [Single collector, multiple viewers](#single-collector-multiple-viewers).
-   Independently useful even before remote mode ships.
-3. **File transfer module.** New `/files/upload` + streaming
-   `/sample/export` response, a `saveBinary` IPC call alongside the
-   existing `saveJson`/`saveText`, built as a separable module per the
-   decision above.
+1. **Remote transport — done, shipped as direct HTTP, not a tunnel.**
+   `main.js` gained a config loader and a provisioning path
+   (`ensureRemoteContainer`); unlike the SSH-tunnel design originally
+   sketched here, the client talks straight to the container over HTTP, so
+   `server.py` (a `--host` flag), `index.html` (relaxed CSP), and
+   `renderer/app.js` (host-aware `API` constant) all needed small changes
+   after all. Ships the Dockerfile/compose file for the remote host
+   (`pid: host`, `network_mode: host`, docker socket mount).
+2. **Collector de-duplication — done.** `State._open_or_reuse()` in
+   `server.py`: a target already open (matched by its exact
+   `docker://{host}/{stats|host|type/name}` path) is returned as-is,
+   check-then-insert under one continuous lock hold rather than the
+   previous two-separate-acquisitions version, which really could start
+   two collectors for the same target under real concurrent load. Proven,
+   not just written: a 16-thread test hitting the identical target through
+   a `threading.Barrier` reliably produces exactly one collector — and,
+   run against the pre-fix code as a check that the test itself has teeth,
+   reliably fails there (8/8 runs), confirming it wasn't passing
+   vacuously. 100% line coverage maintained (157 server tests total).
+3. **File transfer module — done.** `server/files.py` (`download_sample`,
+   `upload_and_open`) plus `GET /files/download` / `POST /files/upload`
+   on `server.py`; `main.js` gained `saveBinary`/`readFile` and dropped
+   the now-unused `saveFile`; `exportSample()` and the Load-metrics
+   handler in `app.js` rewired to fetch/POST bytes instead of exchanging
+   server-side paths. 100% coverage maintained on `server.py` and the new
+   `files.py` (182 server tests); renderer E2E covers the real
+   fetch-based upload/download round trip (53 tests). Full details and a
+   couple of real findings from building it (the
+   `Access-Control-Expose-Headers` gotcha, `contextBridge` object
+   immutability) in
+   [File transfer (upload / download) — implemented](#file-transfer-upload--download--implemented).
 4. **Client-side key management.** Port key generate/import/list/delete
    and sample decryption to Electron/Node `crypto`; retire (or gate behind
    embedded-mode-only) the server's `/cttc/keys/*` endpoints and `/open`'s
    `private_key` parameter once the client can decrypt locally.
-5. **Path B (token + TLS + CSP)** only if a real deployment blocks SSH
-   egress — still deferred, still strictly more code/attack-surface than
-   phases 1–4 need.
+5. **Auth + TLS (bearer token, `--bind` safety catch, cert termination) —
+   explicitly deferred, not forgotten.** Phase 1 shipped the direct-HTTP
+   transport *without* this: trusted-network-only exposure was a deliberate
+   near-term call, not an oversight, made when dropping the SSH-tunnel
+   design. This remains the next thing to build once a deployment needs the
+   server reachable somewhere not already trusted end-to-end (untrusted
+   LAN, internet-facing, compliance requirement, ...) — see option B above
+   for the concrete design (token header + `?token=` for SSE, `--bind`
+   defaulting to loopback unless a token is set, TLS terminated in front
+   rather than added to `server.py` itself).
 
 Phases 1–3 are independent of each other and can land in any order; phase 4
 depends on phase 3 (decryption needs the downloaded bytes to decrypt).
+
+## Future direction: a VS Code extension client (not this phase)
+
+Flagged for a later exploration, not started: packaging the CTTC *client*
+as a VS Code extension instead of (or alongside) the Electron app — viewing
+correlated telemetry/logs inside the editor.
+
+One thing worth banking now while it's fresh: phase 1's decision to keep
+`lib/connection-config.js` and `lib/server-provision.js` as plain Node
+modules with zero `electron` dependency (see
+[What changes in Electron for the remote path](#what-changes-in-electron-for-the-remote-path-as-shipped))
+means they already run unmodified in *any* Node host process — a VS Code
+extension's extension host is exactly that. The remote-server transport
+this phase built isn't Electron-specific despite living in `app/main.js`
+today; a future VS Code extension would reuse both modules as-is rather
+than reimplementing remote provisioning. Whether the *rest* of the client
+(the canvas-based renderer, IPC-shaped interactions) ports as cleanly is
+the real question for that future exploration — not answered here.

@@ -1,0 +1,34 @@
+# Deployment variant of docker-compose.yml: no `build:` context, because
+# this ships alongside a pre-built image (docker load'd from
+# cttc-gateway.tar.gz) rather than the server sources -- see
+# releases/windows/deploy.ps1 and docs/architecture/remote-server.md. Keep
+# the two files' `image`/`pid`/`network_mode`/`volumes` in sync by hand;
+# docker-compose.yml stays the source-build version for local dev.
+services:
+  cttc-gateway:
+    image: cttc-gateway:latest
+    restart: unless-stopped
+    # both required for accurate host telemetry (HostStatsSource uses
+    # psutil, which without these only sees this container's own cgroup/
+    # network-namespace view, not the physical host's):
+    pid: host
+    network_mode: host
+    environment:
+      - SSH_AUTH_SOCK=/ssh-agent
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Lets `docker -H ssh://...` (Set Sources with an ssh:// host) reach a
+      # *third* machine, authenticating as whatever key this host's own
+      # ssh-agent already has loaded -- no key ever lives in the container.
+      # Falls back to /dev/null (a harmless no-op mount) when this host has
+      # no SSH_AUTH_SOCK exported, e.g. no agent running: see
+      # docs/architecture/remote-server.md.
+      - ${SSH_AUTH_SOCK:-/dev/null}:/ssh-agent
+      # The same private key the client used to reach this host, copied
+      # here by server-provision.js's ensureRemoteContainer at deploy time
+      # -- ssh's own default identity location, so it's tried automatically
+      # by every outbound ssh call this container makes (the one above,
+      # HostStatsSource), no per-host ssh_config needed. Falls back to
+      # /dev/null (no-op) when the gateway was reached via agent/no explicit
+      # key -- see docs/architecture/remote-server.md.
+      - ${CTTC_ID_RSA:-/dev/null}:/root/.ssh/id_rsa:ro

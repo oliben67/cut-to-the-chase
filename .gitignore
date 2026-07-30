@@ -8,3 +8,6 @@ stay-the-course/
 .prompts/
 *.cttc
 .coverage
+releases/windows/cttc-windows-deploy.zip
+releases/windows/cttc-windows-deploy/
+.vscode/settings.json

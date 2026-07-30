@@ -24,7 +24,7 @@ In short, CTTC can:
   three-state container legend, searchable virtual-scrolled log panels,
   pop-out windows that stay in sync;
 - **capture and share** — point-in-time snapshots (TXT/JSON), and
-  drag-selected time ranges exported as `.cttc` metrics files — optionally
+  drag-selected time ranges exported as `.cttc-metric` metrics files — optionally
   **encrypted** for a chosen recipient, with a built-in key manager;
 - **reshape logs at ingest** via drop-in Python transform modules.
 
@@ -67,7 +67,7 @@ generator to keep it appending.
     server via `uv run`, opens the renderer with the server's port.
   - [app/server/server.py](app/server/server.py) — Python server (deps via
     **uv**, JSON via **orjson**): ingestion/normalization, tailing, docker +
-    host collectors, series bucketing, `.cttc` export/load + encryption,
+    host collectors, series bucketing, `.cttc-metric` export/load + encryption,
     SSE. Binds `127.0.0.1` only.
   - [app/renderer/](app/renderer/) — dependency-free canvas charting +
     virtual-scrolled log panels.

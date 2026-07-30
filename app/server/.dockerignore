@@ -1,0 +1,10 @@
+# Only pyproject.toml, every top-level *.py module, and transforms/ are ever
+# COPYed into the image (see Dockerfile); everything else here is local
+# dev/test state that shouldn't even be sent to the docker daemon as build
+# context.
+.venv/
+__pycache__/
+.pytest_cache/
+.coverage
+tests/
+uv.lock
