@@ -99,8 +99,17 @@ const state = {
   ticks: new Map(),       // log source id -> counts[]
   visible: new Map(),     // series name -> bool
   hiddenSamples: new Set(), // loaded .cttc-metric/.cttc-record path -> hidden (whole-file toggle)
+  // Whole-app "viewing recorded metrics" mode -- true whenever a loaded
+  // sample/recording should take over the display: the Recording/
+  // Frequency/Live tracking toolbar group and every *live* source's
+  // graphs/logs hide (see isLiveDataHidden), replaced by one "Back to live
+  // tracking" button. Session-only (not persisted): set automatically the
+  // moment a metric/recording finishes loading (see btn-load-sample/
+  // openRecording), cleared by that button without discarding the sample,
+  // so it can flip back and forth as long as the sample stays loaded.
+  liveHidden: false,
   hoverGroup: "svc",      // strip group under the pointer: "svc" | "host"
-  chartStyle: prefs.get("chartStyle", "lines"), // "lines" | "bars"
+  chartStyle: prefs.get("chartStyle", { svc: "lines", host: "lines" }), // per graph: "lines" | "bars"
   showHost: prefs.get("showHost", true),
   showLanes: prefs.get("showLanes", false), // per-log-source "entry occurred here" bars, between telemetry and host
   track: prefs.get("track", {}),           // series name -> "sel" | "mut" | "hid"
@@ -115,6 +124,14 @@ const state = {
   // state.track/state.visible above.
   panelOrder: prefs.get("panelOrder", {}),
 };
+// Migrates a pre-per-graph "chartStyle" pref (a bare "lines"/"bars" string,
+// applied to every graph at once) to the {svc, host} shape -- carries the
+// old single value over to both graphs rather than silently resetting
+// anyone's saved preference.
+if (typeof state.chartStyle === "string") {
+  state.chartStyle = { svc: state.chartStyle, host: state.chartStyle };
+  prefs.set("chartStyle", state.chartStyle);
+}
 
 /* Tracking states: "sel" plots + normal legend entry; "mut" (not selected)
    listed disabled, not plotted; "hid" filtered out of the legend entirely.
@@ -139,7 +156,19 @@ const STRIPS = [
   { key: "net", title: "NET", fmt: fmtBytes },
 ];
 const MARGIN_L = 46, MARGIN_R = 8, AXIS_H = 20;
-let stripH = prefs.get("stripH", 96); // strip height; the splitter resizes it
+const STRIP_MIN_H = 44;
+// Per-strip height -- no longer a fixed/dragged value: each group (svc,
+// host) auto-fits its own strips to whatever vertical room its container
+// (#charts/#host-charts) actually has, shrinking or growing with it rather
+// than staying a constant pixel height regardless of available space.
+// Recomputed per group right before that group's own drawStrip() calls
+// (see drawAll()) -- read by drawStrip() as a plain module variable since
+// strips within one group always draw synchronously, back to back.
+let stripH = 96;
+function computeStripH(containerEl) {
+  const avail = containerEl.clientHeight - AXIS_H;
+  return Math.max(STRIP_MIN_H, avail / STRIPS.length);
+}
 
 // "now" line (Preferences > Appearance > "Now" line) -- a marker for the
 // actual current time, distinct from the cursor/selection accent line.
@@ -285,6 +314,13 @@ function sampleFileGroups() {
 function isSampleHidden(sid) {
   const src = state.sources.find((s) => s.id === sid);
   return !!(src && src.live === false && state.hiddenSamples.has(src.path));
+}
+// The inverse of isSampleHidden: true for a *live* source while the app is
+// in "viewing recorded metrics" mode (state.liveHidden) -- checked
+// everywhere isSampleHidden is, so live and sample data hide symmetrically
+// depending on which one the toolbar is currently focused on.
+function isLiveDataHidden(sid) {
+  return state.liveHidden && isLiveSid(sid);
 }
 // this sample file's dash rhythm for chart lines, keyed by its slot (see
 // sampleSlot() above) so it stays the same across redraws/reorders.
@@ -482,10 +518,10 @@ function seriesOf(group, respectVisibility = true) {
     if (!!s.host !== (group === "host")) return false;
     if (group === "svc" && POPOUT_KIND === "series") {
       // a series popout shows exactly its one series, whatever its track state
-      return s.name === POPOUT_ID && !isSampleHidden(s.sid);
+      return s.name === POPOUT_ID && !isSampleHidden(s.sid) && !isLiveDataHidden(s.sid);
     }
     if (group === "svc" && trackStateOf(s) !== "sel") return false;
-    if (isSampleHidden(s.sid)) return false;
+    if (isSampleHidden(s.sid) || isLiveDataHidden(s.sid)) return false;
     return !respectVisibility || state.visible.get(s.name) !== false;
   });
 }
@@ -524,9 +560,12 @@ function drawAll() {
   lanesEl.hidden = !state.showLanes;
   $("btn-lanes-toggle").textContent = state.showLanes ? "\u25be" : "\u25b8";
   $("btn-lanes-toggle").title = state.showLanes ? "Hide log entry markers" : "Show log entry markers";
+  stripH = computeStripH(chartsEl);
   STRIPS.forEach((spec, i) => drawStrip(stripCanvases[i], spec, "svc", i === STRIPS.length - 1));
-  if (hasHost && state.showHost && !hostBlockEl.hidden)
+  if (hasHost && state.showHost && !hostBlockEl.hidden) {
+    stripH = computeStripH(hostChartsEl);
     STRIPS.forEach((spec, i) => drawStrip(hostCanvases[i], spec, "host", i === STRIPS.length - 1));
+  }
   if (state.showLanes) drawLanes();
   updateTimelineNav(chartNav);
   updateTimelineNav(hostNav);
@@ -575,7 +614,7 @@ function drawStrip(c, spec, group, isLast) {
   ctx.fillText(spec.title, MARGIN_L + 4, 12);
 
   const px = state.series?.px || pw;
-  if (state.chartStyle === "bars") {
+  if (state.chartStyle[group] === "bars") {
     // histogram: one bar per non-empty bucket, translucent so overlapping
     // series stay readable. Sample-sourced series get a grayed hatch fill
     // instead of a solid one (see sample-vs-live styling above).
@@ -731,7 +770,7 @@ function drawVerticals(ctx, h) {
 /* ── density lanes (one per log source) ─────────────────────────────────── */
 
 function drawLanes() {
-  let logs = state.sources.filter((s) => s.kind === "log" && !isSampleHidden(s.id));
+  let logs = state.sources.filter((s) => s.kind === "log" && !isSampleHidden(s.id) && !isLiveDataHidden(s.id));
   // a series popout keeps only the lanes of the same-named log source(s)
   if (POPOUT_KIND === "series") logs = logs.filter((s) => s.name === POPOUT_ID);
   // rebuild DOM if the set changed
@@ -857,7 +896,7 @@ async function startTracking(s) {
           stats: false, host_stats: false, transforms: [],
           logs: [{ name: s.name, type: ttype }],
           ssh_key: dockerHostKeys.get(host) ?? null,
-          interval: 5,
+          interval: dockerPollIntervalSecs,
         });
       } catch (err) {
         setStatus(String(err.message || err));
@@ -1043,6 +1082,18 @@ let sampleArmed = false;
 function setSampleArmed(v) {
   sampleArmed = v;
   document.body.classList.toggle("sample-armed", v);
+  // Blinking "capture mode" reminder in the bottom status bar, for as long
+  // as the next chart drag would export a sample instead of zooming --
+  // covers all three ways this turns back off (drag completes the export,
+  // Esc cancels, or a fresh armSampleCapture() call re-arms it).
+  const el = $("app-status-bar-text");
+  if (v) {
+    el.textContent = "capture mode ✂️";
+    el.classList.add("status-bar-blink");
+  } else if (el.classList.contains("status-bar-blink")) {
+    el.classList.remove("status-bar-blink");
+    el.textContent = "";
+  }
 }
 
 function armSampleCapture() {
@@ -1115,7 +1166,7 @@ function hasDockerDaemon() {
   return state.sources.some((s) => /^docker:\/\//.test(s.path || ""));
 }
 
-// Edit/Remove Docker Daemon only make sense once something is actually
+// Edit/Remove Docker Host only make sense once something is actually
 // being watched -- enabling them regardless invited editing/removing a
 // daemon that doesn't exist (Edit would show a locked, empty form; Remove
 // had nothing to close). Called after every state.sources refresh.
@@ -1123,10 +1174,14 @@ function syncDockerDaemonButtons() {
   const active = hasDockerDaemon();
   $("btn-edit-docker-daemon").disabled = !active;
   $("btn-clear-sources").disabled = !active;
-  // Only one Docker daemon can be watched at a time -- Set Docker Daemon
+  // Only one Docker host can be watched at a time -- Set Docker Host
   // is for defining the first one; once one exists, use Edit Docker
-  // Daemon (or Remove it first) instead of starting a second one.
+  // Daemon (or Disconnect it first) instead of starting a second one.
   $("btn-set").disabled = active;
+  // Remove Docker Host (permanently forgetting a saved one) is independent
+  // of whether anything is currently connected -- it operates on the saved
+  // catalog (savedDockerDaemons), not on state.sources.
+  $("btn-remove-docker-daemon").disabled = Object.keys(prefs.get("savedDockerDaemons", {})).length === 0;
 }
 
 const dlgExport = $("dlg-export");
@@ -1178,7 +1233,7 @@ async function exportSample(t0, t1) {
       await post("/docker/collect", {
         host, stats: false, host_stats: true, logs: [], transforms: [],
         ssh_key: dockerHostKeys.get(host || "local") ?? null,
-        interval: 5,
+        interval: dockerPollIntervalSecs,
       });
     } catch (err) {
       setStatus("could not start host telemetry: " + (err.message || err));
@@ -1251,7 +1306,7 @@ async function computeSlice(t, { includeLogs, ctxLines }) {
 
   let logs = [];
   if (includeLogs) {
-    const logSources = state.sources.filter((s) => s.kind === "log" && !isSampleHidden(s.id));
+    const logSources = state.sources.filter((s) => s.kind === "log" && !isSampleHidden(s.id) && !isLiveDataHidden(s.id));
     logs = await Promise.all(logSources.map(async (s) => {
       try {
         const idx = await get(`/index_at?source=${s.id}&t=${t}`);
@@ -1543,11 +1598,11 @@ function fmtSpan(ms) {
 }
 
 function updateViewRangeLabel() {
-  const el = $("view-range-label");
+  const el = $("view-range-label-text");
   if (!el) return;
   if (!state.view) { el.textContent = ""; return; }
   const t0 = new Date(state.view.t0).toISOString().replace("T", " ").replace(/\.\d+Z$/, " UTC");
-  el.textContent = `view: ${t0} + ${fmtSpan(state.view.t1 - state.view.t0)}`;
+  el.textContent = `${t0} + ${fmtSpan(state.view.t1 - state.view.t0)}`;
 }
 
 function setView(t0, t1, opts = {}) {
@@ -1590,7 +1645,7 @@ function updateLiveResumeUI() {
     $("app-status-bar-text").textContent = `Live tracking disabled — resuming in ${remaining}s (clicking "now" will resume live tracking)`;
     state.liveResumeStatusShown = true;
   } else if (state.liveResumeStatusShown) {
-    $("app-status-bar-text").textContent = "No event activity yet";
+    $("app-status-bar-text").textContent = "";
     state.liveResumeStatusShown = false;
   }
 }
@@ -1886,7 +1941,7 @@ class Panel {
     const close = document.createElement("button");
     close.className = "close";
     close.textContent = "✕";
-    close.title = "Disable this container's telemetry (logs + chart) -- keeps collecting in the background, still Set Docker Daemon-synced";
+    close.title = "Disable this container's telemetry (logs + chart) -- keeps collecting in the background, still Set Docker Host-synced";
     // Same hide as switching it off from the Telemetry legend -- not an
     // actual /close: collection keeps running server-side, and re-enabling
     // it (from the legend) brings this exact panel back at the same spot,
@@ -2232,7 +2287,7 @@ function syncPanels() {
     // via the legend or the panel's own close button (see Panel's close
     // handler) -- collection keeps running server-side either way, so it's
     // still right here, at the exact same spot, whenever it's switched back on.
-    p.el.hidden = isSampleHidden(s.id) || state.visible.get(s.name) === false;
+    p.el.hidden = isSampleHidden(s.id) || isLiveDataHidden(s.id) || state.visible.get(s.name) === false;
   }
   // Reorders the DOM to match panelOrder every sync -- appendChild on an
   // already-attached node just moves it, so this is cheap and keeps a
@@ -2262,6 +2317,15 @@ async function refreshAll() {
   try {
     const [src, range] = await Promise.all([get("/sources"), get("/range")]);
     state.sources = src.sources;
+    // "Viewing recorded metrics" mode (see setLiveHidden) is a reflection of
+    // whether any sample/recording source is actually open, re-derived on
+    // every refresh (not just right after a fresh upload) -- otherwise
+    // re-loading a file that's already open (a no-op upload, see
+    // btn-load-sample) or a sample restored from an earlier session would
+    // never trip it, leaving live data shown right alongside the sample it
+    // was supposed to hide behind.
+    const hasSample = state.sources.some((s) => s.live === false);
+    if (hasSample !== state.liveHidden) setLiveHidden(hasSample);
     assignColorSlots(); // before anything draws, so slots don't depend on draw order
     const hadView = !!state.view;
     state.range = range;
@@ -2320,7 +2384,7 @@ const dlg = $("dlg-set");
 // through the dialog reuse it instead of silently dropping back to null.
 // Persisted via prefs (not just an in-memory Map): without this, restarting
 // the app forgot every remote host's ssh key even though its docker
-// collection itself is restored on launch, so "Edit Docker Daemon" ->
+// collection itself is restored on launch, so "Edit Docker Host" ->
 // Refresh silently fell back to no key at all and failed for any host that
 // actually needs one.
 class PersistedMap extends Map {
@@ -2364,7 +2428,7 @@ function openPaths() {
 // Fetch has shown what's actually on the host.
 let dockerFormFetched = false;
 
-// Whether the dialog is currently in "Edit Docker Daemon" mode -- listContainers()'s
+// Whether the dialog is currently in "Edit Docker Host" mode -- listContainers()'s
 // finally-block needs this so a Refresh doesn't unlock the host/ssh-key
 // fields that Edit mode deliberately locked (see btn-edit-docker-daemon
 // below): Fetch (create mode) and Refresh (edit mode) share the exact same
@@ -2373,8 +2437,10 @@ let dockerFormFetched = false;
 let dockerDaemonEditMode = false;
 
 // No dedicated telemetry section/poll-interval field in Set/Edit Docker
-// Daemon anymore -- collection is always on, at this fixed rate.
-const DEFAULT_DOCKER_POLL_INTERVAL = 5;
+// Host anymore -- it's the toolbar/Settings' own "Frequency" field now
+// (see setDockerPollIntervalSecs further down), applied to every Set/
+// Update Docker Host submission.
+let dockerPollIntervalSecs = prefs.get("dockerPollIntervalSecs", 5);
 
 // Transform names (see server/transforms/*.py) ticked by default in the
 // transforms checklist -- see listContainers()'s Fetch/Refresh handler.
@@ -2383,10 +2449,10 @@ const DEFAULT_ON_TRANSFORMS = new Set(["json_message", "parse_level"]);
 // The durable "which containers/services were actually selected" record
 // for whatever host is currently open in the dialog -- read from
 // ~/.cttc/[user]@[gateway]-containers.json (see lib/container-selection.js)
-// the moment Edit Docker Daemon opens, and what the checklist's checked
+// the moment Edit Docker Host opens, and what the checklist's checked
 // defaults/missing-detection are driven by from then on (not state.track,
 // which is a this-session-only, in-memory legend concern). Reset to empty
-// by Set Docker Daemon -- a fresh daemon starts with nothing preselected,
+// by Set Docker Host -- a fresh daemon starts with nothing preselected,
 // never carrying over a stale file from some earlier, unrelated session.
 let selectedTargets = { containers: new Set(), services: new Set() };
 
@@ -2411,6 +2477,41 @@ async function saveSelectedTargets(hostKey, { containers, services }) {
   }
 }
 
+// Every daemon ever successfully Set/Updated (see savedDockerDaemons' write
+// site further down), newest-used first -- backs both the "Load daemon"
+// dropdown here and the Remove Docker Host picker.
+function dockerHostHistory() {
+  const saved = prefs.get("savedDockerDaemons", {});
+  return Object.entries(saved)
+    .map(([hostKey, entry]) => ({ hostKey, ...entry }))
+    .sort((a, b) => (b.lastUsed || 0) - (a.lastUsed || 0));
+}
+
+// Fills the Set Docker Host dialog's "Load daemon" dropdown -- hidden
+// entirely (rather than just empty) when there's no history yet, so a
+// first-time user isn't shown a picker with nothing useful in it.
+function populateDockerHostHistory() {
+  const history = dockerHostHistory();
+  $("docker-host-history-row").hidden = history.length === 0;
+  const select = $("docker-host-history");
+  select.innerHTML = '<option value="">— pick a previously used daemon —</option>';
+  for (const entry of history) {
+    const opt = document.createElement("option");
+    opt.value = entry.hostKey;
+    opt.textContent = entry.hostKey === "local" ? "This machine" : entry.hostKey.replace(/^ssh:\/\//, "");
+    select.appendChild(opt);
+  }
+  select.value = "";
+}
+$("docker-host-history").onchange = () => {
+  const hostKey = $("docker-host-history").value;
+  if (!hostKey) return;
+  const entry = dockerHostHistory().find((e) => e.hostKey === hostKey);
+  if (!entry) return;
+  $("docker-host").value = hostKey === "local" ? "" : hostKey.replace(/^ssh:\/\//, "");
+  $("docker-ssh-key").value = entry.ssh_key || "";
+};
+
 // Every control except Docker host / SSH key / Fetch starts empty and
 // disabled -- there's nothing to configure until Fetch has actually shown
 // what's running on the host currently typed in (see setDockerFormEnabled),
@@ -2425,21 +2526,22 @@ $("btn-set").onclick = () => {
   $("docker-ssh-key").value = "";
   $("docker-ssh-key").disabled = false;
   $("docker-ssh-key-browse").disabled = false;
-  $("dlg-set-title").textContent = "Set Docker Daemon";
-  $("btn-ps-refresh").textContent = "Fetch";
-  $("dlg-ok").textContent = "Set Docker Daemon";
+  $("dlg-set-title").textContent = "Set Docker Host";
+  $("btn-ps-refresh-label").textContent = "Fetch Sources";
+  $("dlg-ok").textContent = "Set Docker Host";
   $("docker-targets").innerHTML = "";
   $("transforms-list").innerHTML = "none found in server/transforms/";
   $("docker-error").textContent = "";
   setDockerFormEnabled(false);
   renderActivityLog(null);
+  populateDockerHostHistory();
   dlg.showModal();
 };
 
-// Reopens the same dialog pre-pointed at whatever Docker daemon is
+// Reopens the same dialog pre-pointed at whatever Docker host is
 // currently active (see currentDockerHost()/dockerHostKeys) -- host and ssh
 // key are locked (this is "reconfigure/refresh what's already set", not
-// "pick a new target": use Set Docker Daemon for that), and Fetch becomes
+// "pick a new target": use Set Docker Host for that), and Fetch becomes
 // Refresh, since it's re-probing a known daemon rather than connecting to a
 // new one. Submitting still goes through the same dlg-ok handler as the
 // create flow -- disabled inputs' .value reads normally, so nothing there
@@ -2448,14 +2550,17 @@ $("btn-edit-docker-daemon").onclick = async () => {
   dockerDaemonEditMode = true;
   const host = currentDockerHost();
   const hostKey = host || "local";
+  // Load daemon only makes sense when picking a *new* target -- Edit's
+  // host/ssh-key are locked to the daemon already being edited.
+  $("docker-host-history-row").hidden = true;
   $("docker-host").value = host ? host.replace(/^ssh:\/\//, "") : "";
   $("docker-host").disabled = true;
   $("docker-ssh-key").value = dockerHostKeys.get(hostKey) || "";
   $("docker-ssh-key").disabled = true;
   $("docker-ssh-key-browse").disabled = true;
-  $("dlg-set-title").textContent = "Edit Docker Daemon";
-  $("btn-ps-refresh").textContent = "Refresh";
-  $("dlg-ok").textContent = "Update Docker Daemon";
+  $("dlg-set-title").textContent = "Edit Docker Host";
+  $("btn-ps-refresh-label").textContent = "Refresh Sources";
+  $("dlg-ok").textContent = "Update Docker Host";
   $("transforms-list").innerHTML = "none found in server/transforms/";
   $("docker-error").textContent = "";
   // The durable "what was actually selected" record for this daemon --
@@ -2471,7 +2576,7 @@ $("btn-edit-docker-daemon").onclick = async () => {
   setDockerFormEnabled(true);
   renderActivityLog(null);
   dlg.showModal();
-  // Edit Docker Daemon always opens onto the daemon's *actual* current
+  // Edit Docker Host always opens onto the daemon's *actual* current
   // state, not a snapshot from whenever it was last set -- run the same
   // live probe Refresh does immediately, so a container that's since
   // disappeared is caught (and disabled in the list, see
@@ -2496,7 +2601,7 @@ function setDockerFormEnabled(enabled) {
   updateDlgOkEnabled();
 }
 
-// Set/Update Docker Daemon submits exactly what's checked (see dlg-ok's
+// Set/Update Docker Host submits exactly what's checked (see dlg-ok's
 // onclick) -- with nothing ticked there'd be nothing to collect at all, so
 // it stays disabled until at least one container/service is actually
 // checked, on top of the Fetch/Refresh-gated enabling above. Re-checked
@@ -2507,18 +2612,93 @@ function updateDlgOkEnabled() {
   $("dlg-ok").disabled = !dockerFormFetched || !anyChecked;
 }
 
-// close every open source and forget the remembered last-session containers,
-// so the next launch starts with nothing and the set-sources dialog opens.
+// Closes every open source for the currently-connected daemon and drops it
+// from the auto-reconnect-on-launch list (lastDockerSessions), so it
+// doesn't silently come right back next launch -- but keeps its entry in
+// savedDockerDaemons, so it still shows up in Load daemon (Set Docker
+// Daemon) and Remove Docker Host. "Disconnect", not "forget" -- use
+// Remove Docker Host for that.
 $("btn-clear-sources").onclick = async () => {
   if (!state.sources.length) return; // nothing to clear -- no point asking
-  if (!confirm(`Close all ${state.sources.length} open source${state.sources.length === 1 ? "" : "s"}? This can't be undone.`)) return;
+  if (!confirm(`Close all ${state.sources.length} open source${state.sources.length === 1 ? "" : "s"}? You can reconnect it later via Load daemon.`)) return;
+  const hostKey = currentDockerHost() || "local";
   try {
     await Promise.all(state.sources.map((s) => post("/close", { id: s.id })));
-    prefs.set("lastDockerSessions", []);
+    const sessions = prefs.get("lastDockerSessions", []);
+    prefs.set("lastDockerSessions", sessions.filter((s) => (s.host || "local") !== hostKey));
     await refreshAll();
+    // If Edit Docker Host is open on the daemon just cleared, it's left
+    // pointing at a host that no longer exists, with docker-host still
+    // locked disabled (see btn-edit-docker-daemon) -- nothing else re-opens
+    // or resets it, so without this it stays stuck disabled even after the
+    // toolbar's own Set Docker Host re-enables (bug: this used to be the
+    // only way stuck). Closing it is safe: its whole premise (editing the
+    // daemon that was just removed) is gone.
+    if (dlg.open) {
+      dlg.close();
+      dockerDaemonEditMode = false;
+      $("docker-host").disabled = false;
+    }
   } catch (err) {
     alert(String(err.message || err));
   }
+};
+
+/* ── Remove Docker Host: permanently forget a saved daemon ─────────────
+   Distinct from Disconnect (above), which only stops it from auto-
+   reconnecting -- this deletes it from savedDockerDaemons, its ssh-key
+   mapping, and its ~/.cttc/[user]@[gateway]-containers.json selection file
+   on disk, per host, picked from a dropdown of every daemon ever saved. */
+
+const dlgRemoveDaemon = $("dlg-remove-daemon");
+
+function populateRemoveDaemonSelect() {
+  const history = dockerHostHistory();
+  const select = $("remove-daemon-select");
+  select.innerHTML = '<option value="">— pick a daemon to remove —</option>';
+  for (const entry of history) {
+    const opt = document.createElement("option");
+    opt.value = entry.hostKey;
+    opt.textContent = entry.hostKey === "local" ? "This machine" : entry.hostKey.replace(/^ssh:\/\//, "");
+    select.appendChild(opt);
+  }
+  select.value = "";
+  $("dlg-remove-daemon-delete").disabled = true;
+  $("remove-daemon-status").textContent = "";
+}
+$("btn-remove-docker-daemon").onclick = () => {
+  populateRemoveDaemonSelect();
+  dlgRemoveDaemon.showModal();
+};
+$("remove-daemon-select").onchange = () => {
+  $("dlg-remove-daemon-delete").disabled = !$("remove-daemon-select").value;
+};
+$("dlg-remove-daemon-close").onclick = () => dlgRemoveDaemon.close();
+$("dlg-remove-daemon-delete").onclick = async () => {
+  const hostKey = $("remove-daemon-select").value;
+  if (!hostKey) return;
+  if (!confirm(`Permanently forget the saved daemon "${hostKey === "local" ? "This machine" : hostKey}"? This can't be undone.`)) return;
+  // If it's currently connected, close it first -- leaving it running while
+  // its saved record vanishes would be a dangling, un-editable, un-
+  // reconnectable daemon.
+  const activeHostKey = currentDockerHost() || "local";
+  if (activeHostKey === hostKey && state.sources.length) {
+    await Promise.all(state.sources.map((s) => post("/close", { id: s.id })));
+    await refreshAll();
+  }
+  const saved = prefs.get("savedDockerDaemons", {});
+  delete saved[hostKey];
+  prefs.set("savedDockerDaemons", saved);
+  const sessions = prefs.get("lastDockerSessions", []);
+  prefs.set("lastDockerSessions", sessions.filter((s) => (s.host || "local") !== hostKey));
+  dockerHostKeys.delete(hostKey);
+  try {
+    await window.cttc?.deleteSelectedContainers?.(hostKey);
+  } catch (err) {
+    console.error("could not delete saved container selection for", hostKey, err);
+  }
+  syncDockerDaemonButtons();
+  dlgRemoveDaemon.close();
 };
 
 /* ── load .cttc-metric/.cttc-record files (separate from the Docker "Set
@@ -2606,7 +2786,7 @@ $("btn-load-sample").onclick = async () => {
     const errors = [];
     for (const path of files) errors.push(...((await uploadAndResolveSegment(path)).errors || []));
     if (errors.length) alert(errors.map((e) => `${e.path}: ${e.error}`).join("\n"));
-    await refreshAll();
+    await refreshAll(); // also switches into "viewing recorded metrics" mode -- see setLiveHidden
     resetZoom(); // show the full timeline, including the newly loaded metrics
   } catch (err) {
     alert(String(err.message || err));
@@ -2748,7 +2928,7 @@ async function openRecording() {
     const errors = [];
     for (const path of files) errors.push(...((await uploadAndResolveSegment(path)).errors || []));
     if (errors.length) alert(errors.map((e) => `${e.path}: ${e.error}`).join("\n"));
-    await refreshAll();
+    await refreshAll(); // also switches into "viewing recorded metrics" mode -- see setLiveHidden
     resetZoom();
   } catch (err) {
     alert(String(err.message || err));
@@ -2785,14 +2965,19 @@ $("btn-pause-recording").onclick = () => pauseRecording();
 $("btn-stop-recording").onclick = () => stopRecording();
 $("btn-open-recording").onclick = () => openRecording();
 
-/* ── theme preferences (dlg-theme) ───────────────────────────────────────
-   Reached via File > Preferences > Theme. Currently just the log-highlight
-   color (the background + dotted top/bottom border painted on log rows
-   within the sampling frequency window around the selected time — see
+/* ── theme preferences (dlg-preferences' "Preferences" pane) ──────────────
+   Reached via the sidebar's Appearance… button. Currently just the log-
+   highlight color (the background + dotted top/bottom border painted on
+   log rows within the sampling frequency window around the selected time — see
    Panel.render()'s "hl"/"hl-top"/"hl-bottom" classes). */
 
 const DEFAULT_HL_COLOR = "#eaff00"; // light neon yellow
-const dlgTheme = $("dlg-theme");
+// Settings and Preferences (formerly two separate dialogs, dlg-settings and
+// dlg-theme) now share one mac-System-Settings-style dialog with a left-hand
+// pane list -- see openPreferencesDialog/selectPreferencesPane below (kept
+// near the bottom of this section, after both panes' own field wiring is
+// defined, since selecting the Preferences pane re-prefills its fields).
+const dlgPreferences = $("dlg-preferences");
 
 function applyHlColor(color) {
   document.documentElement.style.setProperty("--hl-color", color);
@@ -2838,13 +3023,18 @@ function syncNowStyleButtons(style) {
   }
 }
 
-function openThemeDialog() {
+// Prefills the Preferences pane's fields from saved prefs -- called every
+// time that pane is selected (see selectPreferencesPane), not just once at
+// dialog-open, since the dialog itself now stays open across pane switches.
+function prefillPreferencesPane() {
   $("theme-hl-color").value = prefs.get("hlColor", DEFAULT_HL_COLOR);
   $("theme-status-bar-toggle").checked = statusBarEnabled;
   $("theme-now-color").value = prefs.get("nowLineColor", DEFAULT_NOW_COLOR);
   syncNowStyleButtons(prefs.get("nowLineStyle", DEFAULT_NOW_STYLE));
   $("theme-live-track-color").value = prefs.get("liveTrackColor", DEFAULT_LIVE_TRACK_COLOR);
-  dlgTheme.showModal();
+}
+function openThemeDialog() {
+  openPreferencesDialog("pane-preferences");
 }
 $("theme-hl-color").oninput = (e) => applyHlColor(e.target.value); // live preview
 $("theme-now-color").oninput = (e) => { nowLineColor = e.target.value; drawAll(); }; // live preview
@@ -2871,7 +3061,7 @@ $("dlg-theme-save").onclick = () => {
   prefs.set("nowLineColor", nowLineColor);
   prefs.set("nowLineStyle", nowLineStyle);
   prefs.set("liveTrackColor", liveTrackColor);
-  dlgTheme.close();
+  dlgPreferences.close();
 };
 $("dlg-theme-close").onclick = () => {
   applyHlColor(prefs.get("hlColor", DEFAULT_HL_COLOR)); // discard live preview
@@ -2879,7 +3069,7 @@ $("dlg-theme-close").onclick = () => {
   nowLineStyle = prefs.get("nowLineStyle", DEFAULT_NOW_STYLE);
   applyLiveTrackColor(prefs.get("liveTrackColor", DEFAULT_LIVE_TRACK_COLOR)); // discard live preview
   drawAll();
-  dlgTheme.close();
+  dlgPreferences.close();
 };
 
 /* ── status bar (Appearance > Status bar) ─────────────────────────────────
@@ -2902,7 +3092,6 @@ function setStatusBarVisible(visible) {
 $("theme-status-bar-toggle").onchange = (e) => setStatusBarVisible(e.target.checked);
 if (!POPOUT_KIND) {
   syncStatusBarVisibility();
-  $("app-status-bar-text").textContent = "No event activity yet";
 }
 function notifyEvent(text) {
   $("app-status-bar-text").textContent = `${new Date().toLocaleTimeString()} — ${text}`;
@@ -2910,26 +3099,21 @@ function notifyEvent(text) {
 
 /* ── docker host activity log (ssh:// connections) ──────────────────────── */
 
+// The Show activity switch is always visible now (not just once there's
+// something to show) -- it drives #docker-activity's visibility directly,
+// independent of whether entries exist yet, so flipping it on before any
+// command has run just shows an empty panel rather than a hidden control
+// with nothing to reveal.
 function renderActivityLog(entries) {
-  const toggle = $("btn-activity-toggle");
   const pre = $("docker-activity");
-  if (!entries || !entries.length) {
-    toggle.hidden = true;
-    pre.hidden = true;
-    pre.textContent = "";
-    return;
-  }
-  toggle.hidden = false;
-  pre.textContent = entries
+  pre.textContent = (entries || [])
     .map((e) => `$ ${e.cmd}\n  → exit ${e.returncode} (${e.ms}ms)${e.stderr ? `\n  ${e.stderr}` : ""}`)
     .join("\n\n");
+  pre.hidden = !$("activity-toggle").checked;
 }
 
-$("btn-activity-toggle").onclick = () => {
-  const pre = $("docker-activity");
-  const toggle = $("btn-activity-toggle");
-  pre.hidden = !pre.hidden;
-  toggle.textContent = pre.hidden ? "Show activity" : "Hide activity";
+$("activity-toggle").onchange = () => {
+  $("docker-activity").hidden = !$("activity-toggle").checked;
 };
 
 // Sets a checkbox's checked state and keeps its ✔/nothing mark in sync --
@@ -3022,7 +3206,7 @@ function renderDockerTargetGroup(box, title, items, type, wasChecked, selectedNa
 
 // Repopulates #docker-targets from a {name, image?, replicas?}[] pair --
 // either a live `docker ps` result (listContainers) or, immediately on
-// opening Edit Docker Daemon (before any Refresh), whatever's already being
+// opening Edit Docker Host (before any Refresh), whatever's already being
 // followed for this host (see btn-edit-docker-daemon below). Re-renders
 // are a diff against selectedTargets (the persisted record, see its own
 // comment), not a blind wipe: a Refresh that finds a *selected* container
@@ -3037,7 +3221,7 @@ function renderDockerTargetGroup(box, title, items, type, wasChecked, selectedNa
 // never the initial no-live-data pre-fill, which has nothing to diff
 // against yet) also actually closes any now-gone *selected* container/
 // service's source, so it stops being tracked/plotted immediately rather
-// than waiting on the user to notice and click Update Docker Daemon: "no
+// than waiting on the user to notice and click Update Docker Host: "no
 // longer available" should mean gone from the graph too, not just flagged
 // in this dialog.
 function renderDockerTargets(containers, services, hostKey, { closeMissing = false } = {}) {
@@ -3269,18 +3453,28 @@ $("dlg-ok").onclick = async () => {
 
     // Telemetry (per-container docker stats and host CPU/MEM/NET) is
     // always collected once a daemon is set -- no dedicated section/toggle
-    // for it in this dialog anymore, just the fixed default poll interval.
+    // for it in this dialog anymore, just the toolbar/Settings' own
+    // Frequency field (dockerPollIntervalSecs).
     const collectReq = {
       host, stats: true, logs, transforms,
       host_stats: true,
       ssh_key: sshKey,
-      interval: DEFAULT_DOCKER_POLL_INTERVAL,
+      interval: dockerPollIntervalSecs,
     };
     await post("/docker/collect", collectReq);
     // remember this collection request so it can be restored on next launch
     const sessions = prefs.get("lastDockerSessions", []);
     sessions.push(collectReq);
     prefs.set("lastDockerSessions", sessions);
+    // Separate, durable catalog of every daemon ever configured -- unlike
+    // lastDockerSessions (an unde-duped auto-reconnect-on-launch list that
+    // Disconnect Docker Host removes entries from), this is keyed by host
+    // and never touched by Disconnect, only by Remove Docker Host -- see
+    // dockerHostHistory()/populateDockerHostHistory() (Load daemon) and
+    // removeDockerDaemon() below.
+    const saved = prefs.get("savedDockerDaemons", {});
+    saved[hostKey] = { ...collectReq, lastUsed: Date.now() };
+    prefs.set("savedDockerDaemons", saved);
     // Every entry actually present in the checklist (checked or not, minus
     // the disabled/gone ones) gets its legend track state set explicitly to
     // match -- not just the checked ones. Only ever promoting to "sel" and
@@ -3291,7 +3485,7 @@ $("dlg-ok").onclick = async () => {
       setTrack(cb.value, cb.checked ? "sel" : "mut");
     }
     // ...and, separately, the durable per-daemon record consulted the next
-    // time Set/Edit Docker Daemon opens for this host (see selectedTargets
+    // time Set/Edit Docker Host opens for this host (see selectedTargets
     // / loadSelectedTargets) -- "on the way out" per the spec, on every
     // successful Set/Update, regardless of edit vs. create mode.
     selectedTargets = {
@@ -3316,24 +3510,37 @@ $("dlg-ok").onclick = async () => {
 
 /* ── toolbar ────────────────────────────────────────────────────────────── */
 
-// Poll interval has two live controls now (toolbar + the Settings dialog's
-// own copy) -- both need to stay in sync with each other and with a
-// detached action-bar window's own copy (see onSetPollInterval below), so
-// the actual state update lives in one place. A zero-second window would
-// highlight nothing (or everything, depending on how the ± compare is
+// Settings' "Time window" field (formerly the toolbar's "Frequency" too,
+// before that got repurposed below into the actual Docker poll interval) --
+// the ± highlight window around the selected time. A zero-second window
+// would highlight nothing (or everything, depending on how the ± compare is
 // read) -- 1s is the smallest interval that still means something.
-function setWindowSecs(v) {
+function setTimeWindowSecs(v) {
   const secs = Math.max(1, Math.floor(Number(v)) || 1);
   state.windowMs = secs * 1000;
-  $("win-secs").value = secs;
   $("win-secs-sidebar").value = secs;
   for (const p of panels.values()) p.render();
 }
 // "input" (not "change") so it takes effect immediately as you type/adjust,
 // rather than waiting for blur/Enter.
-$("win-secs").oninput = (e) => setWindowSecs(e.target.value);
-$("win-secs-sidebar").oninput = (e) => setWindowSecs(e.target.value);
-if (!POPOUT_KIND) window.cttc?.onSetPollInterval?.((secs) => setWindowSecs(secs));
+$("win-secs-sidebar").oninput = (e) => setTimeWindowSecs(e.target.value);
+
+// The toolbar's "Frequency" field -- how often (seconds) Set/Update Docker
+// Host polls the daemon for stats/logs. Persisted so it survives restarts;
+// applied to every future Set/Update Docker Host submission
+// (dockerPollIntervalSecs, used in the dlg-ok handler above). Doesn't push
+// a live update to an already-open collector on its own -- Update Docker
+// Host (Edit) is still what applies a changed interval to one already
+// running (see server.py's _update_poll_interval).
+function setDockerPollIntervalSecs(v) {
+  const secs = Math.max(1, Math.floor(Number(v)) || 1);
+  dockerPollIntervalSecs = secs;
+  prefs.set("dockerPollIntervalSecs", secs);
+  $("win-secs").value = secs;
+}
+$("win-secs").oninput = (e) => setDockerPollIntervalSecs(e.target.value);
+setDockerPollIntervalSecs(dockerPollIntervalSecs); // apply the persisted value on load
+if (!POPOUT_KIND) window.cttc?.onSetPollInterval?.((secs) => setDockerPollIntervalSecs(secs));
 
 // Live tracking's own seconds field -- never positive (the future has no
 // data to show yet, see liveTrackTick), persisted so it survives restarts.
@@ -3369,7 +3576,7 @@ setLiveTrackEnabled(liveTrackEnabled); // apply the persisted value to both fiel
 function flashStatus(msg, ms) {
   $("app-status-bar-text").textContent = msg;
   setTimeout(() => {
-    if ($("app-status-bar-text").textContent === msg) $("app-status-bar-text").textContent = "No event activity yet";
+    if ($("app-status-bar-text").textContent === msg) $("app-status-bar-text").textContent = "";
   }, ms);
 }
 
@@ -3400,17 +3607,34 @@ function setDblclickResumeSecs(v) {
 setDblclickResumeSecs(dblclickResumeSecs); // apply the persisted value on load
 $("dblclick-resume-secs-sidebar").oninput = (e) => setDblclickResumeSecs(e.target.value);
 
-// Settings: a real dialog (like Appearance), not an inline foldout --
-// opened via the shared data-action dispatch (see RENDERER_ACTIONS'
-// "open-settings" entry below), same as Appearance's "open-theme".
-const dlgSettings = $("dlg-settings");
-function openSettingsDialog() {
-  dlgSettings.showModal();
+// Settings and Preferences, one dialog: a left-hand pane list (mac System
+// Settings-style, see .mac-settings in style.css) with the selected pane's
+// fields on the right -- opened via the shared data-action dispatch (see
+// RENDERER_ACTIONS' "open-settings"/"open-theme" entries below), each
+// jumping straight to its own pane.
+function selectPreferencesPane(paneId) {
+  for (const item of dlgPreferences.querySelectorAll(".mac-settings-item")) {
+    item.dataset.active = String(item.dataset.pane === paneId);
+  }
+  for (const pane of dlgPreferences.querySelectorAll(".mac-settings-pane")) {
+    pane.hidden = pane.id !== paneId;
+  }
+  if (paneId === "pane-preferences") prefillPreferencesPane();
 }
-$("dlg-settings-close").onclick = () => dlgSettings.close();
+for (const item of dlgPreferences.querySelectorAll(".mac-settings-item")) {
+  item.onclick = () => selectPreferencesPane(item.dataset.pane);
+}
+function openPreferencesDialog(paneId) {
+  selectPreferencesPane(paneId);
+  dlgPreferences.showModal();
+}
+function openSettingsDialog() {
+  openPreferencesDialog("pane-settings");
+}
+$("dlg-settings-close").onclick = () => dlgPreferences.close();
 
 // Settings > Danger > Hard Reset: closes every open source (stopping
-// collection server-side, same as Remove Docker Daemon) and wipes every
+// collection server-side, same as Remove Docker Host) and wipes every
 // persisted UI preference (prefs' entire localStorage namespace -- track
 // states, panelOrder, dockerHostKeys, sidebar dock/size, theme, the "now"
 // line style, everything), then reloads to boot exactly like a brand-new
@@ -4258,20 +4482,31 @@ $("btn-popout-host").onclick = () => {
   window.cttc.popout("host", null, popoutView());
 };
 
-// reflects state.chartStyle onto the lines/histogram segmented control --
-// called on boot and whenever the style changes from elsewhere.
-function syncStyleButton() {
-  $("btn-style-lines").dataset.active = String(state.chartStyle !== "bars");
-  $("btn-style-histogram").dataset.active = String(state.chartStyle === "bars");
+// Lines vs histogram is per graph (state.chartStyle.svc / .host), not one
+// global toggle -- each of Telemetry's and Host telemetry's own headers
+// carries a single icon-only button (no label) that toggles and reflects
+// its own graph's current style, left of that panel's own pop-out button.
+const STYLE_ICON = {
+  lines: '<svg viewBox="0 0 512.007 512.007" fill="currentColor" aria-hidden="true"><path d="M501.333,448.004H64V10.67c0-5.891-4.776-10.667-10.667-10.667S42.667,4.779,42.667,10.67v437.333 h-32C4.776,448.004,0,452.779,0,458.67c0,5.891,4.776,10.667,10.667,10.667h32v32c0,5.891,4.776,10.667,10.667,10.667 S64,507.228,64,501.337v-32h437.333c5.891,0,10.667-4.776,10.667-10.667C512,452.779,507.224,448.004,501.333,448.004z"/><path d="M96,426.67c-5.891-0.008-10.66-4.791-10.651-10.682c0.003-2.414,0.825-4.755,2.331-6.641 l85.333-106.667c1.887-2.374,4.695-3.832,7.723-4.011c3.032-0.187,5.997,0.949,8.128,3.115l33.003,33.024l56.96-94.955 c1.815-3.027,5.01-4.959,8.533-5.163c3.472-0.151,6.816,1.323,9.045,3.989l28.544,35.691L362.901,93.87 c1.217-5.764,6.877-9.45,12.641-8.232c2.025,0.428,3.881,1.435,5.343,2.899l55.296,55.296L492.8,68.27 c3.53-4.716,10.215-5.678,14.931-2.149s5.678,10.215,2.149,14.931c-0.004,0.006-0.009,0.012-0.013,0.017l-64,85.333 c-3.535,4.712-10.221,5.666-14.934,2.131c-0.399-0.299-0.777-0.627-1.13-0.979l-50.069-50.091L341.12,300.932 c-1.213,5.765-6.87,9.454-12.635,8.241c-2.423-0.51-4.593-1.847-6.138-3.782l-33.088-41.344l-56.107,93.504 c-3.006,5.066-9.55,6.737-14.616,3.731c-0.752-0.446-1.446-0.983-2.066-1.598l-34.133-34.133l-77.995,97.131 C102.312,425.209,99.242,426.677,96,426.67z"/><path d="M53.333,512.004c-5.891,0-10.667-4.776-10.667-10.667V10.67c0-5.891,4.776-10.667,10.667-10.667S64,4.779,64,10.67v490.667 C64,507.228,59.224,512.004,53.333,512.004z"/><path d="M501.333,469.337H10.667C4.776,469.337,0,464.561,0,458.67c0-5.891,4.776-10.667,10.667-10.667h490.667 c5.891,0,10.667,4.776,10.667,10.667C512,464.561,507.224,469.337,501.333,469.337z"/></svg>',
+  bars: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="3" y="10" width="4.5" height="11" rx="1"/><rect x="9.75" y="5" width="4.5" height="16" rx="1"/><rect x="16.5" y="13" width="4.5" height="8" rx="1"/></svg>',
+};
+function syncStyleToggle(group) {
+  const btn = $(group === "host" ? "btn-style-toggle-host" : "btn-style-toggle-svc");
+  const style = state.chartStyle[group];
+  // shows the icon for the style a click would switch *to*, matching the
+  // order-toggle/live-toggle icon-swap pattern used elsewhere in the app.
+  const next = style === "bars" ? "lines" : "bars";
+  btn.innerHTML = STYLE_ICON[next];
+  btn.title = `Switch to ${next === "bars" ? "histogram" : "line plot"} (currently ${style === "bars" ? "histogram" : "line plot"})`;
 }
-function setChartStyle(style) {
-  state.chartStyle = style;
+function setChartStyle(group, style) {
+  state.chartStyle[group] = style;
   prefs.set("chartStyle", state.chartStyle);
-  syncStyleButton();
+  syncStyleToggle(group);
   drawAll();
 }
-$("btn-style-lines").onclick = () => setChartStyle("lines");
-$("btn-style-histogram").onclick = () => setChartStyle("bars");
+$("btn-style-toggle-svc").onclick = () => setChartStyle("svc", state.chartStyle.svc === "bars" ? "lines" : "bars");
+$("btn-style-toggle-host").onclick = () => setChartStyle("host", state.chartStyle.host === "bars" ? "lines" : "bars");
 
 $("btn-host-toggle").onclick = () => {
   state.showHost = !state.showHost;
@@ -4285,30 +4520,74 @@ $("btn-lanes-toggle").onclick = () => {
   drawAll();
 };
 
+// #chart-block / #panels split (see style.css's rigid flex: 0 0 <pct>%,
+// overridden here via inline style once a user actually drags this) --
+// individual strip heights are no longer part of what this drags (see
+// computeStripH: each graph now auto-fits whatever room its own container
+// ends up with, shrinking/growing with it), so dragging this now changes
+// how much of that room there *is*, between telemetry and the logs panel.
+let chartSplitPct = prefs.get("chartSplitPct", 70);
+function applyChartSplit() {
+  $("chart-block").style.flexBasis = chartSplitPct + "%";
+  panelsEl.style.flexBasis = 100 - chartSplitPct + "%";
+}
+applyChartSplit();
+
 /* splitter: dragging down grows the charts, dragging up grows the logs panel */
 $("splitter").addEventListener("mousedown", (e) => {
   e.preventDefault();
   $("splitter").classList.add("dragging");
-  const startY = e.clientY, startH = stripH;
-  const groups = 1 + (!hostBlockEl.hidden && state.showHost ? 1 : 0);
+  const startY = e.clientY, startPct = chartSplitPct;
+  const layoutH = $("layout").clientHeight || 1;
   const move = (ev) => {
-    stripH = Math.min(320, Math.max(44, startH + (ev.clientY - startY) / (STRIPS.length * groups)));
+    chartSplitPct = Math.min(85, Math.max(15, startPct + ((ev.clientY - startY) / layoutH) * 100));
+    applyChartSplit();
     drawAll();
   };
   const up = () => {
     window.removeEventListener("mousemove", move);
     $("splitter").classList.remove("dragging");
-    prefs.set("stripH", Math.round(stripH));
+    prefs.set("chartSplitPct", Math.round(chartSplitPct));
     scheduleSeriesFetch();
   };
   window.addEventListener("mousemove", move);
   window.addEventListener("mouseup", up, { once: true });
 });
 
+// Reflects "viewing recorded metrics" mode (state.liveHidden): swaps the
+// toolbar's mode icon (live.svg <-> record.svg), shows/hides the Live data
+// group vs. the Back to live tracking button, and re-renders so every live
+// source's graphs/logs actually hide/reappear (see isLiveDataHidden).
+// Doesn't touch which sources are open -- called automatically from
+// refreshAll() based on whether any sample/recording source is actually
+// present, so it always matches reality rather than only the instant a
+// file finishes uploading.
+function setLiveHidden(hidden) {
+  state.liveHidden = hidden;
+  $("toolbar-mode-live").hidden = hidden;
+  $("toolbar-mode-record").hidden = !hidden;
+  $("live-data-group").hidden = hidden;
+  $("btn-back-to-live").hidden = !hidden;
+  $("status-bar-mode-live").hidden = hidden;
+  $("status-bar-mode-record").hidden = !hidden;
+  relist();
+  syncPanels();
+}
+// Closes every loaded sample/recording source outright (live collection,
+// per its own docstring, was never stopped -- there's nothing else "live"
+// to resume) -- setLiveHidden(false) then follows automatically from
+// refreshAll() once no sample sources remain.
+$("btn-back-to-live").onclick = async () => {
+  const sampleSources = state.sources.filter((s) => s.live === false);
+  await Promise.all(sampleSources.map((s) => post("/close", { id: s.id })));
+  await refreshAll();
+};
+
 /* ── boot ───────────────────────────────────────────────────────────────── */
 
 buildStrips();
-syncStyleButton();
+syncStyleToggle("svc");
+syncStyleToggle("host");
 applyPopoutLayout();
 // main window: default view is the present, ± DEFAULT_SPAN/2. Popped-out
 // panel windows inherit the opener's exact view/cursor from the URL, so they
@@ -4403,6 +4682,7 @@ if (!POPOUT_KIND) {
     "set-sources": () => $("btn-set").click(),
     "edit-docker-daemon": () => $("btn-edit-docker-daemon").click(),
     "clear-sources": () => $("btn-clear-sources").click(),
+    "remove-docker-daemon": () => $("btn-remove-docker-daemon").click(),
     "load-metrics": () => $("btn-load-sample").click(),
     "new-gateway": () => openNewGatewayDialog(),
     "edit-gateways": () => openEditGatewaysDialog(),

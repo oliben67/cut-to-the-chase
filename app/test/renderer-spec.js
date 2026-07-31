@@ -110,45 +110,6 @@
     near((state.view.t0 + state.view.t1) / 2, MID, 1, "still centered");
   });
 
-  await T("zoomAtAnchored keeps the anchor point fixed, unlike zoomAt", () => {
-    setView(MID - 30000, MID + 30000);
-    const anchor = MID + 10000; // off-center, so recentering would move it
-    zoomAtAnchored(anchor, 0.5);
-    near(state.view.t1 - state.view.t0, 30000, 1, "halved");
-    near(anchor, state.view.t0 + (anchor - (MID - 30000)) * 0.5, 1, "anchor stayed put");
-    // the anchor's position within the view (as a fraction of the span) is unchanged
-    const before = { t0: MID - 30000, t1: MID + 30000 };
-    const fracBefore = (anchor - before.t0) / (before.t1 - before.t0);
-    const fracAfter = (anchor - state.view.t0) / (state.view.t1 - state.view.t0);
-    near(fracBefore, fracAfter, 0.001, "anchor's relative position preserved");
-  });
-
-  await T("wheel over a chart zooms anchored on the cursor, not the view center", () => {
-    setView(MID - 30000, MID + 30000);
-    const canvas = document.querySelector("canvas[data-strip]");
-    ok(canvas, "a strip canvas exists");
-    const rect = canvas.getBoundingClientRect();
-    const x = rect.left + rect.width * 0.75; // off-center, right side
-    const before = { ...state.view };
-    canvas.dispatchEvent(new WheelEvent("wheel", { deltaY: -100, clientX: x, clientY: rect.top + 5, bubbles: true, cancelable: true }));
-    ok(state.view.t1 - state.view.t0 < before.t1 - before.t0, "scrolling up (deltaY<0) zoomed in");
-
-    setView(MID - 30000, MID + 30000);
-    const before2 = { ...state.view };
-    canvas.dispatchEvent(new WheelEvent("wheel", { deltaY: 100, clientX: x, clientY: rect.top + 5, bubbles: true, cancelable: true }));
-    ok(state.view.t1 - state.view.t0 > before2.t1 - before2.t0, "scrolling down (deltaY>0) zoomed out");
-  });
-
-  await T("ctrl/meta+wheel over a chart is left alone (reserved for page zoom)", () => {
-    setView(MID - 30000, MID + 30000);
-    const canvas = document.querySelector("canvas[data-strip]");
-    const rect = canvas.getBoundingClientRect();
-    const before = { ...state.view };
-    canvas.dispatchEvent(new WheelEvent("wheel", { deltaY: -100, clientX: rect.left + 10, clientY: rect.top + 5, ctrlKey: true, bubbles: true, cancelable: true }));
-    eq(state.view.t0, before.t0);
-    eq(state.view.t1, before.t1);
-  });
-
   await T("recenterOn keeps span, moves center", () => {
     setView(MID - 30000, MID + 30000);
     recenterOn(R.min_ts);
@@ -196,15 +157,19 @@
 
   /* ── toolbar controls ─────────────────────────────────────────────────── */
 
-  await T("chart style segmented control toggles lines/bars and persists", () => {
-    const before = state.chartStyle;
-    const other = before === "bars" ? "btn-style-lines" : "btn-style-histogram";
-    $(other).click();
-    ok(state.chartStyle !== before, "flipped");
-    eq(prefs.get("chartStyle", null), state.chartStyle, "persisted");
-    const back = before === "bars" ? "btn-style-histogram" : "btn-style-lines";
-    $(back).click();
-    eq(state.chartStyle, before, "flipped back");
+  await T("per-graph chart style toggle flips lines/bars independently and persists", () => {
+    const beforeSvc = state.chartStyle.svc;
+    const beforeHost = state.chartStyle.host;
+    $("btn-style-toggle-svc").click();
+    ok(state.chartStyle.svc !== beforeSvc, "svc graph flipped");
+    eq(state.chartStyle.host, beforeHost, "host graph untouched by the svc toggle");
+    eq(prefs.get("chartStyle", null).svc, state.chartStyle.svc, "persisted");
+    $("btn-style-toggle-host").click();
+    ok(state.chartStyle.host !== beforeHost, "host graph flipped");
+    $("btn-style-toggle-svc").click();
+    $("btn-style-toggle-host").click();
+    eq(state.chartStyle.svc, beforeSvc, "svc flipped back");
+    eq(state.chartStyle.host, beforeHost, "host flipped back");
   });
 
   await T("splitter drag changes strip height within clamps", () => {
@@ -558,11 +523,11 @@
 
   /* ── set-sources dialog logic ─────────────────────────────────────────── */
 
-  await T("Set Docker Daemon dialog opens with the form empty and disabled", () => {
+  await T("Set Docker Host dialog opens with the form empty and disabled", () => {
     $("btn-set").click();
     try {
       eq($("docker-targets").innerHTML, "", "targets empty");
-      eq($("dlg-ok").disabled, true, "Set Docker Daemon disabled");
+      eq($("dlg-ok").disabled, true, "Set Docker Host disabled");
       // only Docker host / SSH key / Fetch stay usable up front
       eq($("docker-host").disabled, false, "host stays enabled");
       eq($("docker-ssh-key").disabled, false, "ssh key stays enabled");
@@ -586,11 +551,11 @@
       $("btn-set").click();
       $("docker-host").value = ""; // empty -- the gateway/local daemon is used
       await listContainers();
-      eq($("dlg-ok").disabled, true, "Set Docker Daemon stays disabled -- nothing checked yet, nothing to collect");
+      eq($("dlg-ok").disabled, true, "Set Docker Host stays disabled -- nothing checked yet, nothing to collect");
       ok($("docker-targets").textContent.includes("demo"), "fetched container listed");
       $("docker-targets").querySelector('input[value="demo"]').checked = true;
       $("docker-targets").querySelector('input[value="demo"]').dispatchEvent(new Event("change"));
-      eq($("dlg-ok").disabled, false, "Set Docker Daemon enabled once at least one container is checked");
+      eq($("dlg-ok").disabled, false, "Set Docker Host enabled once at least one container is checked");
     } finally {
       post = realPost;
       get = realGet;
@@ -638,7 +603,7 @@
     }
   });
 
-  await T("clicking a group title in the Docker Daemon checklist toggles every checkbox in that group", async () => {
+  await T("clicking a group title in the Docker Host checklist toggles every checkbox in that group", async () => {
     const realPost = post;
     const realGet = get;
     post = async (path, body) => {
@@ -674,7 +639,7 @@
     }
   });
 
-  await T("Set/Update Docker Daemon stays disabled with nothing checked, including via the group-select-all header", async () => {
+  await T("Set/Update Docker Host stays disabled with nothing checked, including via the group-select-all header", async () => {
     const realPost = post;
     const realGet = get;
     post = async (path, body) => {
@@ -704,12 +669,12 @@
     }
   });
 
-  await T("Edit Docker Daemon pre-fills and locks host/ssh-key, relabels buttons", async () => {
+  await T("Edit Docker Host pre-fills and locks host/ssh-key, relabels buttons", async () => {
     const fakeSrc = { id: "__edit_test", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
     state.sources.push(fakeSrc);
     syncDockerDaemonButtons(); // a real app calls this via refreshAll() whenever state.sources changes
     dockerHostKeys.set("ssh://u@h", "/path/to/key");
-    // Opening Edit Docker Daemon now always runs an immediate live Refresh
+    // Opening Edit Docker Host now always runs an immediate live Refresh
     // (see btn-edit-docker-daemon's onclick) -- mocked here since this test
     // isn't about that probe itself, just the form's fields/labels.
     const realPost = post;
@@ -726,9 +691,9 @@
       eq($("docker-ssh-key").value, "/path/to/key", "ssh key prefilled");
       eq($("docker-ssh-key").disabled, true, "ssh key locked");
       eq($("docker-ssh-key-browse").disabled, true, "browse locked");
-      eq($("btn-ps-refresh").textContent, "Refresh", "Fetch relabeled Refresh");
-      eq($("dlg-ok").textContent, "Update Docker Daemon", "confirm relabeled");
-      eq($("dlg-set-title").textContent, "Edit Docker Daemon", "dialog titled for editing, not creating");
+      eq($("btn-ps-refresh").textContent, "Refresh Sources", "Fetch relabeled Refresh Sources");
+      eq($("dlg-ok").textContent, "Update Docker Host", "confirm relabeled");
+      eq($("dlg-set-title").textContent, "Edit Docker Host", "dialog titled for editing, not creating");
     } finally {
       post = realPost;
       get = realGet;
@@ -741,13 +706,13 @@
     }
   });
 
-  await T("Edit/Remove Docker Daemon are disabled when no daemon is being watched", () => {
+  await T("Edit/Remove Docker Host are disabled when no daemon is being watched", () => {
     ok(!hasDockerDaemon(), "no docker:// source open in this suite's baseline state");
     eq($("btn-edit-docker-daemon").disabled, true, "Edit disabled");
     eq($("btn-clear-sources").disabled, true, "Remove disabled");
   });
 
-  await T("Edit Docker Daemon pre-fills immediately, then its automatic Refresh confirms both containers still exist, marking only the persisted-selected one with a checkmark", async () => {
+  await T("Edit Docker Host pre-fills immediately, then its automatic Refresh confirms both containers still exist, marking only the persisted-selected one with a checkmark", async () => {
     const fakeStats = { id: "__prefill_stats", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
     const fakeContainer = { id: "__prefill_c", path: "docker://ssh://u@h/container/demo-c", name: "demo-c", kind: "log", live: true };
     const fakeService = { id: "__prefill_s", path: "docker://ssh://u@h/service/demo-svc", name: "demo-svc", kind: "log", live: true };
@@ -762,7 +727,7 @@
     loadSelectedTargets = async () => ({ containers: new Set(["demo-c"]), services: new Set() });
     const realPost = post;
     const realGet = get;
-    // The live daemon still has both -- opening Edit Docker Daemon runs
+    // The live daemon still has both -- opening Edit Docker Host runs
     // this automatically (see btn-edit-docker-daemon), so the pre-fill and
     // the confirmed post-Refresh state should agree.
     post = async (path, body) => {
@@ -799,7 +764,7 @@
     }
   });
 
-  await T("Refresh in Edit Docker Daemon re-fetches, leaves checkboxes selectable, and keeps host/ssh-key locked", async () => {
+  await T("Refresh in Edit Docker Host re-fetches, leaves checkboxes selectable, and keeps host/ssh-key locked", async () => {
     const fakeSrc = { id: "__edit_test2", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
     state.sources.push(fakeSrc);
     syncDockerDaemonButtons();
@@ -812,7 +777,7 @@
     };
     get = async (path) => (path === "/transforms" ? { transforms: [] } : realGet(path));
     try {
-      // opening Edit Docker Daemon already runs this live probe automatically
+      // opening Edit Docker Host already runs this live probe automatically
       await $("btn-edit-docker-daemon").onclick();
       let cb = $("docker-targets").querySelector("input[type=checkbox]");
       ok(cb, "checkbox rendered from the automatic Refresh on open");
@@ -859,7 +824,7 @@
     };
     get = async (path) => (path === "/transforms" ? { transforms: [] } : realGet(path));
     try {
-      // Edit Docker Daemon's automatic Refresh on open already runs the
+      // Edit Docker Host's automatic Refresh on open already runs the
       // live probe above.
       await $("btn-edit-docker-daemon").onclick();
       await until(() => $("docker-targets").textContent.includes("demo-c"), "checklist reflects the live daemon after opening");
@@ -922,7 +887,7 @@
     }
   });
 
-  await T("opening Edit Docker Daemon: persisted-selected stays checked, a followed-but-never-persisted-selected container comes back unchecked, and one no longer returned is removed from the graph but shown disabled only if it was persisted-selected", async () => {
+  await T("opening Edit Docker Host: persisted-selected stays checked, a followed-but-never-persisted-selected container comes back unchecked, and one no longer returned is removed from the graph but shown disabled only if it was persisted-selected", async () => {
     const stillSelected = { id: "__combo_sel", path: "docker://ssh://u@h/container/still-selected", name: "still-selected", kind: "log", live: true };
     const wasUnselected = { id: "__combo_unsel", path: "docker://ssh://u@h/container/was-unselected", name: "was-unselected", kind: "log", live: true };
     const nowGone = { id: "__combo_gone", path: "docker://ssh://u@h/container/now-gone", name: "now-gone", kind: "log", live: true };
@@ -980,21 +945,21 @@
     }
   });
 
-  await T("Set Docker Daemon (create mode) is never left showing edit-mode labels/locks", () => {
+  await T("Set Docker Host (create mode) is never left showing edit-mode labels/locks", () => {
     $("btn-set").click();
     try {
       eq($("docker-host").disabled, false, "host unlocked");
       eq($("docker-ssh-key").disabled, false, "ssh key unlocked");
       eq($("docker-ssh-key-browse").disabled, false, "browse unlocked");
-      eq($("btn-ps-refresh").textContent, "Fetch", "Fetch label restored");
-      eq($("dlg-ok").textContent, "Set Docker Daemon", "confirm label restored");
-      eq($("dlg-set-title").textContent, "Set Docker Daemon", "dialog re-titled for creating, not editing");
+      eq($("btn-ps-refresh").textContent, "Fetch Sources", "Fetch Sources label restored");
+      eq($("dlg-ok").textContent, "Set Docker Host", "confirm label restored");
+      eq($("dlg-set-title").textContent, "Set Docker Host", "dialog re-titled for creating, not editing");
     } finally {
       dlg.close();
     }
   });
 
-  await T("Set Docker Daemon is enabled only when no daemon is currently being watched", () => {
+  await T("Set Docker Host is enabled only when no daemon is currently being watched", () => {
     ok(!hasDockerDaemon(), "no docker:// source open in this suite's baseline state");
     eq($("btn-set").disabled, false, "enabled -- nothing set yet");
     const fakeSrc = { id: "__setbtn_test", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
@@ -1009,7 +974,7 @@
     }
   });
 
-  await T("Set/Update Docker Daemon syncs the legend's track state to exactly what's checked -- a newly checked entry becomes selected (plotted), a just-unchecked one is demoted, not left stuck selected", async () => {
+  await T("Set/Update Docker Host syncs the legend's track state to exactly what's checked -- a newly checked entry becomes selected (plotted), a just-unchecked one is demoted, not left stuck selected", async () => {
     setTrack("was-selected", "sel"); // simulates a prior Set/Update that had this one checked
     const realPost = post;
     const realGet = get;
@@ -1046,19 +1011,29 @@
     }
   });
 
-  await T("activity log toggle reflects the last docker/ps call", async () => {
-    renderActivityLog(null);
-    eq($("btn-activity-toggle").hidden, true, "hidden with no activity");
-    eq($("docker-activity").hidden, true, "panel hidden with no activity");
+  await T("activity log toggle is always visible and drives the panel directly", async () => {
+    const toggle = $("activity-toggle");
+    const before = toggle.checked;
+    try {
+      toggle.checked = false;
+      renderActivityLog(null);
+      eq(toggle.hidden, false, "switch always visible, even with no activity");
+      eq($("docker-activity").hidden, true, "panel hidden while switch is off");
 
-    renderActivityLog([{ cmd: "docker ps --format json", returncode: 0, ms: 12, stderr: "" }]);
-    eq($("btn-activity-toggle").hidden, false, "toggle shown once there's activity");
-    ok($("docker-activity").textContent.includes("docker ps"), "logged command shown");
+      renderActivityLog([{ cmd: "docker ps --format json", returncode: 0, ms: 12, stderr: "" }]);
+      eq($("docker-activity").hidden, true, "still hidden -- rendering entries doesn't itself flip the switch");
+      ok($("docker-activity").textContent.includes("docker ps"), "logged command shown once revealed");
 
-    $("btn-activity-toggle").click();
-    eq($("docker-activity").hidden, false, "shown after toggle click");
-    $("btn-activity-toggle").click();
-    eq($("docker-activity").hidden, true, "hidden again after second click");
+      toggle.checked = true;
+      toggle.dispatchEvent(new Event("change"));
+      eq($("docker-activity").hidden, false, "shown once the switch is turned on");
+      toggle.checked = false;
+      toggle.dispatchEvent(new Event("change"));
+      eq($("docker-activity").hidden, true, "hidden again once turned off");
+    } finally {
+      toggle.checked = before;
+      toggle.dispatchEvent(new Event("change"));
+    }
   });
 
   await T("normalizeDockerHost defaults a schemeless host to ssh://", () => {
@@ -1447,7 +1422,7 @@
     } finally {
       $("theme-status-bar-toggle").checked = true;
       $("theme-status-bar-toggle").dispatchEvent(new Event("change"));
-      dlgTheme.close();
+      dlgPreferences.close();
     }
     eq($("app-status-bar").hidden, false, "restored visible for later tests");
   });

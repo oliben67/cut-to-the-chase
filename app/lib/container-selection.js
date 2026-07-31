@@ -68,9 +68,23 @@ function writeSelectedContainers(hostKey, { containers = [], services = [] } = {
   return file;
 }
 
+// Used when a saved daemon is permanently removed (not just disconnected --
+// see "Remove Docker Daemon" in app.js) -- ENOENT (already gone, or never
+// had a selection file at all) is not an error here, same tolerant
+// treat-as-blank-slate stance as readSelectedContainers above.
+function deleteSelectedContainers(hostKey, opts = {}) {
+  const file = fileForHostKey(hostKey, opts);
+  try {
+    fs.unlinkSync(file);
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err;
+  }
+}
+
 module.exports = {
   identityForHostKey,
   fileForHostKey,
   readSelectedContainers,
   writeSelectedContainers,
+  deleteSelectedContainers,
 };

@@ -701,12 +701,24 @@ body {
 
 /* ~30% shorter than the default control sizing: reduced toolbar padding
    plus toolbar-scoped (not global) button/icon-btn compacting, so the
-   sidebar/dialogs elsewhere keep their normal, more comfortable sizing. */
+   sidebar/dialogs elsewhere keep their normal, more comfortable sizing.
+
+   The various inter-control gaps/margins across the toolbar (see
+   --toolbar-gap/--toolbar-gap-sm, used by .toolbar-section/.toolbar-divider/
+   etc. below) all scale down together as the window narrows, via clamp()
+   against viewport width -- nothing here shrinks the *controls* themselves,
+   only the breathing room between them, so everything (including the
+   right-aligned gateway status pill, the thing most likely to get pushed
+   off the visible edge -- see #toolbar > * { flex-shrink: 0 } below, which
+   deliberately never lets controls themselves shrink/wrap) has a better
+   chance of actually fitting before that clipping kicks in. */
 #toolbar {
+  --toolbar-gap: clamp(3px, 1vw, 10px);
+  --toolbar-gap-sm: clamp(2px, 0.6vw, 8px);
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 3px 12px;
+  gap: var(--toolbar-gap);
+  padding: 3px clamp(4px, 1.2vw, 12px);
   border-bottom: 1px solid var(--border);
   background: var(--surface-1);
   flex: 0 0 auto;
@@ -714,6 +726,8 @@ body {
 #toolbar button { padding: 2px 9px; }
 #toolbar .icon-btn { width: 20px; height: 20px; padding: 0; }
 #toolbar .icon-btn svg { width: 12px; height: 12px; }
+/* 20% larger than the shared 12px toolbar icon-btn default. */
+#btn-freq-help svg { width: 14.4px; height: 14.4px; }
 /* keeps the row a single line under width pressure (many sections competing
    for space) instead of the flex item shrinking below its text's natural
    width and wrapping onto a second line, which was inflating the toolbar's
@@ -725,7 +739,6 @@ body {
    visible. */
 #toolbar { flex-wrap: nowrap; }
 #toolbar > * { flex-shrink: 0; }
-.app-title { margin-right: 4px; white-space: nowrap; }
 /* #status/#cursor-label/#server-status read as one right-aligned status
    cluster -- the margin-left:auto belongs on the first of the three (here)
    so there's a single gap pushing the whole group right, not a second auto
@@ -739,15 +752,73 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-/* Groups the toolbar's Recording/Poll Interval/Graph Type controls under a
-   small muted label with a divider on either side, so the toolbar reads as
-   distinct sections instead of one long undifferentiated row of controls. */
+/* Groups the toolbar's Recording/Frequency/Live tracking controls -- the
+   dividers between them are explicit .toolbar-divider elements (see below),
+   not a border on the section itself, so the space on both sides of every
+   divider in the toolbar is the same (10px) rather than however each
+   section's own padding happened to work out. */
 .toolbar-section {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding-left: 12px;
-  border-left: 1px solid var(--border);
+  gap: var(--toolbar-gap-sm, 8px);
+}
+/* Spacing before Recording/Frequency/Live tracking now comes from
+   .toolbar-mode-divider's own right margin (see below), not a margin here.
+   Hidden as a whole (see app.js's setLiveHidden) whenever a loaded metric/
+   recording is being viewed, since none of them mean anything without live
+   collection happening. */
+#live-data-group {
+  display: flex;
+  align-items: center;
+}
+/* A thin vertical rule with equal space on both sides -- used between
+   Recording/Frequency/Live tracking, and once more before #status, so
+   every divider in the toolbar reads the same regardless of what's next
+   to it. */
+.toolbar-divider {
+  width: 1px;
+  align-self: stretch;
+  background: var(--border);
+  margin: 0 var(--toolbar-gap, 10px);
+}
+/* After the toolbar's mode icon specifically -- drawn as a double dotted
+   vertical line rather than .toolbar-divider's single solid one, so the
+   mode icon reads as its own distinct little unit rather than just another
+   section boundary. */
+.toolbar-mode-divider {
+  width: 4px;
+  align-self: stretch;
+  /* #toolbar's own flex gap (10px) already provides space on each side;
+     the negative margin-left here pulls that down to 6px -- half of the
+     icon's 12px gap from the toolbar's own left edge (see the icon's own
+     margin-left below), so both the "before" and "after" gaps around the
+     icon are equal and both halved from their un-tightened 12px default. */
+  margin: 0 10px 0 -4px;
+  border-left: 1px dotted var(--border);
+  border-right: 1px dotted var(--border);
+}
+/* Toolbar mode indicator, leftmost element: the live.svg-based icon while
+   collecting, swapped for record.svg while viewing a loaded metric/
+   recording (see app.js's setLiveHidden) -- exactly one of the two is ever
+   unhidden at a time. */
+.toolbar-mode-icon {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+}
+.toolbar-mode-icon svg { width: 16px; height: 16px; color: var(--text-secondary); }
+/* Flat rounded frame (see .toolbar-mode-divider above for what follows it)
+   -- only in the toolbar; the bottom status bar reuses the same
+   .toolbar-mode-icon markup without this framing. Negative margin-left
+   halves this icon's gap from #toolbar's own left edge padding
+   (12px -> 6px), matching the halved gap on its other side (see
+   .toolbar-mode-divider above) -- scoped to #toolbar specifically so the
+   status bar's copy of this icon is unaffected. */
+#toolbar .toolbar-mode-icon {
+  margin-left: -6px;
+  padding: 5px;
+  border-radius: 8px;
+  background: var(--surface-2);
 }
 .ts-label {
   font-size: 10px;
@@ -782,9 +853,29 @@ body {
 }
 .ctl { display: inline-flex; align-items: center; gap: 5px; color: var(--text-secondary); }
 .ctl.block { display: flex; margin: 6px 0; }
+/* SSH key's own row/button plus its "(optional...)" hint, stacked tightly
+   underneath the label instead of .ctl.block's default side-by-side
+   row -- keeps the hint visually anchored to the exact controls it's
+   about, not floating as a separate paragraph below everything. */
+.ssh-key-row { flex-wrap: wrap; row-gap: 3px; }
+/* flex-basis: 100% wraps this onto its own line below the label/input/
+   button row above (still the same flex container) instead of sitting
+   beside them, without needing a separate column layout that would also
+   push "SSH key" itself off that row. */
+.ssh-key-hint { flex-basis: 100%; margin: 0; font-size: 11px; }
+/* Fetch/Refresh Sources + Show activity -- a bit more breathing room before
+   the status/error/activity-log area right below. */
+.fetch-row { margin-top: 8px; margin-bottom: 10px; }
 .ctl input[type="number"] { width: 56px; }
+/* Frequency's and Live tracking's number fields only -- just wide enough
+   for two digits plus the native up/down spinner, nothing more. */
+#section-poll .ctl input[type="number"],
+#section-live-track .ctl input[type="number"] { width: 40px; padding-right: 2px; }
 .ctl input[type="text"] { flex: 1; min-width: 240px; }
-.switch-row { gap: 8px; cursor: pointer; user-select: none; }
+.switch-row { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; }
+/* Enable Live tracking's switch + label, and its seconds field, on one row
+   instead of the field sitting alone on the line below. */
+.live-track-enable-row { justify-content: space-between; }
 .switch { position: relative; display: inline-block; flex: 0 0 auto; width: 34px; height: 18px; }
 .switch input { position: absolute; inset: 0; margin: 0; opacity: 0; cursor: pointer; }
 .switch-track {
@@ -820,6 +911,8 @@ body {
   color: var(--text-secondary);
 }
 .cursor-label-icon { width: 12px; height: 12px; flex: 0 0 auto; color: var(--muted); }
+/* 20% larger than the shared 12px cursor-label-icon default. */
+#view-range-label .cursor-label-icon { width: 14.4px; height: 14.4px; }
 
 button {
   font: inherit;
@@ -835,17 +928,69 @@ button:hover { background: var(--surface-3); border-color: var(--border-strong);
 button:active { background: var(--surface-3); }
 button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 500; }
 button.primary:hover { filter: brightness(1.08); background: var(--accent); }
+/* Deliberately a different color from .primary (amber, not accent-blue) --
+   this is the button that actually connects to the daemon and pulls the
+   container/service list everything else in the dialog depends on, so it
+   needs to read as the important one at a glance, not just another action. */
+.btn-fetch {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--warning);
+  border-color: var(--warning);
+  color: #1a1200;
+  font-weight: 600;
+}
+.btn-fetch:hover { filter: brightness(1.08); background: var(--warning); }
+.btn-fetch-icon { width: 15px; height: 15px; flex: 0 0 auto; }
 button:disabled, input:disabled { opacity: 0.5; cursor: default; }
 button:disabled:hover { background: var(--surface-2); border-color: var(--border-strong); }
-body.sample-armed .strip { cursor: cell; }
+/* Scissors cursor only over a graph (the thing a capture-mode drag actually
+   acts on) -- everywhere else in capture mode keeps the ordinary pointer,
+   since dragging there wouldn't start a capture. */
+body.sample-armed .strip {
+  cursor: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28"><text x="0" y="22" font-size="22">%E2%9C%82%EF%B8%8F</text></svg>') 4 20, crosshair;
+}
 
 #layout { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
 
 #chart-block {
-  flex: 0 0 auto;
+  /* Rigid 70/30 split with #panels below (flex: 0 0 30%) -- no grow, no
+     shrink, so it stays exactly 70% regardless of content (strip count/
+     height, legend size, live vs. loaded metrics) rather than drifting
+     with whatever's rendered; each side scrolls internally if it needs
+     more room than its fixed share. */
+  flex: 0 0 70%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
   background: var(--surface-1);
   border-bottom: 1px solid var(--border);
   padding: 4px 0 2px;
+}
+/* Telemetry (#svc-graph) and Host telemetry (#host-block) -- equal shares
+   of #chart-block's height, each internally scrollable if its own content
+   (e.g. a multi-line legend) would otherwise want more than its half. */
+.graph-block {
+  flex: 1 1 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.graph-block #legend,
+.graph-block #chart-nav,
+.graph-block #host-nav,
+.graph-block #chart-head,
+.graph-block #host-head,
+.graph-block #host-loading {
+  flex: 0 0 auto;
+}
+.graph-block #charts,
+.graph-block #host-charts {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
 }
 #empty-state { padding: 28px 16px; text-align: center; }
 
@@ -1035,7 +1180,6 @@ body.popout-telemetry #btn-load-sample,
 body.popout-telemetry #btn-clear-sources,
 body.popout-telemetry #recording-transport,
 body.popout-telemetry #btn-open-recording,
-body.popout-telemetry #style-switch,
 body.popout-telemetry #host-block,
 body.popout-series #panels,
 body.popout-series #splitter,
@@ -1044,7 +1188,6 @@ body.popout-series #btn-load-sample,
 body.popout-series #btn-clear-sources,
 body.popout-series #recording-transport,
 body.popout-series #btn-open-recording,
-body.popout-series #style-switch,
 body.popout-series #host-block {
   display: none;
 }
@@ -1072,8 +1215,8 @@ body.popout-host #btn-load-sample,
 body.popout-host #btn-clear-sources,
 body.popout-host #recording-transport,
 body.popout-host #btn-open-recording,
-body.popout-host #style-switch,
-body.popout-host #btn-popout-telemetry {
+body.popout-host #btn-popout-telemetry,
+body.popout-host #btn-style-toggle-svc {
   display: none;
 }
 
@@ -1097,7 +1240,10 @@ body.popout-host #btn-popout-telemetry {
 .lane-canvas { flex: 1 1 auto; display: block; cursor: crosshair; }
 
 #panels {
-  flex: 1 1 auto;
+  /* Fixed 30% share -- see #chart-block's own comment; the popout-log
+     override below still gives this the full height when #chart-block
+     itself is hidden entirely. */
+  flex: 0 0 30%;
   display: flex;
   gap: 8px;
   padding: 8px;
@@ -1301,6 +1447,96 @@ dialog {
 }
 dialog::backdrop { background: rgba(0, 0, 0, 0.35); }
 dialog h2 { margin: 0 0 10px; font-size: 15px; }
+
+/* Settings/Preferences, combined -- a macOS System Settings-style layout:
+   a narrow pane list on the left, the selected pane's fields on the right.
+   See app.js's selectPreferencesPane for how .mac-settings-item[data-active]
+   and .mac-settings-pane[hidden] get toggled. */
+#dlg-preferences {
+  padding: 0;
+  min-width: 620px;
+  max-width: 760px;
+  overflow: hidden;
+}
+.mac-settings {
+  display: flex;
+  align-items: stretch;
+  /* Height follows content (however many fieldsets the selected pane has),
+     not a fixed value -- max-height is just a ceiling so a pane with a lot
+     of controls scrolls instead of pushing the dialog off-screen. */
+  max-height: 80vh;
+}
+.mac-settings-sidebar {
+  flex: 0 0 160px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 14px 8px;
+  background: var(--surface-2);
+  border-right: 1px solid var(--border);
+  overflow-y: auto;
+}
+/* Not wired up yet (see index.html's comment) -- same visual weight as a
+   .mac-settings-item so it reads as part of the same list, not a stray
+   control floating above it. */
+.mac-settings-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  margin-bottom: 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-1);
+  color: var(--muted);
+}
+.mac-settings-search svg { width: 13px; height: 13px; flex: 0 0 auto; }
+.mac-settings-sidebar-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 10px 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.mac-settings-sidebar-label svg { width: 13px; height: 13px; flex: 0 0 auto; }
+.mac-settings-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+  padding: 7px 10px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.mac-settings-item-icon { display: inline-flex; flex: 0 0 auto; }
+.mac-settings-item-icon svg { width: 15px; height: 15px; }
+.mac-settings-item:hover { background: var(--surface-3); }
+.mac-settings-item[data-active="true"] { background: var(--accent); color: #fff; }
+.mac-settings-content {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 20px 22px;
+  overflow-y: auto;
+}
+/* The selected pane's own header, right above its fields -- same icon and
+   name as its .mac-settings-item on the left, so the two always read as
+   the same thing. */
+.mac-settings-pane-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.mac-settings-pane-title svg { width: 18px; height: 18px; flex: 0 0 auto; color: var(--text-secondary); }
+.mac-settings-pane .dlg-actions { margin-top: 16px; }
 #docker-targets { max-height: 180px; overflow-y: auto; margin-top: 8px; }
 #docker-targets label { display: block; padding: 1px 0; }
 #docker-targets label.unavailable { opacity: 0.75; }
@@ -1310,10 +1546,11 @@ dialog h2 { margin: 0 0 10px; font-size: 15px; }
 #docker-targets .group { font-weight: 600; margin-top: 6px; color: var(--text-secondary); cursor: pointer; user-select: none; }
 #docker-targets .group:hover { color: var(--text-primary); }
 #transforms-box { border: 1px solid var(--border); border-radius: var(--radius-md); margin: 8px 0; }
-#transforms-box legend { font-size: 12px; color: var(--text-secondary); padding: 0 4px; }
+#transforms-box legend { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--text-secondary); padding: 0 4px; }
+.legend-icon { width: 15px; height: 15px; flex: 0 0 auto; }
 .dlg-intro { margin: 10px 0 6px; font-size: 12px; }
 .dlg-section { border: 1px solid var(--border); border-radius: var(--radius-md); margin: 10px 0; padding-bottom: 2px; }
-.dlg-section legend { font-size: 12.5px; font-weight: 600; color: var(--text-primary); padding: 0 4px; }
+.dlg-section legend { display: flex; align-items: center; gap: 5px; font-size: 12.5px; font-weight: 600; color: var(--text-primary); padding: 0 4px; }
 .dlg-section-help { margin: 0 0 8px; font-size: 11.5px; }
 #transforms-list label { display: block; padding: 1px 0; color: var(--text-primary); }
 #transforms-list .tdoc { color: var(--muted); }
@@ -1444,12 +1681,20 @@ body:has(#gateway-setup) { overflow-y: auto; background: var(--surface-1); }
    #app-body, so it never overlaps #activity's own fixed overlay. */
 .app-status-bar {
   flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
   padding: 3px 12px;
   font-size: 11px;
   color: var(--muted);
   background: var(--surface-2);
   border-top: 1px solid var(--border);
+}
+#app-status-bar-text {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* "capture mode ✂️" while Capture metrics is armed -- see setSampleArmed. */
+.status-bar-blink { animation: status-bar-blink 1s step-start infinite; }
+@keyframes status-bar-blink { 50% { opacity: 0; } }
