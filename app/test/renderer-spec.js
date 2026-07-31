@@ -1233,16 +1233,19 @@
     writeRecordingBytes = async (p, bytes) => { store[p] = bytes; };
     try {
       eq(recording.status, "idle");
+      eq($("btn-start-recording").title, "Start Recording");
       await startRecording();
       eq(recording.status, "recording");
       eq(recording.path, "/fake/e2e-recording.cttc-record");
       eq($("btn-start-recording").disabled, true);
+      eq($("btn-start-recording").title, "Recording");
       eq($("btn-pause-recording").disabled, false);
       eq($("btn-stop-recording").disabled, false);
 
       await pauseRecording();
       eq(recording.status, "paused");
       eq($("btn-start-recording").disabled, false);
+      eq($("btn-start-recording").title, "Resume Recording");
       eq($("btn-pause-recording").disabled, true);
       ok(store["/fake/e2e-recording.cttc-record"], "first segment flushed to the in-memory store");
       const afterFirst = store["/fake/e2e-recording.cttc-record"];
@@ -1250,6 +1253,7 @@
 
       await startRecording(); // resume
       eq(recording.status, "recording");
+      eq($("btn-start-recording").title, "Recording");
       await stopRecording();
       eq(recording.status, "idle");
       eq(recording.path, null);

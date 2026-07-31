@@ -2805,6 +2805,12 @@ const recording = { status: "idle", path: null, segmentStart: null };
 function syncRecordingMenu() {
   $("btn-start-recording").dataset.state = recording.status;
   $("btn-start-recording").disabled = recording.status === "recording";
+  $("btn-start-recording").title =
+    recording.status === "recording"
+      ? "Recording"
+      : recording.status === "paused"
+        ? "Resume Recording"
+        : "Start Recording";
   $("btn-pause-recording").disabled = recording.status !== "recording";
   $("btn-stop-recording").disabled = recording.status === "idle";
 }
