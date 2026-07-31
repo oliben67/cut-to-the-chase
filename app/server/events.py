@@ -38,6 +38,8 @@ again without waiting for the condition to actually clear).
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
 import time
 from dataclasses import dataclass, field
@@ -50,7 +52,13 @@ if TYPE_CHECKING:
     from rolling_buffer import RollingBufferManager
     from server import State
 
-_METRIC_INDEX = {"cpu": 1, "mem": 2, "net": 4}  # index into a series row: (ts, cpu, mem, mem_bytes, net)
+logger = logging.getLogger("cttc")
+
+_METRIC_INDEX = {
+    "cpu": 1,
+    "mem": 2,
+    "net": 4,
+}  # index into a series row: (ts, cpu, mem, mem_bytes, net)
 _OPS = {
     ">": lambda v, t: v > t,
     "<": lambda v, t: v < t,
@@ -98,7 +106,9 @@ class Event:
     match: Literal["any", "all"]
     action: Action
     enabled: bool = True
-    status: str = "armed"  # armed (watching, ready to fire) <-> triggered (latched until condition clears)
+    status: str = (
+        "armed"  # armed (watching, ready to fire) <-> triggered (latched until condition clears)
+    )
     buffer_id: str | None = None  # snapshot actions only: the backing rolling buffer
     triggered_at: float | None = None
     artifact_id: str | None = None  # the most recent trigger's session_id
@@ -111,9 +121,7 @@ class Event:
     _log_cursors: dict[int, dict[str, int]] = field(default_factory=dict)
 
 
-def _validate(
-    conditions: list[MetricCondition | LogCondition], match: str, action: Action
-) -> None:
+def _validate(conditions: list[MetricCondition | LogCondition], match: str, action: Action) -> None:
     if not conditions:
         raise InvalidEvent("an event needs at least one condition")
     if match not in ("any", "all"):
@@ -154,7 +162,7 @@ class EventManager:
         self._events: dict[str, Event] = {}
         self._next_id = 1
 
-    def create(
+    async def create(
         self,
         name: str,
         source_ids: set[str],
@@ -176,11 +184,11 @@ class EventManager:
             match=match,
             action=action,
             buffer_id=buffer_id,
-            _log_cursors=self._seed_log_cursors(source_ids, conditions),
+            _log_cursors=await self._seed_log_cursors(source_ids, conditions),
         )
         return eid
 
-    def update(
+    async def update(
         self,
         event_id: str,
         name: str | None = None,
@@ -205,15 +213,21 @@ class EventManager:
         new_source_ids = set(source_ids) if source_ids is not None else ev.source_ids
         was_snapshot = ev.action.kind == "snapshot"
         will_be_snapshot = new_action.kind == "snapshot"
-        needs_restart = will_be_snapshot and (action is not None or source_ids is not None or not was_snapshot)
+        needs_restart = will_be_snapshot and (
+            action is not None or source_ids is not None or not was_snapshot
+        )
         if needs_restart or (was_snapshot and not will_be_snapshot):
             if ev.buffer_id is not None:
                 from rolling_buffer import UnknownBuffer
 
                 try:
-                    self._rolling_buffers.stop(ev.buffer_id)
+                    await self._rolling_buffers.stop(ev.buffer_id)
                 except UnknownBuffer:
-                    pass
+                    # already stopped/expired on its own (e.g. TTL) --
+                    # nothing left to tear down, just proceed to replace it.
+                    logger.debug(
+                        "events: update(%s) found buffer %s already gone", event_id, ev.buffer_id
+                    )
                 ev.buffer_id = None
             if will_be_snapshot:
                 ev.buffer_id = self._rolling_buffers.start(
@@ -226,11 +240,11 @@ class EventManager:
             ev.source_ids = new_source_ids
         if conditions is not None:
             ev.conditions = list(new_conditions)
-            ev._log_cursors = self._seed_log_cursors(new_source_ids, new_conditions)
+            ev._log_cursors = await self._seed_log_cursors(new_source_ids, new_conditions)
         ev.match = new_match
         ev.action = new_action
 
-    def _seed_log_cursors(
+    async def _seed_log_cursors(
         self, source_ids: set[str], conditions: list[MetricCondition | LogCondition]
     ) -> dict[int, dict[str, int]]:
         """A log condition only watches for lines appended *after* it starts
@@ -239,25 +253,33 @@ class EventManager:
         fresh match (a source opened/selected later starts, unavoidably,
         from 0)."""
         watched = set(source_ids) if source_ids else set(self._state.sources.keys())
+        log_sources = {
+            sid: self._state.sources[sid]
+            for sid in watched
+            if getattr(self._state.sources.get(sid), "kind", None) == "log"
+        }
+        totals = dict(
+            zip(
+                log_sources.keys(), await asyncio.gather(*(s.total() for s in log_sources.values()))
+            )
+        )
         return {
-            i: {
-                sid: len(rows)
-                for sid in watched
-                if (rows := getattr(self._state.sources.get(sid), "rows", None)) is not None
-            }
-            for i, cond in enumerate(conditions)
-            if isinstance(cond, LogCondition)
+            i: dict(totals) for i, cond in enumerate(conditions) if isinstance(cond, LogCondition)
         }
 
-    def cancel(self, event_id: str) -> None:
+    async def cancel(self, event_id: str) -> None:
         ev = self._require(event_id)
         if ev.buffer_id is not None:
             from rolling_buffer import UnknownBuffer
 
             try:
-                self._rolling_buffers.stop(ev.buffer_id)
+                await self._rolling_buffers.stop(ev.buffer_id)
             except UnknownBuffer:
-                pass
+                # already stopped/expired on its own -- fine, we're deleting
+                # the event either way.
+                logger.debug(
+                    "events: cancel(%s) found buffer %s already gone", event_id, ev.buffer_id
+                )
         del self._events[event_id]
 
     def enable(self, event_id: str) -> None:
@@ -299,21 +321,26 @@ class EventManager:
     @staticmethod
     def _condition_json(cond: MetricCondition | LogCondition) -> dict:
         if isinstance(cond, MetricCondition):
-            return {"type": "metric", "metric": cond.metric, "op": cond.op, "threshold": cond.threshold}
+            return {
+                "type": "metric",
+                "metric": cond.metric,
+                "op": cond.op,
+                "threshold": cond.threshold,
+            }
         return {"type": "log", "pattern": cond.pattern}
 
     def list_ids(self) -> list[str]:
         return list(self._events.keys())
 
-    def tick(self, now: float | None = None) -> None:
+    async def tick(self, now: float | None = None) -> None:
         now = now if now is not None else time.time() * 1000.0
         for ev in list(self._events.values()):
             if not ev.enabled:
                 continue
-            detail = self._check(ev)
+            detail = await self._check(ev)
             if detail is not None:
                 if ev._armed:
-                    self._fire(ev, detail, now)
+                    await self._fire(ev, detail, now)
                 ev.status = "triggered"
             else:
                 ev._armed = True
@@ -322,11 +349,11 @@ class EventManager:
     def _monitored_ids(self, ev: Event) -> set[str]:
         return ev.source_ids if ev.source_ids else set(self._state.sources.keys())
 
-    def _check(self, ev: Event) -> str | None:
+    async def _check(self, ev: Event) -> str | None:
         # every condition is always evaluated (never short-circuited), so a
         # log condition's read cursor keeps advancing each tick regardless
         # of `match` or of the edge-trigger latch's own state
-        details = [self._check_one(ev, i, cond) for i, cond in enumerate(ev.conditions)]
+        details = [await self._check_one(ev, i, cond) for i, cond in enumerate(ev.conditions)]
         hits = [d for d in details if d is not None]
         if ev.match == "any":
             return hits[0] if hits else None
@@ -334,51 +361,62 @@ class EventManager:
             return "; ".join(hits)
         return None
 
-    def _check_one(self, ev: Event, index: int, cond: MetricCondition | LogCondition) -> str | None:
+    async def _check_one(
+        self, ev: Event, index: int, cond: MetricCondition | LogCondition
+    ) -> str | None:
         if isinstance(cond, MetricCondition):
-            return self._check_metric(ev, cond)
-        return self._check_log(ev, index, cond)
+            return await self._check_metric(ev, cond)
+        return await self._check_log(ev, index, cond)
 
-    def _check_metric(self, ev: Event, cond: MetricCondition) -> str | None:
-        idx = _METRIC_INDEX[cond.metric]
+    async def _check_metric(self, ev: Event, cond: MetricCondition) -> str | None:
+        field = cond.metric  # "cpu" | "mem" | "net" -- matches redis_log's payload keys
         cmp = _OPS[cond.op]
         for sid in self._monitored_ids(ev):
-            series = getattr(self._state.sources.get(sid), "series", None)
-            if not series:
+            src = self._state.sources.get(sid)
+            if src is None or src.kind != "stats":
                 continue
-            for svc, rows in series.items():
-                if not rows:
+            results = await asyncio.gather(
+                *(self._state.redis_log.latest(svc) for svc in src._services)
+            )
+            for svc, best in zip(sorted(src._services), results):
+                if best is None:
                     continue
-                val = rows[-1][idx]
+                _ts, payload = best
+                val = payload.get(field)
                 if val is not None and cmp(val, cond.threshold):
                     return f"{sid}/{svc}: {cond.metric}={val} {cond.op} {cond.threshold}"
         return None
 
-    def _check_log(self, ev: Event, index: int, cond: LogCondition) -> str | None:
+    async def _check_log(self, ev: Event, index: int, cond: LogCondition) -> str | None:
         pattern = re.compile(cond.pattern)
         cursors = ev._log_cursors.setdefault(index, {})
         hit = None
         for sid in self._monitored_ids(ev):
-            rows = getattr(self._state.sources.get(sid), "rows", None)
-            if rows is None:
+            src = self._state.sources.get(sid)
+            if src is None or src.kind != "log":
                 continue
+            total = await src.total()
             start = cursors.get(sid, 0)
-            new_rows = rows[start:]
-            cursors[sid] = len(rows)
+            if total > start:
+                new_rows = await self._state.redis_log.slice_by_rank(src.name, start, total - start)
+            else:
+                new_rows = []
+            cursors[sid] = total
             if hit is None:
-                for _ts, _seq, _uid, text in new_rows:
+                for _ts, payload in new_rows:
+                    text = payload.get("text", "")
                     if pattern.search(text):
                         hit = f"{sid}: matched {text!r}"
                         break
         return hit
 
-    def _fire(self, ev: Event, detail: str, now: float) -> None:
+    async def _fire(self, ev: Event, detail: str, now: float) -> None:
         ev._armed = False
         ev.triggered_at = now
         ev.trigger_detail = detail
         ev.trigger_count += 1
         if ev.action.kind == "snapshot":
-            data, _meta = self._rolling_buffers.snapshot(ev.buffer_id)
+            data, _meta = await self._rolling_buffers.snapshot(ev.buffer_id)
             ev.artifact_id = self._recording_sessions.store_precomputed(
                 data,
                 ext=METRIC_EXT,

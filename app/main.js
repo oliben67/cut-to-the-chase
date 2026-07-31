@@ -8,6 +8,7 @@ const readline = require("readline");
 const {
   loadConnectionConfig,
   saveConnectionConfig,
+  saveRunMode,
   clearConnectionConfig,
   hostFromTarget,
 } = require("./lib/connection-config");
@@ -21,7 +22,7 @@ const {
   checkStillInstalled,
 } = require("./lib/server-provision");
 const { readGateways, recordGateway, removeGateway, gatewayKey } = require("./lib/gateway-registry");
-const { readSelectedContainers, writeSelectedContainers } = require("./lib/container-selection");
+const { readSelectedContainers, writeSelectedContainers, deleteSelectedContainers } = require("./lib/container-selection");
 const { openSshTunnel, closeSshTunnel } = require("./lib/ssh-tunnel");
 const { recordTunnel, removeTunnel, killOrphanedTunnels } = require("./lib/tunnel-registry");
 const {
@@ -245,14 +246,31 @@ function startServer(extraArgs) {
       ["run", "--project", SERVER_DIR, path.join(SERVER_DIR, "server.py"), "--port", "0", ...extraArgs],
       { stdio: ["ignore", "pipe", "pipe"] }
     );
+    let settled = false;
+    // redis-server is a hard dependency now (Redis is the sole source of
+    // truth for logs/telemetry, see redis_log.py) -- kept here purely to
+    // recognize *why* the process exited early and give an actionable
+    // message, same spirit as lib/docker-check.js's missing/unhealthy
+    // Docker probes, not to duplicate any check server.py itself does.
+    let stderrTail = "";
     serverProc.on("error", (err) =>
       reject(new Error(`could not start server via uv: ${err.message}`))
     );
-    serverProc.stderr.on("data", (d) => mainError(`[server] ${d}`.trimEnd()));
+    serverProc.stderr.on("data", (d) => {
+      const text = `${d}`;
+      stderrTail = (stderrTail + text).slice(-4000);
+      mainError(`[server] ${text}`.trimEnd());
+    });
 
     const rl = readline.createInterface({ input: serverProc.stdout });
-    const timer = setTimeout(() => reject(new Error("server did not report a port in 30s")), 30000);
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error("server did not report a port in 30s"));
+    }, 30000);
     rl.once("line", (line) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
       try {
         const info = JSON.parse(line);
@@ -277,6 +295,24 @@ function startServer(extraArgs) {
     serverProc.on("exit", (code) => {
       mainLog(`[server] exited (${code})`);
       serverProc = null;
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      // The embedded/dev server.py path now requires redis-server on PATH,
+      // the same way uv/docker already are (see redis_log.py) -- a missing
+      // binary or a redis-server that failed to come up makes server.py
+      // raise and exit before ever printing its {"port": N} line, which
+      // otherwise surfaces only as an opaque "did not report a port"
+      // timeout. Recognize that case from the process's own stderr and give
+      // an actionable message instead.
+      const mentionsRedis = /redis[-_]?server/i.test(stderrTail);
+      const detail = mentionsRedis
+        ? "redis-server is required to run CTTC's embedded server but wasn't found (or failed to " +
+          "start). Install Redis and make sure `redis-server` is on your PATH, then restart CTTC " +
+          "(e.g. `brew install redis` on macOS, `apt install redis-server` on Debian/Ubuntu)."
+        : `the embedded server exited unexpectedly (code ${code}) before it finished starting.` +
+          (stderrTail.trim() ? `\n\n${stderrTail.trim()}` : "");
+      reject(new Error(detail));
     });
   });
 }
@@ -360,6 +396,11 @@ ipcMain.handle("menubar-action", (e, action) => {
     case "minimize": win?.minimize(); break;
     case "close": win?.close(); break;
     case "quit": app.quit(); break;
+    // Full process restart, not just a page reload (see "reload" above) --
+    // relaunches the whole Electron app (fresh main process, re-spawns the
+    // embedded server child, re-runs every startup path) rather than just
+    // re-executing the renderer's JS in place.
+    case "restart": app.relaunch(); app.exit(); break;
   }
 });
 
@@ -746,7 +787,14 @@ function resourcesDirForApp() {
 async function connectToServer(fileArgs) {
   const cfg = loadConnectionConfig();
   if (cfg.mode === "embedded") {
-    if (app.isPackaged && (await hasLocalDocker())) {
+    // cfg.runMode is the user's one-time choice (see the first-run dialog in
+    // app.whenReady()) between the local Docker container and a bare native
+    // process. Only an explicit "native" pick skips the container path
+    // outright; anything else (an explicit "container" pick, or no choice
+    // ever recorded -- e.g. pre-existing installs, or unpackaged/no-Docker
+    // runs where the dialog never fires) falls back to today's auto-detect.
+    const wantsContainer = cfg.runMode !== "native";
+    if (app.isPackaged && wantsContainer && (await hasLocalDocker())) {
       narrate("starting the local gateway container...");
       const { port } = await ensureLocalContainer({ resourcesDir: resourcesDirForApp(), onLog: mainLog });
       serverHost = "127.0.0.1";
@@ -1088,6 +1136,12 @@ ipcMain.handle("get-gateways", () => listGatewaysWithActiveFlag());
 ipcMain.handle("get-selected-containers", (_e, hostKey) => readSelectedContainers(hostKey));
 ipcMain.handle("set-selected-containers", (_e, hostKey, names) => {
   writeSelectedContainers(hostKey, names);
+  return { ok: true };
+});
+// "Remove Docker Daemon" (permanently forgetting a saved daemon, as opposed
+// to Disconnect's "stop for now") deletes its selection file on disk too.
+ipcMain.handle("delete-selected-containers", (_e, hostKey) => {
+  deleteSelectedContainers(hostKey);
   return { ok: true };
 });
 
@@ -1625,6 +1679,28 @@ app.whenReady().then(async () => {
         }
       }
     } else {
+      // Both a local Docker container and a bare native process are viable
+      // here (that's what canBeServerLocally() just confirmed) -- ask the
+      // user once, the first time this machine ever reaches this point, and
+      // remember the answer (connectToServer() reads cfg.runMode from here
+      // on, so this never re-prompts).
+      if (app.isPackaged && cfg.mode === "embedded" && cfg.runMode === undefined && (await hasLocalDocker())) {
+        const { response } = await dialog.showMessageBox({
+          type: "question",
+          icon: APP_ICON,
+          title: "Run CTTC Timeline locally",
+          message: "How should the local gateway run?",
+          detail:
+            "Docker is available on this machine, so there are two ways to run the gateway that collects and stores your logs/telemetry:\n\n" +
+            "• As a container (recommended) -- self-contained, bundles everything it needs (including its Redis data store), matches how CTTC runs in production.\n\n" +
+            "• Natively -- runs directly as a process on this machine instead, no Docker involved after this point. Requires `redis-server` to already be installed and on this machine's PATH.\n\n" +
+            "This is remembered for next time; you won't be asked again.",
+          buttons: ["Run as a container", "Run natively"],
+          defaultId: 0,
+          cancelId: 0,
+        });
+        saveRunMode(response === 1 ? "native" : "container");
+      }
       await connectToServer(fileArgs);
     }
   } catch (err) {

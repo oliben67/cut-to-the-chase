@@ -21,13 +21,16 @@ import time
 import types
 import urllib.error
 import urllib.request
+import uuid
 import zipfile
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 import uvicorn
+from conftest import unique_redis_tcp_port
 
+import redis_log
 import server
 
 
@@ -202,153 +205,190 @@ class TestApplyTransforms:
 # ── LogSource ────────────────────────────────────────────────────────────────
 
 
-def log_source(transforms=()):
-    return server.LogSource(
-        "s1", "svc", Path("/nonexistent"), live=False, transforms=list(transforms)
+async def _flush():
+    # ingest_chunk's redis_log.record() enqueues via call_soon_threadsafe
+    # and is pumped asynchronously; give the pump a beat before any read
+    # that expects the write to already be visible in Redis.
+    await asyncio.sleep(0.15)
+
+
+def log_source(redis_log_instance, transforms=(), sid="s1"):
+    src = server.LogSource(
+        sid, "svc", Path("/nonexistent"), live=False, transforms=list(transforms)
     )
+    src._state = types.SimpleNamespace(redis_log=redis_log_instance)
+    return src
+
+
+async def ingest_and_flush(src, data: bytes) -> int:
+    n = src.ingest_chunk(data)
+    await _flush()
+    return n
 
 
 class TestLogSource:
-    def test_docker_t_line(self):
-        src = log_source()
-        n = src.ingest_chunk(b"2026-01-02T03:04:05.000000000Z hello world\n")
+    async def test_docker_t_line(self, redis_log_instance):
+        src = log_source(redis_log_instance)
+        n = await ingest_and_flush(src, b"2026-01-02T03:04:05.000000000Z hello world\n")
         assert n == 1
-        row = src.slice(0, 10)[0]
+        row = (await src.slice(0, 10))[0]
         assert row["text"] == "hello world"
         assert row["ts"] == ms(2026, 1, 2, 3, 4, 5)
         assert row["i"] == 0 and len(row["uid"]) == 16
 
-    def test_swarm_service_prefix_stripped(self):
-        src = log_source()
-        src.ingest_chunk(b"2026-01-02T03:04:05Z api.1.abc123@node1    | msg here\n")
-        assert src.slice(0, 1)[0]["text"] == "msg here"
+    async def test_swarm_service_prefix_stripped(self, redis_log_instance):
+        src = log_source(redis_log_instance)
+        await ingest_and_flush(src, b"2026-01-02T03:04:05Z api.1.abc123@node1    | msg here\n")
+        assert (await src.slice(0, 1))[0]["text"] == "msg here"
 
-    def test_json_line_ts_from_fields(self):
-        src = log_source()
-        src.ingest_chunk(b'{"time": "2026-01-02T03:04:05Z", "msg": "x"}\n')
-        assert src.slice(0, 1)[0]["ts"] == ms(2026, 1, 2, 3, 4, 5)
+    async def test_json_line_ts_from_fields(self, redis_log_instance):
+        src = log_source(redis_log_instance)
+        await ingest_and_flush(src, b'{"time": "2026-01-02T03:04:05Z", "msg": "x"}\n')
+        assert (await src.slice(0, 1))[0]["ts"] == ms(2026, 1, 2, 3, 4, 5)
 
-    def test_json_numeric_ts_seconds_and_ms(self):
-        src = log_source()
-        src.ingest_chunk(b'{"ts": 1700000000}\n{"ts": 1700000000500}\n')
-        rows = src.slice(0, 2)
+    async def test_json_numeric_ts_seconds_and_ms(self, redis_log_instance):
+        src = log_source(redis_log_instance)
+        await ingest_and_flush(src, b'{"ts": 1700000000}\n{"ts": 1700000000500}\n')
+        rows = await src.slice(0, 2)
         assert rows[0]["ts"] == 1700000000000.0
         assert rows[1]["ts"] == 1700000000500.0
 
-    def test_bad_json_body_ignored(self):
-        src = log_source()
+    async def test_bad_json_body_ignored(self, redis_log_instance):
+        src = log_source(redis_log_instance)
         # looks like JSON but is not parseable, and has a leading timestamp
-        src.ingest_chunk(b"2026-01-02T03:04:05Z {broken json}\n")
-        assert src.total() == 1
+        await ingest_and_flush(src, b"2026-01-02T03:04:05Z {broken json}\n")
+        assert await src.total() == 1
 
-    def test_continuation_within_batch(self):
-        src = log_source()
-        src.ingest_chunk(b"2026-01-02T03:04:05Z line one\n  at Some.stack(Frame.java:1)\n")
-        assert src.total() == 1
-        assert "Frame.java" in src.slice(0, 1)[0]["text"]
+    async def test_continuation_within_batch(self, redis_log_instance):
+        src = log_source(redis_log_instance)
+        await ingest_and_flush(
+            src, b"2026-01-02T03:04:05Z line one\n  at Some.stack(Frame.java:1)\n"
+        )
+        assert await src.total() == 1
+        assert "Frame.java" in (await src.slice(0, 1))[0]["text"]
 
-    def test_continuation_across_chunks(self):
-        src = log_source()
-        src.ingest_chunk(b"2026-01-02T03:04:05Z line one\n")
-        src.ingest_chunk(b"continued\n")
-        assert src.total() == 1
-        assert src.slice(0, 1)[0]["text"] == "line one\ncontinued"
+    async def test_continuation_across_chunks(self, redis_log_instance):
+        src = log_source(redis_log_instance)
+        await ingest_and_flush(src, b"2026-01-02T03:04:05Z line one\n")
+        await ingest_and_flush(src, b"continued\n")
+        assert await src.total() == 1
+        assert (await src.slice(0, 1))[0]["text"] == "line one\ncontinued"
 
-    def test_continuation_with_no_previous_is_skipped(self):
-        src = log_source()
-        src.ingest_chunk(b"no timestamp at all\n")
-        assert src.total() == 0
+    async def test_continuation_with_no_previous_is_skipped(self, redis_log_instance):
+        src = log_source(redis_log_instance)
+        await ingest_and_flush(src, b"no timestamp at all\n")
+        assert await src.total() == 0
         assert src.skipped == 1
 
-    def test_blank_lines_ignored(self):
-        src = log_source()
-        src.ingest_chunk(b"\n   \n2026-01-02T03:04:05Z x\n")
-        assert src.total() == 1
+    async def test_blank_lines_ignored(self, redis_log_instance):
+        src = log_source(redis_log_instance)
+        await ingest_and_flush(src, b"\n   \n2026-01-02T03:04:05Z x\n")
+        assert await src.total() == 1
 
-    def test_partial_trailing_line_buffered(self):
-        src = log_source()
-        src.ingest_chunk(b"2026-01-02T03:04:05Z first\n2026-01-02T03:04:06Z par")
-        assert src.total() == 1
-        src.ingest_chunk(b"tial\n")
-        assert src.total() == 2
-        assert src.slice(1, 1)[0]["text"] == "partial"
+    async def test_partial_trailing_line_buffered(self, redis_log_instance):
+        src = log_source(redis_log_instance)
+        await ingest_and_flush(src, b"2026-01-02T03:04:05Z first\n2026-01-02T03:04:06Z par")
+        assert await src.total() == 1
+        await ingest_and_flush(src, b"tial\n")
+        assert await src.total() == 2
+        assert (await src.slice(1, 1))[0]["text"] == "partial"
 
-    def test_out_of_order_chunks_sorted(self):
-        src = log_source()
-        src.ingest_chunk(b"2026-01-02T03:04:10Z late\n")
-        src.ingest_chunk(b"2026-01-02T03:04:05Z early\n")
-        texts = [r["text"] for r in src.slice(0, 10)]
+    async def test_out_of_order_chunks_sorted(self, redis_log_instance):
+        src = log_source(redis_log_instance)
+        await ingest_and_flush(src, b"2026-01-02T03:04:10Z late\n")
+        await ingest_and_flush(src, b"2026-01-02T03:04:05Z early\n")
+        texts = [r["text"] for r in await src.slice(0, 10)]
         assert texts == ["early", "late"]
 
-    def test_unsorted_within_chunk_sorted(self):
-        src = log_source()
-        src.ingest_chunk(b"2026-01-02T03:04:10Z b\n2026-01-02T03:04:05Z a\n")
-        assert [r["text"] for r in src.slice(0, 10)] == ["a", "b"]
+    async def test_unsorted_within_chunk_sorted(self, redis_log_instance):
+        src = log_source(redis_log_instance)
+        await ingest_and_flush(src, b"2026-01-02T03:04:10Z b\n2026-01-02T03:04:05Z a\n")
+        assert [r["text"] for r in await src.slice(0, 10)] == ["a", "b"]
 
-    def test_transform_drop_and_fanout_and_missing_ts(self):
+    async def test_transform_drop_and_fanout_and_missing_ts(self, redis_log_instance):
+        # NOTE: the `dup` fanout below produces two records sharing the
+        # exact same source ts -- Redis's schema keys each record by
+        # `str(ts)` (see redis_log.py's module docstring), so an exact-ts
+        # collision coalesces into a single stored record instead of two
+        # (the old RAM version kept both, distinguished only by list
+        # position). This is a pre-existing schema property, not something
+        # this test can change -- asserted here rather than silently
+        # ignored, since a real fanout transform hitting this is worth
+        # knowing about.
         drop = ("drop", lambda r: None if "drop" in r["text"] else r)
         dup = ("dup", lambda r: [r, dict(r)])
         nots = ("nots", lambda r: {**r, "ts": None} if "no-ts" in r["text"] else r)
-        src = log_source([drop, dup, nots])
-        src.ingest_chunk(
-            b"2026-01-02T03:04:05Z keep\n2026-01-02T03:04:06Z drop me\n2026-01-02T03:04:07Z no-ts\n"
+        src = log_source(redis_log_instance, [drop, dup, nots])
+        await ingest_and_flush(
+            src,
+            b"2026-01-02T03:04:05Z keep\n2026-01-02T03:04:06Z drop me\n2026-01-02T03:04:07Z no-ts\n",
         )
-        assert src.total() == 2  # "keep" duplicated; "drop me" gone; "no-ts" skipped
+        assert (
+            await src.total() == 1
+        )  # "keep" x2 coalesce (same ts); "drop me" gone; "no-ts" skipped
         assert src.skipped == 2
 
-    def test_index_at(self):
-        src = log_source()
-        src.ingest_chunk(
-            b"2026-01-02T03:00:00Z a\n2026-01-02T03:00:10Z b\n2026-01-02T03:00:20Z c\n"
+    async def test_index_at(self, redis_log_instance):
+        src = log_source(redis_log_instance)
+        await ingest_and_flush(
+            src, b"2026-01-02T03:00:00Z a\n2026-01-02T03:00:10Z b\n2026-01-02T03:00:20Z c\n"
         )
         t0 = ms(2026, 1, 2, 3, 0, 0)
-        assert src.index_at(t0 - 1000) == 0
-        assert src.index_at(t0 + 4000) == 0  # nearer to a than b
-        assert src.index_at(t0 + 6000) == 1
-        assert src.index_at(t0 + 99999999) == 2
+        assert await src.index_at(t0 - 1000) == 0
+        assert await src.index_at(t0 + 4000) == 0  # nearer to a than b
+        assert await src.index_at(t0 + 6000) == 1
+        assert await src.index_at(t0 + 99999999) == 2
 
-    def test_index_at_empty(self):
-        assert log_source().index_at(0) == -1
+    async def test_index_at_empty(self, redis_log_instance):
+        assert await log_source(redis_log_instance).index_at(0) == -1
 
-    def test_ticks(self):
-        src = log_source()
-        src.ingest_chunk(
-            b"2026-01-02T03:00:00Z a\n2026-01-02T03:00:00Z b\n2026-01-02T03:00:09Z c\n"
+    async def test_ticks(self, redis_log_instance):
+        src = log_source(redis_log_instance)
+        # a/b land in the same 1s bucket without sharing an exact
+        # timestamp -- see test_transform_drop_and_fanout_and_missing_ts's
+        # note on why an exact-ts collision can't be used here.
+        await ingest_and_flush(
+            src,
+            b"2026-01-02T03:00:00.000000000Z a\n"
+            b"2026-01-02T03:00:00.500000000Z b\n"
+            b"2026-01-02T03:00:09Z c\n",
         )
         t0 = ms(2026, 1, 2, 3, 0, 0)
-        counts = src.ticks(t0, t0 + 10000, 10)
+        counts = await src.ticks(t0, t0 + 10000, 10)
         assert counts[0] == 2 and counts[9] == 1 and sum(counts) == 3
-        assert src.ticks(t0, t0 + 10000, 0) != []  # px clamped to >= 1
+        assert await src.ticks(t0, t0 + 10000, 0) != []  # px clamped to >= 1
 
-    def test_range(self):
-        src = log_source()
-        assert src.range() is None
-        src.ingest_chunk(b"2026-01-02T03:00:00Z a\n2026-01-02T03:00:10Z b\n")
-        assert src.range() == (ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 10))
+    async def test_range(self, redis_log_instance):
+        src = log_source(redis_log_instance)
+        assert await src.range() is None
+        await ingest_and_flush(src, b"2026-01-02T03:00:00Z a\n2026-01-02T03:00:10Z b\n")
+        assert await src.range() == (ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 10))
 
-    def test_slice_clamps_negative_start(self):
-        src = log_source()
-        src.ingest_chunk(b"2026-01-02T03:00:00Z a\n")
-        assert src.slice(-5, 10)[0]["text"] == "a"
+    async def test_slice_clamps_negative_start(self, redis_log_instance):
+        src = log_source(redis_log_instance)
+        await ingest_and_flush(src, b"2026-01-02T03:00:00Z a\n")
+        assert (await src.slice(-5, 10))[0]["text"] == "a"
 
-    def test_find_forward_backward_wrap_and_case(self):
-        src = log_source()
-        src.ingest_chunk(
+    async def test_find_forward_backward_wrap_and_case(self, redis_log_instance):
+        src = log_source(redis_log_instance)
+        await ingest_and_flush(
+            src,
             b"2026-01-02T03:00:00Z Alpha ERROR one\n"
             b"2026-01-02T03:00:01Z beta ok\n"
-            b"2026-01-02T03:00:02Z gamma ERROR two\n"
+            b"2026-01-02T03:00:02Z gamma ERROR two\n",
         )
-        assert src.find("error", 0) == 0  # case-insensitive
-        assert src.find("error", 1) == 2  # forward from middle
-        assert src.find("error", 1, forward=False) == 0  # backward from middle
-        assert src.find("ERROR one", 1) == 0  # wraps past the end
-        assert src.find("two", 0, forward=False) == 2  # wraps backward
-        assert src.find("nothing-here", 0) is None
-        assert src.find("   ", 0) is None  # blank query
-        assert src.find("x", 99) is None or src.find("x", 99) >= 0  # start clamped
+        assert await src.find("error", 0) == 0  # case-insensitive
+        assert await src.find("error", 1) == 2  # forward from middle
+        assert await src.find("error", 1, forward=False) == 0  # backward from middle
+        assert await src.find("ERROR one", 1) == 0  # wraps past the end
+        assert await src.find("two", 0, forward=False) == 2  # wraps backward
+        assert await src.find("nothing-here", 0) is None
+        assert await src.find("   ", 0) is None  # blank query
+        got = await src.find("x", 99)
+        assert got is None or got >= 0  # start clamped
 
-    def test_find_empty_log(self):
-        assert log_source().find("x", 0) is None
+    async def test_find_empty_log(self, redis_log_instance):
+        assert await log_source(redis_log_instance).find("x", 0) is None
 
 
 # ── StatsSource ──────────────────────────────────────────────────────────────
@@ -365,19 +405,30 @@ def stats_entry(name, ts, cpu="10%", mem="20%", memuse="100MiB / 1GiB", netio="1
     }
 
 
-def stats_source():
-    return server.StatsSource("s2", "stats", Path("/nonexistent"), live=False)
+def stats_source(redis_log_instance, sid="s2"):
+    src = server.StatsSource(sid, "stats", Path("/nonexistent"), live=False)
+    src._state = types.SimpleNamespace(redis_log=redis_log_instance)
+    return src
 
 
-def feed_stats(src, entries):
+async def feed_stats(src, entries):
     payload = "\n".join(json.dumps(e) for e in entries) + "\n"
-    return src.ingest_chunk(payload.encode())
+    n = src.ingest_chunk(payload.encode())
+    await _flush()
+    return n
+
+
+async def stats_rows(redis_log_instance, svc):
+    """Redis is the store now (see redis_log.py) -- test stand-in for what
+    used to be a direct `src.series[svc]` read."""
+    rows = await redis_log_instance.range_by_score_with_payload(svc, 0, 10**15)
+    return [(ts, p.get("cpu"), p.get("mem"), p.get("mem_bytes"), p.get("net")) for ts, p in rows]
 
 
 class TestStatsSource:
-    def test_jsonl_ingest_and_net_rate(self):
-        src = stats_source()
-        n = feed_stats(
+    async def test_jsonl_ingest_and_net_rate(self, redis_log_instance):
+        src = stats_source(redis_log_instance)
+        n = await feed_stats(
             src,
             [
                 stats_entry("api", "2026-01-02T03:00:00Z", netio="1kB / 2kB"),
@@ -385,54 +436,73 @@ class TestStatsSource:
             ],
         )
         assert n == 2 and src.count == 2
-        rows = src.series["api"]
+        rows = await stats_rows(redis_log_instance, "api")
         assert rows[0][4] is None  # first sample: no rate yet
         assert rows[1][4] == pytest.approx(300.0)  # 3000 B over 10 s
         assert rows[0][1] == 10.0 and rows[0][2] == 20.0
         assert rows[0][3] == pytest.approx(100 * 1024**2)
 
-    def test_net_counter_reset_gives_none(self):
-        src = stats_source()
-        feed_stats(
+    async def test_net_counter_reset_gives_none(self, redis_log_instance):
+        src = stats_source(redis_log_instance)
+        await feed_stats(
             src,
             [
                 stats_entry("api", "2026-01-02T03:00:00Z", netio="9kB / 9kB"),
                 stats_entry("api", "2026-01-02T03:00:10Z", netio="1kB / 1kB"),
             ],
         )
-        assert src.series["api"][1][4] is None
+        rows = await stats_rows(redis_log_instance, "api")
+        assert rows[1][4] is None
 
-    def test_net_same_timestamp_gives_none(self):
-        src = stats_source()
-        feed_stats(
+    async def test_net_same_timestamp_gives_none(self, redis_log_instance):
+        src = stats_source(redis_log_instance)
+        await feed_stats(
             src,
             [
                 stats_entry("api", "2026-01-02T03:00:00Z"),
                 stats_entry("api", "2026-01-02T03:00:00Z", netio="5kB / 5kB"),
             ],
         )
-        assert src.series["api"][1][4] is None
+        rows = await stats_rows(redis_log_instance, "api")
+        assert rows[-1][4] is None
 
-    def test_bad_netio_gives_none(self):
-        src = stats_source()
-        feed_stats(src, [stats_entry("api", "2026-01-02T03:00:00Z", netio="weird")])
-        assert src.series["api"][0][4] is None
+    async def test_bad_netio_gives_none(self, redis_log_instance):
+        src = stats_source(redis_log_instance)
+        await feed_stats(src, [stats_entry("api", "2026-01-02T03:00:00Z", netio="weird")])
+        rows = await stats_rows(redis_log_instance, "api")
+        assert rows[0][4] is None
 
-    def test_unparsable_netio_sides_give_none(self):
-        src = stats_source()
-        feed_stats(src, [stats_entry("api", "2026-01-02T03:00:00Z", netio="abc / def")])
-        assert src.series["api"][0][4] is None
+    async def test_unparsable_netio_sides_give_none(self, redis_log_instance):
+        src = stats_source(redis_log_instance)
+        await feed_stats(src, [stats_entry("api", "2026-01-02T03:00:00Z", netio="abc / def")])
+        rows = await stats_rows(redis_log_instance, "api")
+        assert rows[0][4] is None
 
-    def test_blank_lines_in_jsonl_ignored(self):
-        src = stats_source()
+    async def test_blank_lines_in_jsonl_ignored(self, redis_log_instance):
+        src = stats_source(redis_log_instance)
         n = src.ingest_chunk(
             b"\n   \n" + json.dumps(stats_entry("api", "2026-01-02T03:00:00Z")).encode() + b"\n"
         )
         assert n == 1 and src.skipped == 0
 
-    def test_swarm_grouping_and_detection(self):
-        src = stats_source()
-        feed_stats(
+    def test_stop_is_a_no_op(self, redis_log_instance):
+        # static/file-tailed StatsSource has nothing to tear down -- just
+        # confirms calling it doesn't raise.
+        stats_source(redis_log_instance).stop()
+
+    async def test_range_skips_a_service_with_no_data_yet(self, redis_log_instance):
+        """_services can include a service that redis_log.first_last()
+        returns None for (e.g. its very first sample is still in the write
+        queue -- see redis_log.py's record()/_pump split) -- range() must
+        skip it rather than choke on a None result."""
+        src = stats_source(redis_log_instance)
+        await feed_stats(src, [stats_entry("api", "2026-01-02T03:00:00Z")])
+        src._services.add("ghost")  # known, but never actually recorded
+        assert await src.range() == (ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 0))
+
+    async def test_swarm_grouping_and_detection(self, redis_log_instance):
+        src = stats_source(redis_log_instance)
+        await feed_stats(
             src,
             [
                 stats_entry("api.1.abc", "2026-01-02T03:00:00Z"),
@@ -440,11 +510,11 @@ class TestStatsSource:
                 stats_entry("plain", "2026-01-02T03:00:00Z"),
             ],
         )
-        assert sorted(src.series) == ["api", "plain"]
+        assert src.services() == ["api", "plain"]
         assert src._swarm == {"api"}
 
-    def test_skips(self):
-        src = stats_source()
+    async def test_skips(self, redis_log_instance):
+        src = stats_source(redis_log_instance)
         n = src.ingest_chunk(
             b'{"Name": "--", "timestamp": "2026-01-02T03:00:00Z"}\n'
             b'{"Name": "", "timestamp": "2026-01-02T03:00:00Z"}\n'
@@ -454,8 +524,8 @@ class TestStatsSource:
         )
         assert n == 0 and src.count == 0 and src.skipped == 5
 
-    def test_whole_array_mode(self):
-        src = stats_source()
+    async def test_whole_array_mode(self, redis_log_instance):
+        src = stats_source(redis_log_instance)
         payload = json.dumps(
             [
                 stats_entry("api", "2026-01-02T03:00:00Z"),
@@ -464,27 +534,28 @@ class TestStatsSource:
         ).encode()
         assert src.ingest_chunk(payload) == 2
 
-    def test_partial_array_buffered(self):
-        src = stats_source()
+    async def test_partial_array_buffered(self, redis_log_instance):
+        src = stats_source(redis_log_instance)
         payload = json.dumps([stats_entry("api", "2026-01-02T03:00:00Z")]).encode()
         assert src.ingest_chunk(payload[:10]) == 0
         assert src.ingest_chunk(payload[10:]) == 1
 
-    def test_out_of_order_insort(self):
-        src = stats_source()
-        feed_stats(
+    async def test_out_of_order_insort(self, redis_log_instance):
+        src = stats_source(redis_log_instance)
+        await feed_stats(
             src,
             [
                 stats_entry("api", "2026-01-02T03:00:10Z"),
                 stats_entry("api", "2026-01-02T03:00:00Z"),
             ],
         )
-        ts = [r[0] for r in src.series["api"]]
+        rows = await stats_rows(redis_log_instance, "api")
+        ts = [r[0] for r in rows]
         assert ts == sorted(ts)
 
-    def test_services_range_bucketed(self):
-        src = stats_source()
-        feed_stats(
+    async def test_services_range_bucketed(self, redis_log_instance):
+        src = stats_source(redis_log_instance)
+        await feed_stats(
             src,
             [
                 stats_entry("b", "2026-01-02T03:00:00Z", cpu="10%"),
@@ -493,9 +564,9 @@ class TestStatsSource:
             ],
         )
         assert src.services() == ["a", "b"]
-        lo, hi = src.range()
+        lo, hi = await src.range()
         assert lo == ms(2026, 1, 2, 3, 0, 0) and hi == ms(2026, 1, 2, 3, 0, 5)
-        out = src.bucketed(lo, lo + 10000, 5)  # dt = 2 s: both b samples share bucket 0
+        out = await src.bucketed(lo, lo + 10000, 5)  # dt = 2 s: both b samples share bucket 0
         by_name = {o["name"]: o for o in out}
         assert by_name["b"]["cpu"][0] == 50.0  # max-merged in one bucket
         assert by_name["a"]["ttype"] == "service"
@@ -503,36 +574,37 @@ class TestStatsSource:
         assert all(o["host"] is False for o in out)
         assert all(o["sid"] == "s2" for o in out)
 
-    def test_bucketed_ignores_out_of_window(self):
-        src = stats_source()
-        feed_stats(src, [stats_entry("api", "2026-01-02T03:00:00Z")])
+    async def test_bucketed_ignores_out_of_window(self, redis_log_instance):
+        src = stats_source(redis_log_instance)
+        await feed_stats(src, [stats_entry("api", "2026-01-02T03:00:00Z")])
         t0 = ms(2026, 1, 2, 4, 0, 0)
-        out = src.bucketed(t0, t0 + 1000, 5)
+        out = await src.bucketed(t0, t0 + 1000, 5)
         assert len(out) == 1  # service listed, but no samples land
         assert all(v is None for v in out[0]["cpu"] + out[0]["mem"] + out[0]["net"])
 
-    def test_empty_range(self):
-        assert stats_source().range() is None
+    async def test_empty_range(self, redis_log_instance):
+        assert await stats_source(redis_log_instance).range() is None
 
-    def test_point_at_nearest(self):
-        src = stats_source()
-        feed_stats(
+    async def test_point_at_nearest(self, redis_log_instance):
+        src = stats_source(redis_log_instance)
+        await feed_stats(
             src,
             [
                 stats_entry("api", "2026-01-02T03:00:00Z", cpu="10%"),
                 stats_entry("api", "2026-01-02T03:00:10Z", cpu="90%"),
             ],
         )
-        src.series["empty"] = []  # skipped without crashing
+        src._services.add("empty")  # skipped without crashing -- no data recorded
         t0 = ms(2026, 1, 2, 3, 0, 0)
-        assert src.point_at(t0 + 2000)["api"]["cpu"] == 10.0  # nearest is earlier
-        assert src.point_at(t0 + 8000)["api"]["cpu"] == 90.0  # nearest is later
-        after = src.point_at(t0 + 60000)["api"]  # past the end
+        assert (await src.point_at(t0 + 2000))["api"]["cpu"] == 10.0  # nearest is earlier
+        assert (await src.point_at(t0 + 8000))["api"]["cpu"] == 90.0  # nearest is later
+        after = (await src.point_at(t0 + 60000))["api"]  # past the end
         assert after["cpu"] == 90.0 and after["ts"] == t0 + 10000
-        before = src.point_at(t0 - 60000)["api"]  # before the start
+        before = (await src.point_at(t0 - 60000))["api"]  # before the start
         assert before["cpu"] == 10.0
-        assert src.point_at(t0)["api"]["host"] is False
-        assert "empty" not in src.point_at(t0)
+        at_t0 = await src.point_at(t0)
+        assert at_t0["api"]["host"] is False
+        assert "empty" not in at_t0
 
 
 # ── sniff_kind / read_all / tail_loop ────────────────────────────────────────
@@ -557,6 +629,7 @@ class TestSniffAndTail:
         f = tmp_path / "t.log"
         f.write_text("2026-01-02T03:00:00Z one\n")
         st = server.State(tmp_path)
+        await st.redis_log.start()
         src = st.open_file(str(f), "log", None, live=True, transforms=[])
         # non-Path source and vanished file are skipped without crashing
         st.sources["fake"] = types.SimpleNamespace(live=True, path="docker://x")
@@ -570,23 +643,25 @@ class TestSniffAndTail:
             with open(f, "a") as fh:
                 fh.write("2026-01-02T03:00:01Z two\n")
             deadline = time.time() + 3
-            while src.total() < 2 and time.time() < deadline:
+            while await src.total() < 2 and time.time() < deadline:
                 await asyncio.sleep(0.05)
-            assert src.total() == 2
+            assert await src.total() == 2
 
             f.write_text("2026-01-02T03:00:02Z rewritten\n")  # truncation -> re-read
             deadline = time.time() + 3
-            while src.total() < 3 and time.time() < deadline:
+            while await src.total() < 3 and time.time() < deadline:
                 await asyncio.sleep(0.05)
-            assert src.total() == 3
-            assert gsrc.total() == 1  # unchanged, stat() failed quietly
+            assert await src.total() == 3
+            assert await gsrc.total() == 1  # unchanged, stat() failed quietly
         finally:
             task.cancel()
+            await st.redis_log.stop()
 
     async def test_tail_loop_survives_read_failure(self, tmp_path, monkeypatch):
         f = tmp_path / "r.log"
         f.write_text("2026-01-02T03:00:00Z one\n")
         st = server.State(tmp_path)
+        await st.redis_log.start()
         src = st.open_file(str(f), "log", None, live=True, transforms=[])
 
         def broken_read(_src):
@@ -598,9 +673,10 @@ class TestSniffAndTail:
             with open(f, "a") as fh:
                 fh.write("2026-01-02T03:00:01Z two\n")
             await asyncio.sleep(0.3)  # loop hits OSError and keeps running
-            assert src.total() == 1
+            assert await src.total() == 1
         finally:
             task.cancel()
+            await st.redis_log.stop()
 
 
 # ── ssh helpers ──────────────────────────────────────────────────────────────
@@ -887,7 +963,10 @@ class TestDockerPs:
             if "service" in args:
                 return FakeAsyncProc(returncode=1, communicate_result=(b"", b"not a swarm manager"))
             return FakeAsyncProc(
-                communicate_result=(web_line + b"\n" + gw_line + b"\n" + gw_line_tagless + b"\n", b"")
+                communicate_result=(
+                    web_line + b"\n" + gw_line + b"\n" + gw_line_tagless + b"\n",
+                    b"",
+                )
             )
 
         monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
@@ -1038,11 +1117,19 @@ class TestGatherOwnContainerLogs:
 
 
 class FakeState:
-    def __init__(self):
+    def __init__(self, redis_log=None):
         self.events = []
+        self.redis_log = redis_log
 
     def broadcast(self, ev):
         self.events.append(ev)
+
+
+async def stats_rows_of(fake_state, svc):
+    """Test stand-in for what used to be a direct `src.series[svc]` read
+    -- Redis is the store now (see redis_log.py)."""
+    rows = await fake_state.redis_log.range_by_score_with_payload(svc, 0, 10**15)
+    return [(ts, p.get("cpu"), p.get("mem"), p.get("mem_bytes"), p.get("net")) for ts, p in rows]
 
 
 class TestDockerStatsSource:
@@ -1060,9 +1147,9 @@ class TestDockerStatsSource:
         src = server.DockerStatsSource("d1", "stats@local", None, 0.05, st)
         try:
             deadline = time.time() + 3
-            while not src.series and time.time() < deadline:
+            while not src._services and time.time() < deadline:
                 await asyncio.sleep(0.02)
-            assert "api" in src.series
+            assert "api" in src._services
             assert src.error is None
             assert any(e["type"] == "update" for e in st.events)
             assert src.path == "docker://local/stats"
@@ -1092,10 +1179,10 @@ class TestDockerStatsSource:
         src = server.DockerStatsSource("d3", "stats@local", None, 0.05, FakeState())
         try:
             deadline = time.time() + 3
-            while "good" not in src.series and time.time() < deadline:
+            while "good" not in src._services and time.time() < deadline:
                 await asyncio.sleep(0.02)
-            assert "good" in src.series
-            assert "bad" not in src.series
+            assert "good" in src._services
+            assert "bad" not in src._services
         finally:
             src.stop()
 
@@ -1119,9 +1206,9 @@ class TestDockerStatsSource:
         src = server.DockerStatsSource("d4", "stats@h", "ssh://u@h", 0.05, FakeState())
         try:
             deadline = time.time() + 3
-            while not src.series and time.time() < deadline:
+            while not src._services and time.time() < deadline:
                 await asyncio.sleep(0.02)
-            assert "web" in src.series
+            assert "web" in src._services
             assert captured[0] == ["stats", "--no-stream", "--format", "{{json .}}"]
             assert src.path == "docker://ssh://u@h/stats"
         finally:
@@ -1198,33 +1285,42 @@ class FakeAsyncProc:
 
 
 class TestDockerLogSource:
-    async def test_follows_and_reports_end(self, docker_cli, monkeypatch):
+    async def test_follows_and_reports_end(self, docker_cli, monkeypatch, redis_log_instance):
         proc = FakeAsyncProc([b"2026-01-02T03:04:05Z hello\n2026-01-02T03:04:06Z world\n"])
 
         async def fake_exec(*a, **k):
             return proc
 
         monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
-        st = FakeState()
+        st = FakeState(redis_log=redis_log_instance)
         src = server.DockerLogSource("l1", "web", None, "container", "web", [], st)
         deadline = time.time() + 3
         while src.error is None and time.time() < deadline:
             await asyncio.sleep(0.02)
-        assert src.total() == 2
+        assert await src.total() == 2
         assert src.error == "log stream ended"
         assert src.path == "docker://local/container/web"
         src.stop()
 
-    async def test_service_target_uses_service_logs(self, docker_cli, monkeypatch):
+    async def test_service_target_uses_service_logs(
+        self, docker_cli, monkeypatch, redis_log_instance
+    ):
         client = FakeSSHClientStreaming([b"2026-01-02T03:04:05Z hello\n"])
         monkeypatch.setattr(server, "_connect_ssh", lambda host, key: client)
         src = server.DockerLogSource(
-            "l2", "api", "ssh://u@h", "service", "api", [], FakeState(), ssh_key="/tmp/k"
+            "l2",
+            "api",
+            "ssh://u@h",
+            "service",
+            "api",
+            [],
+            FakeState(redis_log=redis_log_instance),
+            ssh_key="/tmp/k",
         )
         deadline = time.time() + 3
-        while src.total() < 1 and time.time() < deadline:
+        while await src.total() < 1 and time.time() < deadline:
             await asyncio.sleep(0.02)
-        assert src.total() == 1
+        assert await src.total() == 1
         assert src.path == "docker://ssh://u@h/service/api"
         assert client.last_cmd.startswith("sudo docker service logs")
         src.stop()
@@ -1264,7 +1360,9 @@ class TestDockerLogSource:
         assert "exec failed" in src.error
         src.stop()
 
-    async def test_stop_terminates_the_subprocess(self, docker_cli, monkeypatch):
+    async def test_stop_terminates_the_subprocess(
+        self, docker_cli, monkeypatch, redis_log_instance
+    ):
         # hang_after=True keeps the fake stream "live but idle" (as a real
         # tailing `docker logs -f` would be between log lines) so stop()
         # has to actually terminate it rather than finding it already ended.
@@ -1274,11 +1372,13 @@ class TestDockerLogSource:
             return proc
 
         monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
-        src = server.DockerLogSource("l4", "web", None, "container", "web", [], FakeState())
+        src = server.DockerLogSource(
+            "l4", "web", None, "container", "web", [], FakeState(redis_log=redis_log_instance)
+        )
         deadline = time.time() + 3
-        while src.total() < 1 and time.time() < deadline:
+        while await src.total() < 1 and time.time() < deadline:
             await asyncio.sleep(0.02)
-        assert src.total() == 1
+        assert await src.total() == 1
         src.stop()
         assert proc.terminated
 
@@ -1303,15 +1403,17 @@ def proc_files(user, system, idle, iowait, rx, tx):
 
 
 class TestHostStatsSource:
-    async def test_local_psutil_samples(self):
-        src = server.HostStatsSource("h1", "host@local", None, 0.05, FakeState())
+    async def test_local_psutil_samples(self, redis_log_instance):
+        st = FakeState(redis_log=redis_log_instance)
+        src = server.HostStatsSource("h1", "host@local", None, 0.05, st)
         try:
             deadline = time.time() + 5
-            while not src.series.get("host@local") and time.time() < deadline:
+            rows = []
+            while not rows and time.time() < deadline:
                 await asyncio.sleep(0.05)
-            rows = src.series["host@local"]
+                rows = await stats_rows_of(st, "host@local")
             assert rows, "expected at least one host sample"
-            ts, cpu, mem, mem_bytes, rate = rows[0]
+            _ts, cpu, mem, mem_bytes, _rate = rows[0]
             assert 0 <= cpu <= 100 * 64  # cpu_percent can exceed 100 on multicore? no; be lax
             assert 0 < mem <= 100
             assert mem_bytes > 0
@@ -1320,7 +1422,7 @@ class TestHostStatsSource:
         finally:
             src.stop()
 
-    async def test_ssh_sampling_and_interface_filter(self, monkeypatch):
+    async def test_ssh_sampling_and_interface_filter(self, monkeypatch, redis_log_instance):
         samples = [
             proc_files(100, 100, 700, 100, 1000, 2000),
             proc_files(150, 150, 900, 100, 4000, 5000),
@@ -1333,16 +1435,19 @@ class TestHostStatsSource:
             return FakeAsyncProc(communicate_result=(sample.encode(), b""))
 
         monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+        st = FakeState(redis_log=redis_log_instance)
         src = server.HostStatsSource(
-            "h2", "host@h", "ssh://user@h:2222", 0.05, FakeState(), ssh_key="/tmp/key"
+            "h2", "host@h", "ssh://user@h:2222", 0.05, st, ssh_key="/tmp/key"
         )
         try:
             deadline = time.time() + 5
-            while not src.series.get("host@h") and time.time() < deadline:
+            rows = []
+            while not rows and time.time() < deadline:
                 await asyncio.sleep(0.05)
+                rows = await stats_rows_of(st, "host@h")
             assert "-p" in calls[0] and "2222" in calls[0]
             assert calls[0][-4:] == ("cat", "/proc/stat", "/proc/meminfo", "/proc/net/dev")
-            ts, cpu, mem, mem_bytes, rate = src.series["host@h"][0]
+            _ts, cpu, mem, mem_bytes, rate = rows[0]
             # busy: 200 -> 300 (delta 100) of total 1000 -> 1300 (delta 300)
             assert cpu == pytest.approx(100 / 300 * 100, rel=1e-3)
             assert mem == pytest.approx(60.0)
@@ -1356,7 +1461,7 @@ class TestHostStatsSource:
         try:
             assert "ssh://" in src.error
             await asyncio.sleep(0.12)  # loop must idle without sampling
-            assert src.series == {}
+            assert src._services == set()
         finally:
             src.stop()
 
@@ -1386,7 +1491,7 @@ class TestHostStatsSource:
 
 
 @pytest.fixture
-def state(tmp_path):
+async def state(tmp_path):
     tdir = tmp_path / "transforms"
     tdir.mkdir()
     (tdir / "upper.py").write_text(
@@ -1395,7 +1500,10 @@ def state(tmp_path):
         '    r["text"] = r["text"].upper()\n'
         "    return r\n"
     )
-    return server.State(tdir)
+    st = server.State(tdir)
+    await st.redis_log.start()
+    yield st
+    await st.redis_log.stop()
 
 
 @pytest.fixture
@@ -1430,22 +1538,24 @@ def _no_op_docker(monkeypatch):
 
 
 class TestState:
-    def test_open_file_auto_and_kinds(self, state, log_file, stats_file):
+    async def test_open_file_auto_and_kinds(self, state, log_file, stats_file):
         lg = state.open_file(str(log_file), "auto", None, live=False, transforms=[])
         stt = state.open_file(str(stats_file), "auto", None, live=False, transforms=[])
-        assert lg.kind == "log" and lg.total() == 2 and lg.name == "svc"
+        await _flush()
+        assert lg.kind == "log" and await lg.total() == 2 and lg.name == "svc"
         assert stt.kind == "stats" and stt.count == 3
 
-    def test_open_file_with_transform_and_name(self, state, log_file):
+    async def test_open_file_with_transform_and_name(self, state, log_file):
         src = state.open_file(str(log_file), "log", "custom", live=True, transforms=["upper"])
+        await _flush()
         assert src.name == "custom"
-        assert src.slice(0, 1)[0]["text"] == "ALPHA"
+        assert (await src.slice(0, 1))[0]["text"] == "ALPHA"
 
-    def test_open_file_missing(self, state):
+    async def test_open_file_missing(self, state):
         with pytest.raises(FileNotFoundError):
             state.open_file("/no/such/file.log", "auto", None, live=False, transforms=[])
 
-    def test_close_source(self, state, log_file):
+    async def test_close_source(self, state, log_file):
         src = state.open_file(str(log_file), "log", None, live=False, transforms=[])
         stopped = []
         src.stop = lambda: stopped.append(True)
@@ -1454,10 +1564,11 @@ class TestState:
         assert src.id not in state.sources
         state.close_source("ghost")  # no-op
 
-    def test_describe(self, state, log_file, stats_file):
+    async def test_describe(self, state, log_file, stats_file):
         state.open_file(str(log_file), "auto", None, live=False, transforms=["upper"])
         state.open_file(str(stats_file), "auto", None, live=False, transforms=[])
-        d = {s["name"]: s for s in state.describe()}
+        await _flush()
+        d = {s["name"]: s for s in await state.describe()}
         assert d["svc"]["kind"] == "log" and d["svc"]["total"] == 2
         assert d["svc"]["transforms"] == ["upper"]
         assert d["stats"]["kind"] == "stats" and d["stats"]["services"] == ["api"]
@@ -1614,7 +1725,7 @@ class TestState:
         assert len(state.sources) == 1
         state.close_source(results[0])
 
-    def test_broadcast_full_queue_dropped(self, state):
+    async def test_broadcast_full_queue_dropped(self, state):
         full = asyncio.Queue(maxsize=1)
         full.put_nowait({"x": 1})
         state.listeners.append(full)
@@ -1623,49 +1734,68 @@ class TestState:
 
 
 class TestSampleRoundTrip:
-    def test_export_and_load(self, state, log_file, stats_file, tmp_path):
+    async def test_export_and_load(self, state, log_file, stats_file, tmp_path):
         state.open_file(str(log_file), "auto", None, live=False, transforms=[])
         st_src = state.open_file(str(stats_file), "auto", None, live=False, transforms=[])
         st_src.is_host = True  # exercise the host flag
         st_src._swarm.add("api")
+        await _flush()
         t0, t1 = ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 5)
         out = tmp_path / "slice.cttc"
-        r = state.export_sample(str(out), t0, t1)
+        r = await state.export_sample(str(out), t0, t1)
         assert r["sources"] == 2
 
         names = zipfile.ZipFile(out).namelist()
         assert "manifest.json" in names
 
+        # A genuinely separate RedisLog (own redis-server, own unix socket)
+        # -- st2's re-loaded "svc" source must not see `state`'s original
+        # "svc" history, exactly as two independent Source objects sharing
+        # an entity name would collide if they shared one Redis (see
+        # redis_log.py's module docstring on the sole-source-of-truth
+        # scope boundary).
         st2 = server.State(tmp_path)
-        opened = st2.load_sample(str(out))
-        assert len(opened) == 2
-        d = {s["name"]: s for s in st2.describe()}
-        assert d["svc"]["total"] == 1  # only "alpha" is inside [t0, t1]
-        lg = st2.sources[[s for s in opened if st2.sources[s].kind == "log"][0]]
-        assert lg.slice(0, 1)[0]["text"] == "alpha"
-        stt = st2.sources[[s for s in opened if st2.sources[s].kind == "stats"][0]]
-        assert stt.is_host is True
-        assert stt._swarm == {"api"}
-        assert stt.live is False and lg.live is False
+        st2.redis_log = redis_log.RedisLog(
+            socket_path=f"/tmp/cttc-test-{uuid.uuid4().hex[:8]}.sock",
+            tcp_port=unique_redis_tcp_port(),
+        )
+        await st2.redis_log.start()
+        try:
+            opened = st2.load_sample(str(out))
+            assert len(opened) == 2
+            d = {s["name"]: s for s in await st2.describe()}
+            assert d["svc"]["total"] == 1  # only "alpha" is inside [t0, t1]
+            lg = st2.sources[[s for s in opened if st2.sources[s].kind == "log"][0]]
+            assert (await lg.slice(0, 1))[0]["text"] == "alpha"
+            stt = st2.sources[[s for s in opened if st2.sources[s].kind == "stats"][0]]
+            assert stt.is_host is True
+            assert stt._swarm == {"api"}
+            assert stt.live is False and lg.live is False
+        finally:
+            await st2.redis_log.stop()
 
-    def test_export_empty_range(self, state, log_file, stats_file, tmp_path):
+    async def test_export_empty_range(self, state, log_file, stats_file, tmp_path):
         state.open_file(str(log_file), "auto", None, live=False, transforms=[])
         state.open_file(str(stats_file), "auto", None, live=False, transforms=[])
+        await _flush()
         out = tmp_path / "empty.cttc"
-        r = state.export_sample(str(out), 0.0, 1.0)  # both log and stats out of range
+        r = await state.export_sample(str(out), 0.0, 1.0)  # both log and stats out of range
         assert r["sources"] == 0
         assert zipfile.ZipFile(out).namelist() == ["manifest.json"]
 
-    def test_export_include_host_false(self, state, stats_file, tmp_path):
+    async def test_export_include_host_false(self, state, stats_file, tmp_path):
         src = state.open_file(str(stats_file), "auto", None, live=False, transforms=[])
         src.is_host = True
+        await _flush()
         out = tmp_path / "nohost.cttc"
         t0 = ms(2026, 1, 2, 3, 0, 0)
-        r = state.export_sample(str(out), t0, t0 + 60000, include_host=False)
+        r = await state.export_sample(str(out), t0, t0 + 60000, include_host=False)
         assert r["sources"] == 0
-        assert server.State(tmp_path).load_sample(str(out)) == []
+        st2 = server.State(tmp_path)
+        st2.redis_log = state.redis_log
+        assert st2.load_sample(str(out)) == []
 
-    def test_load_sample_skips_blank_log_lines(self, state, tmp_path):
+    async def test_load_sample_skips_blank_log_lines(self, state, tmp_path):
         out = tmp_path / "crafted.cttc"
         with zipfile.ZipFile(out, "w") as z:
             z.writestr("logs/0.jsonl", '{"ts": 1000, "text": "a"}\n\n   \n{"ts": 2000}\n')
@@ -1679,9 +1809,10 @@ class TestSampleRoundTrip:
                 ),
             )
         opened = state.load_sample(str(out))
+        await _flush()
         src = state.sources[opened[0]]
-        assert src.total() == 2
-        assert src.slice(1, 1)[0]["text"] == ""  # missing text defaults to empty
+        assert await src.total() == 2
+        assert (await src.slice(1, 1))[0]["text"] == ""  # missing text defaults to empty
 
 
 class TestMultiSegmentSample:
@@ -1690,22 +1821,24 @@ class TestMultiSegmentSample:
     load_sample() must ask (via MultiSegmentSample) which one to load once
     there's more than one."""
 
-    def test_merge_from_scratch_is_a_single_segment(self, state, log_file):
+    async def test_merge_from_scratch_is_a_single_segment(self, state, log_file):
         state.open_file(str(log_file), "auto", None, live=False, transforms=[])
+        await _flush()
         t0, t1 = ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 5)
-        data, meta, seg_idx = state.merge_sample_bytes(None, t0, t1)
+        data, meta, seg_idx = await state.merge_sample_bytes(None, t0, t1)
         assert seg_idx == 0
         assert len(meta) == 1
         man = json.loads(zipfile.ZipFile(io.BytesIO(data)).read("manifest.json"))
         assert len(man["segments"]) == 1
         assert man["segments"][0]["from"] == t0 and man["segments"][0]["to"] == t1
 
-    def test_merge_appends_a_second_segment_without_losing_the_first(self, state, log_file):
+    async def test_merge_appends_a_second_segment_without_losing_the_first(self, state, log_file):
         state.open_file(str(log_file), "auto", None, live=False, transforms=[])
+        await _flush()
         t0, t1 = ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 5)
-        first, _meta1, idx1 = state.merge_sample_bytes(None, t0, t1)
+        first, _meta1, idx1 = await state.merge_sample_bytes(None, t0, t1)
         t2, t3 = ms(2026, 1, 2, 3, 0, 5), ms(2026, 1, 2, 3, 0, 10)
-        second, meta2, idx2 = state.merge_sample_bytes(first, t2, t3)
+        second, meta2, idx2 = await state.merge_sample_bytes(first, t2, t3)
         assert idx1 == 0 and idx2 == 1
         assert len(meta2) == 1
         man = json.loads(zipfile.ZipFile(io.BytesIO(second)).read("manifest.json"))
@@ -1716,48 +1849,75 @@ class TestMultiSegmentSample:
         z = zipfile.ZipFile(io.BytesIO(second))
         assert z.read(man["segments"][0]["sources"][0]["file"])
 
-    def test_merge_onto_a_legacy_single_segment_file(self, state, log_file, tmp_path):
+    async def test_merge_onto_a_legacy_single_segment_file(self, state, log_file, tmp_path):
         # a file exported before the Recording feature (build_sample_bytes'
         # own one-segment shape) must still be a valid base to append onto
         state.open_file(str(log_file), "auto", None, live=False, transforms=[])
+        await _flush()
         t0, t1 = ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 5)
-        legacy, _meta = state.build_sample_bytes(t0, t1)
+        legacy, _meta = await state.build_sample_bytes(t0, t1)
         t2, t3 = ms(2026, 1, 2, 3, 0, 5), ms(2026, 1, 2, 3, 0, 10)
-        merged, meta2, idx2 = state.merge_sample_bytes(legacy, t2, t3)
+        merged, meta2, idx2 = await state.merge_sample_bytes(legacy, t2, t3)
         assert idx2 == 1 and len(meta2) == 1
         st2 = server.State(tmp_path)
+        st2.redis_log = state.redis_log
         out = tmp_path / "merged.cttc"
         out.write_bytes(merged)
         with pytest.raises(server.MultiSegmentSample) as ei:
             st2.load_sample(str(out))
         assert [s["index"] for s in ei.value.segments] == [0, 1]
 
-    def test_load_sample_with_explicit_segment_picks_that_one(self, state, log_file, tmp_path):
+    async def test_load_sample_with_explicit_segment_picks_that_one(
+        self, state, log_file, tmp_path
+    ):
         state.open_file(str(log_file), "auto", None, live=False, transforms=[])
+        await _flush()
         t0, t1 = ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 5)
-        first, _m1, _i1 = state.merge_sample_bytes(None, t0, t1)
+        first, _m1, _i1 = await state.merge_sample_bytes(None, t0, t1)
         t2, t3 = ms(2026, 1, 2, 3, 0, 5), ms(2026, 1, 2, 3, 0, 10)
-        merged, _m2, _i2 = state.merge_sample_bytes(first, t2, t3)
+        merged, _m2, _i2 = await state.merge_sample_bytes(first, t2, t3)
         out = tmp_path / "two-segments.cttc"
         out.write_bytes(merged)
 
+        # Two genuinely separate RedisLogs -- both segments' sources are
+        # named "svc" (same original file), so sharing one Redis between
+        # st2 and st3 would merge their histories under that one entity
+        # name (see redis_log.py's sole-source-of-truth scope boundary).
         st2 = server.State(tmp_path)
-        opened0 = st2.load_sample(str(out), segment=0)
-        assert len(opened0) == 1
-        assert st2.sources[opened0[0]].slice(0, 1)[0]["text"] == "alpha"
-
+        st2.redis_log = redis_log.RedisLog(
+            socket_path=f"/tmp/cttc-test-{uuid.uuid4().hex[:8]}.sock",
+            tcp_port=unique_redis_tcp_port(),
+        )
+        await st2.redis_log.start()
         st3 = server.State(tmp_path)
-        opened1 = st3.load_sample(str(out), segment=1)
-        assert len(opened1) == 1
-        assert st3.sources[opened1[0]].slice(0, 1)[0]["text"] == "beta"
+        st3.redis_log = redis_log.RedisLog(
+            socket_path=f"/tmp/cttc-test-{uuid.uuid4().hex[:8]}.sock",
+            tcp_port=unique_redis_tcp_port(),
+        )
+        await st3.redis_log.start()
+        try:
+            opened0 = st2.load_sample(str(out), segment=0)
+            await _flush()
+            assert len(opened0) == 1
+            assert (await st2.sources[opened0[0]].slice(0, 1))[0]["text"] == "alpha"
 
-    def test_single_segment_file_loads_without_a_segment_arg(self, state, log_file, tmp_path):
+            opened1 = st3.load_sample(str(out), segment=1)
+            await _flush()
+            assert len(opened1) == 1
+            assert (await st3.sources[opened1[0]].slice(0, 1))[0]["text"] == "beta"
+        finally:
+            await st2.redis_log.stop()
+            await st3.redis_log.stop()
+
+    async def test_single_segment_file_loads_without_a_segment_arg(self, state, log_file, tmp_path):
         state.open_file(str(log_file), "auto", None, live=False, transforms=[])
+        await _flush()
         t0, t1 = ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 5)
-        data, _meta, _idx = state.merge_sample_bytes(None, t0, t1)
+        data, _meta, _idx = await state.merge_sample_bytes(None, t0, t1)
         out = tmp_path / "one-segment.cttc"
         out.write_bytes(data)
         st2 = server.State(tmp_path)
+        st2.redis_log = state.redis_log
         assert len(st2.load_sample(str(out))) == 1  # no MultiSegmentSample raised
 
 
@@ -1799,10 +1959,32 @@ def boot_server(state):
 
 
 @pytest.fixture
-def api(state, log_file, stats_file):
+def api(tmp_path, log_file, stats_file):
+    """Deliberately does NOT reuse the `state` fixture (which starts its
+    own RedisLog on the pytest event loop): the HTTP server here runs on a
+    *separate* event loop in a background thread (see boot_server), and
+    redis.asyncio's client/connection pool is bound to whichever loop
+    first used it -- reusing a client across two different loops raises
+    ("Future attached to a different loop"). Building a fresh, unstarted
+    State here and letting boot_server's lifespan() start its RedisLog
+    keeps everything -- client, pump task, and every route handler's reads
+    -- on the one loop that actually serves requests. Sources are opened
+    only *after* boot_server returns (i.e. after lifespan has finished),
+    via `state.open_file()`'s call_soon_threadsafe write path, which is
+    safe to call from any thread."""
+    tdir = tmp_path / "transforms"
+    tdir.mkdir()
+    (tdir / "upper.py").write_text(
+        '"""Uppercase text."""\n'
+        "def transform(r):\n"
+        '    r["text"] = r["text"].upper()\n'
+        "    return r\n"
+    )
+    state = server.State(tdir)
+    base, srv, t = boot_server(state)
     state.open_file(str(log_file), "auto", None, live=False, transforms=[])
     state.open_file(str(stats_file), "auto", None, live=False, transforms=[])
-    base, srv, t = boot_server(state)
+    time.sleep(0.3)  # let redis_log's pump (on the server's own loop) catch up
     yield base, state
     srv.should_exit = True
     t.join(timeout=5)
@@ -1885,7 +2067,9 @@ class TestHttpApi:
         sid = next(s.id for s in st.sources.values() if s.kind == "log")
         with caplog.at_level("INFO", logger="cttc"):
             get(base, f"/logs?source={sid}&start=0&count=10")
-        match = next((r.message for r in caplog.records if r.name == "cttc" and "/logs" in r.message), None)
+        match = next(
+            (r.message for r in caplog.records if r.name == "cttc" and "/logs" in r.message), None
+        )
         assert match
         assert f"?source={sid}&start=0&count=10" in match
         assert "127.0.0.1" in match
@@ -1894,7 +2078,9 @@ class TestHttpApi:
         base, _ = api
         with caplog.at_level("INFO", logger="cttc"):
             get(base, "/logs?source=nope")
-        match = next((r.message for r in caplog.records if r.name == "cttc" and "/logs" in r.message), None)
+        match = next(
+            (r.message for r in caplog.records if r.name == "cttc" and "/logs" in r.message), None
+        )
         assert match and " 400 " in match
 
     def test_range_empty(self, tmp_path):
@@ -1955,6 +2141,24 @@ class TestHttpApi:
         base, _ = api
         code, j = get(base, "/series")
         assert code == 400 and "bad request" in j["error"]
+
+    def test_index_at_and_ticks_missing_params_400(self, api):
+        base, st = api
+        sid = next(s.id for s in st.sources.values() if s.kind == "log")
+        code, j = get(base, f"/index_at?source={sid}")  # missing t
+        assert code == 400 and "'t' is required" in j["error"]
+        code, j = get(base, f"/ticks?source={sid}&from=0")  # missing to
+        assert code == 400 and "'from' and 'to' are required" in j["error"]
+
+    def test_close_missing_id_400(self, api):
+        base, _ = api
+        code, j = post(base, "/close", {})
+        assert code == 400 and "'id' is required" in j["error"]
+
+    def test_health(self, api):
+        base, _ = api
+        code, j = get(base, "/health")
+        assert code == 200 and j == {"ok": True}
 
     def test_unknown_paths_404(self, api):
         base, _ = api
@@ -2032,13 +2236,13 @@ class TestHttpApi:
         man = json.loads(zipfile.ZipFile(io.BytesIO(second)).read("manifest.json"))
         assert len(man["segments"]) == 2
 
-    def test_sample_record_include_host_false(self, api, state):
-        base, _ = api
+    def test_sample_record_include_host_false(self, api):
+        base, state = api
         for s in state.sources.values():
             if s.kind == "stats":
                 s.is_host = True
         t0 = ms(2026, 1, 2, 3, 0, 0)
-        code, headers, data = post_raw_binary(
+        code, _headers, data = post_raw_binary(
             base,
             "/sample/record",
             b"",
@@ -2200,7 +2404,7 @@ class TestHttpApi:
         assert code == 500 and "error" in j
 
     def test_sse_keepalive_comment(self, api, monkeypatch):
-        base, st = api
+        base, _st = api
         monkeypatch.setattr(server, "SSE_KEEPALIVE_INTERVAL", 0.05)  # shrink the 15s wait
         conn = http.client.HTTPConnection(base.split("//")[1], timeout=5)
         conn.request("GET", "/events")
@@ -2236,11 +2440,139 @@ class TestHttpApi:
         assert st.listeners == []
 
     def test_shutdown_endpoint(self, tmp_path):
-        base, srv, t = boot_server(server.State(tmp_path))
+        base, _srv, t = boot_server(server.State(tmp_path))
         code, j = post(base, "/shutdown")
         assert code == 200 and j["ok"] is True
         t.join(timeout=5)
         assert not t.is_alive()
+
+
+class TestBufferSessionSchedulerEndpoints:
+    """HTTP-level coverage for /buffer/*, /session/*, /logs/ttl, and
+    /scheduler/* -- these managers (rolling_buffer.py, recording_session.py,
+    scheduler.py) each have their own thorough unit tests, but none of that
+    exercised the actual FastAPI routes wrapping them (request body
+    parsing, 404 mapping for unknown ids, response shapes) until now."""
+
+    def test_buffer_start_pause_stop(self, api):
+        base, _ = api
+        code, j = post(base, "/buffer/start", {"minutes": 5})
+        assert code == 200 and j["buffer_id"]
+        buffer_id = j["buffer_id"]
+
+        code, j = post(base, f"/buffer/{buffer_id}/pause")
+        assert code == 200 and j["ok"] is True
+
+        code, headers, data = post_raw_binary(base, f"/buffer/{buffer_id}/stop", b"")
+        assert code == 200
+        # source count isn't asserted here: the buffer's window is
+        # [start_ts, now], and the api fixture's sources are static files
+        # with fixed historical timestamps unrelated to wall-clock "now" --
+        # the header's presence/shape is what this test is really after.
+        assert "X-CTTC-Source-Count" in headers
+        assert data[:2] == b"PK"  # zip magic
+
+    def test_buffer_pause_and_stop_unknown_id_is_404(self, api):
+        base, _ = api
+        assert post(base, "/buffer/nope/pause")[0] == 404
+        assert post_raw_binary(base, "/buffer/nope/stop", b"")[0] == 404
+
+    def test_session_start_stop_status_download(self, api):
+        base, _ = api
+        code, j = post(base, "/session/start", {"safe": True})
+        assert code == 200 and j["session_id"]
+        session_id = j["session_id"]
+
+        code, j = get(base, f"/session/{session_id}/status")
+        assert code == 200 and j["status"] == "running" and j["ready"] is False
+
+        code, j = post(base, f"/session/{session_id}/stop")
+        assert code == 200 and j["ok"] is True
+
+        code, j = get(base, f"/session/{session_id}/status")
+        assert code == 200 and j["status"] == "completed" and j["ready"] is True
+
+        code, headers, data = get_raw(base, f"/session/{session_id}/download")
+        assert code == 200
+        assert headers["Content-Disposition"].endswith(f'{session_id}.cttc-record"')
+        assert data[:2] == b"PK"
+
+    def test_session_safe_flags_a_running_session(self, api):
+        base, _ = api
+        session_id = post(base, "/session/start")[1]["session_id"]
+        code, j = post(base, f"/session/{session_id}/safe", {"max_keep_seconds": 3600})
+        assert code == 200 and j["ok"] is True
+        post(base, f"/session/{session_id}/stop")
+
+    def test_session_download_before_completion_is_404(self, api):
+        base, _ = api
+        session_id = post(base, "/session/start")[1]["session_id"]
+        assert get_raw(base, f"/session/{session_id}/download")[0] == 404
+        post(base, f"/session/{session_id}/stop")  # avoid leaking a running session
+
+    def test_session_unknown_id_is_404_everywhere(self, api):
+        base, _ = api
+        assert post(base, "/session/nope/stop")[0] == 404
+        assert post(base, "/session/nope/safe", {"max_keep_seconds": 60})[0] == 404
+        assert get(base, "/session/nope/status")[0] == 404
+        assert get_raw(base, "/session/nope/download")[0] == 404
+
+    def test_session_ttl(self, api):
+        base, state = api
+        code, j = post(base, "/session/ttl", {"seconds": 60})
+        assert code == 200 and j["ok"] is True
+        assert state.recording_sessions.default_ttl_seconds == 60
+
+    def test_logs_ttl(self, api):
+        base, state = api
+        code, j = post(base, "/logs/ttl", {"seconds": 120})
+        assert code == 200 and j["ok"] is True
+        assert state.redis_log.ttl_seconds == 120
+
+    def test_scheduler_create_status_cancel_one_shot(self, api):
+        base, _ = api
+        code, j = post(
+            base,
+            "/scheduler/create",
+            {"duration_minutes": 5, "start_at": (time.time() + 3600) * 1000.0},
+        )
+        assert code == 200 and j["schedule_id"]
+        schedule_id = j["schedule_id"]
+
+        code, j = get(base, f"/scheduler/{schedule_id}")
+        assert code == 200 and j["schedule_id"] == schedule_id
+
+        code, j = post(base, f"/scheduler/{schedule_id}/cancel")
+        assert code == 200 and j["ok"] is True
+        assert get(base, f"/scheduler/{schedule_id}")[0] == 404
+
+    def test_scheduler_create_recurring_with_cron(self, api):
+        base, _ = api
+        code, j = post(base, "/scheduler/create", {"duration_minutes": 1, "cron": "*/5 * * * *"})
+        assert code == 200 and j["schedule_id"]
+
+    def test_scheduler_create_requires_exactly_one_of_start_at_or_cron(self, api):
+        base, _ = api
+        code, j = post(base, "/scheduler/create", {"duration_minutes": 1})
+        assert code == 400 and "error" in j
+        code, j = post(
+            base,
+            "/scheduler/create",
+            {"duration_minutes": 1, "start_at": time.time() * 1000.0, "cron": "*/5 * * * *"},
+        )
+        assert code == 400
+
+    def test_scheduler_create_invalid_cron_is_400(self, api):
+        base, _ = api
+        code, j = post(
+            base, "/scheduler/create", {"duration_minutes": 1, "cron": "not a cron expr"}
+        )
+        assert code == 400 and "error" in j
+
+    def test_scheduler_status_and_cancel_unknown_id_is_404(self, api):
+        base, _ = api
+        assert get(base, "/scheduler/nope")[0] == 404
+        assert post(base, "/scheduler/nope/cancel")[0] == 404
 
 
 class TestEventsEndpoints:
@@ -2318,7 +2650,11 @@ class TestEventsEndpoints:
         code, j = post(
             base,
             "/events/create",
-            {"name": "x", "conditions": [{"type": "bogus"}], "action": {"kind": "snapshot", "minutes": 5}},
+            {
+                "name": "x",
+                "conditions": [{"type": "bogus"}],
+                "action": {"kind": "snapshot", "minutes": 5},
+            },
         )
         assert code == 400 and "error" in j
 
@@ -2367,6 +2703,99 @@ class TestEventsEndpoints:
         code, j = post(base, f"/events/{event_id}/update", {"conditions": [{"type": "bogus"}]})
         assert code == 400 and "error" in j
 
+    def test_create_with_semantically_invalid_condition_is_a_400(self, api):
+        """Unlike test_create_with_invalid_condition_is_a_400 (a bad
+        condition *type*, rejected by _parse_condition itself), this one
+        parses fine but fails EventManager._validate()'s own semantic check
+        (unknown metric name) -- a different exception type (InvalidEvent)
+        taking a different except branch in route_events_create."""
+        base, _ = api
+        code, j = post(
+            base,
+            "/events/create",
+            {
+                "name": "x",
+                "conditions": [{"type": "metric", "metric": "disk", "op": ">", "threshold": 1}],
+                "action": {"kind": "snapshot", "minutes": 5},
+            },
+        )
+        assert code == 400 and "unknown metric" in j["error"]
+
+    def test_update_with_semantically_invalid_condition_is_a_400(self, api):
+        base, _ = api
+        event_id = post(
+            base,
+            "/events/create",
+            {
+                "name": "x",
+                "conditions": [{"type": "log", "pattern": "ERROR"}],
+                "action": {"kind": "recording", "duration_minutes": 5},
+            },
+        )[1]["event_id"]
+        code, j = post(
+            base,
+            f"/events/{event_id}/update",
+            {"conditions": [{"type": "metric", "metric": "disk", "op": ">", "threshold": 1}]},
+        )
+        assert code == 400 and "unknown metric" in j["error"]
+
+    def test_create_with_missing_condition_fields_is_a_400(self, api):
+        """A metric condition missing its required keys (metric/op/threshold)
+        raises a KeyError inside _parse_condition -- route_events_create
+        must map that to a 400, not let it become an unhandled 500."""
+        base, _ = api
+        code, j = post(
+            base,
+            "/events/create",
+            {
+                "name": "x",
+                "conditions": [{"type": "metric"}],  # missing metric/op/threshold
+                "action": {"kind": "snapshot", "minutes": 5},
+            },
+        )
+        assert code == 400 and "malformed event request" in j["error"]
+
+    def test_create_with_invalid_action_kind_is_a_400(self, api):
+        base, _ = api
+        code, j = post(
+            base,
+            "/events/create",
+            {
+                "name": "x",
+                "conditions": [{"type": "log", "pattern": "ERROR"}],
+                "action": {"kind": "bogus"},
+            },
+        )
+        assert code == 400 and "action.kind" in j["error"]
+
+    def test_update_with_missing_condition_fields_is_a_400(self, api):
+        base, _ = api
+        event_id = post(
+            base,
+            "/events/create",
+            {
+                "name": "x",
+                "conditions": [{"type": "log", "pattern": "ERROR"}],
+                "action": {"kind": "recording", "duration_minutes": 5},
+            },
+        )[1]["event_id"]
+        code, j = post(base, f"/events/{event_id}/update", {"conditions": [{"type": "metric"}]})
+        assert code == 400 and "malformed event request" in j["error"]
+
+    def test_update_with_invalid_action_kind_is_a_400(self, api):
+        base, _ = api
+        event_id = post(
+            base,
+            "/events/create",
+            {
+                "name": "x",
+                "conditions": [{"type": "log", "pattern": "ERROR"}],
+                "action": {"kind": "recording", "duration_minutes": 5},
+            },
+        )[1]["event_id"]
+        code, j = post(base, f"/events/{event_id}/update", {"action": {"kind": "bogus"}})
+        assert code == 400 and "action.kind" in j["error"]
+
 
 # ── /files/* (phase 3: upload/download, docs/architecture/remote-server.md) ──
 
@@ -2401,7 +2830,7 @@ class TestFilesEndpoints:
     def test_download_exposes_source_count_header(self, api):
         base, _ = api
         t0 = ms(2026, 1, 2, 3, 0, 0)
-        code, headers, _data = get_raw(base, f"/files/download?from={t0}&to={t0 + 60000}")
+        _code, headers, _data = get_raw(base, f"/files/download?from={t0}&to={t0 + 60000}")
         assert (
             headers["X-CTTC-Source-Count"] == "2"
         )  # the log + stats sources the api fixture opens
@@ -2413,13 +2842,13 @@ class TestFilesEndpoints:
         assert get_raw(base, "/files/download")[0] == 400
         assert get_raw(base, "/files/download?from=0")[0] == 400
 
-    def test_download_include_host_false(self, api, state):
+    def test_download_include_host_false(self, api):
         base, st = api
         for s in st.sources.values():
             if s.kind == "stats":
                 s.is_host = True
         t0 = ms(2026, 1, 2, 3, 0, 0)
-        code, _h, data = get_raw(base, f"/files/download?from={t0}&to={t0 + 60000}&include_host=0")
+        _code, _h, data = get_raw(base, f"/files/download?from={t0}&to={t0 + 60000}&include_host=0")
         z = zipfile.ZipFile(io.BytesIO(data))
         sources = json.loads(z.read("manifest.json"))["segments"][0]["sources"]
         assert all(
@@ -2428,13 +2857,20 @@ class TestFilesEndpoints:
         assert any(s["type"] == "log" for s in sources)  # the unrelated log source is unaffected
 
     def test_upload_plain_log(self, api):
+        # Checks total() over HTTP (/logs), not by awaiting src.total()
+        # directly -- src's redis_log client is bound to the server's own
+        # event loop (see the `api` fixture's docstring), a different loop
+        # than this (sync) test runs on.
         base, st = api
         data = b"2026-01-02T03:00:00Z hello\n2026-01-02T03:00:01Z world\n"
         code, j = post_raw(base, "/files/upload", data, {"X-CTTC-Filename": "up.log"})
         assert code == 200
         assert len(j["opened"]) == 1 and j["errors"] == []
-        src = st.sources[j["opened"][0]]
-        assert src.path == "upload://up.log" and src.total() == 2
+        sid = j["opened"][0]
+        src = st.sources[sid]
+        assert src.path == "upload://up.log"
+        _, logs_j = get(base, f"/logs?source={sid}")
+        assert logs_j["total"] == 2
 
     def test_upload_multi_segment_cttc_returns_needs_selection(self, api):
         base, _ = api
@@ -2455,7 +2891,10 @@ class TestFilesEndpoints:
         assert [s["index"] for s in j["needs_selection"][0]["segments"]] == [0, 1]
 
         code, j = post_raw(
-            base, "/files/upload", second, {"X-CTTC-Filename": "rec.cttc-record", "X-CTTC-Segment": "0"}
+            base,
+            "/files/upload",
+            second,
+            {"X-CTTC-Filename": "rec.cttc-record", "X-CTTC-Segment": "0"},
         )
         assert code == 200
         assert len(j["opened"]) >= 1
@@ -2467,7 +2906,7 @@ class TestFilesEndpoints:
         assert code == 200 and len(j["opened"]) == 1
 
     def test_upload_applies_transforms_header(self, api):
-        base, st = api
+        base, _st = api
         code, j = post_raw(
             base,
             "/files/upload",
@@ -2475,11 +2914,15 @@ class TestFilesEndpoints:
             {"X-CTTC-Filename": "t.log", "X-CTTC-Transforms": "upper"},
         )
         assert code == 200
-        assert st.sources[j["opened"][0]].slice(0, 1)[0]["text"] == "HI"
+        sid = j["opened"][0]
+        _, logs_j = get(base, f"/logs?source={sid}&start=0&count=1")
+        assert logs_j["rows"][0]["text"] == "HI"
 
     def test_upload_bad_data_reports_error_not_500(self, api):
         base, _ = api
-        code, j = post_raw(base, "/files/upload", b"not a zip", {"X-CTTC-Filename": "bad.cttc-metric"})
+        code, j = post_raw(
+            base, "/files/upload", b"not a zip", {"X-CTTC-Filename": "bad.cttc-metric"}
+        )
         assert code == 200  # request itself succeeded; the failure is reported in errors
         assert j["opened"] == [] and len(j["errors"]) == 1
         assert "bad.cttc-metric" == j["errors"][0]["path"]
@@ -2534,6 +2977,13 @@ class TestMain:
                 "server.py",
                 "--port",
                 "0",
+                # a real redis-server gets spawned here (this test goes
+                # through the actual CLI/lifespan path, unlike the state/api
+                # fixtures) -- a unique port avoids colliding with another
+                # test's redis-server that hasn't fully released the true
+                # default (56379) yet.
+                "--redis-port",
+                str(unique_redis_tcp_port()),
                 "--naive-tz",
                 "local",
                 "--transforms-dir",
@@ -2564,6 +3014,19 @@ class TestMain:
 
         _, j = get(f"http://127.0.0.1:{port}", "/sources")
         assert len(j["sources"]) == 1  # the bad file only warned
+
+        # Regression: CLI-supplied files used to be opened in _run(),
+        # *before* redis_log.start() ever ran (that only happens inside
+        # lifespan(), triggered later by uvicorn's own serve()) -- record()
+        # silently no-ops while disabled, so every sample from a CLI file
+        # was queued and dropped before Redis was even up, permanently
+        # leaving /range at {min_ts: null, max_ts: null} with nothing left
+        # to ever trigger a client re-check (an e2e-only symptom: the
+        # renderer hung forever on "server data loaded"). Opening CLI files
+        # now happens inside lifespan() itself, after redis_log.start().
+        _, j = get(f"http://127.0.0.1:{port}", "/range")
+        assert j["min_ts"] is not None and j["max_ts"] is not None
+
         post(f"http://127.0.0.1:{port}", "/shutdown")
         t.join(timeout=5)
         assert not t.is_alive()

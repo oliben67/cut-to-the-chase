@@ -396,26 +396,43 @@ to only ever have one client because nothing else could reach it.
 ## Always-on collection + durable log/telemetry store (Redis)
 
 Two related gaps in everything above: collection only ever starts because
-a client asked (`POST /docker/collect`), and everything collected lives only
-in unbounded process RAM (`Source.rows`/`series`) — a gateway restart loses
-all of it, and nothing bounds how much piles up over days of uptime.
+a client asked (`POST /docker/collect`), and everything collected used to
+live only in unbounded process RAM (`Source.rows`/`series`) — a gateway
+restart lost all of it, and nothing bounded how much piled up over days of
+uptime.
 
-**Redis is a write-through side store, not a replacement.** The live read
-path this whole document describes (`/series`, `/logs`, `/range`, `/ticks`,
-rolling buffers, event conditions, recording-session exports) is entirely
-unchanged and still reads straight out of RAM — Redis exists only to (a)
-survive a restart and (b) bound retention, default 3 days, live-configurable
-via `POST /logs/ttl` (mirrors the existing `POST /session/ttl` pattern).
+**Redis is the sole source of truth for logs/telemetry now, not a
+write-through side store.** Source objects (`LogSource`/`StatsSource`, see
+`server.py`) keep no unbounded RAM history of their own anymore — only
+small bounded bookkeeping (`LogSource._last_row` for the continuation-line
+heuristic, `StatsSource._services` for which service names to query). Every
+read path this whole document describes (`/series`, `/logs`, `/range`,
+`/ticks`, `/point`, `/index_at`, `/logs/find`, rolling buffers, event
+conditions, recording-session exports) reads from Redis, `async`/`await`
+cascaded all the way from the FastAPI route handlers down. Retention
+defaults to 3 days, live-configurable via `POST /logs/ttl` (mirrors the
+existing `POST /session/ttl` pattern). This means `redis-server` is a hard
+dependency in every deployment mode, including the bare/embedded
+`uv run server.py` path `main.js` uses when Docker isn't present — the
+embedded server now fails fast at startup if `redis-server` isn't on PATH,
+the same way it already requires `uv` itself.
 
 - **Bundled, not a separate container** (for now): `redis-server` (7.4+, for
   per-hash-field TTL — `HEXPIRE`/`HTTL`) runs as a plain subprocess of
-  `server.py` inside the same gateway container, bound to a unix socket only
-  (the image runs `network_mode: host`, so a TCP loopback bind would
-  actually be reachable from the real host, not just this container). The
-  binary is copied from the official `redis:7.4-alpine` image in the
-  Dockerfile rather than relying on Alpine's own `apk` package version.
-  `--save ""`: deliberately ephemeral, same as RAM has always been — a
-  redeploy losing it is an accepted trade-off, not a regression.
+  `server.py`, bound to a unix socket (everything `server.py` itself does
+  goes through this) *and* a loopback-only TCP port (`--redis-port`,
+  default 56379 — see `redis_log.py`'s `DEFAULT_TCP_PORT`), purely so an
+  external tool (`redis-cli`, RedisInsight) can inspect the store directly.
+  `--bind 127.0.0.1` keeps that TCP port from ever being reachable off the
+  machine it's running on, unauthenticated — the containerized image runs
+  `network_mode: host`, so anything less than an explicit loopback bind
+  would actually be reachable from the real host's network, not just this
+  container. Inside the containerized gateway image the binary is copied
+  from the official `redis:7.4-alpine` image in the Dockerfile rather than
+  relying on Alpine's own `apk` package version; the bare/embedded path
+  expects it already on the host's PATH, same as `uv`/`docker`. `--save ""`:
+  deliberately ephemeral, same as RAM always was — a redeploy losing it is
+  an accepted trade-off, not a regression.
 - **Schema**: one hash + one sorted-set index per entity (container name, or
   `host@<hostname>`) — `cttc:log:<id>` (field=timestamp, value=orjson
   record) and `cttc:idx:<id>` (member=same field, score=timestamp), so a
@@ -444,9 +461,23 @@ via `POST /logs/ttl` (mirrors the existing `POST /session/ttl` pattern).
   endpoint: `/docker/collect`, `/series`, `/logs`, `/range` etc. all keep
   their exact existing request/response shapes.
 
-See `server/redis_log.py` for the implementation (`record`/`set_ttl`/
-`read_range`, all no-ops when `redis-server` isn't present, so the bare/
-embedded deployment mode is entirely unaffected by this).
+See `server/redis_log.py` for the implementation: `record`/`set_ttl` for
+writes, plus the read-query helpers backing every method above
+(`total`/`slice_by_rank`/`rank_at_score`/`nearest`/`latest`/`first_last`/
+`range_by_score`/`range_by_score_with_payload`/`find_text`). `start()` now
+raises rather than degrading to a disabled no-op handle — there is no RAM
+fallback left for any deployment mode to fall back to.
+
+Known scope boundary, not solved by this: Source objects (and their `sid`)
+are recreated fresh on every gateway restart, while Redis entity IDs are
+stable service/container names. Redis is the sole source of truth for
+reads *within a running gateway process's lifetime* — automatically
+re-attaching a *new* Source object to *pre-existing* Redis history from
+before a restart (so e.g. `/sources` shows old entities with no live
+collector yet) is a separate follow-up. Two Source objects that happen to
+share an entity name (e.g. two loaded samples of containers both named
+`web`) also share that entity's Redis history, since entities are keyed
+purely by name.
 
 ## File transfer (upload / download) — implemented
 

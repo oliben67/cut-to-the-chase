@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import bisect
 import hashlib
 import importlib.util
 import io
@@ -50,6 +49,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 
 import files  # local sibling module (server/files.py) -- upload/download endpoints
+import redis_log
 from cttc_format import RECORD_EXT, is_cttc_archive
 from events import Action, EventManager, InvalidEvent, LogCondition, MetricCondition, UnknownEvent
 from recording_session import RecordingSessionManager, UnknownSession
@@ -223,12 +223,20 @@ class LogSource:
         self.path = path
         self.live = live
         self.transforms = transforms
-        self.rows: list[tuple[float, int, str, str]] = []  # (ts, seq, uid, text)
         self.seq = 0
         self.line_no = 0
         self.offset = 0
         self.skipped = 0
         self._pending_partial = b""
+        # single most-recent row, kept only for ingest_chunk's continuation-
+        # line-append heuristic below (Redis is the store now -- see
+        # redis_log.py's module docstring)
+        self._last_row: tuple[float, int, str, str] | None = None
+        # set once by State.open_file/collect_docker right after
+        # construction -- declared here (rather than left purely dynamic)
+        # so static analysis knows every Source has it by the time any of
+        # the read methods below run.
+        self._state: State | None = None
 
     def stop(self):
         pass  # static/file-tailed sources have nothing to tear down
@@ -238,6 +246,7 @@ class LogSource:
         lines = data.split(b"\n")
         self._pending_partial = lines.pop()  # incomplete trailing line, if any
         new = []
+        redis_log = getattr(getattr(self, "_state", None), "redis_log", None)
         for bline in lines:
             self.line_no += 1
             raw = bline.decode("utf-8", errors="replace").rstrip("\r")
@@ -249,9 +258,15 @@ class LogSource:
                     ts, seq, uid, text = new[-1]
                     new[-1] = (ts, seq, uid, text + "\n" + raw)
                     continue
-                if self.rows:
-                    ts, seq, uid, text = self.rows[-1]
-                    self.rows[-1] = (ts, seq, uid, text + "\n" + raw)
+                if self._last_row is not None:
+                    ts, seq, uid, text = self._last_row
+                    text = text + "\n" + raw
+                    self._last_row = (ts, seq, uid, text)
+                    if redis_log is not None:
+                        # re-record under the SAME ts field -- HSET on an
+                        # existing field overwrites naturally, no new
+                        # redis_log method needed
+                        redis_log.record(self.name, ts, {"uid": uid, "text": text})
                     continue
                 self.skipped += 1
                 continue
@@ -263,13 +278,7 @@ class LogSource:
                 uid = out.get("uid") or make_uid(self.name, self.line_no, raw)
                 new.append((float(ts), self._next_seq(), uid, str(out.get("text", raw))))
         if new:
-            monotonic = not self.rows or new[0][0] >= self.rows[-1][0]
-            if monotonic and all(a[0] <= b[0] for a, b in zip(new, new[1:])):
-                self.rows.extend(new)
-            else:
-                for row in new:
-                    bisect.insort(self.rows, row)
-            redis_log = getattr(getattr(self, "_state", None), "redis_log", None)
+            self._last_row = new[-1]
             if redis_log is not None:
                 for ts, _seq, uid, text in new:
                     redis_log.record(self.name, ts, {"uid": uid, "text": text})
@@ -315,63 +324,59 @@ class LogSource:
             "source": self.name,
         }
 
-    # API helpers (rows is only ever mutated from ingest_chunk, called either
-    # from the single-threaded event loop directly or via loop.call_soon_
-    # threadsafe -- never concurrently -- so plain reads here need no lock)
-    def total(self) -> int:
-        return len(self.rows)
+    @property
+    def _redis(self) -> RedisLog:
+        """`self._state` is only Optional to cover the brief window between
+        construction and State.open_file/collect_docker attaching it
+        (declared that way so static analysis catches an actually-missing
+        assignment) -- every one of these read methods is only ever called
+        once a source is registered on a State, so it's always set by then.
+        Centralizes that invariant in one assert instead of repeating it
+        (and the None-narrowing it gives the type checker) six times."""
+        assert self._state is not None, (
+            f"{self.name}: read before this source was attached to a State"
+        )
+        return self._state.redis_log
 
-    def slice(self, start: int, count: int):
-        rows = self.rows[max(0, start) : max(0, start) + count]
+    # API helpers -- all Redis-backed now (see redis_log.py's module
+    # docstring): Redis is the sole source of truth for reads, Source
+    # objects keep no RAM copy of their own.
+    async def total(self) -> int:
+        return await self._redis.total(self.name)
+
+    async def slice(self, start: int, count: int):
+        start = max(0, start)
+        rows = await self._redis.slice_by_rank(self.name, start, count)
         return [
-            {"i": max(0, start) + i, "ts": r[0], "uid": r[2], "text": r[3]}
-            for i, r in enumerate(rows)
+            {"i": start + i, "ts": ts, "uid": payload.get("uid"), "text": payload.get("text", "")}
+            for i, (ts, payload) in enumerate(rows)
         ]
 
-    def index_at(self, t: float) -> int:
-        i = bisect.bisect_left(self.rows, (t,))
-        if i >= len(self.rows):
-            return len(self.rows) - 1
-        if i > 0 and t - self.rows[i - 1][0] < self.rows[i][0] - t:
-            return i - 1
-        return i
+    async def index_at(self, t: float) -> int:
+        # -1 on an empty log, matching bisect_left's old behavior on []
+        # (len(rows) - 1 == -1) -- preserved so callers don't need to
+        # special-case "no rows yet" differently from before.
+        rank = await self._redis.rank_at_score(self.name, t)
+        return -1 if rank is None else rank
 
-    def ticks(self, t0: float, t1: float, px: int):
+    async def ticks(self, t0: float, t1: float, px: int):
         """Event-density strip: count of entries per pixel bucket."""
         px = max(1, px)
         dt = max(1.0, (t1 - t0) / px)
         counts = [0] * px
-        lo = bisect.bisect_left(self.rows, (t0,))
-        hi = bisect.bisect_right(self.rows, (t1 + 1,))
-        for ts, *_ in self.rows[lo:hi]:
+        timestamps = await self._redis.range_by_score(self.name, t0, t1 + 1)
+        for ts in timestamps:
             b = int((ts - t0) / dt)
             if 0 <= b < px:
                 counts[b] += 1
         return counts
 
-    def range(self):
-        if not self.rows:
-            return None
-        return (self.rows[0][0], self.rows[-1][0])
+    async def range(self):
+        return await self._redis.first_last(self.name)
 
-    def find(self, query: str, start: int, forward: bool = True) -> int | None:
+    async def find(self, query: str, start: int, forward: bool = True) -> int | None:
         """Case-insensitive substring search, wrapping around the whole log."""
-        q = query.strip().lower()
-        if not q:
-            return None
-        n = len(self.rows)
-        if n == 0:
-            return None
-        start = max(0, min(start, n - 1))
-        order = (
-            list(range(start, n)) + list(range(0, start))
-            if forward
-            else list(range(start, -1, -1)) + list(range(n - 1, start, -1))
-        )
-        for i in order:
-            if q in self.rows[i][3].lower():
-                return i
-        return None
+        return await self._redis.find_text(self.name, query, start, forward)
 
 
 class StatsSource:
@@ -390,12 +395,22 @@ class StatsSource:
         self.skipped = 0
         self.count = 0
         self._pending_partial = b""
-        # per service: sorted [(ts, cpu%, mem%, mem_bytes, net_rate_Bps)]
-        self.series: dict[str, list[tuple]] = {}
+        # service names seen by this Source instance -- Redis entities are
+        # keyed by service name and there's no RAM series dict to enumerate
+        # them from anymore (Redis is the store, see redis_log.py)
+        self._services: set[str] = set()
         # services whose samples came from dotted instance names (swarm tasks)
         self._swarm: set[str] = set()
         # per container instance: last (ts, net_total) for rate calc
         self._net_prev: dict[str, tuple] = {}
+        # set once by State.open_file/collect_docker right after
+        # construction -- see LogSource.__init__'s matching field.
+        self._state: State | None = None
+        # only DockerStatsSource/HostStatsSource (below) actually poll and
+        # set this to a real value; declared here so _update_poll_interval
+        # can narrow on `isinstance(src, StatsSource)` instead of a bare
+        # getattr with no static type behind it.
+        self.interval: float | None = None
 
     def stop(self):
         pass  # static/file-tailed sources have nothing to tear down
@@ -480,20 +495,18 @@ class StatsSource:
         """Shared low-level append, used by both the CLI-JSON replay path
         above and the live docker-py collectors (DockerStatsSource), which
         compute cpu/mem/rate from a completely different (raw API) shape but
-        land in the same per-service series."""
+        land in the same per-service Redis entity (max-merged across
+        container instances at query time -- see bucketed())."""
         service = name.split(".")[0]
         if service != name:
             self._swarm.add(service)
-        lst = self.series.setdefault(service, [])
-        row = (ts, cpu, mem, mem_bytes, rate)
-        if not lst or ts >= lst[-1][0]:
-            lst.append(row)
-        else:
-            bisect.insort(lst, row)
+        self._services.add(service)
         self.count += 1
         redis_log = getattr(getattr(self, "_state", None), "redis_log", None)
         if redis_log is not None:
-            redis_log.record(name, ts, {"cpu": cpu, "mem": mem, "mem_bytes": mem_bytes, "net": rate})
+            redis_log.record(
+                service, ts, {"cpu": cpu, "mem": mem, "mem_bytes": mem_bytes, "net": rate}
+            )
 
     def _net_rate(self, container: str, ts: float, net_total: float | None) -> float | None:
         if net_total is None:
@@ -507,33 +520,50 @@ class StatsSource:
             return None
         return d / ((ts - prev[0]) / 1000.0)
 
-    def services(self):
-        return sorted(self.series.keys())
+    @property
+    def _redis(self) -> RedisLog:
+        """See LogSource._redis's matching docstring -- same invariant,
+        same reasoning."""
+        assert self._state is not None, (
+            f"{self.name}: read before this source was attached to a State"
+        )
+        return self._state.redis_log
 
-    def range(self):
+    def services(self):
+        return sorted(self._services)
+
+    async def range(self):
+        """Redis-backed: first/last across every service, gathered
+        concurrently rather than N serial round trips."""
+        if not self._services:
+            return None
+        results = await asyncio.gather(*(self._redis.first_last(svc) for svc in self._services))
         lo = hi = None
-        for lst in self.series.values():
-            if lst:
-                lo = lst[0][0] if lo is None else min(lo, lst[0][0])
-                hi = lst[-1][0] if hi is None else max(hi, lst[-1][0])
+        for r in results:
+            if r is None:
+                continue
+            lo = r[0] if lo is None else min(lo, r[0])
+            hi = r[1] if hi is None else max(hi, r[1])
         return None if lo is None else (lo, hi)
 
-    def bucketed(self, t0: float, t1: float, px: int):
+    async def bucketed(self, t0: float, t1: float, px: int):
         """Per service, per pixel bucket: max cpu%, max mem%, max net B/s."""
         px = max(1, px)
         dt = max(1.0, (t1 - t0) / px)
+        services = sorted(self._services)
+        rows_per_service = await asyncio.gather(
+            *(self._redis.range_by_score_with_payload(svc, t0, t1 + 1) for svc in services)
+        )
         out = []
-        for svc in sorted(self.series):
-            lst = self.series[svc]
-            lo = bisect.bisect_left(lst, (t0,))
-            hi = bisect.bisect_right(lst, (t1 + 1,))
+        for svc, rows in zip(services, rows_per_service):
             cpu = [None] * px
             mem = [None] * px
             net = [None] * px
-            for ts, c, m, _mb, r in lst[lo:hi]:
+            for ts, payload in rows:
                 b = int((ts - t0) / dt)
                 if not (0 <= b < px):
                     continue
+                c, m, r = payload.get("cpu"), payload.get("mem"), payload.get("net")
                 if c is not None and (cpu[b] is None or c > cpu[b]):
                     cpu[b] = c
                 if m is not None and (mem[b] is None or m > mem[b]):
@@ -553,25 +583,23 @@ class StatsSource:
             )
         return out
 
-    def point_at(self, t: float):
+    async def point_at(self, t: float):
         """Per service, the single sample nearest time t — used to compare an
         arbitrary point (e.g. a loaded sample) against another point (e.g.
         live 'now') regardless of the current chart zoom window."""
+        services = sorted(self._services)
+        results = await asyncio.gather(*(self._redis.nearest(svc, t) for svc in services))
         out = {}
-        for svc, lst in self.series.items():
-            if not lst:
+        for svc, best in zip(services, results):
+            if best is None:
                 continue
-            i = bisect.bisect_left(lst, (t,))
-            cands = [lst[i]] if i < len(lst) else []
-            if i > 0:
-                cands.append(lst[i - 1])
-            best = min(cands, key=lambda r: abs(r[0] - t))
+            ts, payload = best
             out[svc] = {
-                "ts": best[0],
-                "cpu": best[1],
-                "mem": best[2],
-                "mem_bytes": best[3],
-                "net": best[4],
+                "ts": ts,
+                "cpu": payload.get("cpu"),
+                "mem": payload.get("mem"),
+                "mem_bytes": payload.get("mem_bytes"),
+                "net": payload.get("net"),
                 "host": self.is_host,
             }
         return out
@@ -644,10 +672,22 @@ def _connect_ssh(host: str, ssh_key: str | None) -> paramiko.SSHClient:
     source with no key of its own should try."""
     hostname, username, port = _parse_ssh_target(host)
     identity = ssh_key or "ssh-agent/default identity discovery"
-    logger.info("ssh: connecting to %s@%s:%d (key: %s)", username or "<default user>", hostname, port, identity)
+    logger.info(
+        "ssh: connecting to %s@%s:%d (key: %s)",
+        username or "<default user>",
+        hostname,
+        port,
+        identity,
+    )
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    kwargs: dict = {"hostname": hostname, "port": port, "timeout": 10, "banner_timeout": 10, "auth_timeout": 10}
+    kwargs: dict = {
+        "hostname": hostname,
+        "port": port,
+        "timeout": 10,
+        "banner_timeout": 10,
+        "auth_timeout": 10,
+    }
     if username:
         kwargs["username"] = username
     if ssh_key:
@@ -656,19 +696,30 @@ def _connect_ssh(host: str, ssh_key: str | None) -> paramiko.SSHClient:
     try:
         client.connect(**kwargs)
     except Exception as e:
-        logger.warning("ssh: connect to %s:%d failed after %.1fms: %s: %s", hostname, port, (time.monotonic() - t0) * 1000, type(e).__name__, e)
+        logger.warning(
+            "ssh: connect to %s:%d failed after %.1fms: %s: %s",
+            hostname,
+            port,
+            (time.monotonic() - t0) * 1000,
+            type(e).__name__,
+            e,
+        )
         raise
     transport = client.get_transport()
     logger.info(
         "ssh: connected to %s:%d in %.1fms (server: %s, cipher: %s)",
-        hostname, port, (time.monotonic() - t0) * 1000,
+        hostname,
+        port,
+        (time.monotonic() - t0) * 1000,
         transport.remote_version if transport else "?",
         transport.local_cipher if transport else "?",
     )
     return client
 
 
-def _exec_remote_docker(client: paramiko.SSHClient, args: list[str], timeout: float) -> tuple[str, str, int]:
+def _exec_remote_docker(
+    client: paramiko.SSHClient, args: list[str], timeout: float
+) -> tuple[str, str, int]:
     """Runs `sudo docker <args>` over an already-open ssh connection and
     returns (stdout, stderr, returncode). Always blocking (paramiko has no
     asyncio support) -- callers must run this via asyncio.to_thread. sudo is
@@ -709,7 +760,7 @@ _SIZE_RE = re.compile(r"^([\d.]+)\s*([a-zA-Z]*)$")
 
 
 def _parse_docker_size(s: str) -> float:
-    """"12.3MiB" / "648B" / "1.9GB" -> bytes. The only place these human-
+    """ "12.3MiB" / "648B" / "1.9GB" -> bytes. The only place these human-
     formatted units come from is `docker stats`' own MemUsage/NetIO columns
     (binary KiB/MiB/GiB for memory, decimal kB/MB/GB for network -- matching
     Docker's own units.BytesSize/units.HumanSize) -- used for a remote
@@ -806,7 +857,7 @@ async def _find_own_container() -> tuple[str, str] | None:
             stderr=asyncio.subprocess.DEVNULL,
         )
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
-    except (TimeoutError, OSError):
+    except TimeoutError, OSError:
         return None
     for line in out.decode(errors="replace").splitlines():
         if not line.strip():
@@ -868,8 +919,17 @@ async def docker_ps(host: str | None, ssh_key: str | None = None) -> dict:
         try:
             if client is None:
                 return await _run_docker_cli(desc, ["docker", *args], log, max(0.01, t_left))
-            out, err, rc = await asyncio.to_thread(_exec_remote_docker, client, args, max(0.01, t_left))
-            log.append({"cmd": desc, "returncode": rc, "ms": round((time.monotonic() - t0) * 1000), "stderr": err})
+            out, err, rc = await asyncio.to_thread(
+                _exec_remote_docker, client, args, max(0.01, t_left)
+            )
+            log.append(
+                {
+                    "cmd": desc,
+                    "returncode": rc,
+                    "ms": round((time.monotonic() - t0) * 1000),
+                    "stderr": err,
+                }
+            )
             if rc != 0:
                 raise DockerPsError(err or f"{desc} failed", log)
             return out
@@ -905,7 +965,9 @@ async def docker_ps(host: str | None, ssh_key: str | None = None) -> dict:
 
         services = []
         try:
-            svc_out = await run(f"docker service ls @ {where}", ["service", "ls", "--format", "{{json .}}"])
+            svc_out = await run(
+                f"docker service ls @ {where}", ["service", "ls", "--format", "{{json .}}"]
+            )
             services = [
                 {"id": (r := jloads(line))["ID"][:12], "name": r["Name"], "replicas": r["Replicas"]}
                 for line in svc_out.splitlines()
@@ -968,15 +1030,18 @@ class DockerStatsSource(StatsSource):
         name: str,
         host: str | None,
         interval: float,
-        state,
+        state: State,
         ssh_key: str | None = None,
     ):
         super().__init__(sid, name, path=None, live=True)
         self.path = f"docker://{host or 'local'}/stats"
         self.host = host
         self.ssh_key = ssh_key
-        self.interval = interval
-        self._state = state
+        # narrows the base class's Optional declarations for the rest of
+        # this class's own methods -- DockerStatsSource always polls, so
+        # both are unconditionally real from construction on.
+        self.interval: float = interval
+        self._state: State = state
         self.error: str | None = None
         self._ssh_client: paramiko.SSHClient | None = None
         self._task = asyncio.ensure_future(self._loop())
@@ -1014,7 +1079,9 @@ class DockerStatsSource(StatsSource):
         return n
 
     def _sample_remote(self):
-        assert self.host is not None  # only ever called from _sample_once's own `if self.host` guard
+        assert (
+            self.host is not None
+        )  # only ever called from _sample_once's own `if self.host` guard
         if self._ssh_client is None:
             self._ssh_client = _connect_ssh(self.host, self.ssh_key)
         out, err, rc = _exec_remote_docker(
@@ -1031,9 +1098,13 @@ class DockerStatsSource(StatsSource):
             name = row.get("Name") or row.get("Container") or "?"
             cpu = float(row["CPUPerc"].rstrip("%")) if row.get("CPUPerc") else None
             mem_pct = float(row["MemPerc"].rstrip("%")) if row.get("MemPerc") else None
-            mem_bytes = _parse_docker_size(row["MemUsage"].split("/")[0]) if row.get("MemUsage") else None
+            mem_bytes = (
+                _parse_docker_size(row["MemUsage"].split("/")[0]) if row.get("MemUsage") else None
+            )
             net_total = (
-                sum(_parse_docker_size(p) for p in row["NetIO"].split("/")) if row.get("NetIO") else None
+                sum(_parse_docker_size(p) for p in row["NetIO"].split("/"))
+                if row.get("NetIO")
+                else None
             )
             rate = self._net_rate(name, ts_ms, net_total) if net_total is not None else None
             self.ingest_row(name, ts_ms, cpu, mem_pct, mem_bytes, rate)
@@ -1072,14 +1143,16 @@ class HostStatsSource(StatsSource):
         name: str,
         host: str | None,
         interval: float,
-        state,
+        state: State,
         ssh_key: str | None = None,
     ):
         super().__init__(sid, name, path=None, live=True)
         self.path = f"docker://{host or 'local'}/host"
         self.host = host
-        self.interval = interval
-        self._state = state
+        # narrows the base class's Optional declarations -- see
+        # DockerStatsSource.__init__'s matching comment.
+        self.interval: float = interval
+        self._state: State = state
         self.error: str | None = None
         self._prev = None  # (ts, cpu_busy, cpu_total, net_total) for delta rates
         self._ssh_cmd = None
@@ -1236,7 +1309,7 @@ class DockerLogSource(LogSource):
         target_type,
         target,
         transforms,
-        state,
+        state: State,
         tail=2000,
         ssh_key: str | None = None,
     ):
@@ -1244,7 +1317,9 @@ class DockerLogSource(LogSource):
         self.path = f"docker://{host or 'local'}/{target_type}/{target}"
         self.host = host
         self.ssh_key = ssh_key
-        self._state = state
+        # narrows the base class's Optional declaration -- see
+        # DockerStatsSource.__init__'s matching comment.
+        self._state: State = state
         self.error: str | None = None
         self._proc: asyncio.subprocess.Process | None = None
         self._ssh_client: paramiko.SSHClient | None = None
@@ -1339,7 +1414,12 @@ class MultiSegmentSample(Exception):
 
 
 class State:
-    def __init__(self, transforms_dir: Path, sessions_dir: Path | None = None):
+    def __init__(
+        self,
+        transforms_dir: Path,
+        sessions_dir: Path | None = None,
+        redis_tcp_port: int | None = None,
+    ):
         self.sources: dict[str, Source] = {}
         self.registry = TransformRegistry(transforms_dir)
         self.listeners: list[asyncio.Queue] = []
@@ -1350,7 +1430,7 @@ class State:
         )
         self.scheduler = Scheduler(self.recording_sessions)
         self.events = EventManager(self, self.rolling_buffers, self.recording_sessions)
-        self.redis_log = RedisLog()
+        self.redis_log = RedisLog(tcp_port=redis_tcp_port)
 
     def broadcast(self, event: dict):
         for q in list(self.listeners):
@@ -1373,6 +1453,7 @@ class State:
         else:
             fns = self.registry.load(transforms)
             src = LogSource(sid, label, p, live, fns)
+        src._state = self
         read_all(src)
         self.sources[sid] = src
         logger.info("opened source %s: %s (%s, live=%s)", sid, path, kind, live)
@@ -1415,8 +1496,13 @@ class State:
         behavior -- only the interval, since that's the one thing the UI
         that triggers this (Update Docker Daemon) actually claims to change."""
         src = self.sources.get(sid)
-        if src is not None and getattr(src, "interval", None) != interval:
-            logger.info("collect_docker: updating poll interval for %s: %s -> %s", src.path, src.interval, interval)
+        if isinstance(src, StatsSource) and src.interval != interval:
+            logger.info(
+                "collect_docker: updating poll interval for %s: %s -> %s",
+                src.path,
+                src.interval,
+                interval,
+            )
             src.interval = interval
 
     def collect_docker(
@@ -1494,7 +1580,7 @@ class State:
             )
         return opened
 
-    def _write_segment(
+    async def _write_segment(
         self,
         z: zipfile.ZipFile,
         seg_idx: int,
@@ -1510,29 +1596,53 @@ class State:
         collide on filename. Returns that segment's manifest sources list.
         `source_ids`, if given, restricts output to that subset (used by the
         rolling buffer feature to freeze the set of sources live at
-        buffer-start time, ignoring sources opened/closed afterward)."""
+        buffer-start time, ignoring sources opened/closed afterward).
+        Redis-backed now (see redis_log.py) -- per-source slices are fetched
+        concurrently via asyncio.gather rather than serial round trips."""
+        items = [
+            (i, s)
+            for i, s in enumerate(self.sources.values())
+            if (source_ids is None or s.id in source_ids)
+            and (include_host or not getattr(s, "is_host", False))
+        ]
+
+        async def log_slice(s):
+            return await self.redis_log.range_by_score_with_payload(s.name, t0, t1 + 1)
+
+        async def stats_slice(s):
+            svcs = sorted(s._services)
+            per_svc = await asyncio.gather(
+                *(self.redis_log.range_by_score_with_payload(svc, t0, t1 + 1) for svc in svcs)
+            )
+            return dict(zip(svcs, per_svc))
+
+        results = await asyncio.gather(
+            *(log_slice(s) if s.kind == "log" else stats_slice(s) for _i, s in items)
+        )
+
         meta = []
-        for i, s in enumerate(self.sources.values()):
-            if source_ids is not None and s.id not in source_ids:
-                continue
-            if not include_host and getattr(s, "is_host", False):
-                continue
+        for (i, s), result in zip(items, results):
             if s.kind == "log":
-                lo = bisect.bisect_left(s.rows, (t0,))
-                hi = bisect.bisect_right(s.rows, (t1 + 1,))
-                rows = s.rows[lo:hi]
+                rows = result
                 if not rows:
                     continue
                 fn = f"seg{seg_idx}/logs/{i}.jsonl"
-                z.writestr(fn, b"\n".join(jdumps({"ts": r[0], "text": r[3]}) for r in rows))
+                z.writestr(
+                    fn,
+                    b"\n".join(
+                        jdumps({"ts": ts, "text": payload.get("text", "")}) for ts, payload in rows
+                    ),
+                )
                 meta.append({"type": "log", "name": s.name, "file": fn, "count": len(rows)})
             else:
-                ser = {}
-                for svc, lst in s.series.items():
-                    lo = bisect.bisect_left(lst, (t0,))
-                    hi = bisect.bisect_right(lst, (t1 + 1,))
-                    if hi > lo:
-                        ser[svc] = lst[lo:hi]
+                ser = {
+                    svc: [
+                        [ts, p.get("cpu"), p.get("mem"), p.get("mem_bytes"), p.get("net")]
+                        for ts, p in rows
+                    ]
+                    for svc, rows in result.items()
+                    if rows
+                }
                 swarm = sorted(s._swarm)
                 if not ser:
                     continue
@@ -1541,7 +1651,7 @@ class State:
                 meta.append({"type": "stats", "name": s.name, "file": fn, "is_host": s.is_host})
         return meta
 
-    def build_sample_bytes(
+    async def build_sample_bytes(
         self,
         t0: float,
         t1: float,
@@ -1556,7 +1666,7 @@ class State:
         rolling_buffer.RollingBufferManager)."""
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-            meta = self._write_segment(z, 0, t0, t1, include_host, source_ids)
+            meta = await self._write_segment(z, 0, t0, t1, include_host, source_ids)
             segment = {"from": t0, "to": t1, "created": now_iso(), "sources": meta}
             z.writestr("manifest.json", jdumps({"version": 2, "segments": [segment]}))
         return buf.getvalue(), meta
@@ -1589,7 +1699,7 @@ class State:
                 segments.append({**seg, "_members": members})
         return segments
 
-    def merge_sample_bytes(
+    async def merge_sample_bytes(
         self, existing: bytes | None, t0: float, t1: float, include_host: bool = True
     ) -> tuple[bytes, list[dict], int]:
         """Append a new segment covering [t0, t1] to `existing` (raw bytes
@@ -1605,7 +1715,7 @@ class State:
             for seg in prior:
                 for relpath, content in seg["_members"].items():
                     z.writestr(relpath, content)
-            new_meta = self._write_segment(z, seg_idx, t0, t1, include_host)
+            new_meta = await self._write_segment(z, seg_idx, t0, t1, include_host)
             segments_manifest = [
                 {
                     "from": seg["from"],
@@ -1621,10 +1731,12 @@ class State:
             z.writestr("manifest.json", jdumps({"version": 2, "segments": segments_manifest}))
         return buf.getvalue(), new_meta, seg_idx
 
-    def export_sample(self, path: str, t0: float, t1: float, include_host: bool = True) -> dict:
+    async def export_sample(
+        self, path: str, t0: float, t1: float, include_host: bool = True
+    ) -> dict:
         """Write a .cttc sample to a server-side path. See
         build_sample_bytes() for the format."""
-        data, meta = self.build_sample_bytes(t0, t1, include_host)
+        data, meta = await self.build_sample_bytes(t0, t1, include_host)
         p = Path(path).expanduser()
         p.write_bytes(data)
         return {"path": str(p), "sources": len(meta)}
@@ -1669,28 +1781,33 @@ class State:
                 self.next_id += 1
                 if meta["type"] == "log":
                     src = LogSource(sid, meta["name"], p, live=False, transforms=[])
-                    rows = []
+                    src._state = self
                     for line in z.read(meta["file"]).splitlines():
                         if not line.strip():
                             continue
                         e = jloads(line)
                         src.seq += 1
-                        rows.append(
-                            (
-                                float(e["ts"]),
-                                src.seq,
-                                make_uid(meta["name"], src.seq, e.get("text", "")),
-                                str(e.get("text", "")),
-                            )
-                        )
-                    rows.sort()
-                    src.rows = rows
+                        ts = float(e["ts"])
+                        text = str(e.get("text", ""))
+                        uid = make_uid(meta["name"], src.seq, text)
+                        row = (ts, src.seq, uid, text)
+                        src._last_row = row
+                        self.redis_log.record(meta["name"], ts, {"uid": uid, "text": text})
                 else:
                     src = StatsSource(sid, meta["name"], p, live=False)
+                    src._state = self
                     d = jloads(z.read(meta["file"]))
-                    src.series = {svc: [tuple(r) for r in lst] for svc, lst in d["series"].items()}
+                    for svc, lst in d["series"].items():
+                        src._services.add(svc)
+                        for row in lst:
+                            ts, cpu, mem, mem_bytes, rate = tuple(row)
+                            src.count += 1
+                            self.redis_log.record(
+                                svc,
+                                ts,
+                                {"cpu": cpu, "mem": mem, "mem_bytes": mem_bytes, "net": rate},
+                            )
                     src._swarm = set(d.get("swarm", []))
-                    src.count = sum(len(v) for v in src.series.values())
                     if meta.get("is_host"):
                         src.is_host = True
                 self.sources[sid] = src
@@ -1705,11 +1822,21 @@ class State:
         src.stop()  # a no-op for static/file-tailed sources, see LogSource/StatsSource.stop
         logger.info("closed source %s (%s)", sid, src.path)
 
-    def describe(self):
-        out = []
+    async def describe(self):
+        """Per-source min/max/total, gathered concurrently across every
+        open source (Redis-backed now, see redis_log.py) rather than
+        serial awaits -- /sources and export requests fan out across every
+        source, so this stays one round trip of latency, not N."""
         items = list(self.sources.values())
-        for s in items:
-            rng = s.range()
+
+        async def one(s):
+            rng = await s.range()
+            total = await s.total() if s.kind == "log" else s.count
+            return rng, total
+
+        results = await asyncio.gather(*(one(s) for s in items))
+        out = []
+        for s, (rng, total) in zip(items, results):
             d = {
                 "id": s.id,
                 "name": s.name,
@@ -1720,12 +1847,11 @@ class State:
                 "min_ts": rng[0] if rng else None,
                 "max_ts": rng[1] if rng else None,
                 "error": getattr(s, "error", None),
+                "total": total,
             }
             if s.kind == "log":
-                d["total"] = s.total()
                 d["transforms"] = [n for n, _ in s.transforms]
             else:
-                d["total"] = s.count
                 d["services"] = s.services()
                 d["is_host"] = getattr(s, "is_host", False)
             out.append(d)
@@ -1780,8 +1906,8 @@ async def sessions_loop(state: State, interval: float = 1.0):
     while True:
         await asyncio.sleep(interval)
         state.scheduler.tick()
-        state.recording_sessions.tick()
-        state.events.tick()
+        await state.recording_sessions.tick()
+        await state.events.tick()
 
 
 # ── HTTP API (FastAPI) ────────────────────────────────────────────────────────
@@ -1798,6 +1924,20 @@ def bad_request(msg: str) -> ValueError:
 async def lifespan(app: FastAPI):
     state: State = app.state.cttc
     await state.redis_log.start()
+    # Command-line files (uv run server.py file1 file2 ...) must be opened
+    # only *after* redis_log.start() above -- Redis is the sole store now
+    # (see redis_log.py's module docstring), and record() silently no-ops
+    # while self.enabled is still False (start() hasn't run yet). Opening
+    # these from _run() instead, before uvicorn's serve() ever triggers
+    # this lifespan, used to mean every CLI-supplied file's data was queued
+    # and dropped before there was anywhere for it to land -- /range would
+    # report {min_ts: null, max_ts: null} forever, since nothing else ever
+    # changes for a static (non-live) source to trigger a client re-check.
+    for f, live in getattr(app.state, "cli_files", []):
+        try:
+            state.open_file(f, "auto", None, live=live, transforms=[])
+        except Exception as e:
+            logger.warning("could not open %s: %s", f, e)
     # Always-on collection: local Docker + local host telemetry start the
     # moment the gateway boots, no client/Set Docker Daemon action needed.
     # Remote hosts previously configured (see collect_docker's
@@ -1824,7 +1964,11 @@ async def lifespan(app: FastAPI):
                     daemon.get("ssh_key"),
                 )
             except Exception as e:
-                logger.warning("lifespan: auto-collect for remembered daemon %s failed: %s", daemon.get("host"), e)
+                logger.warning(
+                    "lifespan: auto-collect for remembered daemon %s failed: %s",
+                    daemon.get("host"),
+                    e,
+                )
     yield
     await state.redis_log.stop()
 
@@ -1908,11 +2052,28 @@ async def _access_log(request: Request, call_next):
         response = await call_next(request)
     except Exception as e:
         elapsed_ms = (time.monotonic() - start) * 1000
-        logger.info("%s %s%s from %s -> unhandled exception after %.1fms: %s", request.method, request.url.path, query, client, elapsed_ms, e)
+        logger.info(
+            "%s %s%s from %s -> unhandled exception after %.1fms: %s",
+            request.method,
+            request.url.path,
+            query,
+            client,
+            elapsed_ms,
+            e,
+        )
         raise
     elapsed_ms = (time.monotonic() - start) * 1000
     size = response.headers.get("content-length", "?")
-    logger.info("%s %s%s from %s -> %d (%s bytes, %.1fms)", request.method, request.url.path, query, client, response.status_code, size, elapsed_ms)
+    logger.info(
+        "%s %s%s from %s -> %d (%s bytes, %.1fms)",
+        request.method,
+        request.url.path,
+        query,
+        client,
+        response.status_code,
+        size,
+        elapsed_ms,
+    )
     return response
 
 
@@ -1980,7 +2141,7 @@ async def route_mlog():
 @app.get("/sources")
 async def route_sources(request: Request):
     st = get_state(request)
-    return {"sources": st.describe(), "json_impl": JSON_IMPL}
+    return {"sources": await st.describe(), "json_impl": JSON_IMPL}
 
 
 @app.get("/transforms")
@@ -1996,7 +2157,7 @@ async def route_ssh_keys():
 @app.get("/range")
 async def route_range(request: Request):
     lo = hi = None
-    for s in get_state(request).describe():
+    for s in await get_state(request).describe():
         if s["min_ts"] is not None:
             lo = s["min_ts"] if lo is None else min(lo, s["min_ts"])
             hi = s["max_ts"] if hi is None else max(hi, s["max_ts"])
@@ -2014,7 +2175,7 @@ async def route_series(
     out = []
     for s in st.sources.values():
         if s.kind == "stats":
-            out.extend(s.bucketed(t0, t1, pxi))
+            out.extend(await s.bucketed(t0, t1, pxi))
     return {"from": t0, "to": t1, "px": pxi, "services": out}
 
 
@@ -2022,7 +2183,7 @@ async def route_series(
 async def route_logs(request: Request, source: str = "", start: str = "0", count: str = "200"):
     src = get_log_source(request, source)
     starti, counti = int(start), min(int(count), 2000)
-    return {"total": src.total(), "rows": src.slice(starti, counti)}
+    return {"total": await src.total(), "rows": await src.slice(starti, counti)}
 
 
 @app.get("/point")
@@ -2033,7 +2194,7 @@ async def route_point(request: Request, t: str = ""):
     out = {}
     for s in get_state(request).sources.values():
         if s.kind == "stats":
-            out.update(s.point_at(tf))
+            out.update(await s.point_at(tf))
     return {"t": tf, "services": out}
 
 
@@ -2042,7 +2203,7 @@ async def route_index_at(request: Request, source: str = "", t: str = ""):
     src = get_log_source(request, source)
     if not t:
         raise bad_request("'t' is required")
-    return {"index": src.index_at(float(t))}
+    return {"index": await src.index_at(float(t))}
 
 
 @app.get("/ticks")
@@ -2056,7 +2217,7 @@ async def route_ticks(
     src = get_log_source(request, source)
     if not from_ or not to:
         raise bad_request("'from' and 'to' are required")
-    return {"counts": src.ticks(float(from_), float(to), int(px))}
+    return {"counts": await src.ticks(float(from_), float(to), int(px))}
 
 
 @app.get("/logs/find")
@@ -2064,7 +2225,7 @@ async def route_logs_find(
     request: Request, source: str = "", q: str = "", start: str = "0", dir: str = "fwd"
 ):
     src = get_log_source(request, source)
-    idx = src.find(q, int(start), dir != "back")
+    idx = await src.find(q, int(start), dir != "back")
     return {"index": idx}
 
 
@@ -2077,7 +2238,7 @@ async def route_files_download(
     st = get_state(request)
     t0, t1 = float(from_), float(to)
     inc = include_host.lower() not in ("0", "false")
-    data, filename, count = files.download_sample(st, t0, t1, inc)
+    data, filename, count = await files.download_sample(st, t0, t1, inc)
     return Response(
         content=data,
         media_type="application/octet-stream",
@@ -2150,7 +2311,7 @@ async def route_open(request: Request):
         "opened": opened,
         "errors": errors,
         "needs_selection": needs_selection,
-        "sources": st.describe(),
+        "sources": await st.describe(),
     }
 
 
@@ -2170,7 +2331,7 @@ async def route_close(request: Request):
 async def route_sample_export(request: Request):
     body = await request.json()
     st = get_state(request)
-    return st.export_sample(
+    return await st.export_sample(
         body["path"],
         float(body["from"]),
         float(body["to"]),
@@ -2193,7 +2354,7 @@ async def route_sample_record(request: Request):
     t1 = float(request.headers.get("X-CTTC-To", ""))
     inc = (request.headers.get("X-CTTC-Include-Host") or "1").lower() not in ("0", "false")
     st = get_state(request)
-    data, meta, seg_idx = st.merge_sample_bytes(existing or None, t0, t1, inc)
+    data, meta, seg_idx = await st.merge_sample_bytes(existing or None, t0, t1, inc)
     return Response(
         content=data,
         media_type="application/octet-stream",
@@ -2228,7 +2389,7 @@ async def route_buffer_pause(buffer_id: str, request: Request):
 async def route_buffer_stop(buffer_id: str, request: Request):
     st = get_state(request)
     try:
-        data, meta = st.rolling_buffers.stop(buffer_id)
+        data, meta = await st.rolling_buffers.stop(buffer_id)
     except UnknownBuffer:
         raise HTTPException(status_code=404, detail=f"unknown buffer: {buffer_id}")
     return Response(
@@ -2262,7 +2423,7 @@ async def route_session_start(request: Request):
 async def route_session_stop(session_id: str, request: Request):
     st = get_state(request)
     try:
-        st.recording_sessions.stop(session_id)
+        await st.recording_sessions.stop(session_id)
     except UnknownSession:
         raise HTTPException(status_code=404, detail=f"unknown session: {session_id}")
     return {"ok": True}
@@ -2389,8 +2550,11 @@ def _parse_condition(body: dict):
 
 
 def _parse_action(body: dict) -> Action:
+    kind = body.get("kind")
+    if kind not in ("snapshot", "recording"):
+        raise bad_request(f"action.kind must be 'snapshot' or 'recording', got {kind!r}")
     return Action(
-        kind=body.get("kind"),
+        kind=kind,
         minutes=float(body["minutes"]) if body.get("minutes") is not None else None,
         duration_minutes=float(body["duration_minutes"])
         if body.get("duration_minutes") is not None
@@ -2417,7 +2581,7 @@ async def route_events_create(request: Request):
     try:
         conditions = [_parse_condition(c) for c in body.get("conditions") or []]
         action = _parse_action(body.get("action") or {})
-        event_id = st.events.create(
+        event_id = await st.events.create(
             name=body.get("name", ""),
             source_ids=set(body.get("source_ids") or []),
             conditions=conditions,
@@ -2492,11 +2656,13 @@ async def route_events_update(event_id: str, request: Request):
     body = await request.json()
     st = get_state(request)
     try:
-        st.events.update(
+        await st.events.update(
             event_id,
             name=body.get("name"),
             source_ids=set(body["source_ids"]) if "source_ids" in body else None,
-            conditions=[_parse_condition(c) for c in body["conditions"]] if "conditions" in body else None,
+            conditions=[_parse_condition(c) for c in body["conditions"]]
+            if "conditions" in body
+            else None,
             action=_parse_action(body["action"]) if "action" in body else None,
             match=body.get("match"),
         )
@@ -2513,7 +2679,7 @@ async def route_events_update(event_id: str, request: Request):
 async def route_events_cancel(event_id: str, request: Request):
     st = get_state(request)
     try:
-        st.events.cancel(event_id)
+        await st.events.cancel(event_id)
     except UnknownEvent:
         raise HTTPException(status_code=404, detail=f"unknown event: {event_id}")
     return {"ok": True}
@@ -2543,7 +2709,7 @@ async def route_docker_collect(request: Request):
         ssh_key,
     )
     st.broadcast({"type": "sources"})
-    return {"opened": opened, "sources": st.describe()}
+    return {"opened": opened, "sources": await st.describe()}
 
 
 @app.post("/files/upload")
@@ -2569,7 +2735,7 @@ async def route_files_upload(request: Request):
         "opened": opened,
         "errors": errors,
         "needs_selection": needs_selection,
-        "sources": st.describe(),
+        "sources": await st.describe(),
     }
 
 
@@ -2616,6 +2782,15 @@ def main():
     )
     ap.add_argument("--static", action="store_true", help="open files without tailing")
     ap.add_argument(
+        "--redis-port",
+        type=int,
+        default=redis_log.DEFAULT_TCP_PORT,
+        help="TCP port for the bundled Redis instance (see redis_log.py) -- bound to "
+        "127.0.0.1 only, for pointing an external tool (redis-cli, RedisInsight) at it "
+        "to inspect the store; the unix socket used for everything server.py itself does "
+        "is unaffected by this",
+    )
+    ap.add_argument(
         "--auto-collect",
         action="store_true",
         help="start collecting local Docker + local host telemetry immediately on boot "
@@ -2638,15 +2813,14 @@ def main():
 async def _run(args):
     import socket as _socket
 
-    state = State(Path(args.transforms_dir), Path(args.sessions_dir))
+    state = State(
+        Path(args.transforms_dir), Path(args.sessions_dir), redis_tcp_port=args.redis_port
+    )
     app.state.cttc = state
     app.state.auto_collect = args.auto_collect
-
-    for f in args.files:
-        try:
-            state.open_file(f, "auto", None, live=not args.static, transforms=[])
-        except Exception as e:
-            logger.warning("could not open %s: %s", f, e)
+    # Opened by lifespan() itself, *after* redis_log.start() -- see its own
+    # comment there for why this can't happen here anymore.
+    app.state.cli_files = [(f, not args.static) for f in args.files]
 
     # Bind our own socket first so the *actual* port (when --port 0 asks for
     # any free one) is known before uvicorn starts serving -- main.js reads

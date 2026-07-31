@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import zipfile
 from datetime import UTC, datetime
@@ -21,20 +22,25 @@ def stats_entry(name, ts):
 
 
 @pytest.fixture
-def state(tmp_path):
+async def state(tmp_path):
     tdir = tmp_path / "transforms"
     tdir.mkdir()
-    return server.State(tdir)
+    st = server.State(tdir)
+    await st.redis_log.start()
+    yield st
+    await st.redis_log.stop()
+
+
+async def _flush():
+    # record() enqueues via call_soon_threadsafe and is pumped
+    # asynchronously; give the pump a beat before reads that expect it.
+    await asyncio.sleep(0.15)
 
 
 @pytest.fixture
 def log_file(tmp_path):
     f = tmp_path / "svc.log"
-    f.write_text(
-        "2026-01-02T03:00:00Z one\n"
-        "2026-01-02T03:00:30Z two\n"
-        "2026-01-02T03:01:00Z three\n"
-    )
+    f.write_text("2026-01-02T03:00:00Z one\n2026-01-02T03:00:30Z two\n2026-01-02T03:01:00Z three\n")
     return f
 
 
@@ -46,100 +52,84 @@ def _members(data: bytes) -> dict:
 
 
 class TestRollingBuffer:
-    def test_start_returns_unique_ids(self, state):
+    async def test_start_returns_unique_ids(self, state):
         b1 = state.rolling_buffers.start(5)
         b2 = state.rolling_buffers.start(5)
         assert b1 != b2
 
-    def test_stop_unknown_buffer_raises(self, state):
+    async def test_stop_unknown_buffer_raises(self, state):
         with pytest.raises(rolling_buffer.UnknownBuffer):
-            state.rolling_buffers.stop("nope")
+            await state.rolling_buffers.stop("nope")
 
-    def test_pause_unknown_buffer_raises(self, state):
+    async def test_pause_unknown_buffer_raises(self, state):
         with pytest.raises(rolling_buffer.UnknownBuffer):
             state.rolling_buffers.pause("nope")
 
-    def test_stop_removes_buffer(self, state, log_file, monkeypatch):
-        monkeypatch.setattr(
-            rolling_buffer.time, "time", lambda: ms(2026, 1, 2, 3, 1, 0) / 1000.0
-        )
+    async def test_stop_removes_buffer(self, state, log_file, monkeypatch):
+        monkeypatch.setattr(rolling_buffer.time, "time", lambda: ms(2026, 1, 2, 3, 1, 0) / 1000.0)
         state.open_file(str(log_file), "log", None, live=False, transforms=[])
+        await _flush()
         buffer_id = state.rolling_buffers.start(5)
-        state.rolling_buffers.stop(buffer_id)
+        await state.rolling_buffers.stop(buffer_id)
         with pytest.raises(rolling_buffer.UnknownBuffer):
-            state.rolling_buffers.stop(buffer_id)
+            await state.rolling_buffers.stop(buffer_id)
 
-    def test_stop_captures_only_snapshotted_sources(
+    async def test_stop_captures_only_snapshotted_sources(
         self, state, log_file, tmp_path, monkeypatch
     ):
         state.open_file(str(log_file), "log", None, live=False, transforms=[])
-        monkeypatch.setattr(
-            rolling_buffer.time, "time", lambda: ms(2026, 1, 2, 3, 0, 0) / 1000.0
-        )
+        await _flush()
+        monkeypatch.setattr(rolling_buffer.time, "time", lambda: ms(2026, 1, 2, 3, 0, 0) / 1000.0)
         buffer_id = state.rolling_buffers.start(5)
         # opened after the buffer started -- must not appear in its output
         late = tmp_path / "late.log"
         late.write_text("2026-01-02T03:00:00Z late\n")
         state.open_file(str(late), "log", None, live=False, transforms=[])
+        await _flush()
 
-        monkeypatch.setattr(
-            rolling_buffer.time, "time", lambda: ms(2026, 1, 2, 3, 1, 0) / 1000.0
-        )
-        data, meta = state.rolling_buffers.stop(buffer_id)
+        monkeypatch.setattr(rolling_buffer.time, "time", lambda: ms(2026, 1, 2, 3, 1, 0) / 1000.0)
+        _data, meta = await state.rolling_buffers.stop(buffer_id)
         assert len(meta) == 1
         assert meta[0]["name"] == "svc"
 
-    def test_stop_windows_to_last_n_minutes(self, state, log_file, monkeypatch):
+    async def test_stop_windows_to_last_n_minutes(self, state, log_file, monkeypatch):
         state.open_file(str(log_file), "log", None, live=False, transforms=[])
-        monkeypatch.setattr(
-            rolling_buffer.time, "time", lambda: ms(2026, 1, 2, 3, 0, 0) / 1000.0
-        )
+        await _flush()
+        monkeypatch.setattr(rolling_buffer.time, "time", lambda: ms(2026, 1, 2, 3, 0, 0) / 1000.0)
         buffer_id = state.rolling_buffers.start(0.5)  # 30s window
-        monkeypatch.setattr(
-            rolling_buffer.time, "time", lambda: ms(2026, 1, 2, 3, 1, 0) / 1000.0
-        )
-        data, meta = state.rolling_buffers.stop(buffer_id)
+        monkeypatch.setattr(rolling_buffer.time, "time", lambda: ms(2026, 1, 2, 3, 1, 0) / 1000.0)
+        data, meta = await state.rolling_buffers.stop(buffer_id)
         members = _members(data)
         rows = members[meta[0]["file"]].decode().splitlines()
         texts = [json.loads(r)["text"] for r in rows]
         # window is [end - 30s, end] = [03:00:30, 03:01:00] -- "one" (03:00:00) excluded
         assert texts == ["two", "three"]
 
-    def test_pause_freezes_window_end(self, state, log_file, monkeypatch):
+    async def test_pause_freezes_window_end(self, state, log_file, monkeypatch):
         state.open_file(str(log_file), "log", None, live=False, transforms=[])
-        monkeypatch.setattr(
-            rolling_buffer.time, "time", lambda: ms(2026, 1, 2, 3, 0, 0) / 1000.0
-        )
+        await _flush()
+        monkeypatch.setattr(rolling_buffer.time, "time", lambda: ms(2026, 1, 2, 3, 0, 0) / 1000.0)
         buffer_id = state.rolling_buffers.start(10)
-        monkeypatch.setattr(
-            rolling_buffer.time, "time", lambda: ms(2026, 1, 2, 3, 0, 30) / 1000.0
-        )
+        monkeypatch.setattr(rolling_buffer.time, "time", lambda: ms(2026, 1, 2, 3, 0, 30) / 1000.0)
         state.rolling_buffers.pause(buffer_id)
         # time keeps moving after pause, but stop() must use the paused_at
-        monkeypatch.setattr(
-            rolling_buffer.time, "time", lambda: ms(2026, 1, 2, 4, 0, 0) / 1000.0
-        )
-        data, meta = state.rolling_buffers.stop(buffer_id)
+        monkeypatch.setattr(rolling_buffer.time, "time", lambda: ms(2026, 1, 2, 4, 0, 0) / 1000.0)
+        data, meta = await state.rolling_buffers.stop(buffer_id)
         members = _members(data)
         rows = members[meta[0]["file"]].decode().splitlines()
         texts = [json.loads(r)["text"] for r in rows]
         assert texts == ["one", "two"]  # up to 03:00:30, not the later "three"
 
-    def test_pause_twice_keeps_first_pause_time(self, state, log_file, monkeypatch):
+    async def test_pause_twice_keeps_first_pause_time(self, state, log_file, monkeypatch):
         state.open_file(str(log_file), "log", None, live=False, transforms=[])
-        monkeypatch.setattr(
-            rolling_buffer.time, "time", lambda: ms(2026, 1, 2, 3, 0, 0) / 1000.0
-        )
+        await _flush()
+        monkeypatch.setattr(rolling_buffer.time, "time", lambda: ms(2026, 1, 2, 3, 0, 0) / 1000.0)
         buffer_id = state.rolling_buffers.start(10)
-        monkeypatch.setattr(
-            rolling_buffer.time, "time", lambda: ms(2026, 1, 2, 3, 0, 30) / 1000.0
-        )
+        monkeypatch.setattr(rolling_buffer.time, "time", lambda: ms(2026, 1, 2, 3, 0, 30) / 1000.0)
         state.rolling_buffers.pause(buffer_id)
-        monkeypatch.setattr(
-            rolling_buffer.time, "time", lambda: ms(2026, 1, 2, 3, 5, 0) / 1000.0
-        )
+        monkeypatch.setattr(rolling_buffer.time, "time", lambda: ms(2026, 1, 2, 3, 5, 0) / 1000.0)
         state.rolling_buffers.pause(buffer_id)  # no-op, first pause wins
-        data, meta = state.rolling_buffers.stop(buffer_id)
+        data, meta = await state.rolling_buffers.stop(buffer_id)
         members = _members(data)
         rows = members[meta[0]["file"]].decode().splitlines()
         assert len(rows) == 2  # "one" and "two", not "three"

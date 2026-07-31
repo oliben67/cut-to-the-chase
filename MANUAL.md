@@ -20,7 +20,7 @@ executable (see [Getting help](#getting-help)) so it's available offline.
   - [Remote hosts over SSH](#remote-hosts-over-ssh)
   - [Loading metrics files](#loading-metrics-files)
   - [Opening files from the command line](#opening-files-from-the-command-line)
-  - [Removing the Docker Daemon](#removing-the-docker-daemon)
+  - [Removing the Docker Host](#removing-the-docker-daemon)
 - [Reading the telemetry](#reading-the-telemetry)
   - [Metric strips](#metric-strips)
   - [The container legend](#the-container-legend)
@@ -55,11 +55,11 @@ executable (see [Getting help](#getting-help)) so it's available offline.
   container**, or **provisioned onto a remote machine over SSH** — either
   way, the app talks to it the same way. See
   [Connecting to a Gateway](#connecting-to-a-gateway).
-- **Docker Daemon** — the *target* whose containers/services you want
+- **Docker Host** — the *target* whose containers/services you want
   telemetry and logs from. It can be the same machine as the gateway, or a
   different one reached over `ssh://`. Don't confuse the two: you can be
   connected to a gateway running on your laptop while it collects from a
-  Docker daemon on a completely different server, or vice versa.
+  Docker host on a completely different server, or vice versa.
 - **Source** — anything that feeds the timeline: a followed container log,
   a `docker stats` collector, a host-telemetry collector, or an opened file.
 - **Cursor** — the currently selected point in time. Click anywhere on a
@@ -80,8 +80,8 @@ a **gateway setup wizard** may appear — see
 [Connecting to a Gateway](#connecting-to-a-gateway); skip it to use this
 machine's own Docker (or none) directly.
 
-With no sources open, the **Set Docker Daemon…** dialog (sidebar → Docker
-Daemon) attaches to a Docker daemon; or use **Load Metrics…** (sidebar →
+With no sources open, the **Set Docker Host…** dialog (sidebar → Docker
+Daemon) attaches to a Docker host; or use **Load Metrics…** (sidebar →
 Metrics) to open a saved `.cttc-metric` file instead.
 
 If you collected from Docker before, the app **restores those collections on
@@ -99,8 +99,8 @@ collapsible sections:
 
 - **Gateway** — New Gateway…, Edit Gateway (see
   [Connecting to a Gateway](#connecting-to-a-gateway)).
-- **Docker Daemon** — Set Docker Daemon…, Edit Docker Daemon…, Remove
-  Docker Daemon (see [Adding sources](#adding-sources)).
+- **Docker Host** — Set Docker Host…, Edit Docker Host…, Remove
+  Docker Host (see [Adding sources](#adding-sources)).
 - **Metrics** — Load Metrics…, Create Event…, Edit Events… (see
   [Automating with events](#automating-with-events)).
 - **Preferences** — Appearance…, Settings… (see
@@ -177,11 +177,31 @@ A **Gateway** is where the CTTC server actually runs. Three modes:
   reuses one already running), and reaches it either directly or through an
   SSH tunnel if the remote port isn't otherwise reachable.
 
+The gateway stores everything it collects in Redis — its sole data store, no
+in-memory fallback. When Docker is available on this machine, **the first
+time the app ever runs** you're asked to choose how the embedded gateway
+should run: **as a container** (recommended — self-contained, bundles its
+own Redis, matches how CTTC runs in production) or **natively** (runs
+directly as a process on this machine; requires `redis-server` to already be
+installed and on this machine's `PATH`, the same way the container-free
+embedded server has always required `uv`). That choice is remembered — you
+won't be asked again unless you delete `~/.cttc/connection.json`. If Docker
+isn't available at all, the embedded server always runs natively and this
+choice never comes up.
+
+Redis itself is reachable directly (not just through the gateway's own API)
+on `127.0.0.1:56379` by default (`redis-cli -p 56379`, RedisInsight, etc.),
+in both modes — useful for inspecting what's actually stored. Loopback-only,
+no password, same trust model as everything else this app runs locally.
+Configurable via server.py's `--redis-port` flag if 56379 ever collides with
+something else on your machine.
+
 **New Gateway…** (sidebar → Gateway) walks through adding a remote one:
 host, SSH key (a file already on this machine, or paste one directly), and
 which gateway image to use (a registry reference, or a local tarball for
 offline installs). **Skip — use this machine** bypasses all of this and
-uses local Docker (or the embedded server if Docker isn't available).
+uses local Docker (or the embedded server if Docker isn't available), per
+the choice above.
 **Edit Gateway** re-opens that same form for an existing entry — **"This
 machine"** (the embedded/local gateway) is never listed here, since it has
 no connection settings to change and can't be uninstalled; it's always
@@ -210,15 +230,15 @@ reconnects — no action needed on your part.
 
 ### Collecting from Docker
 
-![The Set Docker Daemon dialog: docker host field and the Fetch button
+![The Set Docker Host dialog: docker host field and the Fetch button
 that lists containers/services to follow](docs/images/dlg-set-sources.png)
 
-Only one Docker daemon can be watched at a time, so **Set Docker
+Only one Docker host can be watched at a time, so **Set Docker
 Daemon…** is only enabled while none is defined yet — once one's set, use
-**Edit Docker Daemon…** (or **Remove Docker Daemon** first) instead of
+**Edit Docker Host…** (or **Remove Docker Host** first) instead of
 starting a second one.
 
-**Set Docker Daemon…** attaches to a Docker daemon. Leave the host field
+**Set Docker Host…** attaches to a Docker host. Leave the host field
 empty for the local daemon (or the gateway's own host, if you're connected
 to a remote gateway). CPU/MEM/NET telemetry — both per-container
 (`docker stats`) and for the host machine itself — is always collected
@@ -238,7 +258,7 @@ always right-click a container later to track it (see
 heading** to select or deselect every checkbox in that group at once (a
 partially-ticked group selects all first, rather than deselecting).
 
-**Set Docker Daemon**/**Update Docker Daemon** stays disabled until at
+**Set Docker Host**/**Update Docker Host** stays disabled until at
 least one container or service is actually checked — with nothing
 ticked there's nothing to collect.
 
@@ -246,10 +266,10 @@ An already-followed container or service looks exactly like any other
 entry in the list — same color, still enabled — the only cue is a **✔**
 mark next to it if it's currently ticked. Ticking/unticking toggles that
 mark live. Ticked transforms (see [Transforms](#transforms)) apply to the
-new log sources. **Set Docker Daemon** syncs exactly to what's checked
-here, and — on every successful **Set**/**Update Docker Daemon** —
+new log sources. **Set Docker Host** syncs exactly to what's checked
+here, and — on every successful **Set**/**Update Docker Host** —
 remembers exactly which containers/services were ticked in a small file
-at `~/.cttc/[user]@[gateway]-containers.json` (one file per Docker daemon
+at `~/.cttc/[user]@[gateway]-containers.json` (one file per Docker host
 you connect to), so this daemon's selection survives closing and
 reopening the dialog, and even relaunching CTTC. That same submit also
 updates every entry's legend/graph tracking state to match exactly
@@ -257,17 +277,17 @@ what's ticked — a newly-ticked container starts plotting immediately,
 and one you just unticked stops being selected right away, rather than
 staying stuck in the graph until separately unselected from the legend.
 
-**Edit Docker Daemon…** and **Remove Docker Daemon** are only enabled once
+**Edit Docker Host…** and **Remove Docker Host** are only enabled once
 a daemon is actually being watched — nothing to edit or remove otherwise.
-Once one is set, **Edit Docker Daemon…** re-opens this same form with the
+Once one is set, **Edit Docker Host…** re-opens this same form with the
 host and SSH key pre-filled and locked, **Fetch** relabelled **Refresh**
 (just re-probes for new containers/services rather than starting over),
-and the bottom button relabelled **Update Docker Daemon**. Opening it
+and the bottom button relabelled **Update Docker Host**. Opening it
 immediately runs that same live probe on its own — you don't have to
 remember to click Refresh yourself for the checklist to reflect what's
 actually running right now.
 
-Opening **Edit Docker Daemon…** reads that daemon's
+Opening **Edit Docker Host…** reads that daemon's
 `[user]@[gateway]-containers.json` file first, and the checklist is built
 from it, not from whatever happens to be open in this session:
 
@@ -281,7 +301,7 @@ from it, not from whatever happens to be open in this session:
 - **gone** (stopped/removed) *and* listed in the file — stays **listed,
   disabled, and marked 🚫**, with a "no longer available" note, instead of
   silently vanishing; its source is closed automatically, removing it from
-  the graph — Update Docker Daemon isn't needed for that part;
+  the graph — Update Docker Host isn't needed for that part;
 - **gone** and *not* listed in the file — simply **omitted** from the
   checklist entirely, nothing to flag;
 - **new** — appears unticked (nothing is preselected just for being found);
@@ -289,10 +309,10 @@ from it, not from whatever happens to be open in this session:
   unchanged server-side, keeps exactly that — Refresh never discards an
   in-progress edit.
 
-Clicking **Set**/**Update Docker Daemon** rewrites
+Clicking **Set**/**Update Docker Host** rewrites
 `[user]@[gateway]-containers.json` to match exactly what's ticked (and
 not disabled) at that moment — this is the "on the way out" save that
-Edit Docker Daemon reads back next time.
+Edit Docker Host reads back next time.
 
 ### Remote hosts over SSH
 
@@ -336,9 +356,9 @@ are handled. Start the server with `--static` to disable tailing, and with
 (otherwise naive timestamps are assumed UTC). Times render in your local
 timezone; the toolbar cursor readout shows UTC.
 
-### Removing the Docker Daemon
+### Removing the Docker Host
 
-**Remove Docker Daemon** (sidebar → Docker Daemon) closes every open source
+**Remove Docker Host** (sidebar → Docker Host) closes every open source
 for the current daemon (collectors are stopped) and forgets the remembered
 docker session, giving you a clean slate.
 
@@ -641,7 +661,7 @@ pop-outs are extra views, so nothing moves.
 
 Transforms are user-written Python modules applied to every log record at
 ingest. Drop a `.py` file into `app/server/transforms/` and it appears as a
-checkbox in the **Set Docker Daemon…** dialog. Modules are reloaded every time
+checkbox in the **Set Docker Host…** dialog. Modules are reloaded every time
 sources are opened — edit and re-add, no restart needed.
 
 ```python
@@ -693,14 +713,14 @@ error is recorded on the affected record instead.
 | 🔍 in a log panel | search that log |
 | ✕ on a log panel | hide the panel (collection keeps running) |
 | ⧉ / ⤴ Pop back | pop a panel out / back in |
-| click a group heading in the Docker Daemon checklist | select/deselect every item in that group |
+| click a group heading in the Docker Host checklist | select/deselect every item in that group |
 
 ## What is remembered between launches
 
 Chart style, strip height, host-panel visibility, container tracking states,
 log ordering, panel positions, the *others* list state, per-host SSH keys,
 your docker collections (restored automatically at startup; cleared by
-Remove Docker Daemon), the sidebar's dock position/collapsed state/size, and
+Remove Docker Host), the sidebar's dock position/collapsed state/size, and
 the "now" line's color and style.
 
 ## Scripting the server
@@ -749,6 +769,13 @@ without an internet connection. Two ways to reach it from inside the app:
 - **"could not start server via uv"** — install
   [uv](https://docs.astral.sh/uv/); it provisions the server's Python
   environment on first run.
+- **"redis-server is required to run CTTC's embedded server..."** — the
+  embedded gateway needs `redis-server` on PATH too, the same way it needs
+  `uv` (Redis is the sole store for logs/telemetry now, not just a cache —
+  see [Scripting the server](#scripting-the-server)). Install Redis (e.g.
+  `brew install redis` on macOS, `apt install redis-server` on
+  Debian/Ubuntu) and relaunch. Not needed for the local-Docker-container or
+  remote-gateway modes, which already bundle it.
 - **"docker CLI not found on PATH"** — install the docker CLI, or use the
   app on files / `.cttc-metric` metrics only.
 - **The app opens as a plain terminal process / nothing appears** (VS Code
@@ -765,4 +792,4 @@ without an internet connection. Two ways to reach it from inside the app:
   side); `tcp://` daemons are not supported for host vitals.
 - **A remote gateway won't reconnect** — CTTC falls back to an SSH tunnel
   automatically; if that also fails, check that the SSH key/host in **Edit
-  Gateway** is still correct and that the remote Docker daemon is running.
+  Gateway** is still correct and that the remote Docker host is running.

@@ -5,7 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { loadConnectionConfig, defaultConfigPath, hostFromTarget } = require("../../lib/connection-config");
+const { loadConnectionConfig, saveRunMode, defaultConfigPath, hostFromTarget } = require("../../lib/connection-config");
 
 function tmpConfigPath() {
   return path.join(fs.mkdtempSync(path.join(os.tmpdir(), "cttc-cfg-")), "connection.json");
@@ -119,4 +119,38 @@ test("hostFromTarget strips the user@ prefix", () => {
 
 test("hostFromTarget leaves a bare host (no user@) alone", () => {
   assert.equal(hostFromTarget("docker-host"), "docker-host");
+});
+
+test("embedded config with no run_mode -> runMode omitted", () => {
+  const p = tmpConfigPath();
+  writeConfig(p, { mode: "embedded" });
+  const got = loadConnectionConfig({ env: {}, configPath: p });
+  assert.deepEqual(got, { mode: "embedded" });
+  assert.equal("runMode" in got, false);
+});
+
+test("embedded config with run_mode: container -> runMode reported", () => {
+  const p = tmpConfigPath();
+  writeConfig(p, { mode: "embedded", run_mode: "container" });
+  assert.deepEqual(loadConnectionConfig({ env: {}, configPath: p }), { mode: "embedded", runMode: "container" });
+});
+
+test("embedded config with run_mode: native -> runMode reported", () => {
+  const p = tmpConfigPath();
+  writeConfig(p, { mode: "embedded", run_mode: "native" });
+  assert.deepEqual(loadConnectionConfig({ env: {}, configPath: p }), { mode: "embedded", runMode: "native" });
+});
+
+test("saveRunMode writes a fresh file that loadConnectionConfig reads back", () => {
+  const p = tmpConfigPath();
+  const written = saveRunMode("native", { configPath: p });
+  assert.equal(written, p);
+  assert.deepEqual(loadConnectionConfig({ env: {}, configPath: p }), { mode: "embedded", runMode: "native" });
+});
+
+test("saveRunMode overwrites a previous choice", () => {
+  const p = tmpConfigPath();
+  saveRunMode("container", { configPath: p });
+  saveRunMode("native", { configPath: p });
+  assert.deepEqual(loadConnectionConfig({ env: {}, configPath: p }), { mode: "embedded", runMode: "native" });
 });

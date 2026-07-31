@@ -50,14 +50,20 @@ function readConfigFile(configPath) {
 /**
  * @param {{env?: object, configPath?: string}} opts
  *   configPath overrides the default ~/.cttc/connection.json (mainly for tests).
- * @returns {{mode: "embedded"} | {mode: "remote", host: string, sshTarget: string, sshKey: string|null, remotePort: number}}
+ * @returns {{mode: "embedded", runMode?: "native"|"container"} | {mode: "remote", host: string, sshTarget: string, sshKey: string|null, remotePort: number}}
  */
 function loadConnectionConfig({ env = process.env, configPath } = {}) {
   const resolvedPath = configPath || defaultConfigPath(env);
   const fileCfg = readConfigFile(resolvedPath);
 
   const mode = env.CTTC_MODE || fileCfg.mode || "embedded";
-  if (mode === "embedded") return { mode: "embedded" };
+  if (mode === "embedded") {
+    // runMode: the user's one-time choice (see main.js's first-run dialog)
+    // between running the gateway as a local Docker container or as a bare
+    // native process -- omitted (not just `undefined`) when never chosen,
+    // so callers can tell "never asked" apart from an explicit pick.
+    return fileCfg.run_mode ? { mode: "embedded", runMode: fileCfg.run_mode } : { mode: "embedded" };
+  }
   if (mode !== "remote") {
     throw new Error(`unknown CTTC connection mode: ${JSON.stringify(mode)} (expected "embedded" or "remote")`);
   }
@@ -127,9 +133,28 @@ function clearConnectionConfig({ configPath } = {}) {
   if (fs.existsSync(resolvedPath)) fs.unlinkSync(resolvedPath);
 }
 
+/**
+ * Persists the user's one-time choice (see main.js's first-run dialog)
+ * between running the embedded gateway as a local Docker container or as a
+ * bare native process. Preserves any other keys already in the file (there
+ * shouldn't be any for embedded mode today, but this keeps it forward
+ * compatible rather than clobbering the file).
+ * @param {"native"|"container"} runMode
+ * @param {{configPath?: string}} [opts]
+ */
+function saveRunMode(runMode, { configPath } = {}) {
+  const resolvedPath = configPath || defaultConfigPath(process.env);
+  const existing = readConfigFile(resolvedPath);
+  fs.mkdirSync(path.dirname(resolvedPath), { recursive: true });
+  const json = JSON.stringify({ ...existing, mode: "embedded", run_mode: runMode }, null, 2);
+  fs.writeFileSync(resolvedPath, json, { encoding: "utf8" });
+  return resolvedPath;
+}
+
 module.exports = {
   loadConnectionConfig,
   saveConnectionConfig,
+  saveRunMode,
   clearConnectionConfig,
   defaultConfigPath,
   hostFromTarget,

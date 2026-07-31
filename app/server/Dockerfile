@@ -86,6 +86,11 @@ COPY --from=builder /srv/cttc-gateway ./
 ENV PATH="/srv/cttc-gateway/.venv/bin:${PATH}"
 
 EXPOSE 8765
+# Redis's own TCP monitor port (see redis_log.py's DEFAULT_TCP_PORT) --
+# bound to 127.0.0.1 only regardless of this EXPOSE, unlike 8765 above
+# (documentation-only under --network=host, same as 8765's own EXPOSE;
+# listed here so the two stay consistent/greppable).
+EXPOSE 56379
 # 0.0.0.0: the client talks to this container directly over plain HTTP (no
 # ssh tunnel -- see docs/architecture/remote-server.md), so it must be
 # reachable on the host's real network interfaces, not just loopback.
@@ -96,4 +101,6 @@ EXPOSE 8765
 # service rather than something main.js launches bare/embedded alongside a
 # single client -- so it's the one place always-on collection (see
 # lifespan() in server.py) should default on.
-ENTRYPOINT ["python", "server.py", "--host", "0.0.0.0", "--port", "8765", "--auto-collect"]
+# --redis-port: explicit rather than relying on server.py's own default,
+# matching --auto-collect's own spelled-out-here style.
+ENTRYPOINT ["python", "server.py", "--host", "0.0.0.0", "--port", "8765", "--auto-collect", "--redis-port", "56379"]
