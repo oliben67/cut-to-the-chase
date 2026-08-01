@@ -678,6 +678,47 @@ class TestSniffAndTail:
             task.cancel()
             await st.redis_log.stop()
 
+    async def test_tail_loop_survives_a_non_oserror_failure_on_one_source(self, tmp_path, monkeypatch):
+        # br-ORCH-005: only OSError used to be caught per-source -- any other
+        # exception (a malformed transform raising inside ingest_chunk, say)
+        # propagated out of the for-loop and killed tail_loop's `while True`
+        # outright, silently stopping log tailing for every OTHER live file
+        # source too, for the rest of the gateway's uptime.
+        broken_path = tmp_path / "broken.log"
+        broken_path.write_text("2026-01-02T03:00:00Z one\n")
+        healthy_path = tmp_path / "healthy.log"
+        healthy_path.write_text("2026-01-02T03:00:00Z one\n")
+        st = server.State(tmp_path)
+        await st.redis_log.start()
+        broken_src = st.open_file(str(broken_path), "log", None, live=True, transforms=[])
+        healthy_src = st.open_file(str(healthy_path), "log", None, live=True, transforms=[])
+
+        real_read_all = server.read_all
+
+        def flaky_read(src):
+            if src is broken_src:
+                raise ValueError("malformed transform blew up mid-ingest")
+            return real_read_all(src)
+
+        monkeypatch.setattr(server, "read_all", flaky_read)
+        task = asyncio.ensure_future(server.tail_loop(st, 0.03))
+        try:
+            with open(broken_path, "a") as fh:
+                fh.write("2026-01-02T03:00:01Z two\n")
+            with open(healthy_path, "a") as fh:
+                fh.write("2026-01-02T03:00:01Z two\n")
+            deadline = time.time() + 3
+            while await healthy_src.total() < 2 and time.time() < deadline:
+                await asyncio.sleep(0.05)
+            # the broken source's ValueError must not have killed the loop --
+            # the healthy source, ticked in the same and later iterations,
+            # still picked up its own growth.
+            assert await healthy_src.total() == 2
+            assert await broken_src.total() == 1  # never advanced past its failure, but didn't crash anything else
+        finally:
+            task.cancel()
+            await st.redis_log.stop()
+
 
 # ── ssh helpers ──────────────────────────────────────────────────────────────
 
@@ -702,7 +743,7 @@ class TestSshHelpers:
         locked.chmod(0o000)
         try:
             keys = server.list_ssh_keys()
-            assert keys == [str(d / "id_ed25519")]  # unreadable key skipped quietly
+            assert keys == ["id_ed25519"]  # unreadable key skipped quietly, basename only
         finally:
             locked.chmod(0o644)
 
@@ -904,9 +945,48 @@ class TestNormalizeDockerHost:
     def test_bare_user_at_host_gets_ssh_scheme(self):
         assert server.normalize_docker_host("user@other-server") == "ssh://user@other-server"
 
-    def test_already_schemed_left_alone(self):
+    def test_already_schemed_ssh_left_alone(self):
         assert server.normalize_docker_host("ssh://user@other-server") == "ssh://user@other-server"
-        assert server.normalize_docker_host("tcp://1.2.3.4:2375") == "tcp://1.2.3.4:2375"
+
+    def test_non_ssh_scheme_raises_a_clean_error(self):
+        # br-CONN-002: used to be passed through untouched, then silently
+        # parsed into garbage further down (_parse_ssh_target/
+        # ssh_host_and_port strip a literal "ssh://" -- exactly 6 chars --
+        # off *any* scheme prefix unconditionally, since every scheme here
+        # happens to also be 6 characters long) instead of ever surfacing
+        # a clean "unsupported transport" error.
+        with pytest.raises(ValueError, match="unsupported docker host transport 'tcp'"):
+            server.normalize_docker_host("tcp://1.2.3.4:2375")
+
+    def test_bad_port_raises_a_clean_error(self):
+        # br-CONN-005: _parse_ssh_target's bare `int(port_s)` used to raise
+        # Python's own raw "invalid literal for int()..." ValueError, and
+        # only late -- mid ssh-connect, inside a background poll loop (an
+        # opaque self.error string) or wrapped into a 502 DockerPsError by
+        # docker_ps -- instead of a clean error raised immediately here.
+        with pytest.raises(ValueError, match=r"invalid ssh port 'notaport'"):
+            server.normalize_docker_host("ssh://h:notaport")
+
+    def test_bad_port_raises_a_clean_error_with_user(self):
+        with pytest.raises(ValueError, match=r"invalid ssh port 'notaport'"):
+            server.normalize_docker_host("ssh://user@h:notaport")
+
+    def test_bare_host_with_bad_port_also_raises(self):
+        # the bare `user@host:port` shorthand (no explicit ssh:// scheme
+        # yet) must be validated too, not just an already-schemed host.
+        with pytest.raises(ValueError, match=r"invalid ssh port 'notaport'"):
+            server.normalize_docker_host("user@h:notaport")
+
+    def test_port_zero_and_out_of_range_rejected(self):
+        with pytest.raises(ValueError, match=r"invalid ssh port '0'"):
+            server.normalize_docker_host("ssh://h:0")
+        with pytest.raises(ValueError, match=r"invalid ssh port '99999999'"):
+            server.normalize_docker_host("ssh://h:99999999")
+
+    def test_valid_port_is_left_alone(self):
+        assert server.normalize_docker_host("ssh://user@h:2222") == "ssh://user@h:2222"
+        with pytest.raises(ValueError, match="unsupported docker host transport 'http'"):
+            server.normalize_docker_host("http://example.com")
 
 
 class TestDockerPs:
@@ -1132,6 +1212,34 @@ async def stats_rows_of(fake_state, svc):
     return [(ts, p.get("cpu"), p.get("mem"), p.get("mem_bytes"), p.get("net")) for ts, p in rows]
 
 
+class TestEntityId:
+    """br-DEDUP-006: the Redis entity id every Source read/write actually
+    keys on (see LogSource._entity/StatsSource._entity_for)."""
+
+    def test_bare_for_no_host(self):
+        assert server._entity_id("nginx", None) == "nginx"
+        assert server._entity_id("nginx", "") == "nginx"
+
+    def test_qualified_for_a_remote_host(self):
+        assert server._entity_id("nginx", "ssh://u@h") == "nginx@h"
+
+    def test_hostname_derivation_matches_the_rest_of_the_module(self):
+        # same `host.split("@")[-1]` collect_docker itself already uses for
+        # host@<hostname> naming -- consistent, even where that derivation
+        # has its own separate known gap (br-DEDUP-007, ssh port handling).
+        assert server._entity_id("nginx", "ssh://u@h:2222") == "nginx@h:2222"
+
+    def test_already_qualified_name_is_left_untouched(self):
+        # HostStatsSource pre-builds "host@<hostname>" itself before ever
+        # reaching ingest_row -- must not double-qualify into
+        # "host@<hostname>@<hostname>".
+        assert server._entity_id("host@h", "ssh://u@h") == "host@h"
+
+    def test_two_different_hosts_never_produce_the_same_entity_id(self):
+        assert server._entity_id("nginx", "ssh://u@h1") != server._entity_id("nginx", "ssh://u@h2")
+        assert server._entity_id("nginx", "ssh://u@h1") != server._entity_id("nginx", None)
+
+
 class TestDockerStatsSource:
     async def test_polls_and_ingests(self, docker_cli, monkeypatch):
         client = FakeDockerClient(
@@ -1234,6 +1342,57 @@ class TestDockerStatsSource:
         finally:
             src.stop()
 
+    async def test_same_service_name_from_different_hosts_does_not_interleave_data(
+        self, docker_cli, monkeypatch, redis_log_instance
+    ):
+        # br-DEDUP-006: a local and a remote DockerStatsSource that both
+        # happen to discover a service named "nginx" must not collide into
+        # the same Redis entity -- each host's history stays independent.
+        local_client = FakeDockerClient(
+            containers=[FakeContainer("nginx", stats_raw=raw_stats(cpu_pct=1.0))]
+        )
+        monkeypatch.setattr(server, "docker_client", lambda host: local_client)
+
+        remote_row = {
+            "Name": "nginx",
+            "CPUPerc": "9.00%",
+            "MemPerc": "5.00%",
+            "MemUsage": "10MiB / 100MiB",
+            "NetIO": "0B / 0B",
+        }
+        remote_client = FakeSSHClient()
+        monkeypatch.setattr(server, "_connect_ssh", lambda host, key: remote_client)
+        monkeypatch.setattr(
+            server, "_exec_remote_docker", lambda c, a, timeout=15: (json.dumps(remote_row) + "\n", "", 0)
+        )
+
+        st = FakeState(redis_log=redis_log_instance)
+        local_src = server.DockerStatsSource("d10", "stats@local", None, 0.05, st)
+        remote_src = server.DockerStatsSource("d11", "stats@remotehost", "ssh://u@remotehost", 0.05, st)
+        try:
+            deadline = time.time() + 3
+            while (
+                "nginx" not in local_src._services or "nginx" not in remote_src._services
+            ) and time.time() < deadline:
+                await asyncio.sleep(0.02)
+            assert "nginx" in local_src._services
+            assert "nginx" in remote_src._services
+
+            # each Source's own read methods must see only its own host's data
+            local_rows = await stats_rows_of(st, "nginx")
+            remote_rows = await stats_rows_of(st, "nginx@remotehost")
+            assert local_rows and local_rows[0][1] == pytest.approx(1.0), local_rows
+            assert remote_rows and remote_rows[0][1] == pytest.approx(9.0), remote_rows
+
+            # and via the Source-level API actually used by /series etc.
+            local_point = await local_src.point_at(local_rows[0][0])
+            remote_point = await remote_src.point_at(remote_rows[0][0])
+            assert local_point["nginx"]["cpu"] == pytest.approx(1.0)
+            assert remote_point["nginx"]["cpu"] == pytest.approx(9.0)
+        finally:
+            local_src.stop()
+            remote_src.stop()
+
 
 class FakeAsyncStdout:
     def __init__(self, chunks, hang_after=False):
@@ -1298,7 +1457,7 @@ class TestDockerLogSource:
         while src.error is None and time.time() < deadline:
             await asyncio.sleep(0.02)
         assert await src.total() == 2
-        assert src.error == "log stream ended"
+        assert src.error == "log stream ended -- reconnecting"
         assert src.path == "docker://local/container/web"
         src.stop()
 
@@ -1333,7 +1492,37 @@ class TestDockerLogSource:
         deadline = time.time() + 3
         while src.error is None and time.time() < deadline:
             await asyncio.sleep(0.02)
-        assert src.error == "log stream ended"
+        assert src.error == "log stream ended -- reconnecting"
+        src.stop()
+
+    async def test_stream_end_triggers_a_reconnect_rather_than_giving_up(
+        self, docker_cli, monkeypatch, redis_log_instance
+    ):
+        # br-DEDUP-009: a dead/restarted container must not leave the log
+        # feed permanently stale -- once the first stream ends, _follow has
+        # to reconnect (a fresh create_subprocess_exec call) rather than
+        # returning for good.
+        procs = [
+            FakeAsyncProc([b"2026-01-02T03:04:05Z first\n"]),
+            FakeAsyncProc([b"2026-01-02T03:04:06Z second\n"]),
+        ]
+        calls = {"n": 0}
+
+        async def fake_exec(*a, **k):
+            proc = procs[min(calls["n"], len(procs) - 1)]
+            calls["n"] += 1
+            return proc
+
+        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+        real_sleep = asyncio.sleep
+        monkeypatch.setattr(server.asyncio, "sleep", lambda _s: real_sleep(0))  # skip the backoff
+        st = FakeState(redis_log=redis_log_instance)
+        src = server.DockerLogSource("l7", "web", None, "container", "web", [], st)
+        deadline = time.time() + 3
+        while await src.total() < 2 and time.time() < deadline:
+            await asyncio.sleep(0.02)
+        assert await src.total() == 2  # reconnected and ingested the second stream's line too
+        assert calls["n"] >= 2
         src.stop()
 
     async def test_remote_ssh_connect_failure_recorded(self, docker_cli, monkeypatch):
@@ -1381,6 +1570,46 @@ class TestDockerLogSource:
         assert await src.total() == 1
         src.stop()
         assert proc.terminated
+
+    async def test_same_container_name_from_different_hosts_does_not_interleave_data(
+        self, docker_cli, monkeypatch, redis_log_instance
+    ):
+        # br-DEDUP-006: a local and a remote DockerLogSource for the same
+        # container name ("web") must not collide into the same Redis
+        # entity -- each host's history stays independent.
+        local_proc = FakeAsyncProc([b"2026-01-02T03:04:05Z from local\n"])
+        remote_client = FakeSSHClientStreaming([b"2026-01-02T03:04:05Z from remote\n"])
+
+        async def fake_exec(*a, **k):
+            return local_proc
+
+        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(server, "_connect_ssh", lambda host, key: remote_client)
+
+        st = FakeState(redis_log=redis_log_instance)
+        local_src = server.DockerLogSource("l10", "web", None, "container", "web", [], st)
+        remote_src = server.DockerLogSource(
+            "l11", "web", "ssh://u@remotehost", "container", "web", [], st
+        )
+        try:
+            deadline = time.time() + 3
+            while (
+                await local_src.total() < 1 or await remote_src.total() < 1
+            ) and time.time() < deadline:
+                await asyncio.sleep(0.02)
+            assert await local_src.total() == 1
+            assert await remote_src.total() == 1
+            local_rows = await local_src.slice(0, 10)
+            remote_rows = await remote_src.slice(0, 10)
+            assert local_rows[0]["text"] == "from local"
+            assert remote_rows[0]["text"] == "from remote"
+            # confirm they're actually different Redis entities, not just
+            # coincidentally-consistent reads through each Source's own view
+            assert await redis_log_instance.total("web") == 1
+            assert await redis_log_instance.total("web@remotehost") == 1
+        finally:
+            local_src.stop()
+            remote_src.stop()
 
 
 # ── HostStatsSource ──────────────────────────────────────────────────────────
@@ -1990,17 +2219,18 @@ def api(tmp_path, log_file, stats_file):
     t.join(timeout=5)
 
 
-def get(base, path):
+def get(base, path, headers=None):
+    req = urllib.request.Request(base + path, headers=headers or {})
     try:
-        with urllib.request.urlopen(base + path, timeout=5) as r:
+        with urllib.request.urlopen(req, timeout=5) as r:
             return r.status, json.loads(r.read())
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read())
 
 
-def post(base, path, body=None):
+def post(base, path, body=None, headers=None):
     data = json.dumps(body or {}).encode()
-    req = urllib.request.Request(base + path, data=data, method="POST")
+    req = urllib.request.Request(base + path, data=data, method="POST", headers=headers or {})
     try:
         with urllib.request.urlopen(req, timeout=5) as r:
             return r.status, json.loads(r.read())
@@ -2136,6 +2366,19 @@ class TestHttpApi:
         monkeypatch.setattr(server, "list_ssh_keys", lambda: ["/home/u/.ssh/id_rsa"])
         _, j = get(base, "/ssh/keys")
         assert j["keys"] == ["/home/u/.ssh/id_rsa"]
+
+    def test_ssh_keys_endpoint_never_discloses_full_paths(self, api, tmp_path, monkeypatch):
+        # br-NET-005: any client reachable on the port could enumerate the
+        # operator's private-key file paths (and thus their username/home
+        # dir); only basenames may cross the wire.
+        base, _ = api
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        d = tmp_path / ".ssh"
+        d.mkdir()
+        (d / "id_ed25519").write_text("-----BEGIN OPENSSH PRIVATE KEY-----\n...")
+        _, j = get(base, "/ssh/keys")
+        assert j["keys"] == ["id_ed25519"]
+        assert all("/" not in k and str(tmp_path) not in k for k in j["keys"])
 
     def test_missing_params_400(self, api):
         base, _ = api
@@ -2295,6 +2538,24 @@ class TestHttpApi:
         _, j = post(base, "/docker/ps", {"host": "ssh://u@h", "ssh_key": "/k"})
         assert j["host"] == "ssh://u@h" and j["key"] == "/k"
 
+    def test_docker_ps_endpoint_rejects_a_non_ssh_scheme(self, api):
+        # br-CONN-002: used to be silently parsed into garbage (an ssh
+        # attempt to a nonsense host:port) instead of rejected with a
+        # clean error. Real docker_ps, not monkeypatched -- normalize_docker_host
+        # raises before it ever touches a subprocess/ssh client.
+        base, _ = api
+        code, j = post(base, "/docker/ps", {"host": "tcp://1.2.3.4:2375"})
+        assert code == 400
+        assert "unsupported docker host transport" in j["error"]
+
+    def test_docker_ps_endpoint_rejects_a_bad_port(self, api):
+        # br-CONN-005: real docker_ps, not monkeypatched -- normalize_docker_host
+        # raises before it ever touches a subprocess/ssh client.
+        base, _ = api
+        code, j = post(base, "/docker/ps", {"host": "ssh://h:notaport"})
+        assert code == 400
+        assert "invalid ssh port" in j["error"]
+
     def test_docker_ps_endpoint_reports_runtime_error(self, api, monkeypatch):
         # a failed ssh/docker call must still get a real response (not a
         # dropped connection the client sees as "failed to fetch")
@@ -2354,6 +2615,47 @@ class TestHttpApi:
         assert code == 200 and len(j["opened"]) == 3
         for sid in j["opened"]:
             st.close_source(sid)
+
+    def test_docker_collect_endpoint_rejects_a_non_ssh_scheme(self, api):
+        # br-CONN-002
+        base, st = api
+        before = set(st.sources)
+        code, j = post(
+            base,
+            "/docker/collect",
+            {"host": "tcp://1.2.3.4:2375", "stats": True, "host_stats": False, "logs": []},
+        )
+        assert code == 400
+        assert "unsupported docker host transport" in j["error"]
+        assert set(st.sources) == before, "nothing should have been opened"
+
+    def test_docker_collect_endpoint_rejects_a_bad_port(self, api):
+        # br-CONN-005
+        base, st = api
+        before = set(st.sources)
+        code, j = post(
+            base,
+            "/docker/collect",
+            {"host": "ssh://h:notaport", "stats": True, "host_stats": False, "logs": []},
+        )
+        assert code == 400
+        assert "invalid ssh port" in j["error"]
+        assert set(st.sources) == before, "nothing should have been opened"
+
+    def test_docker_forget_endpoint_calls_forget_daemon_with_the_normalized_host(self, api, monkeypatch):
+        # br-REDIS-017: Remove Docker Host must actually reach the server's
+        # Redis-side daemon registry, not just close in-memory sources --
+        # this is the route that lets it do so.
+        base, st = api
+        captured = {}
+
+        async def fake_forget(host):
+            captured["host"] = host
+
+        monkeypatch.setattr(st.redis_log, "forget_daemon", fake_forget)
+        code, j = post(base, "/docker/forget", {"host": "u@h"})
+        assert code == 200 and j == {"ok": True}
+        assert captured["host"] == "ssh://u@h"  # normalize_docker_host adds the scheme
 
     def test_point_endpoint(self, api):
         base, _ = api
@@ -2477,6 +2779,18 @@ class TestBufferSessionSchedulerEndpoints:
         assert post(base, "/buffer/nope/pause")[0] == 404
         assert post_raw_binary(base, "/buffer/nope/stop", b"")[0] == 404
 
+    def test_buffer_start_rejects_once_the_ad_hoc_cap_is_reached(self, api):
+        # br-RBUF-005: POST /buffer/start used to be completely uncapped.
+        import rolling_buffer
+
+        base, state = api
+        for _ in range(rolling_buffer.MAX_OPEN):
+            state.rolling_buffers.start(5)
+        code, j = post(base, "/buffer/start", {"minutes": 5})
+        assert code == 400 and "error" in j
+        for bid in list(state.rolling_buffers._buffers):
+            state.rolling_buffers._buffers.pop(bid)  # clean up after ourselves
+
     def test_session_start_stop_status_download(self, api):
         base, _ = api
         code, j = post(base, "/session/start", {"safe": True})
@@ -2528,6 +2842,31 @@ class TestBufferSessionSchedulerEndpoints:
         code, j = post(base, "/logs/ttl", {"seconds": 120})
         assert code == 200 and j["ok"] is True
         assert state.redis_log.ttl_seconds == 120
+
+    def test_logs_ttl_rejects_zero_and_negative_values(self, api):
+        # br-REDIS-013: 0/negative used to truncate to a TTL that HEXPIREs
+        # every already-stored field immediately, irrecoverably wiping all
+        # history with no confirmation.
+        base, state = api
+        original = state.redis_log.ttl_seconds
+        _, before = get(base, "/sources")
+        for bad in (0, -1, -3600):
+            code, j = post(base, "/logs/ttl", {"seconds": bad})
+            assert code == 400, (bad, j)
+            assert "error" in j
+        assert state.redis_log.ttl_seconds == original, "rejected calls must not change the TTL"
+        _, after = get(base, "/sources")
+        assert after["sources"] == before["sources"], "rejected calls must not have touched any stored data"
+
+    def test_logs_ttl_rejects_a_fraction_that_truncates_to_zero(self, api):
+        # 0.5 alone passes a bare `seconds <= 0` check but int(0.5) == 0,
+        # which HEXPIREs just as instantly -- the check has to look at the
+        # truncated value, not the raw one.
+        base, state = api
+        original = state.redis_log.ttl_seconds
+        code, j = post(base, "/logs/ttl", {"seconds": 0.5})
+        assert code == 400, j
+        assert state.redis_log.ttl_seconds == original
 
     def test_scheduler_create_status_cancel_one_shot(self, api):
         base, _ = api
@@ -2800,6 +3139,86 @@ class TestEventsEndpoints:
 # ── /files/* (phase 3: upload/download, docs/architecture/remote-server.md) ──
 
 
+class TestApiTokenAuth:
+    """br-NET-004: every route is gated behind X-CTTC-Token once a token is
+    configured (app.state.api_token, set from --api-token/CTTC_API_TOKEN --
+    see TestMain for the CLI/env-var wiring itself). Left unset, behavior is
+    byte-for-byte what it always was -- this only ever tightens a
+    deployment that opted into one."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_token_after(self):
+        # server.app is a module-level singleton shared by every test in
+        # this file (see boot_server) -- leaving a token set here would
+        # otherwise 401 every other test's requests too.
+        yield
+        server.app.state.api_token = None
+
+    def test_no_token_configured_is_unauthenticated_as_before(self, api):
+        base, _ = api
+        assert getattr(server.app.state, "api_token", None) is None
+        code, _ = get(base, "/sources")
+        assert code == 200
+
+    def test_missing_token_is_rejected_once_one_is_configured(self, api):
+        base, _ = api
+        server.app.state.api_token = "s3cr3t"
+        code, j = get(base, "/sources")
+        assert code == 401
+        assert "X-CTTC-Token" in j["error"]
+
+    def test_wrong_token_is_rejected(self, api):
+        base, _ = api
+        server.app.state.api_token = "s3cr3t"
+        code, _ = get(base, "/sources", headers={"X-CTTC-Token": "wrong"})
+        assert code == 401
+
+    def test_correct_token_is_accepted_on_get_routes(self, api):
+        base, _ = api
+        server.app.state.api_token = "s3cr3t"
+        code, j = get(base, "/sources", headers={"X-CTTC-Token": "s3cr3t"})
+        assert code == 200 and len(j["sources"]) == 2
+
+    def test_correct_token_is_accepted_on_post_routes_too(self, api):
+        base, _ = api
+        server.app.state.api_token = "s3cr3t"
+        code, j = post(base, "/close", {"id": "nonexistent"}, headers={"X-CTTC-Token": "s3cr3t"})
+        assert code == 200 and j == {"ok": True}  # reached the real route, not a 401
+
+    def test_options_preflight_is_exempt_even_with_a_token_configured(self, api):
+        base, _ = api
+        server.app.state.api_token = "s3cr3t"
+        req = urllib.request.Request(base + "/sources", method="OPTIONS")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            assert r.status == 204
+            assert "X-CTTC-Token" in r.headers.get("Access-Control-Allow-Headers", "")
+
+    def test_rejected_requests_are_logged(self, api, caplog):
+        base, _ = api
+        server.app.state.api_token = "s3cr3t"
+        with caplog.at_level("WARNING", logger="cttc"):
+            code, _ = get(base, "/sources")
+        assert code == 401
+        assert any(
+            "X-CTTC-Token" in r.message for r in caplog.records if r.name == "cttc"
+        ), caplog.text
+
+    def test_correct_token_via_query_param_is_accepted(self, api):
+        # EventSource (app.js's /events SSE stream) can't attach a custom
+        # header at all -- the query param is its only channel, so it must
+        # work as a fallback alongside (not instead of) the header.
+        base, _ = api
+        server.app.state.api_token = "s3cr3t"
+        code, j = get(base, "/sources?token=s3cr3t")
+        assert code == 200 and len(j["sources"]) == 2
+
+    def test_wrong_token_via_query_param_is_still_rejected(self, api):
+        base, _ = api
+        server.app.state.api_token = "s3cr3t"
+        code, _ = get(base, "/sources?token=wrong")
+        assert code == 401
+
+
 class TestMlogEndpoint:
     async def test_returns_logs_with_name_header(self, api, monkeypatch):
         base, _ = api
@@ -3033,6 +3452,49 @@ class TestMain:
         assert "could not open" in caplog.text
         assert server.NAIVE_TZ is not None and server.NAIVE_TZ != UTC or old_tz != UTC
         server.NAIVE_TZ = UTC  # restore module global for other tests
+
+    def test_api_token_flows_from_cli_through_to_the_real_server(self, tmp_path, monkeypatch, capsys):
+        # br-NET-004 end-to-end: --api-token (or CTTC_API_TOKEN, which it
+        # defaults from) actually gates the real server booted via main(),
+        # not just app.state poked directly (see TestApiTokenAuth).
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "server.py",
+                "--port",
+                "0",
+                "--redis-port",
+                str(unique_redis_tcp_port()),
+                "--transforms-dir",
+                str(tmp_path),
+                "--api-token",
+                "e2e-cli-secret",
+            ],
+        )
+        t = threading.Thread(target=server.main, daemon=True)
+        t.start()
+        out_accum = ""
+        port = None
+        deadline = time.time() + 5
+        while port is None and time.time() < deadline:
+            out_accum += capsys.readouterr().out
+            m = re.search(r'"port":\s*(\d+)', out_accum)
+            if m:
+                port = int(m.group(1))
+            else:
+                time.sleep(0.02)
+        assert port is not None, f"no port line seen: {out_accum!r}"
+        base = f"http://127.0.0.1:{port}"
+
+        code, _ = get(base, "/sources")
+        assert code == 401
+        code, _ = get(base, "/sources", headers={"X-CTTC-Token": "e2e-cli-secret"})
+        assert code == 200
+
+        post(base, "/shutdown", headers={"X-CTTC-Token": "e2e-cli-secret"})
+        t.join(timeout=5)
+        assert not t.is_alive()
 
     def test_main_keyboard_interrupt_exits_cleanly(self, tmp_path, monkeypatch):
         async def raise_interrupt(self):

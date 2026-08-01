@@ -287,7 +287,10 @@ body {
 .connection-info-popup .cip-sep { border-top: 1px solid var(--border); margin: 2px 0; }
 
 /* Record toolbar button's own status dot -- hidden (no dot) when idle,
-   red+pulsing while actively recording, yellow steady while paused. */
+   bright red+blinking while actively recording, orange+blinking while
+   paused. The bottom status bar's own #status-bar-recording-dot mirrors
+   these exact same rules (same colors, same animation) so the two always
+   read as the same state at a glance. */
 .recording-dot {
   display: inline-block;
   width: 7px;
@@ -296,11 +299,16 @@ body {
   border-radius: 50%;
   vertical-align: middle;
 }
-#btn-start-recording[data-state="recording"] .recording-dot {
+#btn-start-recording[data-state="recording"] .recording-dot,
+#status-bar-recording-dot[data-state="recording"] {
   background: var(--critical);
   animation: recording-pulse 1.5s ease-in-out infinite;
 }
-#btn-start-recording[data-state="paused"] .recording-dot { background: #f1c40f; }
+#btn-start-recording[data-state="paused"] .recording-dot,
+#status-bar-recording-dot[data-state="paused"] {
+  background: var(--warning);
+  animation: recording-pulse 1.5s ease-in-out infinite;
+}
 /* the button's own ⏺ glyph (white/light in dark mode, since it's plain
    button text) would otherwise sit right next to the red/yellow dot,
    reading as two dots at once -- hide it whenever the dot itself is
@@ -1680,6 +1688,7 @@ body:has(#gateway-setup) { overflow-y: auto; background: var(--surface-1); }
    flow, not fixed -- sits as the last item in body's flex column, below
    #app-body, so it never overlaps #activity's own fixed overlay. */
 .app-status-bar {
+  position: relative; /* anchors .status-bar-history-popup, springing up from the History button */
   flex: 0 0 auto;
   display: flex;
   align-items: center;
@@ -1691,6 +1700,8 @@ body:has(#gateway-setup) { overflow-y: auto; background: var(--surface-1); }
   border-top: 1px solid var(--border);
 }
 #app-status-bar-text {
+  flex: 1 1 auto;
+  min-width: 0; /* lets it actually shrink/ellipsize instead of pushing History off the row */
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1698,3 +1709,58 @@ body:has(#gateway-setup) { overflow-y: auto; background: var(--surface-1); }
 /* "capture mode ✂️" while Capture metrics is armed -- see setSampleArmed. */
 .status-bar-blink { animation: status-bar-blink 1s step-start infinite; }
 @keyframes status-bar-blink { 50% { opacity: 0; } }
+
+/* History button (right edge of the status bar) + its popup -- same icon
+   as the Logs section of Set/Update Docker Host (see .legend-icon), same
+   floating-card chrome as .connection-info-popup, but anchored to spring
+   up from the bottom-right (bottom: 100%) instead of dropping down, and
+   with an .activity-log-style scrollable body so it reads like the other
+   "logs windows" (Show activity, transforms doc, etc.) rather than a
+   one-off design. */
+.status-bar-history-btn {
+  margin-left: auto;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: none;
+  border: none;
+  padding: 2px 4px;
+  color: var(--muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+.status-bar-history-btn:hover { color: var(--text-primary); }
+.status-bar-history-btn svg { width: 13px; height: 13px; flex: 0 0 auto; }
+.status-bar-history-popup {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  position: absolute;
+  bottom: 100%;
+  right: 12px;
+  width: 340px;
+  max-width: calc(100vw - 24px);
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+  padding: 8px 10px;
+  margin-bottom: 6px;
+  z-index: 50;
+}
+.status-bar-history-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.status-bar-history-list {
+  margin: 0;
+  max-height: 45vh;
+}
+.status-bar-history-row { display: flex; gap: 8px; }
+.status-bar-history-row .sbh-ts { flex: 0 0 auto; color: var(--muted); font-variant-numeric: tabular-nums; }
+.status-bar-history-empty { color: var(--muted); }

@@ -8,6 +8,20 @@ const PORT = new URLSearchParams(location.search).get("port") || "8765";
 // tunnel/port-forward, see docs/architecture/remote-server.md).
 const HOST = new URLSearchParams(location.search).get("host") || "127.0.0.1";
 const API = `http://${HOST}:${PORT}`;
+// The shared-secret this gateway's own HTTP API requires (as X-CTTC-Token)
+// once one is configured server-side (br-NET-004) -- main.js passes it the
+// same synchronous way as host/port above, generated/persisted at
+// provision time (see lib/api-token.js). Empty for the bare/native
+// 127.0.0.1-only embedded path, which was never network-reachable and so
+// never needed one -- server.py itself skips the check entirely then, so
+// sending no header (rather than an empty one) is exactly correct either way.
+// `let`, not `const`: reassigned by renderer-spec.js to exercise
+// authHeaders()/get()/post() with a token present without needing a real
+// token-gated server for the e2e run itself.
+let API_TOKEN = new URLSearchParams(location.search).get("token") || null;
+function authHeaders(extra) {
+  return API_TOKEN ? { "X-CTTC-Token": API_TOKEN, ...extra } : { ...extra };
+}
 
 // a window can either be the main window (POPOUT_KIND == null) or a panel
 // popped out into its own window: "telemetry" (the chart area) or "log"
@@ -27,12 +41,12 @@ window.cttc?.onMainLog?.(({ level, text }) => {
 // GET path (relative to the CTTC server, never the docker/ssh target -- see
 // normalizeDockerHost below) -> parsed JSON body. Throws on any non-2xx.
 async function get(path) {
-  const r = await fetch(API + path);
+  const r = await fetch(API + path, { headers: authHeaders() });
   if (!r.ok) throw new Error(`${path}: ${r.status}`);
   return r.json();
 }
 async function post(path, body) {
-  const r = await fetch(API + path, { method: "POST", body: JSON.stringify(body || {}) });
+  const r = await fetch(API + path, { method: "POST", body: JSON.stringify(body || {}), headers: authHeaders() });
   const j = await r.json().catch(() => ({}));
   if (!r.ok) {
     const e = new Error(j.error || `${path}: ${r.status}`);
@@ -718,6 +732,30 @@ function drawVerticals(ctx, h) {
     ctx.fillRect(Math.min(dragStart, dragX), 0, Math.abs(dragX - dragStart), h);
     ctx.globalAlpha = 1;
   }
+  // While a recording session is running (or paused mid-session), band
+  // every range that's actually been/being captured -- same color/alpha as
+  // a "capture metrics" drag selection (--warning), just persistent
+  // instead of only shown mid-drag, so it reads as "this is what's being
+  // saved" across every chart strip and log density lane alike (both draw
+  // through this same function). Drawn as one rect per completed segment
+  // (recording.segments, each finalized by a Pause) plus, while actually
+  // recording, one more live rect for the in-progress segment -- NOT one
+  // single rect from the session's first Start to now, which would wrongly
+  // paint straight through a pause's gap as if it had been captured too.
+  if ((recording.status === "recording" || recording.status === "paused") && state.view) {
+    const ranges = recording.segments.slice();
+    if (recording.status === "recording" && recording.segmentStart != null) {
+      ranges.push({ from: recording.segmentStart, to: Date.now() });
+    }
+    ctx.fillStyle = themeVar("--warning");
+    ctx.globalAlpha = 0.15;
+    for (const { from, to } of ranges) {
+      const xLo = Math.max(MARGIN_L, Math.min(MARGIN_L + plotWidth(), tToX(from)));
+      const xHi = Math.max(MARGIN_L, Math.min(MARGIN_L + plotWidth(), tToX(to)));
+      if (xHi > xLo) ctx.fillRect(xLo, 0, xHi - xLo, h);
+    }
+    ctx.globalAlpha = 1;
+  }
   if (state.cursorT != null && state.view) {
     const x = tToX(state.cursorT);
     if (x >= MARGIN_L && x <= MARGIN_L + plotWidth()) {
@@ -1194,12 +1232,23 @@ async function askExportOptions() {
     ? "Currently being collected — included automatically unless you uncheck this."
     : "Not currently collected — checking this starts collecting it now (this past range won't have host data yet, but later saved metrics will).";
   return new Promise((resolve) => {
+    let settled = false;
     const done = (ok) => {
-      dlgExport.close();
+      if (settled) return;
+      settled = true;
       $("dlg-export-ok").onclick = null;
       $("dlg-export-cancel").onclick = null;
+      dlgExport.removeEventListener("close", onClose);
+      dlgExport.close(); // no-op if already closed/closing (e.g. Esc got here first)
       resolve(ok ? { includeHost: cb.checked, hadHost: hasHost } : null);
     };
+    // Esc is native <dialog> behavior that closes it without going through
+    // either button's onclick -- without this, that left exportSample's
+    // promise unresolved forever (ui-EXPORT-003). Treated the same as
+    // Cancel; guarded by `settled` so OK/Cancel's own done()-triggered
+    // close() (which also fires this same "close" event) doesn't re-resolve.
+    const onClose = () => done(false);
+    dlgExport.addEventListener("close", onClose);
     $("dlg-export-ok").onclick = () => done(true);
     $("dlg-export-cancel").onclick = () => done(false);
     dlgExport.showModal();
@@ -1247,7 +1296,7 @@ async function exportSample(t0, t1) {
     // remote-server.md phase 3) rather than asking it to write to a path
     // that might not exist on whichever machine actually ran it
     const params = new URLSearchParams({ from: t0, to: t1, include_host: opts.includeHost ? "1" : "0" });
-    const res = await fetch(`${API}/files/download?${params}`);
+    const res = await fetch(`${API}/files/download?${params}`, { headers: authHeaders() });
     if (!res.ok) throw new Error((await res.json().catch(() => null))?.error || `download failed: ${res.status}`);
     const sourceCount = Number(res.headers.get("X-CTTC-Source-Count") || 0);
     const bytes = new Uint8Array(await res.arrayBuffer());
@@ -2367,7 +2416,11 @@ function liveTrackTick() {
 // scheduleRefresh()) is always what actually pulls new data, keeping one
 // single code path for both the SSE-driven and manual-action refresh cases.
 function connectSSE() {
-  const es = new EventSource(API + "/events");
+  // EventSource can't attach a custom header (a long-standing spec
+  // limitation) -- the query param is server.py's own documented fallback
+  // for exactly this one case (see _require_api_token, br-NET-004).
+  const url = API_TOKEN ? `${API}/events?token=${encodeURIComponent(API_TOKEN)}` : `${API}/events`;
+  const es = new EventSource(url);
   es.onmessage = () => scheduleRefresh();
   es.onerror = () => setStatus("reconnecting to server…");
   es.onopen = () => setStatus("");
@@ -2655,7 +2708,7 @@ const dlgRemoveDaemon = $("dlg-remove-daemon");
 function populateRemoveDaemonSelect() {
   const history = dockerHostHistory();
   const select = $("remove-daemon-select");
-  select.innerHTML = '<option value="">— pick a daemon to remove —</option>';
+  select.innerHTML = '<option value="">— pick a Docker host to remove —</option>';
   for (const entry of history) {
     const opt = document.createElement("option");
     opt.value = entry.hostKey;
@@ -2685,6 +2738,20 @@ $("dlg-remove-daemon-delete").onclick = async () => {
   if (activeHostKey === hostKey && state.sources.length) {
     await Promise.all(state.sources.map((s) => post("/close", { id: s.id })));
     await refreshAll();
+  }
+  // br-REDIS-017: forgets the server-side Redis registry entry too, not
+  // just this client's own local catalog above -- without this, a remote
+  // daemon removed here (even one not currently connected) was silently
+  // re-collected forever on the gateway's own next restart (see
+  // redis_log.RedisLog.known_daemons()'s replay). "local" is never
+  // remembered server-side in the first place (see collect_docker), so
+  // there's nothing to forget for it.
+  if (hostKey !== "local") {
+    try {
+      await post("/docker/forget", { host: hostKey });
+    } catch (err) {
+      console.error("could not forget daemon on the server:", hostKey, err);
+    }
   }
   const saved = prefs.get("savedDockerDaemons", {});
   delete saved[hostKey];
@@ -2720,7 +2787,7 @@ async function uploadFile(localPath, segment) {
     return { opened: [], errors: [{ path: filename, error: "cannot read local files in this environment" }] };
   }
   const bytes = await window.cttc.readFile(localPath);
-  const headers = { "X-CTTC-Filename": filename };
+  const headers = authHeaders({ "X-CTTC-Filename": filename });
   if (segment != null) headers["X-CTTC-Segment"] = String(segment);
   const res = await fetch(`${API}/files/upload`, { method: "POST", body: bytes, headers });
   return res.json().catch(() => ({ opened: [], errors: [{ path: filename, error: `upload failed: ${res.status}` }] }));
@@ -2735,11 +2802,23 @@ function pickSegment(segments) {
   const box = $("segment-pick-list");
   box.innerHTML = "";
   return new Promise((resolve) => {
+    let settled = false;
     const done = (index) => {
-      dlgSegmentPick.close();
+      if (settled) return;
+      settled = true;
       $("dlg-segment-pick-cancel").onclick = null;
+      dlgSegmentPick.removeEventListener("close", onClose);
+      dlgSegmentPick.close(); // no-op if already closed/closing (e.g. Esc got here first)
       resolve(index);
     };
+    // Esc is native <dialog> behavior that closes it without going through
+    // any button's onclick -- without this, that left the load promise
+    // unresolved forever, silently hanging Load Metrics/Open Recording
+    // (ui-EXPORT-005). Treated the same as Cancel; guarded by `settled` so a
+    // button's own done()-triggered close() (which also fires this same
+    // "close" event) doesn't re-resolve.
+    const onClose = () => done(null);
+    dlgSegmentPick.addEventListener("close", onClose);
     for (const seg of segments) {
       const btn = document.createElement("button");
       btn.type = "button";
@@ -2800,7 +2879,12 @@ $("btn-load-sample").onclick = async () => {
    each span becoming its own file. A path is chosen once, at Start
    Recording; every later flush overwrites that same local file. */
 
-const recording = { status: "idle", path: null, segmentStart: null };
+// segments is purely for the capture-range highlight (see drawVerticals):
+// {from, to} for every completed (Paused) segment this session, so a pause
+// leaves a genuine, unhighlighted gap instead of the highlight painting
+// straight through it. segmentStart (below) still separately drives the
+// *current* in-progress segment's actual /sample/record range.
+const recording = { status: "idle", path: null, segmentStart: null, segments: [] };
 
 function syncRecordingMenu() {
   $("btn-start-recording").dataset.state = recording.status;
@@ -2813,6 +2897,21 @@ function syncRecordingMenu() {
         : "Start Recording";
   $("btn-pause-recording").disabled = recording.status !== "recording";
   $("btn-stop-recording").disabled = recording.status === "idle";
+  // Bottom status bar's own recording indicator -- same dot, same colors/
+  // blink, as the toolbar button (see .recording-dot in style.css), so
+  // recording state reads the same way whether or not that panel is open.
+  const dot = $("status-bar-recording-dot");
+  dot.hidden = recording.status === "idle";
+  dot.dataset.state = recording.status;
+  dot.title = recording.status === "paused" ? "Recording paused" : "Recording";
+  const label = $("status-bar-recording-text");
+  label.hidden = recording.status === "idle";
+  label.textContent =
+    recording.status === "paused"
+      ? `– paused recording "${basename(recording.path)}"`
+      : recording.status === "recording"
+        ? `– recording "${basename(recording.path)}"`
+        : "";
 }
 
 // Reassignable wrappers (window.cttc's own properties are read-only --
@@ -2829,7 +2928,12 @@ async function persistRecordingMarker() {
   await setRecordingMarkerOnDisk(
     recording.status === "idle"
       ? null
-      : { path: recording.path, status: recording.status, segmentStart: recording.segmentStart }
+      : {
+          path: recording.path,
+          status: recording.status,
+          segmentStart: recording.segmentStart,
+          segments: recording.segments,
+        }
   );
 }
 
@@ -2866,7 +2970,7 @@ async function flushRecordingSegment(t1) {
   const res = await fetch(`${API}/sample/record`, {
     method: "POST",
     body: existing,
-    headers: { "X-CTTC-From": String(recording.segmentStart), "X-CTTC-To": String(t1) },
+    headers: authHeaders({ "X-CTTC-From": String(recording.segmentStart), "X-CTTC-To": String(t1) }),
   });
   if (!res.ok) {
     const j = await res.json().catch(() => ({}));
@@ -2884,27 +2988,44 @@ async function startRecording() {
       if (!window.cttc?.pickRecordingPath) setStatus("Recording needs desktop file access — unavailable here");
       return; // cancelled, or no native dialog available
     }
-    setRecordingState({ status: "recording", path, segmentStart: Date.now() });
-    setStatus(`Recording started — saving to ${path}`);
+    setRecordingState({ status: "recording", path, segmentStart: Date.now(), segments: [] });
+    const msg = `Recording started — saving to ${path}`;
+    setStatus(msg);
+    recordStatusBarHistory(msg);
   } else {
-    // resume from paused: same path, a new segment starts now
+    // resume from paused: same path, a new segment starts now, leaving a
+    // genuine gap in the highlight between the just-completed segment
+    // (already in recording.segments, see pauseRecording) and this one.
     setRecordingState({ status: "recording", segmentStart: Date.now() });
     setStatus("Recording resumed");
+    recordStatusBarHistory(`Recording resumed — ${recording.path}`);
   }
   await persistRecordingMarker();
+  drawAll(); // capture-range highlight starts/resumes immediately, not on the next 1s tick
 }
 
 async function pauseRecording() {
   if (recording.status !== "recording") return;
   try {
-    await flushRecordingSegment(Date.now());
-    setRecordingState({ status: "paused", segmentStart: null });
+    const to = Date.now();
+    await flushRecordingSegment(to);
+    // finalize this segment's highlight range -- frozen here for good, the
+    // gap until the next Resume (if any) is deliberately left unhighlighted
+    setRecordingState({
+      status: "paused",
+      segments: [...recording.segments, { from: recording.segmentStart, to }],
+      segmentStart: null,
+    });
     setStatus(`Recording paused — ${recording.path}`);
+    recordStatusBarHistory(`Recording paused — ${recording.path}`);
   } catch (err) {
-    setStatus(`Could not pause recording: ${err.message || err}`);
+    const msg = `Could not pause recording: ${err.message || err}`;
+    setStatus(msg);
+    recordStatusBarHistory(msg);
     return; // stay "recording" -- the segment wasn't actually flushed
   }
   await persistRecordingMarker();
+  drawAll(); // the just-completed segment's highlight (and the new gap) show up immediately
 }
 
 async function stopRecording() {
@@ -2913,12 +3034,16 @@ async function stopRecording() {
   try {
     if (recording.status === "recording") await flushRecordingSegment(Date.now());
     setStatus(`Recording stopped — ${path}`);
+    recordStatusBarHistory(`Recording stopped — ${path}`);
   } catch (err) {
-    setStatus(`Could not finalize recording: ${err.message || err}`);
+    const msg = `Could not finalize recording: ${err.message || err}`;
+    setStatus(msg);
+    recordStatusBarHistory(msg);
     return; // keep the in-flight state so the user can retry Stop
   }
-  setRecordingState({ status: "idle", path: null, segmentStart: null });
+  setRecordingState({ status: "idle", path: null, segmentStart: null, segments: [] });
   await persistRecordingMarker();
+  drawAll(); // clears the capture-range highlight immediately
 }
 
 async function openRecording() {
@@ -2954,7 +3079,18 @@ async function recoverInterruptedRecording() {
   const marker = await getRecordingMarkerFromDisk();
   if (!marker) return;
   const wasInterrupted = marker.status === "recording";
-  setRecordingState({ status: "paused", path: marker.path, segmentStart: null });
+  setRecordingState({
+    status: "paused",
+    path: marker.path,
+    segmentStart: null,
+    // Whatever was already flushed (via a real Pause) before the crash --
+    // markers written before this field existed just have none. The
+    // segment that was actually in progress at crash time (if any) isn't
+    // added: its true end time is unknown and its data may not have
+    // survived a server restart either, so fabricating a highlighted range
+    // for it would show something that was never really captured.
+    segments: marker.segments ?? [],
+  });
   await persistRecordingMarker();
   if (wasInterrupted) {
     setStatus(
@@ -3101,6 +3237,89 @@ if (!POPOUT_KIND) {
 }
 function notifyEvent(text) {
   $("app-status-bar-text").textContent = `${new Date().toLocaleTimeString()} — ${text}`;
+  recordStatusBarHistory(text);
+}
+
+/* ── status bar history (status bar's own History button) ────────────────
+   Every discrete message that's ever been shown as feedback (notifyEvent's
+   background events, flashStatus's action confirmations, and the Record/
+   Pause/Resume/Stop lifecycle messages -- those go through setStatus, the
+   *toolbar's* status line, not the bottom bar, so they're logged here
+   explicitly rather than via notifyEvent/flashStatus) -- kept in-memory
+   only, capped so a long session can't grow this forever. Deliberately
+   excludes continuous/repeating state that also happens to render into
+   #app-status-bar-text (the live-resume countdown, ticking every second;
+   the "capture mode" reminder, and the persistent " recording ..."
+   suffix from syncRecordingMenu) -- those aren't discrete events and would
+   just flood this with near-duplicate noise. */
+const STATUS_BAR_HISTORY_MAX = 500;
+const statusBarHistory = [];
+function recordStatusBarHistory(text) {
+  statusBarHistory.push({ ts: Date.now(), text });
+  if (statusBarHistory.length > STATUS_BAR_HISTORY_MAX) statusBarHistory.shift();
+  if (!$("status-bar-history-popup").hidden) renderStatusBarHistory();
+}
+function renderStatusBarHistory() {
+  const list = $("status-bar-history-list");
+  list.innerHTML = "";
+  if (!statusBarHistory.length) {
+    const empty = document.createElement("div");
+    empty.className = "status-bar-history-empty";
+    empty.textContent = "Nothing yet.";
+    list.appendChild(empty);
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  for (let i = statusBarHistory.length - 1; i >= 0; i--) {
+    const { ts, text } = statusBarHistory[i];
+    const row = document.createElement("div");
+    row.className = "status-bar-history-row";
+    const t = document.createElement("span");
+    t.className = "sbh-ts";
+    t.textContent = new Date(ts).toLocaleTimeString();
+    const msg = document.createElement("span");
+    msg.textContent = text;
+    row.append(t, msg);
+    frag.appendChild(row);
+  }
+  list.appendChild(frag);
+}
+$("status-bar-history-btn").onclick = () => {
+  const popup = $("status-bar-history-popup");
+  popup.hidden = !popup.hidden;
+  if (!popup.hidden) renderStatusBarHistory();
+};
+$("status-bar-history-clear").onclick = () => {
+  statusBarHistory.length = 0;
+  renderStatusBarHistory();
+};
+document.addEventListener("click", (e) => {
+  const popup = $("status-bar-history-popup");
+  if (
+    !popup.hidden &&
+    !popup.contains(e.target) &&
+    e.target !== $("status-bar-history-btn") &&
+    !$("status-bar-history-btn").contains(e.target)
+  ) {
+    popup.hidden = true;
+  }
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") $("status-bar-history-popup").hidden = true;
+});
+
+// "application starting"/"application shutting down" -- the earliest and
+// latest things this window's own lifecycle can report in the status bar,
+// bookending whatever real activity notifyEvent/flashStatus show in
+// between. Main window only: popouts never show the status bar at all (see
+// syncStatusBarVisibility's own `if (!POPOUT_KIND)` gate) and have no
+// app-level lifecycle worth announcing -- closing one is just closing a
+// panel, not the app going away. main.js only sends "app-shutting-down" to
+// windows still open when an actual quit begins (Quit menu/button, Cmd+Q,
+// Dock > Quit) -- see its before-quit handler.
+if (!POPOUT_KIND) {
+  notifyEvent("application starting");
+  window.cttc?.onAppShuttingDown?.(() => notifyEvent("application shutting down"));
 }
 
 /* ── docker host activity log (ssh:// connections) ──────────────────────── */
@@ -3581,6 +3800,7 @@ setLiveTrackEnabled(liveTrackEnabled); // apply the persisted value to both fiel
 // since overwritten it.
 function flashStatus(msg, ms) {
   $("app-status-bar-text").textContent = msg;
+  recordStatusBarHistory(msg);
   setTimeout(() => {
     if ($("app-status-bar-text").textContent === msg) $("app-status-bar-text").textContent = "";
   }, ms);
@@ -3720,15 +3940,14 @@ if (!POPOUT_KIND) {
   });
 }
 
-// Edit mode only. Every field this touches (ssh/key + image + Connect/
-// Uninstall) is disabled until something is actually picked from the
-// dropdown -- rather than hiding the form outright, so it's obvious at a
-// glance that there's more here once a gateway is chosen. "This machine"
-// (embedded) is filtered out of the dropdown entirely by
-// gwLoadGatewaysForEdit -- every entry reachable here is a real, editable/
-// uninstallable remote or local-docker gateway, so isRemote below is
-// effectively always true, but the check is left in place as a defensive
-// fallback rather than assumed.
+// Edit mode only. Every field this touches (ssh/key + image + Connect) is
+// disabled until something is actually picked from the dropdown -- rather
+// than hiding the form outright, so it's obvious at a glance that there's
+// more here once a gateway is chosen. "This machine" (embedded) is
+// filtered out of the dropdown entirely by gwLoadGatewaysForEdit -- every
+// entry reachable here is a real, editable remote or local-docker gateway,
+// so isRemote below is effectively always true, but the check is left in
+// place as a defensive fallback rather than assumed.
 function gwFillFormForEdit(g) {
   $("gw-error").hidden = true;
   const sshFields = [
@@ -3743,7 +3962,6 @@ function gwFillFormForEdit(g) {
   if (!g) {
     for (const el of [...sshFields, ...imageFields]) el.disabled = true;
     $("gw-btn-connect").disabled = true;
-    $("gw-btn-uninstall").disabled = true;
     $("gw-ssh-user").value = "";
     $("gw-ssh-host").value = "";
     $("gw-key-path").value = "";
@@ -3751,7 +3969,6 @@ function gwFillFormForEdit(g) {
   }
 
   $("gw-btn-connect").disabled = false;
-  $("gw-btn-uninstall").disabled = false;
   for (const el of imageFields) el.disabled = false;
   const isRemote = g.mode !== "embedded";
   for (const el of sshFields) el.disabled = !isRemote;
@@ -3802,26 +4019,63 @@ async function gwLoadGatewaysForEdit() {
 }
 $("gw-select").onchange = () => gwFillFormForEdit(gwSelectedGateway());
 
-$("gw-btn-uninstall").onclick = async () => {
-  const g = gwSelectedGateway();
+/* ── Uninstall Gateway: its own dialog (sidebar → Gateway → Uninstall
+   Gateway…), split out from Edit Gateway's old inline Uninstall button so
+   picking a gateway to uninstall isn't tangled up with editing one's ssh/
+   image settings. Reuses the exact same editableGateways()-filtered
+   dropdown listing and window.cttc.uninstallGateway(g) call/result
+   handling Edit Gateway's button used to. */
+const dlgGatewayUninstall = $("dlg-gateway-uninstall");
+let gwUninstallGateways = [];
+
+function gwUninstallSelectedGateway() {
+  return gwUninstallGateways.find((g) => gwKeyOf(g) === $("gw-uninstall-select").value);
+}
+
+async function gwLoadGatewaysForUninstall() {
+  gwUninstallGateways = editableGateways(await window.cttc.getGateways());
+  const select = $("gw-uninstall-select");
+  const prevKey = select.value;
+  select.innerHTML = '<option value="">— pick a gateway to uninstall —</option>';
+  for (const g of gwUninstallGateways) {
+    const opt = document.createElement("option");
+    opt.value = gwKeyOf(g);
+    const loc = g.port == null ? g.host : `${g.host}:${g.port}`;
+    opt.textContent = `${g.label || g.host} (${loc})${g.active ? " — active" : ""}`;
+    select.appendChild(opt);
+  }
+  select.value = gwUninstallGateways.some((g) => gwKeyOf(g) === prevKey) ? prevKey : "";
+  $("gw-uninstall-delete").disabled = !select.value;
+  $("gw-uninstall-error").hidden = true;
+  $("gw-uninstall-status").textContent = "";
+}
+$("gw-uninstall-select").onchange = () => {
+  $("gw-uninstall-delete").disabled = !$("gw-uninstall-select").value;
+};
+$("gw-uninstall-close").onclick = () => dlgGatewayUninstall.close();
+$("gw-uninstall-delete").onclick = async () => {
+  const g = gwUninstallSelectedGateway();
   if (!g) return;
   if (!confirm(`Uninstall ${g.label || g.host}? This stops and removes its container.`)) return;
-  $("gw-error").hidden = true;
-  $("gw-activity-log").textContent = "";
-  $("gw-wait-msg").textContent = "Uninstalling, please wait…";
-  $("gw-form").hidden = true;
-  $("gw-wait").hidden = false;
+  $("gw-uninstall-error").hidden = true;
+  $("gw-uninstall-select").disabled = true;
+  $("gw-uninstall-delete").disabled = true;
+  $("gw-uninstall-status").textContent = "Uninstalling, please wait…";
   const result = await window.cttc.uninstallGateway(g);
-  $("gw-wait").hidden = true;
-  $("gw-form").hidden = false;
-  $("gw-wait-msg").textContent = "Applying changes, please wait…";
+  $("gw-uninstall-select").disabled = false;
+  $("gw-uninstall-status").textContent = "";
   if (!result.ok) {
-    $("gw-error").textContent = result.error;
-    $("gw-error").hidden = false;
+    $("gw-uninstall-error").textContent = result.error;
+    $("gw-uninstall-error").hidden = false;
+    $("gw-uninstall-delete").disabled = false;
     return;
   }
-  await gwLoadGatewaysForEdit();
+  await gwLoadGatewaysForUninstall();
 };
+async function openUninstallGatewayDialog() {
+  await gwLoadGatewaysForUninstall();
+  dlgGatewayUninstall.showModal();
+}
 
 function gwReadImageSource() {
   const mode = document.querySelector('input[name="gw-image-source"]:checked').value;
@@ -3907,7 +4161,6 @@ function openNewGatewayDialog() {
   $("gw-title").textContent = "New Gateway";
   $("gw-intro").hidden = false;
   $("gw-select-row").hidden = true;
-  $("gw-btn-uninstall").hidden = true;
   $("gw-btn-connect").textContent = "Connect";
   $("gw-btn-connect").disabled = false;
   $("gw-wait-msg").textContent = "Connecting, please wait…";
@@ -3925,7 +4178,6 @@ async function openEditGatewaysDialog() {
   $("gw-title").textContent = "Edit Gateways";
   $("gw-intro").hidden = true;
   $("gw-select-row").hidden = false;
-  $("gw-btn-uninstall").hidden = false;
   $("gw-wait-msg").textContent = "Applying changes, please wait…";
   $("gw-form").hidden = false;
   $("gw-wait").hidden = true;
@@ -4205,6 +4457,44 @@ $("dlg-event-create").onclick = async () => {
   const action = buildEventAction();
   const match = $("event-match").value;
   if (!conditions.length) { setStatus("add at least one condition"); return; }
+  // Gateway-hosted conditions are validated server-side (events.py's
+  // _validate: a bad regex or a NaN-turned-null threshold both 400 there) --
+  // UI-hosted ones have no server to reject them, so an invalid value would
+  // otherwise be stored to localStorage as-is: a NaN/blank threshold
+  // silently breaks every future comparison (ui-EVT-003), and an invalid
+  // regex throws uncaught from uiEventTick's setInterval callback on every
+  // tick, which (since that throw aborts the loop before saveUiEvents runs)
+  // silently stops evaluating and persisting cursor progress for every OTHER
+  // UI-hosted event too, not just this one (ui-EVT-004).
+  //
+  // Validated against the raw field values, not `conditions` (already built
+  // via Number(...)/read as-is above): a `type="number"` input silently
+  // sanitizes anything it can't parse (empty included) down to "" rather
+  // than leaving it as typed, and Number("") is 0 -- a legitimate threshold,
+  // not something Number.isFinite would ever catch -- so "was this field
+  // actually left blank/unparseable" can only be answered from its raw
+  // string, before that coercion already happened.
+  const isUiHosted = editingEvent ? editingEvent.hosted !== "gateway" : $("event-hosted").value !== "gateway";
+  if (isUiHosted) {
+    for (const row of document.querySelectorAll("[data-condition-row]")) {
+      const type = row.querySelector('[data-field="type"]').value;
+      if (type === "metric") {
+        const raw = row.querySelector('[data-field="threshold"]').value;
+        if (raw.trim() === "" || !Number.isFinite(Number(raw))) {
+          setStatus("threshold must be a valid number");
+          return;
+        }
+      } else {
+        const pattern = row.querySelector('[data-field="pattern"]').value;
+        try {
+          new RegExp(pattern);
+        } catch {
+          setStatus(`invalid regex: ${pattern}`);
+          return;
+        }
+      }
+    }
+  }
   try {
     if (editingEvent) {
       const { id, hosted } = editingEvent;
@@ -4276,7 +4566,7 @@ function renderEventRow(ev, hosted) {
       row.appendChild(mkBtn("Save…", async () => {
         try {
           if (hosted === "gateway") {
-            const res = await fetch(`${API}/session/${artifactId}/download`);
+            const res = await fetch(`${API}/session/${artifactId}/download`, { headers: authHeaders() });
             if (!res.ok) throw new Error(`download failed: ${res.status}`);
             const bytes = new Uint8Array(await res.arrayBuffer());
             const ext = res.headers.get("Content-Disposition")?.includes(".cttc-record") ? ".cttc-record" : ".cttc-metric";
@@ -4387,7 +4677,7 @@ async function fireUiEvent(ev, detail) {
     if (ev.action.kind === "snapshot") {
       const t1 = Date.now(), t0 = t1 - ev.action.minutes * 60000;
       const params = new URLSearchParams({ from: t0, to: t1, include_host: "1" });
-      const res = await fetch(`${API}/files/download?${params}`);
+      const res = await fetch(`${API}/files/download?${params}`, { headers: authHeaders() });
       if (!res.ok) throw new Error(`snapshot failed: ${res.status}`);
       const bytes = new Uint8Array(await res.arrayBuffer());
       const name = `${ev.name}-${ev.id}.cttc-metric`;
@@ -4416,7 +4706,7 @@ async function resolvePendingUiRecordings() {
     try {
       const st = await get(`/session/${ev._pendingGatewaySessionId}/status`);
       if (!st.ready) continue;
-      const res = await fetch(`${API}/session/${ev._pendingGatewaySessionId}/download`);
+      const res = await fetch(`${API}/session/${ev._pendingGatewaySessionId}/download`, { headers: authHeaders() });
       const bytes = new Uint8Array(await res.arrayBuffer());
       const name = `${ev.name}-${ev.id}.cttc-record`;
       const opts = { safe: ev.action.safe, maxKeepMs: ev.action.max_keep_seconds ? ev.action.max_keep_seconds * 1000 : null };
@@ -4692,6 +4982,7 @@ if (!POPOUT_KIND) {
     "load-metrics": () => $("btn-load-sample").click(),
     "new-gateway": () => openNewGatewayDialog(),
     "edit-gateways": () => openEditGatewaysDialog(),
+    "uninstall-gateway": () => openUninstallGatewayDialog(),
     "event-create": () => $("btn-event-create").click(),
     "event-edit": () => $("btn-event-edit").click(),
     "open-theme": () => openThemeDialog(),

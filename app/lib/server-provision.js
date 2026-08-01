@@ -146,11 +146,20 @@ function resolveSource(source, { resourcesDir } = {}) {
  * Gets the server container running on *this* machine: docker-load or
  * docker-pull per resolveSource(), then `docker compose up -d` with the
  * matching compose file, then wait for the fixed container port to open.
+ * `apiToken`, when given, is passed through as CTTC_API_TOKEN -- this
+ * container binds 0.0.0.0 with `network_mode: host` (see docker-compose.yml)
+ * exactly like a remote gateway's, so it's reachable by anything else on
+ * the LAN too, not just this machine (br-NET-004); main.js always supplies
+ * the same persisted token across calls (see lib/api-token.js) so this
+ * never changes between an ordinary reconnect's `docker compose up -d`
+ * calls -- an env var that *did* change would make compose recreate the
+ * container instead of leaving the already-running one alone.
  * @returns {{port: number, imageRef: string}}
  */
-async function ensureLocalContainer({ spawnFn = spawn, resourcesDir, port = 8765, source, onLog } = {}) {
+async function ensureLocalContainer({ spawnFn = spawn, resourcesDir, port = 8765, source, apiToken, onLog } = {}) {
   const resolved = resolveSource(source, { resourcesDir });
   const env = { ...process.env };
+  if (apiToken) env.CTTC_API_TOKEN = apiToken;
   if (resolved.kind === "tarball") {
     await run(spawnFn, "docker", ["load", "-i", resolved.tarballPath], {}, onLog);
   } else {
@@ -177,10 +186,13 @@ async function ensureLocalContainer({ spawnFn = spawn, resourcesDir, port = 8765
  * directly) shouldn't fail provisioning, since the container itself is
  * genuinely fine either way.
  * @param {{sshTarget: string, sshKey: string|null, sshPort?: number, remotePort: number, host?: string}} cfg
- * @param {{source?: {type: "tarball", path: string} | {type: "registry", ref: string}, onLog?: (line: string) => void}} [opts]
+ * @param {{source?: {type: "tarball", path: string} | {type: "registry", ref: string}, apiToken?: string, onLog?: (line: string) => void}} [opts]
  * @returns {{host: string, port: number, imageRef: string}}
  */
-async function ensureRemoteContainer(cfg, { spawnFn = spawn, sshBin = "ssh", scpBin = "scp", resourcesDir, source, onLog } = {}) {
+async function ensureRemoteContainer(
+  cfg,
+  { spawnFn = spawn, sshBin = "ssh", scpBin = "scp", resourcesDir, source, apiToken, onLog } = {}
+) {
   const remoteDir = "cttc-gateway";
   const ssh = sshExecArgs(cfg);
   const scp = scpArgs(cfg);
@@ -204,25 +216,37 @@ async function ensureRemoteContainer(cfg, { spawnFn = spawn, sshBin = "ssh", scp
     await run(spawnFn, sshBin, [...ssh, `chmod 600 ${remoteDir}/id_rsa`], {}, onLog);
     idRsaEnv = 'CTTC_ID_RSA="$PWD/id_rsa" ';
   }
+  // br-NET-004: this container binds 0.0.0.0 with network_mode: host (see
+  // docker-compose.yml), reachable by anything else that can reach this
+  // host, not just this client -- CTTC_API_TOKEN gates server.py's own
+  // auth middleware behind it. main.js always supplies the same persisted
+  // token across calls (lib/api-token.js), so this never changes between
+  // an ordinary reconnect's `docker compose up -d` calls -- an env var
+  // that did change would make compose recreate the container instead of
+  // leaving the already-running, already-authenticated one alone.
+  const apiTokenEnv = apiToken ? `CTTC_API_TOKEN=${apiToken} ` : "";
 
   if (resolved.kind === "tarball") {
     await run(spawnFn, scpBin, [...scp, resolved.tarballPath, `${target}:${remoteDir}/`], {}, onLog);
     await run(spawnFn, scpBin, [...scp, resolved.composeFile, `${target}:${remoteDir}/docker-compose.yml`], {}, onLog);
     await run(spawnFn, sshBin, [
       ...ssh,
-      `cd ${remoteDir} && docker load -i ${path.basename(resolved.tarballPath)} && ${idRsaEnv}docker compose -f docker-compose.yml up -d`,
+      `cd ${remoteDir} && docker load -i ${path.basename(resolved.tarballPath)} && ${apiTokenEnv}${idRsaEnv}docker compose -f docker-compose.yml up -d`,
     ], {}, onLog);
   } else {
     await run(spawnFn, scpBin, [...scp, resolved.composeFile, `${target}:${remoteDir}/docker-compose.yml`], {}, onLog);
     await run(spawnFn, sshBin, [
       ...ssh,
-      `cd ${remoteDir} && docker pull ${resolved.ref} && CTTC_IMAGE=${resolved.ref} ${idRsaEnv}docker compose -f docker-compose.yml up -d`,
+      `cd ${remoteDir} && docker pull ${resolved.ref} && CTTC_IMAGE=${resolved.ref} ${apiTokenEnv}${idRsaEnv}docker compose -f docker-compose.yml up -d`,
     ], {}, onLog);
   }
 
   onLog?.(`$ waiting for the container to come up (checking http://${host}:${cfg.remotePort}/health) ...`);
   try {
-    await waitForHttpOk(`http://${host}:${cfg.remotePort}/health`, { timeoutMs: 30000 });
+    await waitForHttpOk(`http://${host}:${cfg.remotePort}/health`, {
+      timeoutMs: 30000,
+      ...(apiToken ? { headers: { "X-CTTC-Token": apiToken } } : {}),
+    });
   } catch (err) {
     onLog?.(`  → not reachable directly yet (${err.message || err}) -- setting ssh tunnel instead`);
   }
@@ -234,10 +258,18 @@ async function ensureRemoteContainer(cfg, { spawnFn = spawn, sshBin = "ssh", scp
  * Gateways' Uninstall, for a local-docker entry) -- `--rmi all` extends
  * `docker compose down`'s default scope (container + network only) to also
  * drop the image, so a re-install pulls/loads it fresh rather than silently
- * reusing whatever's still cached.
+ * reusing whatever's still cached. `source` must be the same one the
+ * gateway was actually provisioned with (main.js persists it on the
+ * registry entry as `imageSource` right after a successful
+ * ensureLocalContainer, precisely so uninstall can pass it back in here) --
+ * resolving with no source always picks the bundled-tarball/offline compose
+ * regardless of what's actually running (br-PROV-007), so a gateway
+ * provisioned from a custom registry ref (via Settings > "Update server
+ * image") got `--rmi all`'d against the wrong image name, leaving the real
+ * one behind while reporting success.
  */
-async function uninstallLocalContainer({ spawnFn = spawn, resourcesDir, onLog } = {}) {
-  const resolved = resolveSource(undefined, { resourcesDir });
+async function uninstallLocalContainer({ spawnFn = spawn, resourcesDir, source, onLog } = {}) {
+  const resolved = resolveSource(source, { resourcesDir });
   await run(spawnFn, "docker", ["compose", "-f", resolved.composeFile, "down", "--rmi", "all"], {}, onLog);
 }
 
@@ -270,7 +302,11 @@ async function checkStillInstalled(entry, { spawnFn = spawn, resourcesDir, sshBi
   onLog?.("$ checking whether the container is still there...");
   try {
     if (entry.mode === "embedded") {
-      const resolved = resolveSource(undefined, { resourcesDir });
+      // br-PROV-007: same fix as uninstallLocalContainer -- must resolve
+      // against what this entry was actually provisioned with, not the
+      // bundled/default source, or this post-mortem inspects the wrong
+      // compose file's containers.
+      const resolved = resolveSource(entry.imageSource, { resourcesDir });
       await run(spawnFn, "docker", ["compose", "-f", resolved.composeFile, "ps", "-a"], {}, onLog);
     } else {
       const ssh = sshExecArgs({ sshTarget: entry.sshTarget, sshKey: entry.sshKey, sshPort: entry.sshPort });

@@ -133,3 +133,53 @@ class TestRollingBuffer:
         members = _members(data)
         rows = members[meta[0]["file"]].decode().splitlines()
         assert len(rows) == 2  # "one" and "two", not "three"
+
+
+class TestRollingBufferRetention:
+    """br-RBUF-005: ad-hoc buffers (POST /buffer/start) used to have no
+    retention/cap of any kind, leaking forever without an explicit stop()."""
+
+    def test_tick_reclaims_an_ad_hoc_buffer_past_max_age(self, state, monkeypatch):
+        monkeypatch.setattr(rolling_buffer.time, "time", lambda: ms(2026, 1, 2, 3, 0, 0) / 1000.0)
+        buffer_id = state.rolling_buffers.start(5)
+        future = ms(2026, 1, 2, 3, 0, 0) + rolling_buffer.MAX_AGE_SECONDS * 1000.0 + 1000.0
+        reclaimed = state.rolling_buffers.tick(now=future)
+        assert reclaimed == [buffer_id]
+        assert buffer_id not in state.rolling_buffers._buffers
+
+    def test_tick_does_not_reclaim_before_max_age(self, state, monkeypatch):
+        monkeypatch.setattr(rolling_buffer.time, "time", lambda: ms(2026, 1, 2, 3, 0, 0) / 1000.0)
+        buffer_id = state.rolling_buffers.start(5)
+        almost = ms(2026, 1, 2, 3, 0, 0) + rolling_buffer.MAX_AGE_SECONDS * 1000.0 - 1000.0
+        assert state.rolling_buffers.tick(now=almost) == []
+        assert buffer_id in state.rolling_buffers._buffers
+
+    def test_tick_never_reclaims_an_event_owned_buffer_no_matter_how_old(self, state, monkeypatch):
+        monkeypatch.setattr(rolling_buffer.time, "time", lambda: ms(2026, 1, 2, 3, 0, 0) / 1000.0)
+        buffer_id = state.rolling_buffers.start(5, owned_by_event=True)
+        far_future = ms(2026, 1, 2, 3, 0, 0) + rolling_buffer.MAX_AGE_SECONDS * 1000.0 * 100
+        assert state.rolling_buffers.tick(now=far_future) == []
+        assert buffer_id in state.rolling_buffers._buffers
+
+    def test_start_raises_once_max_open_ad_hoc_buffers_are_reached(self, state):
+        for _ in range(rolling_buffer.MAX_OPEN):
+            state.rolling_buffers.start(5)
+        with pytest.raises(rolling_buffer.TooManyBuffers):
+            state.rolling_buffers.start(5)
+
+    def test_event_owned_buffers_do_not_count_toward_the_ad_hoc_cap(self, state):
+        for _ in range(rolling_buffer.MAX_OPEN):
+            state.rolling_buffers.start(5, owned_by_event=True)
+        # every slot "used" above was event-owned -- an ad-hoc one must
+        # still be free to start
+        buffer_id = state.rolling_buffers.start(5)
+        assert buffer_id in state.rolling_buffers._buffers
+
+    def test_stopping_an_ad_hoc_buffer_frees_a_cap_slot(self, state):
+        first = state.rolling_buffers.start(5)
+        for _ in range(rolling_buffer.MAX_OPEN - 1):
+            state.rolling_buffers.start(5)
+        with pytest.raises(rolling_buffer.TooManyBuffers):
+            state.rolling_buffers.start(5)
+        state.rolling_buffers._buffers.pop(first)  # simulate a completed stop()
+        state.rolling_buffers.start(5)  # no longer raises

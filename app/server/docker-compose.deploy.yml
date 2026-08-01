@@ -15,6 +15,13 @@ services:
     network_mode: host
     environment:
       - SSH_AUTH_SOCK=/ssh-agent
+      # Shared-secret required (as the X-CTTC-Token header) on every HTTP
+      # request once set (br-NET-004) -- this container binds 0.0.0.0 with
+      # network_mode: host above, so without it anything that can reach
+      # this host at all has full unauthenticated API access. Passed
+      # through from the invoking shell's env, generated/persisted by
+      # main.js's lib/api-token.js at provision time.
+      - CTTC_API_TOKEN
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       # Lets `docker -H ssh://...` (Set Sources with an ssh:// host) reach a

@@ -175,7 +175,9 @@ class EventManager:
         self._next_id += 1
         buffer_id = None
         if action.kind == "snapshot":
-            buffer_id = self._rolling_buffers.start(action.minutes, source_ids=source_ids or None)
+            buffer_id = self._rolling_buffers.start(
+                action.minutes, source_ids=source_ids or None, owned_by_event=True
+            )
         self._events[eid] = Event(
             id=eid,
             name=name,
@@ -231,7 +233,7 @@ class EventManager:
                 ev.buffer_id = None
             if will_be_snapshot:
                 ev.buffer_id = self._rolling_buffers.start(
-                    new_action.minutes, source_ids=new_source_ids or None
+                    new_action.minutes, source_ids=new_source_ids or None, owned_by_event=True
                 )
 
         if name is not None:
@@ -337,14 +339,17 @@ class EventManager:
         for ev in list(self._events.values()):
             if not ev.enabled:
                 continue
-            detail = await self._check(ev)
-            if detail is not None:
-                if ev._armed:
-                    await self._fire(ev, detail, now)
-                ev.status = "triggered"
-            else:
-                ev._armed = True
-                ev.status = "armed"
+            try:
+                detail = await self._check(ev)
+                if detail is not None:
+                    if ev._armed:
+                        await self._fire(ev, detail, now)
+                    ev.status = "triggered"
+                else:
+                    ev._armed = True
+                    ev.status = "armed"
+            except Exception:
+                logger.exception("events: tick failed for event %s", ev.id)
 
     def _monitored_ids(self, ev: Event) -> set[str]:
         return ev.source_ids if ev.source_ids else set(self._state.sources.keys())

@@ -72,6 +72,43 @@
     ok(fmtIso(0).endsWith(" UTC"));
   });
 
+  await T("authHeaders adds X-CTTC-Token only when API_TOKEN is set (br-NET-004)", () => {
+    const realToken = API_TOKEN;
+    try {
+      API_TOKEN = null;
+      eq(JSON.stringify(authHeaders()), "{}", "no token in this suite's own connection -- nothing added");
+      eq(JSON.stringify(authHeaders({ Foo: "bar" })), JSON.stringify({ Foo: "bar" }), "extras still pass through");
+
+      API_TOKEN = "test-token-abc";
+      eq(authHeaders()["X-CTTC-Token"], "test-token-abc");
+      const merged = authHeaders({ "X-CTTC-Filename": "x.log" });
+      eq(merged["X-CTTC-Token"], "test-token-abc");
+      eq(merged["X-CTTC-Filename"], "x.log");
+    } finally {
+      API_TOKEN = realToken;
+    }
+  });
+
+  await T("get()/post() actually send X-CTTC-Token on the wire once API_TOKEN is set", async () => {
+    const realToken = API_TOKEN;
+    const realFetch = window.fetch;
+    const calls = [];
+    window.fetch = (url, opts) => {
+      calls.push({ url, headers: opts?.headers });
+      return realFetch(url, opts);
+    };
+    try {
+      API_TOKEN = "test-token-abc";
+      await get("/sources");
+      await post("/close", { id: "nonexistent" });
+      eq(calls.length, 2);
+      for (const c of calls) eq(c.headers["X-CTTC-Token"], "test-token-abc", c.url);
+    } finally {
+      window.fetch = realFetch;
+      API_TOKEN = realToken;
+    }
+  });
+
   await T("colorFor assigns stable slots and never folds to gray past 8", () => {
     const c1 = colorFor("__test_series_1");
     eq(colorFor("__test_series_1"), c1, "stable on repeat");
@@ -712,6 +749,74 @@
     eq($("btn-clear-sources").disabled, true, "Remove disabled");
   });
 
+  await T("Remove Docker Host also forgets the daemon server-side, not just the local catalog (br-REDIS-017)", async () => {
+    const hostKey = "ssh://e2e@removeme";
+    const saved = prefs.get("savedDockerDaemons", {});
+    saved[hostKey] = { host: hostKey, stats: true, logs: [], transforms: [], interval: 5, lastUsed: Date.now() };
+    prefs.set("savedDockerDaemons", saved);
+
+    const realConfirm = window.confirm;
+    const realPost = post;
+    const calls = [];
+    window.confirm = () => true;
+    // Stubbed rather than forwarded to the real server: this hostKey never
+    // matches the suite's actual active daemon (there is none, in this
+    // suite's baseline), so the handler's own "close every current source"
+    // branch never fires for it regardless -- stubbing just keeps this test
+    // from depending on that, and from ever touching the real demo sources
+    // every other test in this file relies on staying open.
+    post = async (path, body) => {
+      calls.push({ path, body });
+      return {};
+    };
+    try {
+      populateRemoveDaemonSelect();
+      $("remove-daemon-select").value = hostKey;
+      $("remove-daemon-select").onchange();
+      await $("dlg-remove-daemon-delete").onclick();
+      ok(
+        calls.some((c) => c.path === "/docker/forget" && c.body.host === hostKey),
+        `expected a POST /docker/forget for ${hostKey}: ${JSON.stringify(calls)}`
+      );
+      ok(!(hostKey in prefs.get("savedDockerDaemons", {})), "removed from the local catalog too");
+    } finally {
+      window.confirm = realConfirm;
+      post = realPost;
+      if (dlgRemoveDaemon.open) dlgRemoveDaemon.close();
+    }
+  });
+
+  await T("Remove Docker Host never calls /docker/forget for 'This machine' (never remembered server-side)", async () => {
+    const saved = prefs.get("savedDockerDaemons", {});
+    saved.local = { host: null, stats: true, logs: [], transforms: [], interval: 5, lastUsed: Date.now() };
+    prefs.set("savedDockerDaemons", saved);
+
+    const realConfirm = window.confirm;
+    const realPost = post;
+    const calls = [];
+    window.confirm = () => true;
+    // Stubbed, not forwarded: with no active docker daemon in this suite's
+    // baseline, currentDockerHost() falls back to "local" too, so picking
+    // "local" here would otherwise trip the handler's "close every current
+    // source" branch and tear down the demo sources every other test in
+    // this file depends on -- this test only cares what path gets posted.
+    post = async (path, body) => {
+      calls.push({ path, body });
+      return {};
+    };
+    try {
+      populateRemoveDaemonSelect();
+      $("remove-daemon-select").value = "local";
+      $("remove-daemon-select").onchange();
+      await $("dlg-remove-daemon-delete").onclick();
+      ok(!calls.some((c) => c.path === "/docker/forget"), JSON.stringify(calls));
+    } finally {
+      window.confirm = realConfirm;
+      post = realPost;
+      if (dlgRemoveDaemon.open) dlgRemoveDaemon.close();
+    }
+  });
+
   await T("Edit Docker Host pre-fills immediately, then its automatic Refresh confirms both containers still exist, marking only the persisted-selected one with a checkmark", async () => {
     const fakeStats = { id: "__prefill_stats", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
     const fakeContainer = { id: "__prefill_c", path: "docker://ssh://u@h/container/demo-c", name: "demo-c", kind: "log", live: true };
@@ -1234,6 +1339,7 @@
     try {
       eq(recording.status, "idle");
       eq($("btn-start-recording").title, "Start Recording");
+      eq($("status-bar-recording-dot").hidden, true, "no dot while idle");
       await startRecording();
       eq(recording.status, "recording");
       eq(recording.path, "/fake/e2e-recording.cttc-record");
@@ -1241,23 +1347,46 @@
       eq($("btn-start-recording").title, "Recording");
       eq($("btn-pause-recording").disabled, false);
       eq($("btn-stop-recording").disabled, false);
+      eq(recording.segments.length, 0, "no completed segment yet -- still recording the first one");
+      const firstSegmentStart = recording.segmentStart;
+      eq($("status-bar-recording-dot").hidden, false, "dot visible while recording");
+      eq($("status-bar-recording-dot").dataset.state, "recording");
+      eq($("status-bar-recording-text").hidden, false);
+      eq($("status-bar-recording-text").textContent, '– recording "e2e-recording.cttc-record"');
 
       await pauseRecording();
       eq(recording.status, "paused");
       eq($("btn-start-recording").disabled, false);
       eq($("btn-start-recording").title, "Resume Recording");
       eq($("btn-pause-recording").disabled, true);
+      eq($("status-bar-recording-dot").hidden, false, "dot stays visible while paused");
+      eq($("status-bar-recording-dot").dataset.state, "paused");
+      eq($("status-bar-recording-text").textContent, '– paused recording "e2e-recording.cttc-record"');
       ok(store["/fake/e2e-recording.cttc-record"], "first segment flushed to the in-memory store");
       const afterFirst = store["/fake/e2e-recording.cttc-record"];
       eq(afterFirst[0], 0x50, "PK zip magic byte 1");
+      // the completed segment is recorded for the highlight; segmentStart
+      // (the *next* segment's start, not yet known) is cleared meanwhile,
+      // leaving a genuine gap rather than painting through the pause
+      eq(recording.segments.length, 1, "first segment finalized for the highlight");
+      eq(recording.segments[0].from, firstSegmentStart);
+      ok(recording.segments[0].to > firstSegmentStart, "finalized with a real end time");
+      eq(recording.segmentStart, null, "no in-progress segment while paused -- pause gap stays unhighlighted");
 
       await startRecording(); // resume
       eq(recording.status, "recording");
       eq($("btn-start-recording").title, "Recording");
+      eq(recording.segments.length, 1, "still just the one completed segment");
+      ok(recording.segmentStart >= recording.segments[0].to, "new segment starts at/after the pause gap");
+      eq($("status-bar-recording-dot").dataset.state, "recording", "dot back to recording on resume");
+      eq($("status-bar-recording-text").textContent, '– recording "e2e-recording.cttc-record"');
       await stopRecording();
       eq(recording.status, "idle");
       eq(recording.path, null);
+      eq(recording.segments.length, 0, "highlight cleared once actually stopped");
       eq($("btn-stop-recording").disabled, true);
+      eq($("status-bar-recording-dot").hidden, true, "dot hidden again once stopped");
+      eq($("status-bar-recording-text").hidden, true, "text hidden again once stopped");
       const afterSecond = store["/fake/e2e-recording.cttc-record"];
       ok(afterSecond.length >= afterFirst.length, "second segment appended, archive grew (or stayed same size)");
 
@@ -1269,6 +1398,39 @@
       eq(openRes.opened.length, 0, "ambiguous -- nothing opened without a segment choice");
       eq(openRes.needs_selection.length, 1);
       eq(openRes.needs_selection[0].segments.length, 2, "both flushed segments present");
+    } finally {
+      pickRecordingSavePath = realPick;
+      readRecordingBytes = realRead;
+      writeRecordingBytes = realWrite;
+    }
+  });
+
+  await T("Record/Pause/Resume/Stop each land in status bar History (regression: these go through setStatus, not notifyEvent)", async () => {
+    const realPick = pickRecordingSavePath, realRead = readRecordingBytes, realWrite = writeRecordingBytes;
+    const store = {};
+    pickRecordingSavePath = async () => "/fake/e2e-history-recording.cttc-record";
+    readRecordingBytes = async (p) => {
+      if (!(p in store)) throw new Error("no such file");
+      return store[p];
+    };
+    writeRecordingBytes = async (p, bytes) => { store[p] = bytes; };
+    statusBarHistory.length = 0;
+    try {
+      // Defensive: an earlier test failing before its own cleanup can leave
+      // `recording` non-idle (it's shared module state) -- force a clean
+      // baseline so this test's own "started" (vs. "resumed") assertion
+      // isn't at the mercy of test execution order.
+      if (recording.status !== "idle") await stopRecording();
+      eq(recording.status, "idle", "clean baseline before this test's own assertions");
+      await startRecording();
+      await pauseRecording();
+      await startRecording(); // resume
+      await stopRecording();
+      const texts = statusBarHistory.map((e) => e.text);
+      ok(texts.some((t) => t.startsWith("Recording started")), `expected a "Recording started" entry: ${texts}`);
+      ok(texts.some((t) => t.startsWith("Recording paused")), `expected a "Recording paused" entry: ${texts}`);
+      ok(texts.some((t) => t.startsWith("Recording resumed")), `expected a "Recording resumed" entry: ${texts}`);
+      ok(texts.some((t) => t.startsWith("Recording stopped")), `expected a "Recording stopped" entry: ${texts}`);
     } finally {
       pickRecordingSavePath = realPick;
       readRecordingBytes = realRead;
@@ -1348,6 +1510,24 @@
     } finally {
       pickSegment = realPickSegment;
     }
+  });
+
+  await T("Esc-dismissing the segment picker resolves as a cancel (null) instead of hanging forever (ui-EXPORT-005)", async () => {
+    const segments = [
+      { index: 0, from: R.min_ts, to: R.min_ts + 60000, source_count: 1 },
+      { index: 1, from: R.min_ts + 60000, to: R.min_ts + 120000, source_count: 1 },
+    ];
+    const p = pickSegment(segments);
+    await until(() => dlgSegmentPick.open, "segment picker open");
+    dlgSegmentPick.close(); // native <dialog> Esc behavior: closes without touching any button
+    const chosen = await p; // must not hang
+    eq(chosen, null, "Esc must resolve as a cancel");
+    // the next real open must still work normally -- proof the close-event
+    // listener/handlers were cleaned up, not left stale from the Esc above
+    const p2 = pickSegment(segments);
+    await until(() => dlgSegmentPick.open, "segment picker reopened");
+    $("segment-pick-list").querySelector("button").click();
+    eq(await p2, 0, "choosing a segment still resolves normally after a prior Esc");
   });
 
   /* ── sidebar / appearance ──────────────────────────────────────────────── */
@@ -1434,6 +1614,67 @@
   await T("notifyEvent updates the status bar text with a timestamp", () => {
     notifyEvent("something happened");
     ok($("app-status-bar-text").textContent.includes("something happened"));
+  });
+
+  await T("application-starting/shutting-down status messages", () => {
+    // The real "application starting" call already fired once at this
+    // window's own boot, before any test ran -- re-invoking notifyEvent
+    // here with the exact same strings the boot-time code uses confirms
+    // the wording/wiring is correct without needing to re-run boot itself.
+    statusBarHistory.length = 0;
+    notifyEvent("application starting");
+    ok($("app-status-bar-text").textContent.includes("application starting"));
+    eq(statusBarHistory.at(-1).text, "application starting");
+
+    eq(typeof window.cttc?.onAppShuttingDown, "function", "preload exposes onAppShuttingDown");
+
+    notifyEvent("application shutting down");
+    ok($("app-status-bar-text").textContent.includes("application shutting down"));
+    eq(statusBarHistory.at(-1).text, "application shutting down");
+  });
+
+  await T("status bar History records notifyEvent/flashStatus and renders newest-first", () => {
+    statusBarHistory.length = 0;
+    notifyEvent("first e2e history event");
+    flashStatus("second e2e history event", 50000);
+    eq(statusBarHistory.length, 2);
+    eq(statusBarHistory[0].text, "first e2e history event");
+    eq(statusBarHistory[1].text, "second e2e history event");
+
+    eq($("status-bar-history-popup").hidden, true, "starts closed");
+    $("status-bar-history-btn").onclick();
+    try {
+      eq($("status-bar-history-popup").hidden, false, "opens on click");
+      const rows = [...$("status-bar-history-list").querySelectorAll(".status-bar-history-row")];
+      eq(rows.length, 2);
+      // newest first
+      ok(rows[0].textContent.includes("second e2e history event"));
+      ok(rows[1].textContent.includes("first e2e history event"));
+    } finally {
+      $("status-bar-history-btn").onclick(); // close again
+    }
+    eq($("status-bar-history-popup").hidden, true, "closes on a second click");
+  });
+
+  await T("status bar History: Clear empties it", () => {
+    statusBarHistory.length = 0;
+    notifyEvent("to be cleared");
+    $("status-bar-history-btn").onclick();
+    try {
+      eq($("status-bar-history-list").querySelectorAll(".status-bar-history-row").length, 1);
+      $("status-bar-history-clear").onclick();
+      eq(statusBarHistory.length, 0);
+      ok($("status-bar-history-list").textContent.includes("Nothing yet"));
+    } finally {
+      $("status-bar-history-btn").onclick();
+    }
+  });
+
+  await T("status bar History icon matches the Set Docker Host 'Logs' section icon", () => {
+    const historyPath = $("status-bar-history-btn").querySelector("svg path").getAttribute("d");
+    const logsLegend = document.querySelector("#dlg-set fieldset:has(#docker-targets) legend svg path");
+    ok(logsLegend, "Logs legend icon found");
+    eq(historyPath, logsLegend.getAttribute("d"));
   });
 
   await T("creating an event notifies the status bar", async () => {
@@ -1542,6 +1783,75 @@
     eq(list[list.length - 1].name, "e2e ui event");
     eq(list[list.length - 1].armed, true, "starts armed/watching");
     saveUiEvents(list.slice(0, before)); // clean up after ourselves
+  });
+
+  await T("creating a UI-hosted event with a non-numeric threshold is rejected, not silently stored (ui-EVT-003)", async () => {
+    // Gateway-hosted events get this for free server-side (events.py's
+    // _validate 400s a NaN-turned-null threshold); UI-hosted ones have no
+    // server to reject them, so this used to be stored as-is and every
+    // future comparison against it silently broke forever.
+    const before = loadUiEvents().length;
+    openEventCreateDialog();
+    try {
+      $("event-name").value = "e2e bad threshold";
+      $("event-hosted").value = "ui";
+      // Number("") is 0 (a valid threshold) -- only a genuinely non-numeric
+      // string actually reproduces the NaN this bug is about.
+      $("event-conditions").children[0].querySelector('[data-field="threshold"]').value = "abc";
+      await $("dlg-event-create").onclick();
+      eq(loadUiEvents().length, before, "must not be saved with an invalid threshold");
+      ok($("status").textContent.includes("threshold"), "status explains why");
+      ok(dlgEventForm.open, "dialog stays open so the user can fix it");
+    } finally {
+      dlgEventForm.close();
+    }
+  });
+
+  await T("creating a UI-hosted event with an invalid regex is rejected, not silently stored (ui-EVT-004)", async () => {
+    // Gateway-hosted events get this for free server-side too (events.py's
+    // _validate 400s an uncompilable regex at create time); UI-hosted ones
+    // used to reach `new RegExp()` with no try/catch inside uiEventTick's
+    // setInterval callback, throwing uncaught on every tick and (since that
+    // throw aborted the loop before saveUiEvents ran) silently freezing
+    // every OTHER UI-hosted event's status/log-cursor progress too.
+    const before = loadUiEvents().length;
+    openEventCreateDialog();
+    try {
+      $("event-name").value = "e2e bad regex";
+      $("event-hosted").value = "ui";
+      const row = $("event-conditions").children[0];
+      row.querySelector('[data-field="type"]').value = "log";
+      row.querySelector('[data-field="type"]').dispatchEvent(new Event("change"));
+      row.querySelector('[data-field="pattern"]').value = "(unclosed";
+      await $("dlg-event-create").onclick();
+      eq(loadUiEvents().length, before, "must not be saved with an invalid regex");
+      ok($("status").textContent.includes("invalid regex"), "status explains why");
+      ok(dlgEventForm.open, "dialog stays open so the user can fix it");
+    } finally {
+      dlgEventForm.close();
+    }
+  });
+
+  await T("editing a UI event with an invalid regex is rejected, leaving the saved event unchanged (ui-EVT-004)", async () => {
+    const list = loadUiEvents();
+    list.push({
+      id: "ui-e2e-badregex-edit", name: "before bad edit", sourceIds: [], match: "any",
+      conditions: [{ type: "log", pattern: "ok" }],
+      action: { kind: "recording", duration_minutes: 5 },
+      enabled: true, status: "armed", armed: true, logCursors: {},
+    });
+    saveUiEvents(list);
+    try {
+      const ev = loadUiEvents().find((e) => e.id === "ui-e2e-badregex-edit");
+      openEventEditForm(ev, "ui");
+      $("event-conditions").children[0].querySelector('[data-field="pattern"]').value = "(unclosed";
+      await $("dlg-event-create").onclick();
+      const stillSaved = loadUiEvents().find((e) => e.id === "ui-e2e-badregex-edit");
+      eq(stillSaved.conditions[0].pattern, "ok", "the bad edit must not have overwritten the saved event");
+    } finally {
+      dlgEventForm.close();
+      saveUiEvents(loadUiEvents().filter((e) => e.id !== "ui-e2e-badregex-edit"));
+    }
   });
 
   await T("Edit Events lists both gateway and UI events with an Update button", async () => {
@@ -1743,7 +2053,6 @@
       eq($("gw-title").textContent, "New Gateway");
       eq($("gw-intro").hidden, false);
       eq($("gw-select-row").hidden, true);
-      eq($("gw-btn-uninstall").hidden, true);
       eq($("gw-btn-connect").textContent, "Connect");
       eq(typeof window.cttc?.addGateway, "function", "addGateway exposed via preload");
       ok(!window.cttc?.newGateway, "old separate-window IPC method is gone");
@@ -1759,12 +2068,37 @@
       eq($("gw-title").textContent, "Edit Gateways");
       eq($("gw-intro").hidden, true);
       eq($("gw-select-row").hidden, false);
-      eq($("gw-btn-uninstall").hidden, false);
       // nothing picked yet -- ssh/image/connect fields start disabled
       eq($("gw-btn-connect").disabled, true);
       eq($("gw-ssh-user").disabled, true);
     } finally {
       dlgGatewaySetup.close();
+    }
+  });
+
+  await T("Uninstall Gateway opens its own dialog, populated from getGateways, excluding This machine", async () => {
+    await openUninstallGatewayDialog();
+    try {
+      ok(dlgGatewayUninstall.open, "dialog opened");
+      const options = [...$("gw-uninstall-select").options].map((o) => o.textContent);
+      ok(!options.some((t) => t.includes("This machine")), "embedded gateway excluded");
+      eq($("gw-uninstall-delete").disabled, true, "nothing picked yet");
+    } finally {
+      dlgGatewayUninstall.close();
+    }
+  });
+
+  await T("Uninstall Gateway: picking an entry enables the Uninstall button", async () => {
+    await openUninstallGatewayDialog();
+    try {
+      const select = $("gw-uninstall-select");
+      if (select.options.length > 1) {
+        select.value = select.options[1].value;
+        select.onchange();
+        eq($("gw-uninstall-delete").disabled, false);
+      }
+    } finally {
+      dlgGatewayUninstall.close();
     }
   });
 
@@ -2097,6 +2431,20 @@
     $("dlg-export-ok").click();
     const opts = await p;
     eq(opts.includeHost, false, "host choice returned");
+  });
+
+  await T("Esc-dismissing the export dialog resolves the promise as a cancel instead of hanging forever (ui-EXPORT-003)", async () => {
+    const p = askExportOptions();
+    await until(() => dlgExport.open, "export dialog open");
+    dlgExport.close(); // native <dialog> Esc behavior: closes without touching either button
+    const opts = await p; // must not hang
+    eq(opts, null, "Esc must resolve as a cancel");
+    // the next real open must still work normally -- proof the close-event
+    // listener/handlers were cleaned up, not left stale from the Esc above
+    const p2 = askExportOptions();
+    await until(() => dlgExport.open, "export dialog reopened");
+    $("dlg-export-ok").click();
+    ok((await p2) !== null, "OK still resolves normally after a prior Esc");
   });
 
   await T("Hard Reset asks for confirmation first, and does nothing if declined", () => {

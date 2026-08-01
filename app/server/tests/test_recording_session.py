@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 import zipfile
 from datetime import UTC, datetime
 
@@ -46,6 +47,137 @@ def _members(data: bytes) -> dict:
 
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
         return {n: zf.read(n) for n in zf.namelist()}
+
+
+class TestRecordingSessionTickResilience:
+    async def test_one_failing_finish_does_not_raise_or_block_sweep(
+        self, state, log_file, monkeypatch
+    ):
+        # br-ORCH-004: an exception finishing one session must not kill the
+        # tick (and, transitively, all future orchestration ticks) -- the
+        # TTL sweep in the same tick must still run.
+        state.open_file(str(log_file), "log", None, live=False, transforms=[])
+        await _flush()
+        monkeypatch.setattr(
+            recording_session.time, "time", lambda: ms(2026, 1, 2, 3, 0, 0) / 1000.0
+        )
+        bad_id = state.recording_sessions.start(duration_minutes=1)
+
+        orig_finish = recording_session.RecordingSessionManager._finish
+
+        async def flaky_finish(self, sess, end_ts):
+            if sess.id == bad_id:
+                raise RuntimeError("boom")
+            return await orig_finish(self, sess, end_ts)
+
+        monkeypatch.setattr(recording_session.RecordingSessionManager, "_finish", flaky_finish)
+        sweep_calls = []
+        orig_sweep = recording_session.RecordingSessionManager._sweep
+        monkeypatch.setattr(
+            recording_session.RecordingSessionManager,
+            "_sweep",
+            lambda self, now: (sweep_calls.append(now), orig_sweep(self, now))[-1],
+        )
+
+        await state.recording_sessions.tick(
+            now=ms(2026, 1, 2, 3, 1, 30)
+        )  # must not raise
+
+        assert state.recording_sessions.status_of(bad_id)["status"] == "running"
+        assert len(sweep_calls) == 1
+
+
+class TestRecordingSessionReclaim:
+    async def test_orphaned_archive_is_reclaimed_and_next_id_avoids_collision(
+        self, state, log_file, tmp_path
+    ):
+        # br-RECS-013: a gateway restart must not (a) leak a previously
+        # completed archive forever, or (b) let a fresh session's id
+        # collide with -- and silently overwrite -- one of them.
+        sessions_dir = tmp_path / "sess"
+        mgr1 = recording_session.RecordingSessionManager(state, sessions_dir)
+        state.open_file(str(log_file), "log", None, live=False, transforms=[])
+        await _flush()
+        sid = mgr1.start()
+        await mgr1.stop(sid)
+        assert mgr1.status_of(sid)["ready"] is True
+        old_bytes = mgr1.download(sid)
+        old_path = mgr1._sessions[sid].path
+        assert old_path.exists()
+
+        # simulate a restart: a brand-new manager pointed at the same dir,
+        # with no memory of mgr1's in-flight state
+        mgr2 = recording_session.RecordingSessionManager(state, sessions_dir)
+
+        # (a) reclaimed -- still reachable via its original id
+        assert mgr2.status_of(sid) == {
+            "session_id": sid,
+            "status": "completed",
+            "ready": True,
+            "safe": False,
+        }
+        assert mgr2.download(sid) == old_bytes
+
+        # (b) _next_id was advanced past it, so a fresh session can't collide
+        new_sid = mgr2.start()
+        assert new_sid != sid
+        await mgr2.stop(new_sid)
+        assert old_path.exists(), "the old archive must survive a same-process restart + new session"
+        assert mgr2.download(sid) == old_bytes, "old archive content must be untouched"
+
+    async def test_reclaimed_orphan_is_swept_once_its_normal_ttl_elapses(self, state, tmp_path):
+        sessions_dir = tmp_path / "sess2"
+        mgr1 = recording_session.RecordingSessionManager(state, sessions_dir)
+        sid = mgr1.start()
+        await mgr1.stop(sid)
+        path = mgr1._sessions[sid].path
+        assert path.exists()
+
+        mgr2 = recording_session.RecordingSessionManager(state, sessions_dir)
+        assert sid in mgr2._sessions  # reclaimed
+
+        future = time.time() * 1000.0 + mgr2.default_ttl_seconds * 1000.0 + 1000.0
+        mgr2._sweep(future)
+        assert not path.exists(), "a reclaimed orphan must be swept once its normal TTL has elapsed"
+        assert sid not in mgr2._sessions
+
+    async def test_a_safe_orphan_is_not_reclaimed_with_its_own_max_keep_seconds(
+        self, state, tmp_path
+    ):
+        # A restart can't know the original safe/max_keep_seconds a session
+        # was marked with -- reclaimed orphans always fall back to the
+        # ordinary default_ttl_seconds sweep, never a longer safe window.
+        # Confirms the fallback doesn't accidentally look "safe" by default.
+        sessions_dir = tmp_path / "sess3"
+        mgr1 = recording_session.RecordingSessionManager(state, sessions_dir)
+        sid = mgr1.start()
+        await mgr1.stop(sid)
+        mgr1.mark_safe(sid, max_keep_seconds=999_999)
+
+        mgr2 = recording_session.RecordingSessionManager(state, sessions_dir)
+        assert mgr2.status_of(sid)["safe"] is False
+
+    async def test_unrelated_or_malformed_filenames_are_left_alone(self, state, tmp_path):
+        sessions_dir = tmp_path / "sess4"
+        sessions_dir.mkdir(parents=True)
+        (sessions_dir / ".DS_Store").write_bytes(b"")
+        (sessions_dir / "recABC.cttc-record").write_bytes(b"not a real id")
+        (sessions_dir / "notarec3.cttc-record").write_bytes(b"wrong prefix")
+
+        mgr = recording_session.RecordingSessionManager(state, sessions_dir)
+        assert mgr._sessions == {}
+        assert mgr._next_id == 1  # nothing recognized -- no reason to advance it
+        # and nothing was touched/deleted
+        assert (sessions_dir / ".DS_Store").exists()
+        assert (sessions_dir / "recABC.cttc-record").exists()
+        assert (sessions_dir / "notarec3.cttc-record").exists()
+
+    async def test_fresh_install_with_no_sessions_dir_yet_starts_clean(self, state, tmp_path):
+        sessions_dir = tmp_path / "never-created"
+        mgr = recording_session.RecordingSessionManager(state, sessions_dir)
+        assert mgr._sessions == {}
+        assert mgr._next_id == 1
+        assert sessions_dir.is_dir()  # still created up front, as before
 
 
 class TestRecordingSession:

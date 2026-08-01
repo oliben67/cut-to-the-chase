@@ -18,7 +18,9 @@ from pathlib import Path
 
 import pytest
 
+import orjson
 import redis_log
+from conftest import unique_redis_tcp_port
 
 
 def _short_socket_path() -> str:
@@ -68,6 +70,31 @@ async def test_start_binds_loopback_only_tcp_port(monkeypatch):
         await rl.stop()
 
 
+async def test_start_uses_an_eviction_policy_that_can_actually_evict(monkeypatch):
+    # br-REDIS-012: `volatile-*` policies only consider keys with a
+    # key-level EXPIRE, which none of these ever have (TTLs here are all
+    # per-field HEXPIRE) -- so the policy must be an `allkeys-*` one, or
+    # Redis silently refuses every write once it hits maxmemory instead of
+    # evicting anything.
+    captured = {}
+    real_exec = asyncio.create_subprocess_exec
+
+    async def spy_exec(*args, **kwargs):
+        captured["args"] = args
+        return await real_exec(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spy_exec)
+    rl = redis_log.RedisLog(socket_path=_short_socket_path(), tcp_port=unique_redis_tcp_port())
+    await rl.start()
+    try:
+        args = captured["args"]
+        assert "--maxmemory-policy" in args
+        policy = args[args.index("--maxmemory-policy") + 1]
+        assert policy.startswith("allkeys-"), f"{policy!r} can't evict a key with no key-level TTL"
+    finally:
+        await rl.stop()
+
+
 async def test_tcp_port_is_actually_reachable_and_usable(redis_log_instance):
     """Not just "redis-server accepted the flag" -- a real client, connected
     over TCP rather than the unix socket every other test here uses, can
@@ -100,6 +127,45 @@ async def test_start_raises_when_redis_server_missing(monkeypatch):
 async def test_stop_without_start_does_not_raise():
     rl = redis_log.RedisLog()
     await rl.stop()
+
+
+async def test_stop_clears_enabled():
+    # br-REDIS-008: `enabled` staying True after stop() let any late
+    # record() keep enqueuing against a pump/server that were already gone.
+    rl = redis_log.RedisLog(socket_path=_short_socket_path(), tcp_port=unique_redis_tcp_port())
+    await rl.start()
+    await rl.stop()
+    assert rl.enabled is False
+
+
+async def test_stop_drains_the_queue_before_tearing_down():
+    # br-REDIS-008: stop() used to cancel the pump and kill redis-server
+    # immediately, permanently losing whatever was still queued. Monkeypatch
+    # around terminate()/wait() so redis-server survives past stop()
+    # returning, letting us confirm the queued write actually landed.
+    rl = redis_log.RedisLog(socket_path=_short_socket_path(), tcp_port=unique_redis_tcp_port())
+    await rl.start()
+    proc = rl._proc
+    real_terminate, real_wait = proc.terminate, proc.wait
+    proc.terminate = lambda: None
+    proc.wait = _noop_async
+
+    rl._enqueue("queued-at-shutdown", 1000.0, {"text": "should not be lost"})
+    await rl.stop()  # no sleep first -- the write is still only queued, not yet pumped
+
+    assert rl.enabled is False
+    assert rl._queue.empty()
+    raw = await rl._client.hget("cttc:log:queued-at-shutdown", "1000.0")
+    assert raw is not None
+    assert orjson.loads(raw)["text"] == "should not be lost"
+
+    await rl._client.aclose()
+    real_terminate()
+    await real_wait()
+
+
+async def _noop_async(*_args, **_kwargs):
+    return None
 
 
 async def test_start_raises_when_redis_package_missing(monkeypatch, tmp_path):
@@ -148,6 +214,7 @@ async def test_disabled_instance_helpers_are_all_safe_noops():
     assert rl.ttl_seconds == 99.0
     await rl.remember_daemon("ssh://host", {"host": "ssh://host"})
     assert await rl.known_daemons() == []
+    await rl.forget_daemon("ssh://host")  # must not raise with no _client either
     rl.record("c", 1.0, {"text": "dropped, no _client to enqueue against"})  # must not raise
 
 
@@ -281,9 +348,54 @@ async def test_set_ttl_reapplies_to_existing_entries(redis_log_instance):
     assert ttl and ttl[0] <= 60
 
 
+@pytest.mark.parametrize("bad", [0, -1, -3600, 0.5, 0.999, -0.5])
+async def test_set_ttl_rejects_anything_that_truncates_below_one_second(redis_log_instance, bad):
+    # br-REDIS-013: HEXPIRE takes int(seconds), and Redis treats a TTL <= 0
+    # as "expire this field right now" -- 0.5 alone passes a bare
+    # `seconds <= 0` check but still truncates to 0, so the check has to
+    # look at the truncated value, not the raw one.
+    rl = redis_log_instance
+    rl.record("c7b", 1000.0, {"text": "must survive"})
+    await _settle()
+    with pytest.raises(ValueError):
+        await rl.set_ttl(bad)
+    # rejected outright -- must not have touched the existing TTL/default,
+    # nor (a fortiori) actually expired anything
+    assert rl.ttl_seconds != bad
+    ttl = await rl._client.httl("cttc:log:c7b", "1000.0")
+    assert ttl and ttl[0] > 0
+
+
+async def test_set_ttl_accepts_exactly_one_second(redis_log_instance):
+    rl = redis_log_instance
+    await rl.set_ttl(1)
+    assert rl.ttl_seconds == 1
+
+
 async def test_remember_and_known_daemons(redis_log_instance):
     rl = redis_log_instance
     await rl.remember_daemon("ssh://user@host", {"host": "ssh://user@host"})
+    known = await rl.known_daemons()
+    assert {"host": "ssh://user@host"} in known
+
+
+async def test_forget_daemon_removes_it_from_known_daemons(redis_log_instance):
+    # br-REDIS-017: the counterpart remember_daemon lacked entirely --
+    # without it, a daemon removed in the UI was silently re-collected
+    # forever on the gateway's own next restart.
+    rl = redis_log_instance
+    await rl.remember_daemon("ssh://user@host", {"host": "ssh://user@host"})
+    await rl.remember_daemon("ssh://other@host2", {"host": "ssh://other@host2"})
+    await rl.forget_daemon("ssh://user@host")
+    known = await rl.known_daemons()
+    assert {"host": "ssh://user@host"} not in known
+    assert {"host": "ssh://other@host2"} in known  # sibling entry untouched
+
+
+async def test_forget_daemon_on_an_unknown_host_is_a_safe_noop(redis_log_instance):
+    rl = redis_log_instance
+    await rl.remember_daemon("ssh://user@host", {"host": "ssh://user@host"})
+    await rl.forget_daemon("ssh://never@known")
     known = await rl.known_daemons()
     assert {"host": "ssh://user@host"} in known
 
@@ -370,6 +482,59 @@ async def test_latest_and_nearest_skip_a_field_evicted_after_the_index_lookup(
 
     assert await rl.latest("c11") is None
     assert await rl.nearest("c11", 1000.0) is None
+
+
+async def test_latest_falls_back_past_a_stale_newest_entry_and_prunes_it(redis_log_instance):
+    # br-REDIS-011: a field's hash payload can expire while its zset member
+    # lingers -- latest() used to return None just because the *newest* one
+    # had expired, silently disabling every metric event condition on the
+    # entity, even though an older, still-live sample exists.
+    rl = redis_log_instance
+    rl.record("c14", 1000.0, {"text": "still alive"})
+    rl.record("c14", 2000.0, {"text": "expired"})
+    await _settle()
+    await rl._client.hdel("cttc:log:c14", "2000.0")  # simulate the newest one expiring
+
+    assert await rl._client.zcard("cttc:idx:c14") == 2  # phantom member still indexed
+    ts, payload = await rl.latest("c14")
+    assert (ts, payload["text"]) == (1000.0, "still alive")
+    assert await rl._client.zcard("cttc:idx:c14") == 1  # br-REDIS-011: pruned on discovery
+
+
+async def test_nearest_falls_back_past_a_stale_candidate_and_prunes_it(redis_log_instance):
+    rl = redis_log_instance
+    rl.record("c15", 1000.0, {"text": "still alive"})
+    rl.record("c15", 2000.0, {"text": "expired"})
+    await _settle()
+    await rl._client.hdel("cttc:log:c15", "2000.0")
+
+    ts, payload = await rl.nearest("c15", 2000.0)  # nearest to the now-gone field itself
+    assert (ts, payload["text"]) == (1000.0, "still alive")
+    assert await rl._client.zcard("cttc:idx:c15") == 1
+
+
+async def test_slice_by_rank_prunes_a_stale_index_entry_it_discovers(redis_log_instance):
+    rl = redis_log_instance
+    rl.record("c16", 1000.0, {"text": "a"})
+    rl.record("c16", 2000.0, {"text": "b"})
+    await _settle()
+    await rl._client.hdel("cttc:log:c16", "1000.0")
+
+    await rl.slice_by_rank("c16", 0, 10)
+    assert await rl._client.zcard("cttc:idx:c16") == 1  # br-REDIS-011: stale member pruned
+
+
+async def test_range_by_score_with_payload_prunes_a_stale_index_entry_it_discovers(
+    redis_log_instance,
+):
+    rl = redis_log_instance
+    rl.record("c17", 1000.0, {"text": "a"})
+    rl.record("c17", 2000.0, {"text": "b"})
+    await _settle()
+    await rl._client.hdel("cttc:log:c17", "1000.0")
+
+    await rl.range_by_score_with_payload("c17", 0, 3000)
+    assert await rl._client.zcard("cttc:idx:c17") == 1
 
 
 async def test_find_text_skips_a_field_evicted_mid_scan(redis_log_instance):

@@ -25,6 +25,8 @@ const { readGateways, recordGateway, removeGateway, gatewayKey } = require("./li
 const { readSelectedContainers, writeSelectedContainers, deleteSelectedContainers } = require("./lib/container-selection");
 const { openSshTunnel, closeSshTunnel } = require("./lib/ssh-tunnel");
 const { recordTunnel, removeTunnel, killOrphanedTunnels } = require("./lib/tunnel-registry");
+const { gracefulStop } = require("./lib/graceful-stop");
+const { getOrCreateApiToken, forgetApiToken } = require("./lib/api-token");
 const {
   readSettings: readLogCollectorSettings,
   writeSettings: writeLogCollectorSettings,
@@ -73,6 +75,15 @@ let serverPort = null;
 let activeGatewayHost = "127.0.0.1";
 let activeGatewayPort = null;
 let serverConnectionType = "local";
+// The shared-secret required (as X-CTTC-Token) by the *currently active*
+// gateway's own HTTP API, once one is generated for it -- null only for the
+// bare/native 127.0.0.1-only embedded path (see startServer), which never
+// binds 0.0.0.0 and so was never network-reachable in the first place
+// (br-NET-004). Exposed to the renderer via get-api-token/preload.js; every
+// gateway connect path below (connectToServer, connectRemoteGateway,
+// gateway-manage-save, the boot-time local-container fallback) must set
+// this to whatever token it actually used to provision/reach that gateway.
+let currentApiToken = null;
 // The ssh -N -L child process backing a "remote-tunnel" connection, if any
 // -- see connectRemoteGateway/lib/ssh-tunnel.js. Tracked here (not just
 // left to whatever called openSshTunnel) so switching or disconnecting from
@@ -153,8 +164,15 @@ function listGatewaysWithActiveFlag() {
 // always treated as reachable.
 async function checkGatewayReachable(entry) {
   if (entry.mode === "embedded" && entry.port == null) return true;
+  // Every other entry here has been successfully connected to before (see
+  // recordGateway's own comment), so its token already exists -- this only
+  // ever retrieves it, never generates a new one.
+  const apiToken = getOrCreateApiToken(entry.mode === "embedded" ? "embedded" : hostFromTarget(entry.sshTarget));
   try {
-    const r = await fetch(`http://${entry.host}:${entry.port}/health`, { signal: AbortSignal.timeout(4000) });
+    const r = await fetch(`http://${entry.host}:${entry.port}/health`, {
+      signal: AbortSignal.timeout(4000),
+      headers: { "X-CTTC-Token": apiToken },
+    });
     return r.ok;
   } catch {
     return false;
@@ -522,7 +540,11 @@ async function createWindow() {
   });
   attachEditContextMenu(win);
   await win.loadFile(path.join(__dirname, "renderer", "index.html"), {
-    search: `host=${serverHost}&port=${serverPort}`,
+    // br-NET-004: token is whatever the active gateway actually requires
+    // (null for the bare/native 127.0.0.1-only embedded path, which never
+    // needed one) -- app.js reads it the same synchronous way it already
+    // reads host/port, so every request it ever makes can carry it.
+    search: `host=${serverHost}&port=${serverPort}&token=${currentApiToken || ""}`,
   });
   // e2e mode: CTTC_TEST=<spec.js> runs the spec in the page, reports results
   // + V8 byte coverage of app.js (as exercised by the spec) on stdout, then
@@ -734,7 +756,12 @@ ipcMain.handle("popout", async (e, kind, id, view) => {
   });
   popoutWindows.set(key, win);
   attachEditContextMenu(win);
-  const params = new URLSearchParams({ host: serverHost, port: String(serverPort), popout: kind });
+  const params = new URLSearchParams({
+    host: serverHost,
+    port: String(serverPort),
+    popout: kind,
+    token: currentApiToken || "",
+  });
   if (id) params.set("id", id);
   // hand the opener's current view/cursor over so the new window opens on
   // exactly the same time range instead of blank-then-reset
@@ -796,7 +823,8 @@ async function connectToServer(fileArgs) {
     const wantsContainer = cfg.runMode !== "native";
     if (app.isPackaged && wantsContainer && (await hasLocalDocker())) {
       narrate("starting the local gateway container...");
-      const { port } = await ensureLocalContainer({ resourcesDir: resourcesDirForApp(), onLog: mainLog });
+      const apiToken = getOrCreateApiToken("embedded");
+      const { port } = await ensureLocalContainer({ resourcesDir: resourcesDirForApp(), apiToken, onLog: mainLog });
       serverHost = "127.0.0.1";
       serverPort = port;
       activeGatewayHost = "127.0.0.1";
@@ -804,11 +832,13 @@ async function connectToServer(fileArgs) {
       serverConnectionType = "local";
       activeSshTarget = null;
       activeSshPort = undefined;
+      currentApiToken = apiToken;
       mainLog(`[docker] server container running locally — port ${serverPort}`);
       recordGateway({ mode: "embedded", host: serverHost, port: serverPort, label: "This machine", connectionType: "local" });
       return;
     }
     narrate("starting the server...");
+    currentApiToken = null; // bare/native, 127.0.0.1-only -- never needed one (br-NET-004)
     await startServer(fileArgs);
     return;
   }
@@ -829,6 +859,7 @@ async function connectToServer(fileArgs) {
   serverConnectionType = result.connectionType;
   activeSshTarget = cfg.sshTarget;
   activeSshPort = cfg.sshPort;
+  currentApiToken = result.apiToken;
   mainLog(
     `[remote] connected to ${cfg.sshTarget} via ${result.connectionType} — http://${serverHost}:${serverPort}`
   );
@@ -851,12 +882,13 @@ async function connectToServer(fileArgs) {
 // informational: failure here doesn't block setup, it just tells the user
 // up front whether they'll need to type an explicit target in Set Sources
 // instead of relying on the default.
-async function checkServerHostDocker(host, port, onLog) {
+async function checkServerHostDocker(host, port, onLog, apiToken) {
   onLog?.("$ checking for docker on the server host...");
   try {
     const r = await fetch(`http://${host}:${port}/docker/ps`, {
       method: "POST",
       body: JSON.stringify({}),
+      ...(apiToken ? { headers: { "X-CTTC-Token": apiToken } } : {}),
     });
     const j = await r.json().catch(() => ({}));
     if (r.ok) {
@@ -929,13 +961,20 @@ async function provisionRemoteGateway(payload, onLog) {
 // Returns the *client-facing* host/port (what serverHost/serverPort should
 // become -- 127.0.0.1 when tunneled) separately from the gateway's logical
 // identity (gatewayHost/gatewayPort -- always its real address, tunneled or
-// not), plus imageRef for the registry.
+// not), plus imageRef for the registry and apiToken for every later request
+// (br-NET-004) -- callers must set currentApiToken from the result.
 async function connectRemoteGateway(cfg, { onLog, forceTunnel = false } = {}) {
   const sshBin = process.env.CTTC_SSH_BIN || "ssh";
+  // Same key ensureRemoteContainer itself resolves `host` from below --
+  // getOrCreateApiToken always returns the same, already-persisted token
+  // for a given gateway (see lib/api-token.js), so this never changes
+  // between an ordinary reconnect's `docker compose up -d` calls.
+  const apiToken = getOrCreateApiToken(cfg.host || hostFromTarget(cfg.sshTarget));
   const remote = await ensureRemoteContainer(cfg, {
     sshBin,
     resourcesDir: resourcesDirForApp(),
     source: cfg.imageSource || undefined,
+    apiToken,
     onLog,
   });
 
@@ -943,7 +982,10 @@ async function connectRemoteGateway(cfg, { onLog, forceTunnel = false } = {}) {
 
   if (!forceTunnel) {
     try {
-      const r = await fetch(`http://${remote.host}:${remote.port}/health`, { signal: AbortSignal.timeout(10000) });
+      const r = await fetch(`http://${remote.host}:${remote.port}/health`, {
+        signal: AbortSignal.timeout(10000),
+        headers: { "X-CTTC-Token": apiToken },
+      });
       if (r.ok) {
         return {
           host: remote.host,
@@ -952,6 +994,7 @@ async function connectRemoteGateway(cfg, { onLog, forceTunnel = false } = {}) {
           gatewayPort: remote.port,
           connectionType: "remote",
           imageRef: remote.imageRef,
+          apiToken,
         };
       }
     } catch {
@@ -986,6 +1029,7 @@ async function connectRemoteGateway(cfg, { onLog, forceTunnel = false } = {}) {
     gatewayPort: remote.port,
     connectionType: "remote-tunnel",
     imageRef: remote.imageRef,
+    apiToken,
   };
 }
 
@@ -1053,6 +1097,7 @@ function runSetupWizard() {
         serverConnectionType = remote.connectionType;
         activeSshTarget = cfg.sshTarget;
         activeSshPort = cfg.sshPort;
+        currentApiToken = remote.apiToken;
         saveConnectionConfig(cfg);
         recordGateway({
           mode: "remote",
@@ -1065,7 +1110,12 @@ function runSetupWizard() {
           connectionType: remote.connectionType,
           imageRef: remote.imageRef,
         });
-        await checkServerHostDocker(remote.host, remote.port, (line) => wizardWindow?.webContents.send("setup-log", line));
+        await checkServerHostDocker(
+          remote.host,
+          remote.port,
+          (line) => wizardWindow?.webContents.send("setup-log", line),
+          remote.apiToken
+        );
         settled = true;
         ipcMain.removeHandler("gateway-setup-submit");
         wizardWindow.destroy();
@@ -1093,7 +1143,7 @@ async function reconnectMainWindow() {
   }
   if (mainWindow && !mainWindow.isDestroyed()) {
     await mainWindow.loadFile(path.join(__dirname, "renderer", "index.html"), {
-      search: `host=${serverHost}&port=${serverPort}`,
+      search: `host=${serverHost}&port=${serverPort}&token=${currentApiToken || ""}`,
     });
   } else {
     await createWindow();
@@ -1219,6 +1269,9 @@ ipcMain.handle("switch-gateway", async (_e, entry) => {
       serverConnectionType = "local";
       activeSshTarget = null;
       activeSshPort = undefined;
+      // Already provisioned (not re-running ensureLocalContainer here) --
+      // just retrieves the same token generated back then.
+      currentApiToken = getOrCreateApiToken("embedded");
     }
     await reconnectMainWindow();
     return { ok: true };
@@ -1253,6 +1306,7 @@ ipcMain.handle("switch-gateway", async (_e, entry) => {
     serverConnectionType = result.connectionType;
     activeSshTarget = cfg.sshTarget;
     activeSshPort = cfg.sshPort;
+    currentApiToken = result.apiToken;
     recordGateway({
       mode: "remote",
       host: result.gatewayHost,
@@ -1293,6 +1347,7 @@ ipcMain.handle("gateway-add-submit", async (_e, payload) => {
     serverConnectionType = remote.connectionType;
     activeSshTarget = cfg.sshTarget;
     activeSshPort = cfg.sshPort;
+    currentApiToken = remote.apiToken;
     saveConnectionConfig(cfg);
     recordGateway({
       mode: "remote",
@@ -1305,7 +1360,12 @@ ipcMain.handle("gateway-add-submit", async (_e, payload) => {
       connectionType: remote.connectionType,
       imageRef: remote.imageRef,
     });
-    await checkServerHostDocker(remote.host, remote.port, (line) => mainWindow?.webContents.send("setup-log", line));
+    await checkServerHostDocker(
+      remote.host,
+      remote.port,
+      (line) => mainWindow?.webContents.send("setup-log", line),
+      remote.apiToken
+    );
   } catch (err) {
     return { ok: false, error: err.message || String(err) };
   }
@@ -1427,7 +1487,10 @@ ipcMain.handle("ship-logs", async () => {
   const entries = localFiles.map((p) => ({ name: path.basename(p), data: fs.readFileSync(p) }));
 
   try {
-    const res = await fetch(`http://${serverHost}:${serverPort}/mlog`, { signal: AbortSignal.timeout(20000) });
+    const res = await fetch(`http://${serverHost}:${serverPort}/mlog`, {
+      signal: AbortSignal.timeout(20000),
+      ...(currentApiToken ? { headers: { "X-CTTC-Token": currentApiToken } } : {}),
+    });
     const gatewayName = res.headers.get("X-CTTC-Gateway-Name") || "gateway";
     const bytes = Buffer.from(await res.arrayBuffer());
     entries.push({ name: `${gatewayName}.log`, data: bytes });
@@ -1482,15 +1545,28 @@ ipcMain.handle("gateway-manage-save", async (_e, payload) => {
     // rather than a registry lookup, since the never-provisioned "This
     // machine" placeholder (see get-gateways) was never actually recorded.
     if (payload.mode === "embedded") {
+      const apiToken = getOrCreateApiToken("embedded");
       const { port } = await ensureLocalContainer({
         source: payload.imageSource || undefined,
         resourcesDir: resourcesDirForApp(),
+        apiToken,
         onLog: mainLog,
       });
-      recordGateway({ mode: "embedded", host: "127.0.0.1", port, label: "This machine", connectionType: "local" });
+      recordGateway({
+        mode: "embedded",
+        host: "127.0.0.1",
+        port,
+        label: "This machine",
+        connectionType: "local",
+        // br-PROV-007: remembered so a later Uninstall resolves the same
+        // compose file this was actually provisioned with, instead of always
+        // falling back to the bundled/default one -- see uninstallLocalContainer.
+        ...(payload.imageSource ? { imageSource: payload.imageSource } : {}),
+      });
       if (activeGatewayHost === "127.0.0.1" && serverConnectionType === "local") {
         serverPort = port;
         activeGatewayPort = port;
+        currentApiToken = apiToken;
         await offerRestart("Reconnect CTTC to apply the updated image?");
       }
       return { ok: true };
@@ -1511,12 +1587,16 @@ ipcMain.handle("gateway-manage-save", async (_e, payload) => {
     const wasActive = payload.key === gatewayKey({ host: activeGatewayHost, port: activeGatewayPort });
     // Only reconnects the transport (direct vs tunnel) if this is the
     // *active* gateway -- otherwise it's just re-provisioned in place,
-    // same as before, with nothing to reconnect.
+    // same as before, with nothing to reconnect. Either way it's the same
+    // persisted token (br-NET-004, see lib/api-token.js) -- connectRemoteGateway
+    // resolves its own copy internally for the wasActive path below.
+    const apiToken = getOrCreateApiToken(hostFromTarget(cfg.sshTarget));
     const result = wasActive
       ? await connectRemoteGateway(cfg, { onLog: (line) => mainWindow?.webContents.send("setup-log", line) })
       : await ensureRemoteContainer(cfg, {
           sshBin: process.env.CTTC_SSH_BIN || "ssh",
           source: cfg.imageSource,
+          apiToken,
           onLog: (line) => mainWindow?.webContents.send("setup-log", line),
         });
     const gatewayHost = result.gatewayHost || result.host;
@@ -1542,6 +1622,7 @@ ipcMain.handle("gateway-manage-save", async (_e, payload) => {
       serverConnectionType = result.connectionType;
       activeSshTarget = cfg.sshTarget;
       activeSshPort = cfg.sshPort;
+      currentApiToken = result.apiToken;
       await offerRestart("Reconnect CTTC to apply the updated gateway settings?");
     }
     return { ok: true };
@@ -1563,7 +1644,10 @@ ipcMain.handle("gateway-manage-uninstall", async (_e, entry) => {
   const onLog = (line) => mainWindow?.webContents.send("setup-log", line);
   try {
     if (entry.mode === "embedded") {
-      await uninstallLocalContainer({ resourcesDir: resourcesDirForApp(), onLog });
+      // br-PROV-007: pass back whatever source this entry was actually
+      // provisioned with (see recordGateway above in gateway-manage-save),
+      // so uninstall resolves the same compose file instead of the default.
+      await uninstallLocalContainer({ source: entry.imageSource, resourcesDir: resourcesDirForApp(), onLog });
     } else {
       await uninstallRemoteContainer(
         { sshTarget: entry.sshTarget, sshKey: entry.sshKey, sshPort: entry.sshPort },
@@ -1571,6 +1655,9 @@ ipcMain.handle("gateway-manage-uninstall", async (_e, entry) => {
       );
     }
     removeGateway(gatewayKey(entry));
+    // So a stale token isn't silently reused if this same host is ever
+    // re-provisioned as a fresh gateway later (br-NET-004).
+    forgetApiToken(entry.mode === "embedded" ? "embedded" : hostFromTarget(entry.sshTarget));
     const wasActive = isActiveGateway(entry);
     if (wasActive) {
       // stopServer() (not just clearCurrentTunnel()) so a bare `uv run
@@ -1664,7 +1751,8 @@ app.whenReady().then(async () => {
         // embedded server if that attempt itself fails.
         try {
           narrate("starting the local gateway container...");
-          const { port } = await ensureLocalContainer({ resourcesDir: resourcesDirForApp(), onLog: mainLog });
+          const apiToken = getOrCreateApiToken("embedded");
+          const { port } = await ensureLocalContainer({ resourcesDir: resourcesDirForApp(), apiToken, onLog: mainLog });
           serverHost = "127.0.0.1";
           serverPort = port;
           activeGatewayHost = "127.0.0.1";
@@ -1672,9 +1760,11 @@ app.whenReady().then(async () => {
           serverConnectionType = "local";
           activeSshTarget = null;
           activeSshPort = undefined;
+          currentApiToken = apiToken;
           mainLog(`[docker] server container running locally — port ${serverPort}`);
         } catch {
           narrate("starting the server...");
+          currentApiToken = null; // bare/native, 127.0.0.1-only -- never needed one (br-NET-004)
           await startServer(fileArgs);
         }
       }
@@ -1732,21 +1822,49 @@ function stopServer() {
   // process's own child: there's nothing local to tear down, and this
   // process must never POST /shutdown to it. Only a bare `uv run server.py`
   // (serverProc) is actually owned by this process.
-  if (serverProc) {
-    try {
-      // graceful: lets the server stop docker collectors and ssh sessions
-      fetch(`http://${serverHost}:${serverPort}/shutdown`, { method: "POST" }).catch(() => {});
-      setTimeout(() => serverProc && serverProc.kill(), 1500);
-    } catch {
-      serverProc.kill();
-    }
-  }
+  //
+  // Returns a promise that resolves once serverProc has actually exited
+  // (gracefully, or via gracefulStop's own fallback kill) -- see
+  // lib/graceful-stop.js and the before-quit handler below (br-EMBED-002).
+  return gracefulStop(serverProc, {
+    stopUrl: `http://${serverHost}:${serverPort}/shutdown`,
+    onLog: mainLog,
+  });
 }
 
 app.on("window-all-closed", () => {
-  stopServer();
-  stopLogCollector();
+  // Just triggers the real teardown below -- app.quit() always fires
+  // before-quit first, which is the one place stopServer()/stopLogCollector()
+  // now run (br-EMBED-002: having two independent call sites racing to stop
+  // the same process is exactly what made the fallback-kill timing bug hard
+  // to reason about in the first place).
   app.quit();
 });
-app.on("before-quit", stopServer);
-app.on("before-quit", stopLogCollector);
+// Every quit path (Quit menu/button, Cmd+Q, Dock > Quit, a window's own
+// close triggering window-all-closed above, or the app.quit() at the end of
+// this same handler on its second pass) funnels through this event -- the
+// one place to tell every still-open window's status bar a shutdown is
+// underway, then actually stop the server, before the process really exits.
+// Guarded against re-entrancy since the deferred app.quit() below re-fires
+// before-quit -- stopServer/stopLogCollector are idempotent and safely run
+// twice, but shuttingDownNotified being true means this branch is skipped
+// on that second pass, letting the quit actually proceed.
+let shuttingDownNotified = false;
+app.on("before-quit", (e) => {
+  if (shuttingDownNotified) return;
+  shuttingDownNotified = true;
+  e.preventDefault();
+  for (const w of BrowserWindow.getAllWindows()) {
+    if (!w.isDestroyed()) w.webContents.send("app-shutting-down");
+  }
+  stopLogCollector();
+  // br-EMBED-002: the re-quit below must wait for stopServer()'s own
+  // graceful-shutdown/fallback-kill sequence to actually finish, not fire on
+  // a fixed timer that races past it -- otherwise a wedged (or silently
+  // failed-to-POST) embedded server was never actually killed, because the
+  // app had already force-quit by the time gracefulStop's 1500ms fallback
+  // timer would have run. The 200ms floor alongside it is kept only so the
+  // "shutting down" broadcast above still gets at least one paint even when
+  // stopServer() resolves almost instantly (no serverProc to stop at all).
+  Promise.all([stopServer(), new Promise((resolve) => setTimeout(resolve, 200))]).then(() => app.quit());
+});

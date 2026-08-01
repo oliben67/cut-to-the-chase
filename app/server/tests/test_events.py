@@ -116,6 +116,39 @@ class TestEventValidation:
             await state.events.cancel("nope")
 
 
+class TestEventTickResilience:
+    async def test_one_failing_event_does_not_raise_or_block_others(self, state, monkeypatch):
+        # br-ORCH-004: an exception checking/firing one event must not kill
+        # the tick (and, transitively, all future orchestration ticks).
+        src = stats_source(state)
+        state.sources[src.id] = src
+        bad_id = await state.events.create(
+            "bad",
+            {src.id},
+            [events.MetricCondition(metric="cpu", op=">", threshold=80)],
+            events.Action(kind="snapshot", minutes=5),
+        )
+        good_id = await state.events.create(
+            "good",
+            {src.id},
+            [events.MetricCondition(metric="cpu", op=">", threshold=80)],
+            events.Action(kind="snapshot", minutes=5),
+        )
+
+        orig_check = events.EventManager._check
+
+        async def flaky_check(self, ev):
+            if ev.id == bad_id:
+                raise RuntimeError("boom")
+            return await orig_check(self, ev)
+
+        monkeypatch.setattr(events.EventManager, "_check", flaky_check)
+
+        await state.events.tick()  # must not raise
+
+        assert state.events.status_of(good_id)["status"] == "armed"
+
+
 class TestMetricEvents:
     async def test_snapshot_action_starts_a_rolling_buffer_for_its_sources(self, state):
         src = stats_source(state)

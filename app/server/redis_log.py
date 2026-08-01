@@ -133,7 +133,20 @@ class RedisLog:
             "--maxmemory",
             "256mb",
             "--maxmemory-policy",
-            "volatile-ttl",
+            # br-REDIS-012: `volatile-*` policies only ever consider keys
+            # that have a *key-level* EXPIRE -- but every record's TTL here
+            # is a per-*field* HEXPIRE on the shared `cttc:log:<entity>`
+            # hash (see _write()), so none of `cttc:log:*`/`cttc:idx:*`/
+            # `cttc:entities`/`cttc:daemons` ever qualify. `volatile-ttl`
+            # therefore finds nothing evictable and Redis falls back to
+            # rejecting writes outright once the 256MB cap is hit, which
+            # _write()'s warning-and-drop path turns into every subsequent
+            # sample being silently, permanently lost. `allkeys-lru` can
+            # actually evict (whichever key -- any entity's full history --
+            # was least recently touched), trading "lose one entity's
+            # oldest history under sustained memory pressure" for "every
+            # gateway silently stops recording anything at all".
+            "allkeys-lru",
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
@@ -167,8 +180,24 @@ class RedisLog:
         )
 
     async def stop(self) -> None:
+        """Stops accepting new writes immediately, cancels the pump, then
+        drains whatever was still queued directly (rather than counting on
+        the now-cancelled pump to finish it) before tearing down
+        redis-server (br-REDIS-008): otherwise every orderly shutdown
+        silently lost up to 10,000 queued samples, and `enabled` staying
+        `True` meant a late record() kept enqueuing against a pump/server
+        that were about to die (or already had), never to be read."""
+        self.enabled = False
         if self._pump_task is not None:
             self._pump_task.cancel()
+            try:
+                await self._pump_task
+            except asyncio.CancelledError:
+                pass
+        if self._queue is not None:
+            while not self._queue.empty():
+                entity_id, ts, payload = self._queue.get_nowait()
+                await self._write(entity_id, ts, payload)
         if self._proc is not None:
             self._proc.terminate()
             await self._proc.wait()
@@ -205,27 +234,32 @@ class RedisLog:
     async def _pump(self) -> None:
         while True:
             entity_id, ts, payload = await self._queue.get()
-            field = str(ts)
-            try:
-                pipe = self._client.pipeline(transaction=False)
-                pipe.hset(f"cttc:log:{entity_id}", field, orjson.dumps(payload))
-                pipe.zadd(f"cttc:idx:{entity_id}", {field: ts})
-                pipe.hexpire(f"cttc:log:{entity_id}", int(self.ttl_seconds), field)
-                pipe.sadd("cttc:entities", entity_id)
-                await pipe.execute()
-            except Exception as e:
-                # Broad on purpose: this loop must keep pumping later
-                # samples even after one bad write (a malformed payload, a
-                # transient Redis hiccup) -- but since Redis is the sole
-                # store, a write that doesn't land here is permanently
-                # gone, so this must never be quieter than `warning`.
-                logger.warning(
-                    "redis_log: write failed, sample for %s@%s lost: %s: %s",
-                    entity_id,
-                    ts,
-                    type(e).__name__,
-                    e,
-                )
+            await self._write(entity_id, ts, payload)
+
+    async def _write(self, entity_id: str, ts: float, payload: dict) -> None:
+        """The actual I/O for one queued write -- shared by _pump() (the
+        normal path) and stop() (draining whatever _pump didn't get to)."""
+        field = str(ts)
+        try:
+            pipe = self._client.pipeline(transaction=False)
+            pipe.hset(f"cttc:log:{entity_id}", field, orjson.dumps(payload))
+            pipe.zadd(f"cttc:idx:{entity_id}", {field: ts})
+            pipe.hexpire(f"cttc:log:{entity_id}", int(self.ttl_seconds), field)
+            pipe.sadd("cttc:entities", entity_id)
+            await pipe.execute()
+        except Exception as e:
+            # Broad on purpose: this loop must keep pumping later
+            # samples even after one bad write (a malformed payload, a
+            # transient Redis hiccup) -- but since Redis is the sole
+            # store, a write that doesn't land here is permanently
+            # gone, so this must never be quieter than `warning`.
+            logger.warning(
+                "redis_log: write failed, sample for %s@%s lost: %s: %s",
+                entity_id,
+                ts,
+                type(e).__name__,
+                e,
+            )
 
     # ── TTL ──────────────────────────────────────────────────────────────
 
@@ -234,7 +268,21 @@ class RedisLog:
         every already-stored field across every known entity -- "even live:
         changes to this configuration would trigger a new ttl for future
         and existing entries" per the original ask. Uses HSCAN, not
-        HKEYS/KEYS, so this doesn't block Redis on a large hash."""
+        HKEYS/KEYS, so this doesn't block Redis on a large hash.
+
+        br-REDIS-013: rejects anything that would truncate below 1 whole
+        second -- HEXPIRE (here and in _write()) takes an integer TTL via
+        `int(seconds)`, and Redis treats a TTL <= 0 as "expire this field
+        right now". Checking the *truncated* value (not just `seconds <= 0`)
+        matters: 0.5 alone passes a bare positivity check but still
+        truncates to 0, instantly and irrecoverably wiping every
+        already-stored record across every entity, and would keep doing
+        the same to every future write from then on."""
+        if int(seconds) < 1:
+            raise ValueError(
+                f"TTL must be at least 1 second, got {seconds!r} -- anything less would "
+                "instantly and irrecoverably expire all stored history"
+            )
         self.ttl_seconds = seconds
         if not self.enabled:
             return
@@ -282,10 +330,14 @@ class RedisLog:
         fields = [f for f, _ in fields_scores]
         values = await self._client.hmget(f"cttc:log:{entity_id}", fields)
         out = []
-        for (_field, score), raw in zip(fields_scores, values):
+        stale = []
+        for (field, score), raw in zip(fields_scores, values):
             if raw is None:
+                stale.append(field)  # br-REDIS-011: field expired, index member didn't
                 continue
             out.append((score, orjson.loads(raw)))
+        if stale:
+            await self._client.zrem(idx_key, *stale)
         return out
 
     async def rank_at_score(self, entity_id: str, t: float) -> int | None:
@@ -308,34 +360,43 @@ class RedisLog:
     async def nearest(self, entity_id: str, t: float) -> tuple[float, dict] | None:
         """Nearest-record lookup by time, payload included -- used for
         StatsSource.point_at (no index concept there, just "the closest
-        sample")."""
+        sample"). Retries past a stale index entry (br-REDIS-011: the
+        field's hash payload can expire while the zset member lingers) by
+        pruning it and re-querying, rather than returning None even though
+        a genuinely live nearby sample exists."""
         idx_key = f"cttc:idx:{entity_id}"
-        after, before = await asyncio.gather(
-            self._client.zrangebyscore(idx_key, t, "+inf", start=0, num=1, withscores=True),
-            self._client.zrevrangebyscore(idx_key, t, "-inf", start=0, num=1, withscores=True),
-        )
-        candidates = list(after) + list(before)
-        if not candidates:
-            return None
-        field, score = min(candidates, key=lambda fs: abs(fs[1] - t))
-        raw = await self._client.hget(f"cttc:log:{entity_id}", field)
-        if raw is None:
-            return None
-        return score, orjson.loads(raw)
+        hash_key = f"cttc:log:{entity_id}"
+        while True:
+            after, before = await asyncio.gather(
+                self._client.zrangebyscore(idx_key, t, "+inf", start=0, num=1, withscores=True),
+                self._client.zrevrangebyscore(idx_key, t, "-inf", start=0, num=1, withscores=True),
+            )
+            candidates = list(after) + list(before)
+            if not candidates:
+                return None
+            field, score = min(candidates, key=lambda fs: abs(fs[1] - t))
+            raw = await self._client.hget(hash_key, field)
+            if raw is not None:
+                return score, orjson.loads(raw)
+            await self._client.zrem(idx_key, field)  # br-REDIS-011: prune, then retry
 
     async def latest(self, entity_id: str) -> tuple[float, dict] | None:
         """The single most-recent record for `entity_id`, payload included
         -- used by EventManager._check_metric's threshold check (the old
-        RAM version read series[...][-1])."""
+        RAM version read series[...][-1]). Walks past stale index entries
+        (br-REDIS-011: their hash field expired but the zset member didn't)
+        instead of returning None just because the newest one has expired."""
         idx_key = f"cttc:idx:{entity_id}"
-        last = await self._client.zrange(idx_key, -1, -1, withscores=True)
-        if not last:
-            return None
-        field, score = last[0]
-        raw = await self._client.hget(f"cttc:log:{entity_id}", field)
-        if raw is None:
-            return None
-        return score, orjson.loads(raw)
+        hash_key = f"cttc:log:{entity_id}"
+        while True:
+            last = await self._client.zrange(idx_key, -1, -1, withscores=True)
+            if not last:
+                return None
+            field, score = last[0]
+            raw = await self._client.hget(hash_key, field)
+            if raw is not None:
+                return score, orjson.loads(raw)
+            await self._client.zrem(idx_key, field)  # br-REDIS-011: prune, then retry
 
     async def first_last(self, entity_id: str) -> tuple[float, float] | None:
         """(first_ts, last_ts) for `entity_id`, or None if it has no
@@ -370,10 +431,14 @@ class RedisLog:
         fields = [f for f, _ in fields_scores]
         values = await self._client.hmget(f"cttc:log:{entity_id}", fields)
         out = []
-        for (_, score), raw in zip(fields_scores, values):
+        stale = []
+        for (field, score), raw in zip(fields_scores, values):
             if raw is None:
+                stale.append(field)  # br-REDIS-011: field expired, index member didn't
                 continue
             out.append((score, orjson.loads(raw)))
+        if stale:
+            await self._client.zrem(idx_key, *stale)
         return out
 
     async def find_text(
@@ -447,3 +512,15 @@ class RedisLog:
             return []
         raw = await self._client.hgetall("cttc:daemons")
         return [orjson.loads(v) for v in raw.values()]
+
+    async def forget_daemon(self, host: str) -> None:
+        """Removes a remembered remote daemon (br-REDIS-017) -- the
+        counterpart remember_daemon lacked entirely. Without this,
+        State.close_source only ever drops the in-memory source; the entry
+        here survives, so a host removed in the UI kept being silently
+        re-collected forever on the gateway's own next restart (see
+        lifespan()'s known_daemons() replay), including with a since-deleted
+        ssh_key path."""
+        if not self.enabled or not host:
+            return
+        await self._client.hdel("cttc:daemons", host)

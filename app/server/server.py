@@ -210,6 +210,33 @@ def make_uid(source: str, line_no: int, raw: str) -> str:
     return hashlib.sha1(f"{source}\x00{line_no}\x00{raw}".encode(errors="replace")).hexdigest()[:16]
 
 
+def _entity_id(name: str, host: str | None) -> str:
+    """The Redis entity id for one source's data (br-DEDUP-006): host-
+    qualified for any remote docker target, so the same container/service
+    name collected from two different hosts never collides into the same
+    cttc:log:<id>/cttc:idx:<id> and silently interleaves their history --
+    the scenario redis_log.py's own module docstring already claimed was
+    handled, but never actually was for anything except host telemetry
+    (HostStatsSource's `host@<hostname>` naming, which this mirrors). Bare
+    for a local target (today's existing on-disk data, unambiguous since
+    there's only one local machine) or anything with no host concept at
+    all (static/demo file replay, imported .cttc samples) -- `name` itself
+    is what every caller still uses for display/grouping (API responses,
+    exported sample files); only the Redis key changes here.
+
+    A `name` that already contains "@" is left untouched: HostStatsSource
+    builds its own already-unique `host@<hostname>` name up front (used as
+    both its display name *and* the single entity id it ever passes
+    through StatsSource.ingest_row), so qualifying it again here would
+    double up into `host@<hostname>@<hostname>`. "@" can't appear in a
+    real docker container/service name, so this is an unambiguous signal,
+    not a heuristic."""
+    if not host or "@" in name:
+        return name
+    hostname = host.split("@")[-1]
+    return f"{name}@{hostname}"
+
+
 DOCKER_SVCLOG_PREFIX = re.compile(r"^(\S+\.\d+\.\S+@\S+|\S+)\s+\|\s?")
 TS_FIELDS = ("timestamp", "ts", "time", "@timestamp", "datetime", "date")
 
@@ -247,6 +274,7 @@ class LogSource:
         self._pending_partial = lines.pop()  # incomplete trailing line, if any
         new = []
         redis_log = getattr(getattr(self, "_state", None), "redis_log", None)
+        entity = _entity_id(self.name, getattr(self, "host", None))
         for bline in lines:
             self.line_no += 1
             raw = bline.decode("utf-8", errors="replace").rstrip("\r")
@@ -266,7 +294,7 @@ class LogSource:
                         # re-record under the SAME ts field -- HSET on an
                         # existing field overwrites naturally, no new
                         # redis_log method needed
-                        redis_log.record(self.name, ts, {"uid": uid, "text": text})
+                        redis_log.record(entity, ts, {"uid": uid, "text": text})
                     continue
                 self.skipped += 1
                 continue
@@ -281,7 +309,7 @@ class LogSource:
             self._last_row = new[-1]
             if redis_log is not None:
                 for ts, _seq, uid, text in new:
-                    redis_log.record(self.name, ts, {"uid": uid, "text": text})
+                    redis_log.record(entity, ts, {"uid": uid, "text": text})
         return len(new)
 
     def _next_seq(self) -> int:
@@ -338,15 +366,24 @@ class LogSource:
         )
         return self._state.redis_log
 
+    @property
+    def _entity(self) -> str:
+        """The Redis entity id every read/write below actually keys on --
+        `self.name` host-qualified when this source has one (see
+        _entity_id/br-DEDUP-006). Distinct from `self.name` itself, which
+        stays the bare display/grouping name everywhere else (API
+        responses, exported sample files)."""
+        return _entity_id(self.name, getattr(self, "host", None))
+
     # API helpers -- all Redis-backed now (see redis_log.py's module
     # docstring): Redis is the sole source of truth for reads, Source
     # objects keep no RAM copy of their own.
     async def total(self) -> int:
-        return await self._redis.total(self.name)
+        return await self._redis.total(self._entity)
 
     async def slice(self, start: int, count: int):
         start = max(0, start)
-        rows = await self._redis.slice_by_rank(self.name, start, count)
+        rows = await self._redis.slice_by_rank(self._entity, start, count)
         return [
             {"i": start + i, "ts": ts, "uid": payload.get("uid"), "text": payload.get("text", "")}
             for i, (ts, payload) in enumerate(rows)
@@ -356,7 +393,7 @@ class LogSource:
         # -1 on an empty log, matching bisect_left's old behavior on []
         # (len(rows) - 1 == -1) -- preserved so callers don't need to
         # special-case "no rows yet" differently from before.
-        rank = await self._redis.rank_at_score(self.name, t)
+        rank = await self._redis.rank_at_score(self._entity, t)
         return -1 if rank is None else rank
 
     async def ticks(self, t0: float, t1: float, px: int):
@@ -364,7 +401,7 @@ class LogSource:
         px = max(1, px)
         dt = max(1.0, (t1 - t0) / px)
         counts = [0] * px
-        timestamps = await self._redis.range_by_score(self.name, t0, t1 + 1)
+        timestamps = await self._redis.range_by_score(self._entity, t0, t1 + 1)
         for ts in timestamps:
             b = int((ts - t0) / dt)
             if 0 <= b < px:
@@ -372,11 +409,11 @@ class LogSource:
         return counts
 
     async def range(self):
-        return await self._redis.first_last(self.name)
+        return await self._redis.first_last(self._entity)
 
     async def find(self, query: str, start: int, forward: bool = True) -> int | None:
         """Case-insensitive substring search, wrapping around the whole log."""
-        return await self._redis.find_text(self.name, query, start, forward)
+        return await self._redis.find_text(self._entity, query, start, forward)
 
 
 class StatsSource:
@@ -505,7 +542,7 @@ class StatsSource:
         redis_log = getattr(getattr(self, "_state", None), "redis_log", None)
         if redis_log is not None:
             redis_log.record(
-                service, ts, {"cpu": cpu, "mem": mem, "mem_bytes": mem_bytes, "net": rate}
+                self._entity_for(service), ts, {"cpu": cpu, "mem": mem, "mem_bytes": mem_bytes, "net": rate}
             )
 
     def _net_rate(self, container: str, ts: float, net_total: float | None) -> float | None:
@@ -529,6 +566,17 @@ class StatsSource:
         )
         return self._state.redis_log
 
+    def _entity_for(self, svc: str) -> str:
+        """The Redis entity id one service's read/write actually keys on --
+        `svc` host-qualified when this source has one (see
+        _entity_id/br-DEDUP-006). `svc` itself (bare) stays what every
+        caller uses for display/grouping (API responses, exported sample
+        files) -- it's also the dict key both bucketed()/point_at() already
+        return their per-service results under, so a caller reading two
+        different sources' same-named service still tells them apart via
+        each response entry's own "sid", exactly as it does today."""
+        return _entity_id(svc, getattr(self, "host", None))
+
     def services(self):
         return sorted(self._services)
 
@@ -537,7 +585,9 @@ class StatsSource:
         concurrently rather than N serial round trips."""
         if not self._services:
             return None
-        results = await asyncio.gather(*(self._redis.first_last(svc) for svc in self._services))
+        results = await asyncio.gather(
+            *(self._redis.first_last(self._entity_for(svc)) for svc in self._services)
+        )
         lo = hi = None
         for r in results:
             if r is None:
@@ -552,7 +602,7 @@ class StatsSource:
         dt = max(1.0, (t1 - t0) / px)
         services = sorted(self._services)
         rows_per_service = await asyncio.gather(
-            *(self._redis.range_by_score_with_payload(svc, t0, t1 + 1) for svc in services)
+            *(self._redis.range_by_score_with_payload(self._entity_for(svc), t0, t1 + 1) for svc in services)
         )
         out = []
         for svc, rows in zip(services, rows_per_service):
@@ -588,7 +638,7 @@ class StatsSource:
         arbitrary point (e.g. a loaded sample) against another point (e.g.
         live 'now') regardless of the current chart zoom window."""
         services = sorted(self._services)
-        results = await asyncio.gather(*(self._redis.nearest(svc, t) for svc in services))
+        results = await asyncio.gather(*(self._redis.nearest(self._entity_for(svc), t) for svc in services))
         out = {}
         for svc, best in zip(services, results):
             if best is None:
@@ -613,15 +663,56 @@ Source = LogSource | StatsSource  # everything State.sources can hold
 _HOST_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
 
 
+def _validate_ssh_port(host: str) -> None:
+    """br-CONN-005: _parse_ssh_target/ssh_host_and_port both split a trailing
+    `:port` off an `ssh://[user@]host[:port]` target and hand it onward
+    assuming it's already a valid number -- _parse_ssh_target's `int(port_s)`
+    in particular raises a raw `ValueError` (Python's own "invalid literal
+    for int()..." message) for anything else, and only once something is
+    already mid ssh-connect (inside a background poll loop, where it ends up
+    as an opaque `self.error` string, or wrapped into a 502 DockerPsError by
+    docker_ps) instead of as a clean upfront error. Every caller reaches
+    _parse_ssh_target/ssh_host_and_port via a host that already passed
+    through normalize_docker_host (see its own docstring's br-CONN-002
+    note), so validating the port here rejects a bad one immediately."""
+    rest = host[len("ssh://") :]
+    userhost = rest.rsplit("@", 1)[-1]
+    if ":" not in userhost:
+        return
+    _, port_s = userhost.rsplit(":", 1)
+    if not port_s.isdigit() or not (0 < int(port_s) < 65536):
+        raise ValueError(f"invalid ssh port {port_s!r} in {host!r} -- must be 1-65535")
+
+
 def normalize_docker_host(host: str | None) -> str | None:
     """ssh is the only remote transport CTTC supports, so a host string with
     no scheme (e.g. "user@other-server") is unambiguous shorthand for
     ssh://user@other-server. The client already normalizes this (see
     normalizeDockerHost in app.js); this is defense in depth for any other
-    caller of the HTTP API."""
+    caller of the HTTP API.
+
+    br-CONN-002: any *other* explicit scheme (`tcp://`, `http://`, ...) is
+    rejected outright here instead of being passed through untouched.
+    Every caller downstream (docker_ps, and every DockerStatsSource/
+    DockerLogSource collect_docker() ever constructs) eventually reaches
+    _parse_ssh_target/ssh_host_and_port, which strip a literal `"ssh://"`
+    prefix unconditionally via `host[len("ssh://"):]` -- since every scheme
+    prefix here happens to also be exactly 6 characters, that silently
+    chopped off the wrong 6 and fed the remainder to ssh as a garbage
+    host[:port] (e.g. `tcp://1.2.3.4:2375` -> ssh to host `1.2.3.4` port
+    `2375`) instead of ever surfacing a clean "unsupported transport"
+    error."""
     if not host:
         return None
-    return host if _HOST_SCHEME_RE.match(host) else f"ssh://{host}"
+    if _HOST_SCHEME_RE.match(host) and not host.startswith("ssh://"):
+        scheme = host.split("://", 1)[0]
+        raise ValueError(
+            f"unsupported docker host transport {scheme!r} -- only ssh:// "
+            "(or a bare user@host, treated as ssh://user@host) is supported"
+        )
+    host = host if _HOST_SCHEME_RE.match(host) else f"ssh://{host}"
+    _validate_ssh_port(host)
+    return host
 
 
 def docker_client(host: str | None = None) -> docker.DockerClient:
@@ -775,7 +866,12 @@ def _parse_docker_size(s: str) -> float:
 
 
 def list_ssh_keys() -> list[str]:
-    """Private keys under ~/.ssh (files whose header says so)."""
+    """Filenames (not full paths) of private keys under ~/.ssh (files whose
+    header says so). Only the basename is returned -- the full path would
+    disclose the gateway operator's home directory/username to any client
+    that can reach this route (br-NET-005), and nothing needs it back:
+    `ssh_key` request params are never resolved through this list (see
+    docs/architecture/remote-connectivity-call-trace.md)."""
     keys = []
     d = Path.home() / ".ssh"
     if d.is_dir():
@@ -789,7 +885,7 @@ def list_ssh_keys() -> list[str]:
                 logger.debug("could not read %s while listing ssh keys: %s", p, e)
                 continue
             if b"PRIVATE KEY" in head:
-                keys.append(str(p))
+                keys.append(p.name)
     return keys
 
 
@@ -1329,43 +1425,67 @@ class DockerLogSource(LogSource):
         self._task = asyncio.ensure_future(self._follow())
 
     def stop(self):
+        self._task.cancel()
+        self._close_conn()
+
+    def _close_conn(self):
+        """Tears down whatever the current connection attempt holds, so a
+        reconnect (br-DEDUP-009) always starts from a clean slate -- also
+        used directly by stop()."""
         if self._proc is not None and self._proc.returncode is None:
             self._proc.terminate()
+        self._proc = None
         if self._channel is not None:
             try:
                 self._channel.close()
             except Exception as e:
                 logger.debug("error closing ssh channel for %s: %s", self.path, e)
+            self._channel = None
         if self._ssh_client is not None:
             try:
                 self._ssh_client.close()
             except Exception as e:
                 logger.debug("error closing ssh client for %s: %s", self.path, e)
-        self._task.cancel()
+            self._ssh_client = None
 
     async def _follow(self):
-        try:
-            read_chunk = await (self._start_remote() if self.host else self._start_local())
-            last_emit = 0.0
-            pending = 0
-            while True:
-                # blocks until data or true EOF -- never returns b"" while
-                # the stream is merely idle (docker logs -f between lines)
-                chunk = await read_chunk()
-                if not chunk:
-                    self.error = "log stream ended"
-                    self._state.broadcast({"type": "update", "source": self.id})
-                    return
-                pending += self.ingest_chunk(chunk)
-                now = time.time()
-                if pending and now - last_emit > 0.5:  # throttle SSE chatter
-                    self._state.broadcast({"type": "update", "source": self.id})
-                    pending, last_emit = 0, now
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.debug("log follow failed for %s: %s", self.path, e)
-            self.error = f"{type(e).__name__}: {e}"[:500]
+        # br-DEDUP-009: a dead/restarted container (or a transient ssh/
+        # docker hiccup) ends this stream with a clean EOF, not an
+        # exception -- reconnecting with backoff (mirroring
+        # DockerStatsSource._loop's own retry-forever pattern) instead of
+        # giving up for good means this source's log feed recovers the same
+        # way the paired stats source already does, rather than looking
+        # "healthy in stats but permanently stale in logs".
+        backoff = 1.0
+        while True:
+            try:
+                read_chunk = await (self._start_remote() if self.host else self._start_local())
+                self.error = None  # connected -- clears any error from a previous attempt
+                last_emit = 0.0
+                pending = 0
+                while True:
+                    # blocks until data or true EOF -- never returns b"" while
+                    # the stream is merely idle (docker logs -f between lines)
+                    chunk = await read_chunk()
+                    if not chunk:
+                        self.error = "log stream ended -- reconnecting"
+                        break
+                    pending += self.ingest_chunk(chunk)
+                    now = time.time()
+                    if pending and now - last_emit > 0.5:  # throttle SSE chatter
+                        self._state.broadcast({"type": "update", "source": self.id})
+                        pending, last_emit = 0, now
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.debug("log follow failed for %s: %s", self.path, e)
+                self.error = f"{type(e).__name__}: {e}"[:500]
+            else:
+                backoff = 1.0  # a stream that actually ran resets the backoff
+            self._state.broadcast({"type": "update", "source": self.id})
+            self._close_conn()
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
 
     async def _start_local(self):
         self._proc = await asyncio.create_subprocess_exec(
@@ -1607,12 +1727,12 @@ class State:
         ]
 
         async def log_slice(s):
-            return await self.redis_log.range_by_score_with_payload(s.name, t0, t1 + 1)
+            return await self.redis_log.range_by_score_with_payload(s._entity, t0, t1 + 1)
 
         async def stats_slice(s):
             svcs = sorted(s._services)
             per_svc = await asyncio.gather(
-                *(self.redis_log.range_by_score_with_payload(svc, t0, t1 + 1) for svc in svcs)
+                *(self.redis_log.range_by_score_with_payload(s._entity_for(svc), t0, t1 + 1) for svc in svcs)
             )
             return dict(zip(svcs, per_svc))
 
@@ -1878,36 +1998,62 @@ def read_all(src):
 
 
 async def tail_loop(state: State, interval: float = 1.0):
+    """Polls every live file source for growth and re-reads it -- see
+    read_all(). Each source's stat/read/broadcast is isolated (br-ORCH-005):
+    an unhandled exception from one (a permissions error transient enough not
+    to be an OSError, a malformed transform raising mid-ingest, anything past
+    what the narrower OSError catches below predicted) is logged and skipped,
+    not left to kill this loop and silently stop tailing every OTHER live
+    file source for the rest of the gateway's uptime."""
     while True:
         await asyncio.sleep(interval)
         for src in list(state.sources.values()):
             if not src.live or not isinstance(src.path, Path):
                 continue
             try:
-                size = src.path.stat().st_size
-            except OSError as e:
-                logger.debug("tail: could not stat %s: %s", src.path, e)
-                continue
-            if size < src.offset:  # truncated/rotated: start over
-                src.offset = 0
-            if size > src.offset:
                 try:
-                    await asyncio.to_thread(read_all, src)
+                    size = src.path.stat().st_size
                 except OSError as e:
-                    logger.debug("tail: could not read %s: %s", src.path, e)
+                    logger.debug("tail: could not stat %s: %s", src.path, e)
                     continue
-                state.broadcast({"type": "update", "source": src.id})
+                if size < src.offset:  # truncated/rotated: start over
+                    src.offset = 0
+                if size > src.offset:
+                    try:
+                        await asyncio.to_thread(read_all, src)
+                    except OSError as e:
+                        logger.debug("tail: could not read %s: %s", src.path, e)
+                        continue
+                    state.broadcast({"type": "update", "source": src.id})
+            except Exception:
+                logger.exception("tail_loop: failed to tail %s", src.path)
 
 
 async def sessions_loop(state: State, interval: float = 1.0):
     """Drives recording_session.py's duration-elapsed/TTL-sweep checks,
-    scheduler.py's due-schedule firing, and events.py's condition checks --
-    see each module's docstring."""
+    scheduler.py's due-schedule firing, rolling_buffer.py's ad-hoc-buffer
+    TTL sweep (br-RBUF-005), and events.py's condition checks -- see each
+    module's docstring. Each tick is isolated so an unhandled exception
+    from one never stops the others, or this loop itself (br-ORCH-004): a
+    single bad beat is logged and skipped, not fatal."""
     while True:
         await asyncio.sleep(interval)
-        state.scheduler.tick()
-        await state.recording_sessions.tick()
-        await state.events.tick()
+        try:
+            state.scheduler.tick()
+        except Exception:
+            logger.exception("sessions_loop: scheduler tick failed")
+        try:
+            await state.recording_sessions.tick()
+        except Exception:
+            logger.exception("sessions_loop: recording_sessions tick failed")
+        try:
+            state.rolling_buffers.tick()
+        except Exception:
+            logger.exception("sessions_loop: rolling_buffers tick failed")
+        try:
+            await state.events.tick()
+        except Exception:
+            logger.exception("sessions_loop: events tick failed")
 
 
 # ── HTTP API (FastAPI) ────────────────────────────────────────────────────────
@@ -2093,9 +2239,54 @@ async def _options_preflight(request: Request, call_next):
             headers={
                 "Access-Control-Allow-Origin": "*",
                 "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-                "Access-Control-Allow-Headers": "Content-Type, X-CTTC-Filename, X-CTTC-Private-Key, X-CTTC-Transforms",
+                "Access-Control-Allow-Headers": "Content-Type, X-CTTC-Filename, X-CTTC-Private-Key, X-CTTC-Transforms, X-CTTC-Token",
             },
         )
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def _require_api_token(request: Request, call_next):
+    """Gates every route behind a shared-secret token when one is configured
+    (br-NET-004): Docker-based deployments (a local "This machine" container
+    or a remote gateway) always bind 0.0.0.0 with `network_mode: host` (see
+    docker-compose.yml/Dockerfile), so without this, anyone who could reach
+    the port at all -- the whole LAN, or further if port-forwarded -- had
+    full unauthenticated access: collect arbitrary docker sources, read
+    every log, upload files, even POST /shutdown. main.js generates a
+    random token at provision time (the same trust moment the ssh key
+    already establishes for a remote gateway) and passes it here via
+    CTTC_API_TOKEN; the bare/native embedded path (127.0.0.1 only, never
+    network-reachable) leaves this unset, so it stays exactly as permissive
+    as it always was -- this only ever tightens a deployment that opted
+    into being reachable from the network in the first place.
+
+    OPTIONS is exempt: a CORS preflight can't carry the real header yet
+    (that's exactly what it's asking permission for), so gating it here
+    would break every actual request that needs one, not just
+    unauthenticated ones.
+
+    A `?token=` query param is accepted as a fallback alongside the header
+    for one reason: the browser's native EventSource (app.js's /events SSE
+    stream) has no way to attach a custom header at all, by spec -- the
+    query string is the only channel it has. Every other request goes
+    through get()/post()/authHeaders() and always uses the header.
+    """
+    expected = getattr(request.app.state, "api_token", None)
+    if expected and request.method != "OPTIONS":
+        got = request.headers.get("x-cttc-token") or request.query_params.get("token")
+        if got != expected:
+            logger.warning(
+                "rejected %s %s from %s: missing/incorrect X-CTTC-Token",
+                request.method,
+                request.url.path,
+                request.client.host if request.client else "?",
+            )
+            return Response(
+                jdumps({"error": "missing or incorrect X-CTTC-Token"}),
+                media_type="application/json",
+                status_code=401,
+            )
     return await call_next(request)
 
 
@@ -2712,6 +2903,19 @@ async def route_docker_collect(request: Request):
     return {"opened": opened, "sources": await st.describe()}
 
 
+@app.post("/docker/forget")
+async def route_docker_forget(request: Request):
+    """br-REDIS-017: the counterpart to /docker/collect's remember_daemon --
+    without this, Remove Docker Host only ever closed the in-memory sources
+    (see /close), leaving the Redis-side registry entry to be silently
+    replayed and reconnected on the gateway's own next restart."""
+    body = await request.json()
+    st = get_state(request)
+    host = normalize_docker_host(body.get("host") or None)
+    await st.redis_log.forget_daemon(host)
+    return {"ok": True}
+
+
 @app.post("/files/upload")
 async def route_files_upload(request: Request):
     data = await request.body()
@@ -2800,6 +3004,16 @@ def main():
         "process (see main.js) and for tests, where an unprompted background collector "
         "would be a surprise.",
     )
+    ap.add_argument(
+        "--api-token",
+        default=os.environ.get("CTTC_API_TOKEN"),
+        help="shared-secret required (as the X-CTTC-Token header) on every request when "
+        "set -- see _require_api_token (br-NET-004). Read from CTTC_API_TOKEN by default "
+        "so main.js's docker-compose invocations (which set the env var, not this flag "
+        "directly) and a bare `uv run server.py` both pick it up the same way. Unset for "
+        "the bare/embedded 127.0.0.1-only path, which was never network-reachable in the "
+        "first place.",
+    )
     ap.add_argument("files", nargs="*")
     args = ap.parse_args()
 
@@ -2818,6 +3032,7 @@ async def _run(args):
     )
     app.state.cttc = state
     app.state.auto_collect = args.auto_collect
+    app.state.api_token = args.api_token
     # Opened by lifespan() itself, *after* redis_log.start() -- see its own
     # comment there for why this can't happen here anymore.
     app.state.cli_files = [(f, not args.static) for f in args.files]
