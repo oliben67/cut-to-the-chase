@@ -1709,21 +1709,21 @@
     }
   });
 
-  await T("Create Event/Edit Events buttons live inside the Metrics sidebar section", () => {
-    const metricsGroup = document.querySelector('.ab-group[data-section="metrics"]');
-    ok(metricsGroup, "Metrics section exists");
-    ok(metricsGroup.contains($("btn-event-create")), "btn-event-create is inside the Metrics section");
-    ok(metricsGroup.contains($("btn-event-edit")), "btn-event-edit is inside the Metrics section");
+  await T("Create Event/Edit Events buttons live inside the Analysis sidebar section", () => {
+    const analysisGroup = document.querySelector('.ab-group[data-section="analysis"]');
+    ok(analysisGroup, "Analysis section exists");
+    ok(analysisGroup.contains($("btn-event-create")), "btn-event-create is inside the Analysis section");
+    ok(analysisGroup.contains($("btn-event-edit")), "btn-event-edit is inside the Analysis section");
   });
 
   await T("sidebar sections start collapsed and expand on header click", () => {
-    const metricsGroup = document.querySelector('.ab-group[data-section="metrics"]');
-    const header = metricsGroup.querySelector(".ab-group-header");
-    const body = metricsGroup.querySelector(".ab-group-body");
+    const analysisGroup = document.querySelector('.ab-group[data-section="analysis"]');
+    const header = analysisGroup.querySelector(".ab-group-header");
+    const body = analysisGroup.querySelector(".ab-group-body");
     eq(body.hidden, true, "starts collapsed");
     header.click();
     eq(body.hidden, false, "expands on click");
-    eq(metricsGroup.dataset.expanded, "true");
+    eq(analysisGroup.dataset.expanded, "true");
     header.click();
     eq(body.hidden, true, "collapses again on a second click");
   });

@@ -113,7 +113,7 @@ const state = {
   ticks: new Map(),       // log source id -> counts[]
   visible: new Map(),     // series name -> bool
   hiddenSamples: new Set(), // loaded .cttc-metric/.cttc-record path -> hidden (whole-file toggle)
-  // Whole-app "viewing recorded metrics" mode -- true whenever a loaded
+  // Whole-app "analysis" mode -- true whenever a loaded
   // sample/recording should take over the display: the Recording/
   // Frequency/Live tracking toolbar group and every *live* source's
   // graphs/logs hide (see isLiveDataHidden), replaced by one "Back to live
@@ -331,7 +331,7 @@ function isSampleHidden(sid) {
   return !!(src && src.live === false && state.hiddenSamples.has(src.path));
 }
 // The inverse of isSampleHidden: true for a *live* source while the app is
-// in "viewing recorded metrics" mode (state.liveHidden) -- checked
+// in analysis mode (state.liveHidden) -- checked
 // everywhere isSampleHidden is, so live and sample data hide symmetrically
 // depending on which one the toolbar is currently focused on.
 function isLiveDataHidden(sid) {
@@ -2361,7 +2361,7 @@ async function refreshAll() {
   try {
     const [src, range] = await Promise.all([get("/sources"), get("/range")]);
     state.sources = src.sources;
-    // "Viewing recorded metrics" mode (see setLiveHidden) is a reflection of
+    // Analysis mode (see setLiveHidden) is a reflection of
     // whether any sample/recording source is actually open, re-derived on
     // every refresh (not just right after a fresh upload) -- otherwise
     // re-loading a file that's already open (a no-op upload, see
@@ -2876,7 +2876,7 @@ $("btn-load-sample").onclick = async () => {
     const errors = [];
     for (const path of files) errors.push(...((await uploadAndResolveSegment(path)).errors || []));
     if (errors.length) alert(errors.map((e) => `${e.path}: ${e.error}`).join("\n"));
-    await refreshAll(); // also switches into "viewing recorded metrics" mode -- see setLiveHidden
+    await refreshAll(); // also switches into analysis mode -- see setLiveHidden
     resetZoom(); // show the full timeline, including the newly loaded metrics
   } catch (err) {
     alert(String(err.message || err));
@@ -3135,7 +3135,7 @@ async function openRecording() {
     const errors = [];
     for (const path of files) errors.push(...((await uploadAndResolveSegment(path)).errors || []));
     if (errors.length) alert(errors.map((e) => `${e.path}: ${e.error}`).join("\n"));
-    await refreshAll(); // also switches into "viewing recorded metrics" mode -- see setLiveHidden
+    await refreshAll(); // also switches into analysis mode -- see setLiveHidden
     resetZoom();
   } catch (err) {
     alert(String(err.message || err));
@@ -4950,7 +4950,7 @@ $("splitter").addEventListener("mousedown", (e) => {
   window.addEventListener("mouseup", up, { once: true });
 });
 
-// Reflects "viewing recorded metrics" mode (state.liveHidden): swaps the
+// Reflects analysis mode (state.liveHidden): swaps the
 // toolbar's mode icon (live.svg <-> record.svg), shows/hides the Live data
 // group vs. the Back to live tracking button, and re-renders so every live
 // source's graphs/logs actually hide/reappear (see isLiveDataHidden).
