@@ -34,7 +34,7 @@ async def download_sample(state, t0: float, t1: float, include_host: bool):
     return data, filename, len(meta)
 
 
-def upload_and_open(
+async def upload_and_open(
     state, filename: str, data: bytes, transforms: list[str], segment: int | None = None
 ):
     """Write the uploaded bytes to a scratch file, open it exactly like a
@@ -63,7 +63,7 @@ def upload_and_open(
         with os.fdopen(fd, "wb") as f:
             f.write(data)
         if is_cttc_archive(filename):
-            opened = state.load_sample(tmp_path, segment=segment)
+            opened = await state.load_sample(tmp_path, segment=segment)
         else:
             src = state.open_file(tmp_path, "auto", filename, live=False, transforms=transforms)
             opened = [src.id]

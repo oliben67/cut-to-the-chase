@@ -236,6 +236,50 @@ class RedisLog:
             entity_id, ts, payload = await self._queue.get()
             await self._write(entity_id, ts, payload)
 
+    async def bulk_record(self, rows: list[tuple[str, float, dict]]) -> None:
+        """For batch imports (State.load_sample loading a whole .cttc-record/
+        .cttc-metric archive) rather than the hot ingestion paths record()
+        serves: writes everything directly in chunked pipelines, awaited
+        here, instead of going through the bounded live-ingestion queue.
+
+        record()'s queue (maxsize=10_000, see start()) is sized for the drip
+        of real-time samples arriving one at a time -- a bulk load can hand
+        it tens of thousands of rows in one synchronous burst (every row of
+        every source in the archive, enqueued faster than _pump() can drain
+        real Redis round trips), overflowing it and silently, permanently
+        dropping the excess (br-REDIS-018). Blocking here for the duration
+        of an explicit, user-initiated "Open" is correct, unlike record()'s
+        callers, which must never stall."""
+        if not self.enabled or not rows:
+            return
+        chunk_size = 500
+        for i in range(0, len(rows), chunk_size):
+            chunk = rows[i : i + chunk_size]
+            pipe = self._client.pipeline(transaction=False)
+            entities = set()
+            for entity_id, ts, payload in chunk:
+                field = str(ts)
+                pipe.hset(f"cttc:log:{entity_id}", field, orjson.dumps(payload))
+                pipe.zadd(f"cttc:idx:{entity_id}", {field: ts})
+                pipe.hexpire(f"cttc:log:{entity_id}", int(self.ttl_seconds), field)
+                entities.add(entity_id)
+            for entity_id in entities:
+                pipe.sadd("cttc:entities", entity_id)
+            try:
+                await pipe.execute()
+            except Exception as e:
+                # Broad on purpose, same reasoning as _write(): this must
+                # keep importing later batches even after one bad batch, but
+                # since Redis is the sole store, a batch that doesn't land
+                # here is permanently gone, so this must never be quieter
+                # than `warning`.
+                logger.warning(
+                    "redis_log: bulk write failed, %d samples lost: %s: %s",
+                    len(chunk),
+                    type(e).__name__,
+                    e,
+                )
+
     async def _write(self, entity_id: str, ts: float, payload: dict) -> None:
         """The actual I/O for one queued write -- shared by _pump() (the
         normal path) and stop() (draining whatever _pump didn't get to)."""

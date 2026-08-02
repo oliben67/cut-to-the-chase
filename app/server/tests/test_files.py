@@ -70,7 +70,7 @@ class TestDownloadSample:
 class TestUploadAndOpen:
     async def test_upload_plain_log(self, state):
         data = b"2026-01-02T03:00:00Z hello\n2026-01-02T03:00:01Z world\n"
-        opened = files.upload_and_open(state, "mylog.log", data, [])
+        opened = await files.upload_and_open(state, "mylog.log", data, [])
         await _flush()
         assert len(opened) == 1
         src = state.sources[opened[0]]
@@ -80,12 +80,12 @@ class TestUploadAndOpen:
 
     async def test_upload_applies_transforms(self, state):
         data = b"2026-01-02T03:00:00Z hello\n"
-        opened = files.upload_and_open(state, "mylog.log", data, ["upper"])
+        opened = await files.upload_and_open(state, "mylog.log", data, ["upper"])
         await _flush()
         src = state.sources[opened[0]]
         assert (await src.slice(0, 1))[0]["text"] == "HELLO"
 
-    def test_upload_scratch_file_removed_after(self, state, monkeypatch):
+    async def test_upload_scratch_file_removed_after(self, state, monkeypatch):
         captured = {}
         real_mkstemp = files.tempfile.mkstemp
 
@@ -95,7 +95,7 @@ class TestUploadAndOpen:
             return fd, path
 
         monkeypatch.setattr(files.tempfile, "mkstemp", spy_mkstemp)
-        files.upload_and_open(state, "x.log", b"2026-01-02T03:00:00Z a\n", [])
+        await files.upload_and_open(state, "x.log", b"2026-01-02T03:00:00Z a\n", [])
         assert not Path(captured["path"]).exists()
 
     async def test_upload_cttc_sample(self, state, log_file):
@@ -112,24 +112,24 @@ class TestUploadAndOpen:
         # subprocess's lifecycle just for this test.
         state2 = server.State(Path("/tmp"))
         state2.redis_log = state.redis_log
-        opened = files.upload_and_open(state2, "reload.cttc-metric", data, [])
+        opened = await files.upload_and_open(state2, "reload.cttc-metric", data, [])
         src = state2.sources[opened[0]]
         assert len(opened) == 1
         assert src.path == "upload://reload.cttc-metric"
         assert (await src.slice(0, 1))[0]["text"] == "alpha"
 
-    def test_upload_bad_data_propagates_error(self, state):
+    async def test_upload_bad_data_propagates_error(self, state):
         with pytest.raises(Exception):
-            files.upload_and_open(state, "broken.cttc-metric", b"not a zip file", [])
+            await files.upload_and_open(state, "broken.cttc-metric", b"not a zip file", [])
 
-    def test_upload_no_extension_defaults_to_log_suffix(self, state):
+    async def test_upload_no_extension_defaults_to_log_suffix(self, state):
         # mainly asserts this doesn't blow up picking a temp-file suffix
-        opened = files.upload_and_open(state, "noext", b"2026-01-02T03:00:00Z a\n", [])
+        opened = await files.upload_and_open(state, "noext", b"2026-01-02T03:00:00Z a\n", [])
         assert len(opened) == 1
 
-    def test_upload_survives_scratch_cleanup_failure(self, state, monkeypatch):
+    async def test_upload_survives_scratch_cleanup_failure(self, state, monkeypatch):
         # a failed unlink (already gone, permissions, ...) must not surface
         # as an error on top of an otherwise-successful upload
         monkeypatch.setattr(files.os, "unlink", lambda *_: (_ for _ in ()).throw(OSError("nope")))
-        opened = files.upload_and_open(state, "x.log", b"2026-01-02T03:00:00Z a\n", [])
+        opened = await files.upload_and_open(state, "x.log", b"2026-01-02T03:00:00Z a\n", [])
         assert len(opened) == 1

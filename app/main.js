@@ -27,6 +27,7 @@ const { openSshTunnel, closeSshTunnel } = require("./lib/ssh-tunnel");
 const { recordTunnel, removeTunnel, killOrphanedTunnels } = require("./lib/tunnel-registry");
 const { gracefulStop } = require("./lib/graceful-stop");
 const { getOrCreateApiToken, forgetApiToken } = require("./lib/api-token");
+const { isRoutineServerLine } = require("./lib/server-log-level");
 const {
   readSettings: readLogCollectorSettings,
   writeSettings: writeLogCollectorSettings,
@@ -274,10 +275,24 @@ function startServer(extraArgs) {
     serverProc.on("error", (err) =>
       reject(new Error(`could not start server via uv: ${err.message}`))
     );
+    // server.py's own logging.basicConfig deliberately sends every level
+    // (including routine per-request INFO lines) to stderr, not just actual
+    // errors -- treating 100% of this stream as an error-level main-log
+    // entry (as a single unconditional mainError call used to) meant every
+    // normal request the embedded server handled showed up as a red
+    // "exception" in DevTools, burying any real warning/error in a flood of
+    // noise (br-LOG-001). Route each line by the level word its own
+    // formatter already put there ("HH:MM:SS LEVELNAME cttc: ..."); only
+    // WARNING/ERROR/CRITICAL -- or anything that doesn't match at all, e.g.
+    // a raw Python traceback -- still goes through mainError.
     serverProc.stderr.on("data", (d) => {
       const text = `${d}`;
       stderrTail = (stderrTail + text).slice(-4000);
-      mainError(`[server] ${text}`.trimEnd());
+      for (const line of text.split("\n")) {
+        if (!line.trim()) continue;
+        const logFn = isRoutineServerLine(line) ? mainLog : mainError;
+        logFn(`[server] ${line}`.trimEnd());
+      }
     });
 
     const rl = readline.createInterface({ input: serverProc.stdout });

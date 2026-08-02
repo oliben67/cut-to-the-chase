@@ -216,6 +216,7 @@ async def test_disabled_instance_helpers_are_all_safe_noops():
     assert await rl.known_daemons() == []
     await rl.forget_daemon("ssh://host")  # must not raise with no _client either
     rl.record("c", 1.0, {"text": "dropped, no _client to enqueue against"})  # must not raise
+    await rl.bulk_record([("c", 1.0, {"text": "dropped, no _client to write against"})])
 
 
 async def test_range_by_score_with_payload_empty_range_returns_empty_list(redis_log_instance):
@@ -407,6 +408,76 @@ async def test_enqueue_logs_and_drops_when_the_write_queue_is_full(redis_log_ins
     with caplog.at_level(logging.WARNING):
         rl._enqueue("c8", 2000.0, {"text": "dropped"})  # queue full -> logged, not raised
     assert "queue full" in caplog.text
+
+
+async def test_bulk_record_survives_more_rows_than_the_live_queue_capacity(
+    redis_log_instance, caplog
+):
+    """br-REDIS-018: a bulk import (State.load_sample loading a whole
+    recording) must not lose data just because the archive holds more rows
+    than record()'s live-ingestion queue can hold at once -- bulk_record()
+    bypasses that bounded queue entirely, so every row here has to land,
+    where the same volume through record()/_enqueue would start dropping
+    once the queue (maxsize=10_000, see start()) filled up."""
+    rl = redis_log_instance
+    assert rl._queue.maxsize == 10_000
+    rows = [("bulk-c", float(i), {"text": f"row {i}"}) for i in range(10_500)]
+    with caplog.at_level(logging.WARNING):
+        await rl.bulk_record(rows)
+    assert "queue full" not in caplog.text
+    assert "lost" not in caplog.text
+    assert await rl.total("bulk-c") == 10_500
+
+
+async def test_bulk_record_continues_after_a_failed_batch(redis_log_instance, caplog, monkeypatch):
+    """One bad batch (a malformed payload, a transient Redis hiccup) must
+    not stop later batches from landing -- same broad-except-and-keep-going
+    contract as _write()'s per-sample failure handling."""
+    rl = redis_log_instance
+    real_pipeline = rl._client.pipeline
+    calls = {"n": 0}
+
+    def flaky_pipeline(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+
+            class BoomPipeline:
+                def hset(self, *a, **k):
+                    return self
+
+                def zadd(self, *a, **k):
+                    return self
+
+                def hexpire(self, *a, **k):
+                    return self
+
+                def sadd(self, *a, **k):
+                    return self
+
+                async def execute(self):
+                    raise RuntimeError("simulated redis write failure")
+
+            return BoomPipeline()
+        return real_pipeline(*a, **k)
+
+    monkeypatch.setattr(rl._client, "pipeline", flaky_pipeline)
+    # 500 rows exactly fills bulk_record's first chunk (chunk_size=500) --
+    # the next 5 start a genuinely separate pipeline().execute() call, so
+    # this actually exercises "first batch fails, second batch still lands"
+    # rather than both landing (or failing) in the same one pipeline call.
+    rows = [("bulk-a", float(i), {"text": "lost"}) for i in range(500)] + [
+        ("bulk-b", float(i), {"text": "ok"}) for i in range(5)
+    ]
+    with caplog.at_level(logging.WARNING):
+        await rl.bulk_record(rows)
+    assert "bulk write failed" in caplog.text
+    assert await rl.total("bulk-a") == 0  # first batch's write failed
+    assert await rl.total("bulk-b") == 5  # later batch still landed
+
+
+async def test_bulk_record_with_no_rows_is_a_noop(redis_log_instance):
+    rl = redis_log_instance
+    await rl.bulk_record([])  # must not raise, nothing to write
 
 
 async def test_pump_logs_and_keeps_running_after_a_write_failure(

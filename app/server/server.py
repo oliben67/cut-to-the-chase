@@ -1861,14 +1861,24 @@ class State:
         p.write_bytes(data)
         return {"path": str(p), "sources": len(meta)}
 
-    def load_sample(self, path: str, segment: int | None = None) -> list[str]:
+    async def load_sample(self, path: str, segment: int | None = None) -> list[str]:
         """Open a .cttc sample as a set of static sources. If it holds more
         than one recorded segment and `segment` isn't given, raises
         MultiSegmentSample (carrying each segment's from/to/created/source
         count) so the caller can ask the user which one to load instead of
-        silently picking one."""
+        silently picking one.
+
+        Every row gets its own redis_log entry -- collected here and handed
+        to bulk_record() in one go at the end, rather than calling
+        redis_log.record() per row: record() is the non-blocking hot path
+        meant for real-time ingestion (see its docstring), and a recording
+        of any real length routinely holds far more rows than its queue's
+        capacity, arriving here in one synchronous burst instead of spread
+        over real time -- record() would silently drop most of it
+        (br-REDIS-018)."""
         p = Path(path).expanduser()
         opened = []
+        rows: list[tuple[str, float, dict]] = []
         raw = p.read_bytes()
         with zipfile.ZipFile(io.BytesIO(raw)) as z:
             man = jloads(z.read("manifest.json"))
@@ -1912,7 +1922,7 @@ class State:
                         uid = make_uid(meta["name"], src.seq, text)
                         row = (ts, src.seq, uid, text)
                         src._last_row = row
-                        self.redis_log.record(meta["name"], ts, {"uid": uid, "text": text})
+                        rows.append((meta["name"], ts, {"uid": uid, "text": text}))
                 else:
                     src = StatsSource(sid, meta["name"], p, live=False)
                     src._state = self
@@ -1922,16 +1932,19 @@ class State:
                         for row in lst:
                             ts, cpu, mem, mem_bytes, rate = tuple(row)
                             src.count += 1
-                            self.redis_log.record(
-                                svc,
-                                ts,
-                                {"cpu": cpu, "mem": mem, "mem_bytes": mem_bytes, "net": rate},
+                            rows.append(
+                                (
+                                    svc,
+                                    ts,
+                                    {"cpu": cpu, "mem": mem, "mem_bytes": mem_bytes, "net": rate},
+                                )
                             )
                     src._swarm = set(d.get("swarm", []))
                     if meta.get("is_host"):
                         src.is_host = True
                 self.sources[sid] = src
                 opened.append(sid)
+        await self.redis_log.bulk_record(rows)
         return opened
 
     def close_source(self, sid: str):
@@ -2483,7 +2496,7 @@ async def route_open(request: Request):
     for f in body.get("files", []):
         try:
             if is_cttc_archive(str(f["path"])):
-                opened.extend(st.load_sample(f["path"], segment=f.get("segment")))
+                opened.extend(await st.load_sample(f["path"], segment=f.get("segment")))
                 continue
             src = st.open_file(
                 f["path"],
@@ -2926,7 +2939,7 @@ async def route_files_upload(request: Request):
     st = get_state(request)
     needs_selection = []
     try:
-        opened = files.upload_and_open(st, filename, data, transforms, segment=segment)
+        opened = await files.upload_and_open(st, filename, data, transforms, segment=segment)
         errors = []
     except MultiSegmentSample as e:
         opened, errors = [], []

@@ -1990,7 +1990,7 @@ class TestSampleRoundTrip:
         )
         await st2.redis_log.start()
         try:
-            opened = st2.load_sample(str(out))
+            opened = await st2.load_sample(str(out))
             assert len(opened) == 2
             d = {s["name"]: s for s in await st2.describe()}
             assert d["svc"]["total"] == 1  # only "alpha" is inside [t0, t1]
@@ -2022,7 +2022,7 @@ class TestSampleRoundTrip:
         assert r["sources"] == 0
         st2 = server.State(tmp_path)
         st2.redis_log = state.redis_log
-        assert st2.load_sample(str(out)) == []
+        assert await st2.load_sample(str(out)) == []
 
     async def test_load_sample_skips_blank_log_lines(self, state, tmp_path):
         out = tmp_path / "crafted.cttc"
@@ -2037,7 +2037,7 @@ class TestSampleRoundTrip:
                     }
                 ),
             )
-        opened = state.load_sample(str(out))
+        opened = await state.load_sample(str(out))
         await _flush()
         src = state.sources[opened[0]]
         assert await src.total() == 2
@@ -2093,7 +2093,7 @@ class TestMultiSegmentSample:
         out = tmp_path / "merged.cttc"
         out.write_bytes(merged)
         with pytest.raises(server.MultiSegmentSample) as ei:
-            st2.load_sample(str(out))
+            await st2.load_sample(str(out))
         assert [s["index"] for s in ei.value.segments] == [0, 1]
 
     async def test_load_sample_with_explicit_segment_picks_that_one(
@@ -2125,12 +2125,12 @@ class TestMultiSegmentSample:
         )
         await st3.redis_log.start()
         try:
-            opened0 = st2.load_sample(str(out), segment=0)
+            opened0 = await st2.load_sample(str(out), segment=0)
             await _flush()
             assert len(opened0) == 1
             assert (await st2.sources[opened0[0]].slice(0, 1))[0]["text"] == "alpha"
 
-            opened1 = st3.load_sample(str(out), segment=1)
+            opened1 = await st3.load_sample(str(out), segment=1)
             await _flush()
             assert len(opened1) == 1
             assert (await st3.sources[opened1[0]].slice(0, 1))[0]["text"] == "beta"
@@ -2147,7 +2147,7 @@ class TestMultiSegmentSample:
         out.write_bytes(data)
         st2 = server.State(tmp_path)
         st2.redis_log = state.redis_log
-        assert len(st2.load_sample(str(out))) == 1  # no MultiSegmentSample raised
+        assert len(await st2.load_sample(str(out))) == 1  # no MultiSegmentSample raised
 
 
 # ── HTTP API ─────────────────────────────────────────────────────────────────
