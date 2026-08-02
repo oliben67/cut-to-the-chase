@@ -274,19 +274,20 @@ function themeVar(name) {
 }
 
 /* ── sample vs. live styling ───────────────────────────────────────────────
-   Per stay-the-course/sampled-vs-live-data.md: live data stays a solid,
-   full-saturation line/fill; data coming from a loaded .cttc-metric/
-   .cttc-record sample is
-   grayed + dashed/hatched instead. Each *sample file* (source id) gets its
-   own gray level + dash rhythm, so several loaded samples stay visually
-   distinguishable from each other and from live data. */
+   ui-CHART-026 (see stay-the-course/sampled-vs-live-data.md, updated):
+   a loaded .cttc-metric/.cttc-record sample's data is exactly as real as
+   live data, just not still updating -- the main charts (lines/bars) draw
+   it identically to live data, full color/saturation, no dashing. Log
+   density lanes (a different, auxiliary chart element -- see
+   ui-CHART-009) still hatch sample-sourced lanes; each *sample file*
+   (source id) still gets its own gray level there so several loaded
+   samples stay visually distinguishable from each other. */
 
 const sampleSlotBySid = new Map();
 function sampleSlot(sid) {
   if (!sampleSlotBySid.has(sid)) sampleSlotBySid.set(sid, sampleSlotBySid.size);
   return sampleSlotBySid.get(sid);
 }
-const SAMPLE_DASH_PATTERNS = [[6, 4], [2, 3], [9, 3, 2, 3], [1, 2.5], [10, 3, 3, 3]];
 const SAMPLE_GRAY_LEVELS = [0.3, 0.45, 0.6, 0.75];
 
 // A source is "live" (still being tailed/polled) unless the server marked
@@ -630,18 +631,13 @@ function drawStrip(c, spec, group, isLast) {
   const px = state.series?.px || pw;
   if (state.chartStyle[group] === "bars") {
     // histogram: one bar per non-empty bucket, translucent so overlapping
-    // series stay readable. Sample-sourced series get a grayed hatch fill
-    // instead of a solid one (see sample-vs-live styling above).
+    // series stay readable. Sample-sourced series render identically to
+    // live ones (ui-CHART-026) -- a loaded .cttc-metric/.cttc-record
+    // file's data is exactly as real as live data, just not still updating.
     const bw = Math.max(1, pw / px - 0.5);
     for (const s of services) {
-      const live = isLiveSid(s.sid);
-      if (live) {
-        ctx.globalAlpha = services.length > 1 ? 0.55 : 0.85;
-        ctx.fillStyle = colorFor(s.name);
-      } else {
-        ctx.globalAlpha = 0.9;
-        ctx.fillStyle = hatchPattern(ctx, grayedColor(colorFor(s.name), s.sid), s.sid);
-      }
+      ctx.globalAlpha = services.length > 1 ? 0.55 : 0.85;
+      ctx.fillStyle = colorFor(s.name);
       const arr = s[spec.key];
       for (let b = 0; b < arr.length; b++) {
         if (arr[b] == null) continue;
@@ -653,9 +649,9 @@ function drawStrip(c, spec, group, isLast) {
   } else {
     // series lines. Buckets are sparse when zoomed out (one sample every
     // N pixels), so connect across gaps up to ~4x the typical sample spacing
-    // and render truly isolated samples as dots. Live series are solid and
-    // full-saturation; sample-sourced series are grayed + dashed, with the
-    // dash rhythm/gray level unique per sample file.
+    // and render truly isolated samples as dots. Sample-sourced series
+    // render as full, solid, full-saturation lines, same as live ones (see
+    // the bars branch above for why).
     for (const s of services) {
       const arr = s[spec.key];
       const pts = [];
@@ -664,12 +660,11 @@ function drawStrip(c, spec, group, isLast) {
       if (!pts.length) continue;
       const spacing = Math.max(1, px / pts.length);
       const gapLimit = spacing * 4;
-      const live = isLiveSid(s.sid);
-      const color = live ? colorFor(s.name) : grayedColor(colorFor(s.name), s.sid);
+      const color = colorFor(s.name);
       ctx.strokeStyle = color;
       ctx.fillStyle = color;
-      ctx.lineWidth = live ? 2 : 1.25;
-      ctx.setLineDash(live ? [] : dashFor(s.sid));
+      ctx.lineWidth = 2;
+      ctx.setLineDash([]);
       ctx.lineJoin = "round";
       ctx.beginPath();
       let runLen = 0;
@@ -2374,6 +2369,20 @@ async function refreshAll() {
     // never trip it, leaving live data shown right alongside the sample it
     // was supposed to hide behind.
     const hasSample = state.sources.some((s) => s.live === false);
+    // Self-heals #record-sections: if the tracked record's own sources got
+    // closed some other way (Back to live tracking, a sidebar per-file
+    // close, the dropdown's own onchange, ...) there's nothing left for it
+    // to switch between, so it shouldn't linger showing a stale file's
+    // segments. Checked unconditionally (not just inside setLiveHidden,
+    // below) since that only runs when state.liveHidden itself flips --
+    // with some OTHER sample still open, closing just this one wouldn't
+    // change it at all, and the dropdown would never get a chance to hide.
+    if (
+      activeRecordSections &&
+      !activeRecordSections.openedIds.some((id) => state.sources.some((s) => s.id === id))
+    ) {
+      setActiveRecordSections(null);
+    }
     if (hasSample !== state.liveHidden) setLiveHidden(hasSample);
     assignColorSlots(); // before anything draws, so slots don't depend on draw order
     const hadView = !!state.view;
@@ -2840,14 +2849,66 @@ function pickSegment(segments) {
 // Shared by "Load metrics" and "Open Recording": upload once, and if the
 // server comes back asking which segment (a multi-segment recording, see
 // merge_sample_bytes/MultiSegmentSample), show the picker and re-upload
-// with that choice instead of silently picking one or giving up.
+// with that choice instead of silently picking one or giving up. Once
+// resolved, remembers the choice via setActiveRecordSections so the
+// #record-sections dropdown (right of Back to live tracking) can switch
+// between the *other* segments afterward too, instead of the modal picker
+// being the only way in and every segment but the chosen one staying
+// permanently inaccessible.
 async function uploadAndResolveSegment(path) {
   const first = await uploadFile(path);
-  if (!first.needs_selection?.length) return first;
-  const index = await pickSegment(first.needs_selection[0].segments);
-  if (index == null) return { opened: [], errors: [] }; // cancelled
-  return uploadFile(path, index);
+  if (!first.needs_selection?.length) {
+    setActiveRecordSections(null);
+    return first;
+  }
+  const segments = first.needs_selection[0].segments;
+  const index = await pickSegment(segments);
+  if (index == null) {
+    setActiveRecordSections(null);
+    return { opened: [], errors: [] }; // cancelled
+  }
+  const res = await uploadFile(path, index);
+  setActiveRecordSections({ path, segments, activeIndex: index, openedIds: res.opened || [] });
+  return res;
 }
+
+// Tracks the most recently opened multi-segment .cttc-record/.cttc-metric
+// file (null once there isn't one, or it only had a single segment) so
+// #record-sections can offer switching to any OTHER segment without
+// re-running the one-shot picker -- see uploadAndResolveSegment above and
+// this dropdown's own onchange handler below.
+let activeRecordSections = null; // {path, segments, activeIndex, openedIds}
+
+function setActiveRecordSections(next) {
+  activeRecordSections = next;
+  const sel = $("record-sections");
+  if (!next || next.segments.length < 2) {
+    sel.hidden = true;
+    sel.innerHTML = "";
+    return;
+  }
+  sel.innerHTML = "";
+  for (const seg of next.segments) {
+    const opt = document.createElement("option");
+    opt.value = String(seg.index);
+    opt.textContent = `${fmtIso(seg.from)} — ${fmtIso(seg.to)}`;
+    sel.appendChild(opt);
+  }
+  sel.value = String(next.activeIndex);
+  sel.hidden = false;
+}
+
+$("record-sections").onchange = async () => {
+  if (!activeRecordSections) return;
+  const index = Number($("record-sections").value);
+  if (index === activeRecordSections.activeIndex) return;
+  const { path, segments, openedIds } = activeRecordSections;
+  await Promise.all(openedIds.map((id) => post("/close", { id })));
+  const res = await uploadFile(path, index);
+  if (res.errors?.length) alert(res.errors.map((e) => `${e.path}: ${e.error}`).join("\n"));
+  setActiveRecordSections({ path, segments, activeIndex: index, openedIds: res.opened || [] });
+  await refreshAll();
+};
 
 $("btn-load-sample").onclick = async () => {
   let paths = [];
@@ -2876,8 +2937,10 @@ $("btn-load-sample").onclick = async () => {
    Each Record→Pause span is flushed as one more segment into the same
    .cttc-record archive via /sample/record (byte-oriented, mirroring Capture
    metrics/Load metrics -- no shared-filesystem assumption), rather than
-   each span becoming its own file. A path is chosen once, at Start
-   Recording; every later flush overwrites that same local file. */
+   each span becoming its own file. Every flush between Start and Stop
+   overwrites a fixed internal scratch file (main.js's
+   RECORDING_SCRATCH_PATH) -- the user only picks a real destination once,
+   at Stop, once the recording is actually finished (see stopRecording). */
 
 // segments is purely for the capture-range highlight (see drawVerticals):
 // {from, to} for every completed (Paused) segment this session, so a pause
@@ -2888,30 +2951,51 @@ const recording = { status: "idle", path: null, segmentStart: null, segments: []
 
 function syncRecordingMenu() {
   $("btn-start-recording").dataset.state = recording.status;
-  $("btn-start-recording").disabled = recording.status === "recording";
+  // "stopped" (finalized, awaiting the Stop save-path prompt -- see
+  // stopRecording) can't be resumed into, same as "recording" itself.
+  $("btn-start-recording").disabled = recording.status === "recording" || recording.status === "stopped";
   $("btn-start-recording").title =
     recording.status === "recording"
       ? "Recording"
       : recording.status === "paused"
         ? "Resume Recording"
         : "Start Recording";
+  // dataset.state (not just .disabled) so the paused glyph itself can be
+  // styled directly (blinking orange -- see .recording-dot's neighboring
+  // CSS) instead of just reading as a grayed-out, disabled-and-uninformative
+  // button while there's nothing left for it to do.
+  $("btn-pause-recording").dataset.state = recording.status;
   $("btn-pause-recording").disabled = recording.status !== "recording";
   $("btn-stop-recording").disabled = recording.status === "idle";
   // Bottom status bar's own recording indicator -- same dot, same colors/
   // blink, as the toolbar button (see .recording-dot in style.css), so
   // recording state reads the same way whether or not that panel is open.
+  // While paused specifically, the dedicated pause glyph (see below)
+  // replaces the dot rather than showing alongside it -- one indicator per
+  // state, same reasoning as the toolbar's own glyph/dot swap.
   const dot = $("status-bar-recording-dot");
-  dot.hidden = recording.status === "idle";
+  dot.hidden = recording.status === "idle" || recording.status === "paused";
   dot.dataset.state = recording.status;
-  dot.title = recording.status === "paused" ? "Recording paused" : "Recording";
+  dot.title =
+    recording.status === "stopped" ? "Recording stopped -- not yet saved" : "Recording";
+  const pauseGlyph = $("status-bar-recording-glyph");
+  pauseGlyph.hidden = recording.status !== "paused";
   const label = $("status-bar-recording-text");
   label.hidden = recording.status === "idle";
+  // No filename here while "recording"/"paused"/"stopped": recording.path
+  // is the fixed internal scratch file (see main.js's
+  // RECORDING_SCRATCH_PATH), not anything the user chose -- the real
+  // destination is only known once Stop's save prompt actually succeeds,
+  // at which point this label is hidden again (status back to "idle")
+  // anyway, so it never needs to show a real name at all.
   label.textContent =
     recording.status === "paused"
-      ? `– paused recording "${basename(recording.path)}"`
+      ? "recording paused"
       : recording.status === "recording"
-        ? `– recording "${basename(recording.path)}"`
-        : "";
+        ? "recording"
+        : recording.status === "stopped"
+          ? "recording stopped, not yet saved"
+          : "";
 }
 
 // Reassignable wrappers (window.cttc's own properties are read-only --
@@ -2942,9 +3026,9 @@ function setRecordingState(next) {
   syncRecordingMenu();
 }
 
-// Thin, individually reassignable wrappers around the three native-fs
-// calls Recording needs -- same pattern as saveBinaryFile above, so tests
-// can substitute an in-memory store instead of driving a real native save
+// Thin, individually reassignable wrappers around the native-fs calls
+// Recording needs -- same pattern as saveBinaryFile above, so tests can
+// substitute an in-memory store instead of driving a real native save
 // dialog (which can't run headlessly).
 async function pickRecordingSavePath() {
   return window.cttc?.pickRecordingPath ? window.cttc.pickRecordingPath() : null;
@@ -2954,6 +3038,14 @@ async function readRecordingBytes(path) {
 }
 async function writeRecordingBytes(path, bytes) {
   return window.cttc.writeBinaryFile(path, bytes);
+}
+// The fixed, never-prompted-for path every segment flush writes to while
+// "recording"/"paused"/"stopped" -- see main.js's RECORDING_SCRATCH_PATH
+// docstring for why a fixed path rather than asking upfront.
+async function recordingScratchPath() {
+  return window.cttc?.getRecordingScratchPath
+    ? window.cttc.getRecordingScratchPath()
+    : "/tmp/cttc-recording-in-progress.cttc-record";
 }
 
 // Flushes [recording.segmentStart, t1) as one more segment: reads whatever
@@ -2983,22 +3075,29 @@ async function flushRecordingSegment(t1) {
 async function startRecording() {
   if (recording.status === "recording") return;
   if (recording.status === "idle") {
-    const path = await pickRecordingSavePath();
-    if (!path) {
-      if (!window.cttc?.pickRecordingPath) setStatus("Recording needs desktop file access — unavailable here");
-      return; // cancelled, or no native dialog available
+    if (!window.cttc?.getRecordingScratchPath && !window.cttc?.writeBinaryFile) {
+      setStatus("Recording needs desktop file access — unavailable here");
+      return;
     }
+    // No save-path prompt here -- see main.js's RECORDING_SCRATCH_PATH
+    // docstring for why: every segment flushed between now and Stop goes
+    // to this fixed internal file instead, so starting never interrupts
+    // the user before they even know how long they'll be recording.
+    const path = await recordingScratchPath();
     setRecordingState({ status: "recording", path, segmentStart: Date.now(), segments: [] });
-    const msg = `Recording started — saving to ${path}`;
+    const msg = "Recording started";
     setStatus(msg);
     recordStatusBarHistory(msg);
-  } else {
-    // resume from paused: same path, a new segment starts now, leaving a
-    // genuine gap in the highlight between the just-completed segment
-    // (already in recording.segments, see pauseRecording) and this one.
+  } else if (recording.status === "paused") {
+    // resume from paused: same (scratch) path, a new segment starts now,
+    // leaving a genuine gap in the highlight between the just-completed
+    // segment (already in recording.segments, see pauseRecording) and
+    // this one.
     setRecordingState({ status: "recording", segmentStart: Date.now() });
     setStatus("Recording resumed");
-    recordStatusBarHistory(`Recording resumed — ${recording.path}`);
+    recordStatusBarHistory("Recording resumed");
+  } else {
+    return; // "stopped" -- btn-start-recording is disabled here, nothing to do
   }
   await persistRecordingMarker();
   drawAll(); // capture-range highlight starts/resumes immediately, not on the next 1s tick
@@ -3016,8 +3115,8 @@ async function pauseRecording() {
       segments: [...recording.segments, { from: recording.segmentStart, to }],
       segmentStart: null,
     });
-    setStatus(`Recording paused — ${recording.path}`);
-    recordStatusBarHistory(`Recording paused — ${recording.path}`);
+    setStatus("Recording paused");
+    recordStatusBarHistory("Recording paused");
   } catch (err) {
     const msg = `Could not pause recording: ${err.message || err}`;
     setStatus(msg);
@@ -3028,22 +3127,49 @@ async function pauseRecording() {
   drawAll(); // the just-completed segment's highlight (and the new gap) show up immediately
 }
 
+// Finalizes whatever's still in progress (if anything), then -- and only
+// then -- asks where to actually save it (the point of this whole
+// scratch-file design, see main.js's pick-recording-path docstring).
+// Reaching "stopped" without a chosen destination yet (the save dialog was
+// cancelled, or the write itself failed) is a real, expected resting
+// state: btn-stop-recording stays enabled so clicking Stop again just
+// re-prompts, without re-flushing (there's nothing left to flush) or
+// losing what's already safely on the scratch file.
 async function stopRecording() {
   if (recording.status === "idle") return;
-  const path = recording.path;
+  if (recording.status === "recording") {
+    try {
+      await flushRecordingSegment(Date.now());
+    } catch (err) {
+      const msg = `Could not finalize recording: ${err.message || err}`;
+      setStatus(msg);
+      recordStatusBarHistory(msg);
+      return; // stay "recording" -- the final segment wasn't actually flushed
+    }
+  }
+  if (recording.status !== "stopped") {
+    setRecordingState({ status: "stopped", segmentStart: null, segments: [] });
+    await persistRecordingMarker();
+    drawAll(); // clears the capture-range highlight immediately, recording is over
+  }
+  const savePath = await pickRecordingSavePath();
+  if (!savePath) {
+    setStatus("Recording stopped but not saved — click Stop again to choose a file");
+    return; // stays "stopped"
+  }
   try {
-    if (recording.status === "recording") await flushRecordingSegment(Date.now());
-    setStatus(`Recording stopped — ${path}`);
-    recordStatusBarHistory(`Recording stopped — ${path}`);
+    const bytes = await readRecordingBytes(recording.path);
+    await writeRecordingBytes(savePath, bytes);
   } catch (err) {
-    const msg = `Could not finalize recording: ${err.message || err}`;
+    const msg = `Could not save recording: ${err.message || err}`;
     setStatus(msg);
     recordStatusBarHistory(msg);
-    return; // keep the in-flight state so the user can retry Stop
+    return; // stays "stopped" -- Stop can be clicked again to retry
   }
+  setStatus(`Recording stopped — saved to ${savePath}`);
+  recordStatusBarHistory(`Recording stopped — ${savePath}`);
   setRecordingState({ status: "idle", path: null, segmentStart: null, segments: [] });
   await persistRecordingMarker();
-  drawAll(); // clears the capture-range highlight immediately
 }
 
 async function openRecording() {
@@ -3079,8 +3205,14 @@ async function recoverInterruptedRecording() {
   const marker = await getRecordingMarkerFromDisk();
   if (!marker) return;
   const wasInterrupted = marker.status === "recording";
+  // A crash while already "stopped" (finalized, just waiting on the save
+  // dialog -- see stopRecording) has nothing left to resume into: recover
+  // straight back into "stopped" so Stop only needs to re-prompt for a
+  // destination, not incorrectly reopen it as a resumable "paused"
+  // recording (which would start a fresh segment on top of already-
+  // finished data instead of just asking where to save it).
   setRecordingState({
-    status: "paused",
+    status: marker.status === "stopped" ? "stopped" : "paused",
     path: marker.path,
     segmentStart: null,
     // Whatever was already flushed (via a real Pause) before the crash --
@@ -3089,13 +3221,13 @@ async function recoverInterruptedRecording() {
     // added: its true end time is unknown and its data may not have
     // survived a server restart either, so fabricating a highlighted range
     // for it would show something that was never really captured.
-    segments: marker.segments ?? [],
+    segments: marker.status === "stopped" ? [] : (marker.segments ?? []),
   });
   await persistRecordingMarker();
   if (wasInterrupted) {
-    setStatus(
-      `A previous recording was interrupted and is now paused: ${marker.path} — Resume to continue, or Stop to finalize.`
-    );
+    setStatus("A previous recording was interrupted and is now paused — Resume to continue, or Stop to finalize.");
+  } else if (marker.status === "stopped") {
+    setStatus("A previous recording finished but wasn't saved yet — click Stop to choose where to save it.");
   }
 }
 recoverInterruptedRecording();
@@ -3240,6 +3372,19 @@ function notifyEvent(text) {
   recordStatusBarHistory(text);
 }
 
+// Same as notifyEvent, but force-clears the status bar after `ms` unless
+// something else has already overwritten it by then -- used for
+// "application starting" (see this app's own boot block, ui-SBAR-006) so a
+// quiet boot with nothing else to report doesn't leave it on screen
+// indefinitely instead of being cleared shortly past the app's own render.
+function notifyEventWithCap(text, ms) {
+  notifyEvent(text);
+  const shown = $("app-status-bar-text").textContent;
+  setTimeout(() => {
+    if ($("app-status-bar-text").textContent === shown) $("app-status-bar-text").textContent = "";
+  }, ms);
+}
+
 /* ── status bar history (status bar's own History button) ────────────────
    Every discrete message that's ever been shown as feedback (notifyEvent's
    background events, flashStatus's action confirmations, and the Record/
@@ -3318,7 +3463,12 @@ document.addEventListener("keydown", (e) => {
 // windows still open when an actual quit begins (Quit menu/button, Cmd+Q,
 // Dock > Quit) -- see its before-quit handler.
 if (!POPOUT_KIND) {
-  notifyEvent("application starting");
+  // By the time this line runs the window's own markup/toolbar/sidebar are
+  // already fully rendered (this is a synchronous script running against
+  // already-parsed DOM; only the data behind it loads progressively
+  // afterward), so notifyEventWithCap's 3s here is 3s past that render --
+  // see its own docstring for why this needs a cap at all.
+  notifyEventWithCap("application starting", 3000);
   window.cttc?.onAppShuttingDown?.(() => notifyEvent("application shutting down"));
 }
 
@@ -4866,6 +5016,12 @@ function setLiveHidden(hidden) {
   $("btn-back-to-live").hidden = !hidden;
   $("status-bar-mode-live").hidden = hidden;
   $("status-bar-mode-record").hidden = !hidden;
+  // Back live -- #record-sections' own self-heal (refreshAll, above) only
+  // fires once its tracked sources are actually gone, which isn't
+  // necessarily true the instant this specific call happens (a caller
+  // might flip liveHidden before closing them) -- clear it unconditionally
+  // here too so it never lingers into a live view.
+  if (!hidden) setActiveRecordSections(null);
   relist();
   syncPanels();
 }

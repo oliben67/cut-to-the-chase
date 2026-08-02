@@ -12,5 +12,5 @@ releases/windows/cttc-windows-deploy.zip
 releases/windows/cttc-windows-deploy/
 .vscode/settings.json
 .dev-instructions.json
-.cttc-dev-project/
+.catalyst-proj/*
 .vscode/*

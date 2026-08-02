@@ -661,12 +661,15 @@ ipcMain.handle("read-file", async (_e, filePath) => {
    renderer can't: show the native save dialog once, and read/write bytes
    to a path outside the sandbox. See renderer/app.js's recording section. */
 
-// Asked once, when Start Recording is clicked: after this, every
-// Pause/Stop segment flush overwrites the *same* path non-interactively
-// (see write-binary-file below) -- no repeated dialog per segment.
+// Asked once, at Stop -- not Start, so beginning a recording never
+// interrupts the user with a save dialog before they even know how long
+// they'll be recording for (every segment flushed in the meantime went to
+// RECORDING_SCRATCH_PATH instead, see get-recording-scratch-path above).
+// If Stop's own save is cancelled/fails, the renderer keeps the scratch
+// file around and can prompt again next time Stop is clicked.
 ipcMain.handle("pick-recording-path", async () => {
   const r = await dialog.showSaveDialog({
-    title: "Start Recording",
+    title: "Save Recording",
     defaultPath: `recording-${new Date().toISOString().slice(0, 19).replace(/[T:]/g, "-")}.cttc-record`,
     filters: [{ name: "CTTC recording", extensions: ["cttc-record"] }],
   });
@@ -695,6 +698,21 @@ setInterval(() => sweepArtifacts(), 3600_000); // hourly, same cadence as the ga
 // connection.json, since it's per-install session state, not deployment
 // config.
 const RECORDING_MARKER_PATH = path.join(app.getPath("userData"), "recording.json");
+
+// A fixed, never-prompted-for path every Start/Pause/Resume segment flush
+// writes to (see renderer/app.js's flushRecordingSegment) -- the user only
+// ever picks a *real* destination once, at Stop (pick-recording-path,
+// below), which is exactly the point: asking upfront, before they even
+// know how long they'll be recording, was the whole UX complaint this
+// scratch file exists to fix. Using a fixed path rather than a fresh one
+// per session means a crash mid-recording still recovers cleanly (same
+// path recoverInterruptedRecording expects from RECORDING_MARKER_PATH) at
+// the cost of only ever tracking one in-progress recording at a time,
+// which the app's own UI already assumes throughout (a single `recording`
+// object, one set of transport buttons).
+const RECORDING_SCRATCH_PATH = path.join(app.getPath("userData"), "recording-in-progress.cttc-record");
+
+ipcMain.handle("get-recording-scratch-path", () => RECORDING_SCRATCH_PATH);
 
 ipcMain.handle("get-recording-marker", async () => {
   try {

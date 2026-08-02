@@ -42,8 +42,12 @@ def log_source(state, sid="s2"):
 async def append_log_row(state, src, ts, uid, text):
     """Test stand-in for what LogSource.ingest_chunk normally does --
     Redis is the store now (see redis_log.py), there's no src.rows list to
-    append to directly."""
-    state.redis_log.record(src.name, ts, {"uid": uid, "text": text})
+    append to directly. Records under src._entity (not the bare src.name)
+    to match ingest_chunk's own real write path -- for every existing
+    caller (src.host is None) the two are identical, but a host-qualified
+    source needs this to actually land under the same key _check_log reads
+    from (see br-EVTO-016)."""
+    state.redis_log.record(src._entity, ts, {"uid": uid, "text": text})
     src._last_row = (ts, 0, uid, text)
     await _flush()
 
@@ -389,6 +393,49 @@ class TestLogEvents:
         # only rows appended after creation should ever be scanned
         await state.events.tick(now=2000.0)
         assert state.events.status_of(event_id)["status"] == "armed"
+
+
+class TestHostQualifiedEntities:
+    """br-EVTO-016: _check_metric/_check_log used to read Redis via the
+    bare service/source name while StatsSource.ingest_row/LogSource.
+    ingest_chunk (the real write paths) write under the host-qualified
+    entity id (server.py's _entity_id/_entity_for, see br-DEDUP-006) --
+    for any remote host source (src.host set) the read key never matched
+    the write key, so a condition could never fire for anything but a
+    local target. Every other test in this file uses src.host=None, where
+    the bare name and the qualified entity id are identical, which is
+    exactly why this went unnoticed."""
+
+    async def test_metric_condition_fires_for_a_remote_host_source(self, state):
+        src = stats_source(state)
+        src.host = "ssh://user@remote-host"
+        state.sources[src.id] = src
+        event_id = await state.events.create(
+            "cpu high",
+            {src.id},
+            [events.MetricCondition(metric="cpu", op=">", threshold=80)],
+            events.Action(kind="snapshot", minutes=5),
+        )
+        src.ingest_row("api", 1000.0, 90.0, 10.0, 1000.0, 100.0)
+        await _flush()
+        await state.events.tick(now=2000.0)
+        assert state.events.status_of(event_id)["status"] == "triggered"
+
+    async def test_log_condition_matches_for_a_remote_host_source(self, state):
+        src = log_source(state)
+        src.host = "ssh://user@remote-host"
+        state.sources[src.id] = src
+        event_id = await state.events.create(
+            "errors",
+            {src.id},
+            [events.LogCondition(pattern=r"ERROR")],
+            events.Action(kind="snapshot", minutes=5),
+        )
+        await append_log_row(state, src, 1000.0, "u1", "ERROR: disk full")
+        await state.events.tick(now=2000.0)
+        st = state.events.status_of(event_id)
+        assert st["status"] == "triggered"
+        assert "ERROR: disk full" in st["trigger_detail"]
 
 
 class TestUpdate:

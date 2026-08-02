@@ -286,11 +286,15 @@ body {
 .connection-info-popup .cip-val { font-variant-numeric: tabular-nums; text-align: right; }
 .connection-info-popup .cip-sep { border-top: 1px solid var(--border); margin: 2px 0; }
 
-/* Record toolbar button's own status dot -- hidden (no dot) when idle,
-   bright red+blinking while actively recording, orange+blinking while
-   paused. The bottom status bar's own #status-bar-recording-dot mirrors
-   these exact same rules (same colors, same animation) so the two always
-   read as the same state at a glance. */
+/* Record toolbar button's own status dot -- hidden (no dot) when idle or
+   paused (paused colors the ⏺ glyph itself instead, see below), bright
+   red+blinking while actively recording, orange+blinking while
+   stopped-but-not-yet-saved (still needs attention: the Stop save prompt
+   was cancelled/failed, see stopRecording). The bottom status bar's own
+   #status-bar-recording-dot mirrors these exact same rules (same colors,
+   same animation) so the two always read as the same state at a glance;
+   it's hidden outright while paused (see syncRecordingMenu), replaced by
+   #status-bar-recording-glyph instead. */
 .recording-dot {
   display: inline-block;
   width: 7px;
@@ -304,18 +308,40 @@ body {
   background: var(--critical);
   animation: recording-pulse 1.5s ease-in-out infinite;
 }
-#btn-start-recording[data-state="paused"] .recording-dot,
-#status-bar-recording-dot[data-state="paused"] {
+#btn-start-recording[data-state="stopped"] .recording-dot,
+#status-bar-recording-dot[data-state="stopped"] {
   background: var(--warning);
   animation: recording-pulse 1.5s ease-in-out infinite;
 }
 /* the button's own ⏺ glyph (white/light in dark mode, since it's plain
-   button text) would otherwise sit right next to the red/yellow dot,
-   reading as two dots at once -- hide it whenever the dot itself is
-   showing a real state so only one is ever visible. */
+   button text) would otherwise sit right next to the red dot, reading as
+   two dots at once -- hidden whenever the dot itself is showing a real
+   state (recording/stopped) so only one is ever visible. Paused is the
+   one exception: the glyph itself becomes the indicator there (solid
+   orange, not blinking -- blinking is reserved for the pause button/status
+   bar glyph below, so only one thing on screen blinks at a time), which
+   is why "paused" isn't in this hide list. */
 #btn-start-recording[data-state="recording"] #recording-glyph,
-#btn-start-recording[data-state="paused"] #recording-glyph {
+#btn-start-recording[data-state="stopped"] #recording-glyph {
   display: none;
+}
+#btn-start-recording[data-state="paused"] #recording-glyph {
+  color: var(--warning);
+}
+/* Pause button/status-bar pause glyph -- both blink orange while actually
+   paused, so "paused" reads clearly from either without relying solely on
+   the small recording-dot. #pause-glyph stays inside a disabled button
+   while paused (there's nothing left to pause further) -- opacity is
+   restored to 1 here, overriding the shared button:disabled dimming
+   below, since a dimmed "blinking orange" reads as barely-there instead
+   of as the state indicator it's meant to be. */
+#btn-pause-recording[data-state="paused"] {
+  opacity: 1;
+}
+#btn-pause-recording[data-state="paused"] #pause-glyph,
+#status-bar-recording-glyph {
+  color: var(--warning);
+  animation: recording-pulse 1.5s ease-in-out infinite;
 }
 @keyframes recording-pulse {
   0%, 100% { opacity: 1; }
@@ -770,11 +796,11 @@ body {
   align-items: center;
   gap: var(--toolbar-gap-sm, 8px);
 }
-/* Spacing before Recording/Frequency/Live tracking now comes from
-   .toolbar-mode-divider's own right margin (see below), not a margin here.
-   Hidden as a whole (see app.js's setLiveHidden) whenever a loaded metric/
-   recording is being viewed, since none of them mean anything without live
-   collection happening. */
+/* Frequency/Live tracking only -- Recording lives outside this group now
+   (see index.html's comment on #section-recording for why). Hidden as a
+   whole (see app.js's setLiveHidden) whenever a loaded metric/recording is
+   being viewed, since neither means anything without live collection
+   happening. */
 #live-data-group {
   display: flex;
   align-items: center;
@@ -827,6 +853,31 @@ body {
   padding: 5px;
   border-radius: 8px;
   background: var(--surface-2);
+}
+/* A toolbar action that reads as a plain label with an icon, not a boxed
+   button -- background:none/border:none override the shared `button`
+   rule (style.css's own base, which every other toolbar button keeps).
+   Used by #btn-back-to-live so it doesn't compete visually with the real
+   buttons (Record/Pause/Stop/Open) beside it while still being obviously
+   clickable via the accent color + underline-on-hover. */
+.flat-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: none;
+  border: none;
+  padding: 4px 2px;
+  color: var(--accent);
+  font: inherit;
+}
+.flat-action:hover, .flat-action:active { background: none; text-decoration: underline; }
+.flat-action-icon { width: 14px; height: 14px; flex: 0 0 auto; }
+/* Segment picker for a loaded multi-segment .cttc-record -- only shown
+   once such a file is active (see app.js's setActiveRecordSections), so
+   it stays out of the way for the common single-segment case. */
+#record-sections {
+  padding: 3px 8px;
+  font-size: 12px;
 }
 .ts-label {
   font-size: 10px;

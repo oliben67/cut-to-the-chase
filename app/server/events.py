@@ -381,7 +381,7 @@ class EventManager:
             if src is None or src.kind != "stats":
                 continue
             results = await asyncio.gather(
-                *(self._state.redis_log.latest(svc) for svc in src._services)
+                *(self._state.redis_log.latest(src._entity_for(svc)) for svc in src._services)
             )
             for svc, best in zip(sorted(src._services), results):
                 if best is None:
@@ -403,7 +403,7 @@ class EventManager:
             total = await src.total()
             start = cursors.get(sid, 0)
             if total > start:
-                new_rows = await self._state.redis_log.slice_by_rank(src.name, start, total - start)
+                new_rows = await self._state.redis_log.slice_by_rank(src._entity, start, total - start)
             else:
                 new_rows = []
             cursors[sid] = total

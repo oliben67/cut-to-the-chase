@@ -1239,7 +1239,7 @@
 
   /* ── sample round trip through the UI data model ──────────────────────── */
 
-  await T("sample export + load shows grayed sample sources", async () => {
+  await T("sample export + load tracks sample sources in the data model", async () => {
     const out = "/tmp/cttc-e2e-sample.cttc-metric";
     const r = await post("/sample/export", { path: out, from: R.min_ts, to: R.min_ts + 5 * 60000 });
     ok(r.sources >= 2, "exported sources");
@@ -1258,7 +1258,6 @@
       state.hiddenSamples.add(sample.path);
       eq(isSampleHidden(sample.id), true, "hide toggle honors path");
       state.hiddenSamples.delete(sample.path);
-      ok(Array.isArray(dashFor(sample.id)), "dash pattern assigned");
       renderLegend();
       ok(document.getElementById("sample-files"), "sample chip row rendered");
     } finally {
@@ -1327,9 +1326,18 @@
 
   /* ── Recording (Start/Pause/Stop/Open Recording) ──────────────────────── */
 
-  await T("Record -> Pause -> Resume -> Stop writes a real 2-segment .cttc-record, menu state tracks it", async () => {
-    const realPick = pickRecordingSavePath, realRead = readRecordingBytes, realWrite = writeRecordingBytes;
+  await T("Record -> Pause -> Resume -> Stop writes a real 2-segment .cttc-record, filename is only asked at Stop", async () => {
+    // br-REC-UI-002: Start used to prompt for a save path immediately;
+    // every segment now flushes to a fixed scratch path instead (see
+    // main.js's RECORDING_SCRATCH_PATH), and the *real* destination is
+    // only asked for once, when Stop actually finalizes the recording.
+    const realScratch = recordingScratchPath,
+      realPick = pickRecordingSavePath,
+      realRead = readRecordingBytes,
+      realWrite = writeRecordingBytes;
     const store = {};
+    const scratchPath = "/fake/scratch.cttc-record";
+    recordingScratchPath = async () => scratchPath;
     pickRecordingSavePath = async () => "/fake/e2e-recording.cttc-record";
     readRecordingBytes = async (p) => {
       if (!(p in store)) throw new Error("no such file");
@@ -1342,7 +1350,7 @@
       eq($("status-bar-recording-dot").hidden, true, "no dot while idle");
       await startRecording();
       eq(recording.status, "recording");
-      eq(recording.path, "/fake/e2e-recording.cttc-record");
+      eq(recording.path, scratchPath, "writes to the fixed scratch path, not a user-chosen one");
       eq($("btn-start-recording").disabled, true);
       eq($("btn-start-recording").title, "Recording");
       eq($("btn-pause-recording").disabled, false);
@@ -1352,18 +1360,30 @@
       eq($("status-bar-recording-dot").hidden, false, "dot visible while recording");
       eq($("status-bar-recording-dot").dataset.state, "recording");
       eq($("status-bar-recording-text").hidden, false);
-      eq($("status-bar-recording-text").textContent, '– recording "e2e-recording.cttc-record"');
+      eq($("status-bar-recording-text").textContent, "recording", "no filename shown yet -- nothing's been chosen");
 
       await pauseRecording();
       eq(recording.status, "paused");
       eq($("btn-start-recording").disabled, false);
       eq($("btn-start-recording").title, "Resume Recording");
       eq($("btn-pause-recording").disabled, true);
-      eq($("status-bar-recording-dot").hidden, false, "dot stays visible while paused");
-      eq($("status-bar-recording-dot").dataset.state, "paused");
-      eq($("status-bar-recording-text").textContent, '– paused recording "e2e-recording.cttc-record"');
-      ok(store["/fake/e2e-recording.cttc-record"], "first segment flushed to the in-memory store");
-      const afterFirst = store["/fake/e2e-recording.cttc-record"];
+      eq($("btn-pause-recording").dataset.state, "paused");
+      // br-REC-UI-004: paused reads via the glyphs themselves (record
+      // button's ⏺ solid orange, pause button's/status bar's ⏸ blinking
+      // orange), not the small recording-dot -- the dot is hidden outright
+      // on both the toolbar button and the status bar while paused.
+      eq($("status-bar-recording-dot").hidden, true, "dot hidden while paused -- the pause glyph is the indicator instead");
+      eq($("status-bar-recording-glyph").hidden, false, "pause glyph shown while paused");
+      eq(getComputedStyle($("recording-glyph")).display, "inline", "record button's own glyph shown (not hidden) while paused");
+      eq(getComputedStyle($("recording-glyph")).color, getComputedStyle($("status-bar-recording-glyph")).color, "record button glyph is the same orange as the pause glyphs");
+      eq(getComputedStyle($("pause-glyph")).color, getComputedStyle($("status-bar-recording-glyph")).color, "pause button glyph matches too");
+      eq(getComputedStyle($("recording-glyph")).animationName, "none", "record button glyph is solid orange, not blinking");
+      eq(getComputedStyle($("pause-glyph")).animationName, "recording-pulse", "pause button glyph blinks");
+      eq(getComputedStyle($("status-bar-recording-glyph")).animationName, "recording-pulse", "status bar pause glyph blinks");
+      eq(getComputedStyle($("btn-pause-recording")).opacity, "1", "pause button reads at full vibrancy despite being disabled");
+      eq($("status-bar-recording-text").textContent, "recording paused");
+      ok(store[scratchPath], "first segment flushed to the scratch path");
+      const afterFirst = store[scratchPath];
       eq(afterFirst[0], 0x50, "PK zip magic byte 1");
       // the completed segment is recorded for the highlight; segmentStart
       // (the *next* segment's start, not yet known) is cleared meanwhile,
@@ -1379,15 +1399,17 @@
       eq(recording.segments.length, 1, "still just the one completed segment");
       ok(recording.segmentStart >= recording.segments[0].to, "new segment starts at/after the pause gap");
       eq($("status-bar-recording-dot").dataset.state, "recording", "dot back to recording on resume");
-      eq($("status-bar-recording-text").textContent, '– recording "e2e-recording.cttc-record"');
+      eq($("status-bar-recording-text").textContent, "recording");
+
       await stopRecording();
-      eq(recording.status, "idle");
+      eq(recording.status, "idle", "a save path was provided -- fully finalized");
       eq(recording.path, null);
       eq(recording.segments.length, 0, "highlight cleared once actually stopped");
       eq($("btn-stop-recording").disabled, true);
       eq($("status-bar-recording-dot").hidden, true, "dot hidden again once stopped");
       eq($("status-bar-recording-text").hidden, true, "text hidden again once stopped");
       const afterSecond = store["/fake/e2e-recording.cttc-record"];
+      ok(afterSecond, "the chosen destination (not the scratch path) received the final bytes");
       ok(afterSecond.length >= afterFirst.length, "second segment appended, archive grew (or stayed same size)");
 
       // write the final in-memory bytes to a real path and confirm /open
@@ -1399,6 +1421,47 @@
       eq(openRes.needs_selection.length, 1);
       eq(openRes.needs_selection[0].segments.length, 2, "both flushed segments present");
     } finally {
+      recordingScratchPath = realScratch;
+      pickRecordingSavePath = realPick;
+      readRecordingBytes = realRead;
+      writeRecordingBytes = realWrite;
+    }
+  });
+
+  await T("Stop without choosing a save path stays 'stopped' -- the recording itself isn't lost, Stop can be retried", async () => {
+    const realScratch = recordingScratchPath,
+      realPick = pickRecordingSavePath,
+      realRead = readRecordingBytes,
+      realWrite = writeRecordingBytes;
+    const store = {};
+    const scratchPath = "/fake/scratch2.cttc-record";
+    recordingScratchPath = async () => scratchPath;
+    readRecordingBytes = async (p) => {
+      if (!(p in store)) throw new Error("no such file");
+      return store[p];
+    };
+    writeRecordingBytes = async (p, bytes) => { store[p] = bytes; };
+    try {
+      if (recording.status !== "idle") await stopRecording(); // clean baseline
+      pickRecordingSavePath = async () => null; // user closes the native dialog
+      await startRecording();
+      await stopRecording();
+      eq(recording.status, "stopped", "finalized, but no destination chosen yet");
+      eq($("btn-start-recording").disabled, true, "can't start a new one until this is saved");
+      eq($("btn-pause-recording").disabled, true);
+      eq($("btn-stop-recording").disabled, false, "Stop can be clicked again to retry the save prompt");
+      eq($("status-bar-recording-dot").hidden, false);
+      eq($("status-bar-recording-dot").dataset.state, "stopped");
+      eq($("status-bar-recording-text").textContent, "recording stopped, not yet saved");
+      ok(store[scratchPath], "the recording itself was NOT lost -- it's safely on the scratch file");
+      const scratchBytes = store[scratchPath];
+
+      pickRecordingSavePath = async () => "/fake/e2e-retry.cttc-record"; // retry succeeds
+      await stopRecording();
+      eq(recording.status, "idle");
+      eq(store["/fake/e2e-retry.cttc-record"], scratchBytes, "retried save wrote the already-finalized bytes, no re-flush");
+    } finally {
+      recordingScratchPath = realScratch;
       pickRecordingSavePath = realPick;
       readRecordingBytes = realRead;
       writeRecordingBytes = realWrite;
@@ -1406,8 +1469,12 @@
   });
 
   await T("Record/Pause/Resume/Stop each land in status bar History (regression: these go through setStatus, not notifyEvent)", async () => {
-    const realPick = pickRecordingSavePath, realRead = readRecordingBytes, realWrite = writeRecordingBytes;
+    const realScratch = recordingScratchPath,
+      realPick = pickRecordingSavePath,
+      realRead = readRecordingBytes,
+      realWrite = writeRecordingBytes;
     const store = {};
+    recordingScratchPath = async () => "/fake/scratch-history.cttc-record";
     pickRecordingSavePath = async () => "/fake/e2e-history-recording.cttc-record";
     readRecordingBytes = async (p) => {
       if (!(p in store)) throw new Error("no such file");
@@ -1432,22 +1499,18 @@
       ok(texts.some((t) => t.startsWith("Recording resumed")), `expected a "Recording resumed" entry: ${texts}`);
       ok(texts.some((t) => t.startsWith("Recording stopped")), `expected a "Recording stopped" entry: ${texts}`);
     } finally {
+      recordingScratchPath = realScratch;
       pickRecordingSavePath = realPick;
       readRecordingBytes = realRead;
       writeRecordingBytes = realWrite;
     }
   });
 
-  await T("Start Recording without a chosen path stays idle (dialog cancelled)", async () => {
-    const realPick = pickRecordingSavePath;
-    pickRecordingSavePath = async () => null; // user closed the native dialog
-    try {
-      await startRecording();
-      eq(recording.status, "idle");
-    } finally {
-      pickRecordingSavePath = realPick;
-    }
-  });
+  // No e2e coverage for startRecording()'s "no window.cttc at all" guard
+  // (setStatus("Recording needs desktop file access — unavailable here")):
+  // window.cttc's own properties are read-only (contextBridge), so that
+  // environment can't be simulated from here -- the real Electron preload
+  // is always present in this test harness.
 
   await T("Pause/Stop are no-ops when not recording", async () => {
     eq(recording.status, "idle");
@@ -1468,6 +1531,37 @@
       eq(recording.path, "/fake/stale.cttc-record");
       ok($("status").textContent.includes("interrupted"), $("status").textContent);
       ok(lastSet && lastSet.status === "paused", "corrected marker persisted as paused");
+    } finally {
+      getRecordingMarkerFromDisk = realGetMarker;
+      setRecordingMarkerOnDisk = realSetMarker;
+      setRecordingState({ status: "idle", path: null, segmentStart: null });
+      await persistRecordingMarker();
+    }
+  });
+
+  await T("recoverInterruptedRecording keeps a stale 'stopped' marker stopped, not paused", async () => {
+    // br-REC-UI-002: a crash after Stop already finalized the recording
+    // (scratch file fully written, just waiting on the save dialog) has
+    // nothing left to resume into -- recovering it as "paused" would let
+    // Start Recording silently begin a fresh segment on top of already-
+    // finished data instead of just re-asking where to save it.
+    const realGetMarker = getRecordingMarkerFromDisk, realSetMarker = setRecordingMarkerOnDisk;
+    let lastSet = null;
+    getRecordingMarkerFromDisk = async () => ({
+      path: "/fake/stale-stopped.cttc-record",
+      status: "stopped",
+      segmentStart: null,
+      segments: [{ from: 1, to: 2 }],
+    });
+    setRecordingMarkerOnDisk = async (m) => { lastSet = m; };
+    try {
+      await recoverInterruptedRecording();
+      eq(recording.status, "stopped");
+      eq(recording.path, "/fake/stale-stopped.cttc-record");
+      eq(recording.segments.length, 0, "nothing left to highlight -- the recording is already over");
+      eq($("btn-start-recording").disabled, true, "can't resume into a finished recording");
+      ok($("status").textContent.includes("wasn't saved"), $("status").textContent);
+      ok(lastSet && lastSet.status === "stopped", "marker persisted still as stopped, not paused");
     } finally {
       getRecordingMarkerFromDisk = realGetMarker;
       setRecordingMarkerOnDisk = realSetMarker;
@@ -1505,7 +1599,58 @@
       eq(shownSegments.length, 2, "both segments offered");
       eq(r.errors.length, 0, JSON.stringify(r.errors));
       ok(r.opened.length >= 1, "chosen segment's sources opened");
+
+      // br-REC-UI-003: the one-shot picker isn't the only way in anymore --
+      // #record-sections (right of Back to live tracking) offers the SAME
+      // segments afterward too, so the one NOT picked isn't permanently
+      // inaccessible.
+      await until(() => !$("record-sections").hidden, "record-sections dropdown shown");
+      eq($("record-sections").options.length, 2, "both segments listed");
+      eq($("record-sections").value, "1", "reflects the segment actually chosen via the picker");
+      eq(activeRecordSections.path, realPath);
+      eq(activeRecordSections.activeIndex, 1);
+
       for (const sid of r.opened) await post("/close", { id: sid });
+      await refreshAll();
+      eq($("record-sections").hidden, true, "hidden again once its sources are gone (self-heals via setLiveHidden)");
+    } finally {
+      pickSegment = realPickSegment;
+    }
+  });
+
+  await T("#record-sections dropdown switches segments without re-running the picker", async () => {
+    const t0 = R.min_ts;
+    const firstRes = await fetch(`${API}/sample/record`, {
+      method: "POST", body: new Uint8Array(0),
+      headers: { "X-CTTC-From": String(t0), "X-CTTC-To": String(t0 + 60000) },
+    });
+    const firstBytes = new Uint8Array(await firstRes.arrayBuffer());
+    const secondRes = await fetch(`${API}/sample/record`, {
+      method: "POST", body: firstBytes,
+      headers: { "X-CTTC-From": String(t0 + 60000), "X-CTTC-To": String(t0 + 120000) },
+    });
+    const secondBytes = new Uint8Array(await secondRes.arrayBuffer());
+    const realPath = "/tmp/cttc-e2e-record-sections-switch.cttc-record";
+    await window.cttc.writeBinaryFile(realPath, secondBytes);
+
+    const realPickSegment = pickSegment;
+    pickSegment = async () => 0; // pick the first segment initially
+    try {
+      const first = await uploadAndResolveSegment(realPath);
+      ok(first.opened.length >= 1, "first segment's sources opened");
+      const firstIds = first.opened.slice();
+      eq(activeRecordSections.activeIndex, 0);
+
+      $("record-sections").value = "1";
+      $("record-sections").dispatchEvent(new Event("change"));
+      await until(() => activeRecordSections?.activeIndex === 1, "switched to segment 1");
+      eq($("record-sections").value, "1");
+      for (const sid of firstIds) {
+        ok(!state.sources.some((s) => s.id === sid), `segment 0's source ${sid} was closed on switch`);
+      }
+      ok(activeRecordSections.openedIds.length >= 1, "segment 1's sources opened");
+
+      for (const sid of activeRecordSections.openedIds) await post("/close", { id: sid });
       await refreshAll();
     } finally {
       pickSegment = realPickSegment;
@@ -1528,6 +1673,60 @@
     await until(() => dlgSegmentPick.open, "segment picker reopened");
     $("segment-pick-list").querySelector("button").click();
     eq(await p2, 0, "choosing a segment still resolves normally after a prior Esc");
+  });
+
+  await T("Recording controls stay usable while viewing loaded metrics (br-REC-UI-001 regression)", async () => {
+    // #section-recording (Start/Pause/Stop/Open Recording) used to live
+    // inside #live-data-group, so it vanished the instant any sample was
+    // loaded (state.liveHidden true) -- silently blocking Open Recording
+    // (and Start Recording) from ever being clicked again.
+    ok(
+      !$("live-data-group").contains($("section-recording")),
+      "#section-recording must live outside #live-data-group"
+    );
+    const res = await fetch(
+      `${API}/files/download?from=${R.min_ts}&to=${R.max_ts}&include_host=0`,
+      { headers: authHeaders() }
+    );
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const realPath = "/tmp/cttc-e2e-recording-controls-visible.cttc-metric";
+    await window.cttc.writeBinaryFile(realPath, bytes);
+    const r = await uploadAndResolveSegment(realPath);
+    try {
+      ok(r.opened.length >= 1, "sample opened");
+      await refreshAll();
+      eq(state.liveHidden, true, "now viewing loaded metrics");
+      eq($("live-data-group").hidden, true, "Frequency/Live tracking hidden while viewing a sample");
+      eq($("section-recording").hidden, false, "Recording stays visible regardless");
+      eq($("btn-open-recording").hidden, false);
+      eq($("btn-open-recording").disabled, false);
+    } finally {
+      for (const sid of r.opened) await post("/close", { id: sid });
+      await refreshAll();
+    }
+  });
+
+  await T("Back to live tracking reads as a flat action, not a boxed button", async () => {
+    const res = await fetch(
+      `${API}/files/download?from=${R.min_ts}&to=${R.max_ts}&include_host=0`,
+      { headers: authHeaders() }
+    );
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const realPath = "/tmp/cttc-e2e-back-to-live-style.cttc-metric";
+    await window.cttc.writeBinaryFile(realPath, bytes);
+    const r = await uploadAndResolveSegment(realPath);
+    try {
+      ok(r.opened.length >= 1, "sample opened");
+      await refreshAll();
+      eq($("btn-back-to-live").hidden, false);
+      const style = getComputedStyle($("btn-back-to-live"));
+      eq(style.borderStyle === "none" || style.borderWidth === "0px", true, `expected no border, got ${style.borderStyle}/${style.borderWidth}`);
+      eq(style.backgroundColor, "rgba(0, 0, 0, 0)", "expected a transparent background");
+      ok($("btn-back-to-live").querySelector("svg.flat-action-icon"), "has a leading icon");
+    } finally {
+      for (const sid of r.opened) await post("/close", { id: sid });
+      await refreshAll();
+    }
   });
 
   /* ── sidebar / appearance ──────────────────────────────────────────────── */
@@ -1631,6 +1830,23 @@
     notifyEvent("application shutting down");
     ok($("app-status-bar-text").textContent.includes("application shutting down"));
     eq(statusBarHistory.at(-1).text, "application shutting down");
+  });
+
+  await T("notifyEventWithCap force-clears the status bar after its timeout (ui-SBAR-006)", async () => {
+    notifyEventWithCap("e2e cap test message", 200);
+    ok($("app-status-bar-text").textContent.includes("e2e cap test message"));
+    await sleep(300);
+    eq($("app-status-bar-text").textContent, "", "cleared once nothing else replaced it within the cap");
+  });
+
+  await T("notifyEventWithCap's clear is skipped once something else already replaced the message", async () => {
+    notifyEventWithCap("e2e cap test message 2", 200);
+    notifyEvent("something else happened in the meantime");
+    await sleep(300);
+    ok(
+      $("app-status-bar-text").textContent.includes("something else happened in the meantime"),
+      "the newer message must survive the stale cap timer, not get clobbered back to blank"
+    );
   });
 
   await T("status bar History records notifyEvent/flashStatus and renders newest-first", () => {
