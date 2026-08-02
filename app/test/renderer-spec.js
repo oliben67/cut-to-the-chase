@@ -1570,7 +1570,7 @@
     }
   });
 
-  await T("multi-segment .cttc-record upload surfaces the picker, choosing a segment loads it", async () => {
+  await T("multi-segment .cttc-record upload auto-loads the first segment without prompting", async () => {
     // build a real 2-segment recording server-side via /sample/record
     const t0 = R.min_ts;
     const firstRes = await fetch(`${API}/sample/record`, {
@@ -1590,35 +1590,31 @@
     const realPath = "/tmp/cttc-e2e-multi-segment.cttc-record";
     await window.cttc.writeBinaryFile(realPath, secondBytes);
 
-    const realPickSegment = pickSegment;
-    let shownSegments = null;
-    pickSegment = async (segments) => { shownSegments = segments; return 1; };
-    try {
-      const r = await uploadAndResolveSegment(realPath);
-      ok(shownSegments, "picker was invoked");
-      eq(shownSegments.length, 2, "both segments offered");
-      eq(r.errors.length, 0, JSON.stringify(r.errors));
-      ok(r.opened.length >= 1, "chosen segment's sources opened");
+    const r = await uploadAndResolveSegment(realPath);
+    eq(r.errors.length, 0, JSON.stringify(r.errors));
+    ok(r.opened.length >= 1, "first segment's sources opened, no user choice needed");
 
-      // br-REC-UI-003: the one-shot picker isn't the only way in anymore --
-      // #record-sections (right of Back to live tracking) offers the SAME
-      // segments afterward too, so the one NOT picked isn't permanently
-      // inaccessible.
-      await until(() => !$("record-sections").hidden, "record-sections dropdown shown");
-      eq($("record-sections").options.length, 2, "both segments listed");
-      eq($("record-sections").value, "1", "reflects the segment actually chosen via the picker");
-      eq(activeRecordSections.path, realPath);
-      eq(activeRecordSections.activeIndex, 1);
+    // #record-sections (right of Back to live tracking) is populated
+    // immediately with every segment, first one selected, so the others
+    // aren't permanently inaccessible.
+    await until(() => !$("record-sections").hidden, "record-sections dropdown shown");
+    eq($("record-sections").options.length, 2, "both segments listed");
+    eq($("record-sections").value, "0", "first segment selected by default");
+    eq(activeRecordSections.path, realPath);
+    eq(activeRecordSections.activeIndex, 0);
 
-      for (const sid of r.opened) await post("/close", { id: sid });
-      await refreshAll();
-      eq($("record-sections").hidden, true, "hidden again once its sources are gone (self-heals via setLiveHidden)");
-    } finally {
-      pickSegment = realPickSegment;
-    }
+    // the auto-loaded recording must switch the app out of live mode just
+    // like the old prompt-driven flow did -- see setLiveHidden.
+    await refreshAll();
+    eq(state.liveHidden, true, "auto-loading a recording enters analysis mode");
+    eq($("live-data-group").hidden, true, "Frequency/Live tracking hidden once the recording is auto-loaded");
+
+    for (const sid of r.opened) await post("/close", { id: sid });
+    await refreshAll();
+    eq($("record-sections").hidden, true, "hidden again once its sources are gone (self-heals via setLiveHidden)");
   });
 
-  await T("#record-sections dropdown switches segments without re-running the picker", async () => {
+  await T("#record-sections dropdown switches segments after the automatic first-segment load", async () => {
     const t0 = R.min_ts;
     const firstRes = await fetch(`${API}/sample/record`, {
       method: "POST", body: new Uint8Array(0),
@@ -1633,46 +1629,22 @@
     const realPath = "/tmp/cttc-e2e-record-sections-switch.cttc-record";
     await window.cttc.writeBinaryFile(realPath, secondBytes);
 
-    const realPickSegment = pickSegment;
-    pickSegment = async () => 0; // pick the first segment initially
-    try {
-      const first = await uploadAndResolveSegment(realPath);
-      ok(first.opened.length >= 1, "first segment's sources opened");
-      const firstIds = first.opened.slice();
-      eq(activeRecordSections.activeIndex, 0);
+    const first = await uploadAndResolveSegment(realPath);
+    ok(first.opened.length >= 1, "first segment's sources opened");
+    const firstIds = first.opened.slice();
+    eq(activeRecordSections.activeIndex, 0);
 
-      $("record-sections").value = "1";
-      $("record-sections").dispatchEvent(new Event("change"));
-      await until(() => activeRecordSections?.activeIndex === 1, "switched to segment 1");
-      eq($("record-sections").value, "1");
-      for (const sid of firstIds) {
-        ok(!state.sources.some((s) => s.id === sid), `segment 0's source ${sid} was closed on switch`);
-      }
-      ok(activeRecordSections.openedIds.length >= 1, "segment 1's sources opened");
-
-      for (const sid of activeRecordSections.openedIds) await post("/close", { id: sid });
-      await refreshAll();
-    } finally {
-      pickSegment = realPickSegment;
+    $("record-sections").value = "1";
+    $("record-sections").dispatchEvent(new Event("change"));
+    await until(() => activeRecordSections?.activeIndex === 1, "switched to segment 1");
+    eq($("record-sections").value, "1");
+    for (const sid of firstIds) {
+      ok(!state.sources.some((s) => s.id === sid), `segment 0's source ${sid} was closed on switch`);
     }
-  });
+    ok(activeRecordSections.openedIds.length >= 1, "segment 1's sources opened");
 
-  await T("Esc-dismissing the segment picker resolves as a cancel (null) instead of hanging forever (ui-EXPORT-005)", async () => {
-    const segments = [
-      { index: 0, from: R.min_ts, to: R.min_ts + 60000, source_count: 1 },
-      { index: 1, from: R.min_ts + 60000, to: R.min_ts + 120000, source_count: 1 },
-    ];
-    const p = pickSegment(segments);
-    await until(() => dlgSegmentPick.open, "segment picker open");
-    dlgSegmentPick.close(); // native <dialog> Esc behavior: closes without touching any button
-    const chosen = await p; // must not hang
-    eq(chosen, null, "Esc must resolve as a cancel");
-    // the next real open must still work normally -- proof the close-event
-    // listener/handlers were cleaned up, not left stale from the Esc above
-    const p2 = pickSegment(segments);
-    await until(() => dlgSegmentPick.open, "segment picker reopened");
-    $("segment-pick-list").querySelector("button").click();
-    eq(await p2, 0, "choosing a segment still resolves normally after a prior Esc");
+    for (const sid of activeRecordSections.openedIds) await post("/close", { id: sid });
+    await refreshAll();
   });
 
   await T("Recording controls stay usable while viewing loaded metrics (br-REC-UI-001 regression)", async () => {

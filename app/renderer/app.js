@@ -2802,59 +2802,13 @@ async function uploadFile(localPath, segment) {
   return res.json().catch(() => ({ opened: [], errors: [{ path: filename, error: `upload failed: ${res.status}` }] }));
 }
 
-const dlgSegmentPick = $("dlg-segment-pick");
-
-// Shows the multi-segment picker and resolves to the chosen index, or null
-// if cancelled. `segments` is the needs_selection entry's own list:
-// [{index, from, to, created, source_count}].
-function pickSegment(segments) {
-  const box = $("segment-pick-list");
-  box.innerHTML = "";
-  return new Promise((resolve) => {
-    let settled = false;
-    const done = (index) => {
-      if (settled) return;
-      settled = true;
-      $("dlg-segment-pick-cancel").onclick = null;
-      dlgSegmentPick.removeEventListener("close", onClose);
-      dlgSegmentPick.close(); // no-op if already closed/closing (e.g. Esc got here first)
-      resolve(index);
-    };
-    // Esc is native <dialog> behavior that closes it without going through
-    // any button's onclick -- without this, that left the load promise
-    // unresolved forever, silently hanging Load Metrics/Open Recording
-    // (ui-EXPORT-005). Treated the same as Cancel; guarded by `settled` so a
-    // button's own done()-triggered close() (which also fires this same
-    // "close" event) doesn't re-resolve.
-    const onClose = () => done(null);
-    dlgSegmentPick.addEventListener("close", onClose);
-    for (const seg of segments) {
-      const btn = document.createElement("button");
-      btn.type = "button";
-      const range = document.createElement("span");
-      range.className = "seg-range";
-      range.textContent = `${fmtIso(seg.from)} — ${fmtIso(seg.to)}`;
-      const meta = document.createElement("span");
-      meta.className = "seg-meta";
-      meta.textContent = `${seg.source_count} source(s)${seg.created ? " · recorded " + fmtIso(new Date(seg.created).getTime() || seg.created) : ""}`;
-      btn.append(range, meta);
-      btn.onclick = () => done(seg.index);
-      box.appendChild(btn);
-    }
-    $("dlg-segment-pick-cancel").onclick = () => done(null);
-    dlgSegmentPick.showModal();
-  });
-}
-
 // Shared by "Load metrics" and "Open Recording": upload once, and if the
 // server comes back asking which segment (a multi-segment recording, see
-// merge_sample_bytes/MultiSegmentSample), show the picker and re-upload
-// with that choice instead of silently picking one or giving up. Once
-// resolved, remembers the choice via setActiveRecordSections so the
-// #record-sections dropdown (right of Back to live tracking) can switch
-// between the *other* segments afterward too, instead of the modal picker
-// being the only way in and every segment but the chosen one staying
-// permanently inaccessible.
+// merge_sample_bytes/MultiSegmentSample), load the first recorded segment
+// automatically -- no prompt -- and remember the full list via
+// setActiveRecordSections so the #record-sections dropdown (right of Back
+// to live tracking) is populated immediately and lets the user switch to
+// any of the *other* segments afterward.
 async function uploadAndResolveSegment(path) {
   const first = await uploadFile(path);
   if (!first.needs_selection?.length) {
@@ -2862,11 +2816,7 @@ async function uploadAndResolveSegment(path) {
     return first;
   }
   const segments = first.needs_selection[0].segments;
-  const index = await pickSegment(segments);
-  if (index == null) {
-    setActiveRecordSections(null);
-    return { opened: [], errors: [] }; // cancelled
-  }
+  const index = segments[0].index;
   const res = await uploadFile(path, index);
   setActiveRecordSections({ path, segments, activeIndex: index, openedIds: res.opened || [] });
   return res;

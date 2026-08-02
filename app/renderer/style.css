@@ -1652,19 +1652,6 @@ pre.snapshot-body {
   text-overflow: ellipsis;
 }
 
-/* multi-segment recording picker (dlg-segment-pick) */
-#segment-pick-list { display: flex; flex-direction: column; gap: 4px; margin: 8px 0; }
-#segment-pick-list button {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 2px;
-  padding: 6px 10px;
-  text-align: left;
-}
-#segment-pick-list .seg-range { font-weight: 600; }
-#segment-pick-list .seg-meta { font-size: 11px; color: var(--muted); }
-
 /* settings dialog fieldsets (remote connection, update server image) */
 .keys-box { border: 1px solid var(--border); border-radius: var(--radius-md); margin: 8px 0; }
 /* "Ship logs" (Settings > Collect CTTC Own Logs): icon-only button, aligned
