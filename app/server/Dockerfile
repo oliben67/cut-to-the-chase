@@ -40,6 +40,15 @@ RUN uv sync --no-dev
 # COPY list here. .dockerignore already keeps tests/, caches, and .venv/ out
 # of the build context, so this can't accidentally sweep those in.
 COPY *.py ./
+# redis_log.py's own Redis Function (LUA_PATH) -- *.py's wildcard above
+# doesn't catch this non-Python sibling, and it was missed when the
+# Redis-backed store was introduced (see redis_log.py's module docstring):
+# the container built fine, then crash-looped forever on its very first
+# request needing Redis, since redis_log.start() raises RedisUnavailable
+# the instant FileNotFoundError'ing on logs.lua turns into a failed
+# function_load -- never caught locally/in tests, which run server.py
+# straight from this same source directory, logs.lua sitting right there.
+COPY logs.lua ./
 COPY transforms ./transforms
 
 FROM python:3.14-alpine
