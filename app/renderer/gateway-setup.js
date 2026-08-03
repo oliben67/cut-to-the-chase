@@ -7,6 +7,14 @@
 // button does (Connect a new one vs. Save changes to an existing one) --
 // everything else (ssh fields, key mode, image source) is shared.
 const MODE = new URLSearchParams(location.search).get("mode") === "edit" ? "edit" : "new";
+// Only meaningful for MODE "new" (the first-run/no-local-docker fallback) --
+// main.js computes this via lib/gateway-setup-visibility.js's
+// shouldShowSkipButton (based on its own hasLocalDocker() probe, run fresh
+// every time this window opens -- first launch, or a later launch after a
+// Hard Reset; there's no persisted "first run" flag to go stale) and passes
+// the already-decided result through, so the decision itself stays testable
+// Node-side rather than living in this DOM-only, un-unit-testable script.
+const SHOW_SKIP = new URLSearchParams(location.search).get("skip") !== "0";
 
 const newIntroEl = document.getElementById("new-intro");
 const gatewaySelectRowEl = document.getElementById("gateway-select-row");
@@ -50,6 +58,8 @@ if (MODE === "edit") {
   btnUninstall.hidden = false;
   btnConnect.textContent = "Save changes"; // overwritten per-gateway once one's picked (fillFormForEdit)
   waitMsgEl.textContent = "Applying changes, please wait…";
+} else if (!SHOW_SKIP) {
+  btnSkip.hidden = true;
 }
 
 // Both control groups stay visible at all times -- only one is ever enabled,

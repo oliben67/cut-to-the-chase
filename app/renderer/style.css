@@ -796,11 +796,11 @@ body {
   align-items: center;
   gap: var(--toolbar-gap-sm, 8px);
 }
-/* Frequency/Live tracking only -- Recording lives outside this group now
-   (see index.html's comment on #section-recording for why). Hidden as a
-   whole (see app.js's setLiveHidden) whenever a loaded metric/recording is
-   being viewed, since neither means anything without live collection
-   happening. */
+/* Frequency/Live tracking -- Recording (#section-recording) is a DOM
+   sibling, not nested here (see index.html's comment for why), but both are
+   hidden together (see app.js's setLiveHidden) whenever a loaded
+   metric/recording is being viewed, since none of them mean anything
+   without live collection currently being watched. */
 #live-data-group {
   display: flex;
   align-items: center;

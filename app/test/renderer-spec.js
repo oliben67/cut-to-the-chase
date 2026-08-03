@@ -1324,6 +1324,41 @@
     ok(!open.has("/some/local/never-opened.cttc-metric"), "sanity: local path form never matches");
   });
 
+  await T("Load Analysis accepts a .cttc-record file, not just .cttc-metric (ui-EXPORT-011)", async () => {
+    // Previously this button's client-side filter only kept ".cttc-metric"
+    // paths, silently dropping ".cttc-record" even though the button's own
+    // label ("Load Data...") advertises
+    // accepting both -- see ui-EXPORT-011's stale "silently dropped" bullet.
+    const t0 = R.min_ts;
+    const res = await fetch(`${API}/sample/record`, {
+      method: "POST", body: new Uint8Array(0),
+      headers: { "X-CTTC-From": String(t0), "X-CTTC-To": String(t0 + 60000) },
+    });
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const realPath = "/tmp/cttc-e2e-load-analysis.cttc-record";
+    await window.cttc.writeBinaryFile(realPath, bytes);
+
+    const realPick = pickAnalysisFiles;
+    pickAnalysisFiles = async () => [realPath];
+    try {
+      // Awaits the actual onclick handler directly (it's a plain async
+      // function reference, not a DOM-dispatched event) rather than
+      // .click()-and-poll -- .click() doesn't return its promise, so
+      // polling for a side effect risked this test's own cleanup below
+      // racing the handler's still-in-flight refreshAll()/centering.
+      await $("btn-load-sample").onclick();
+      ok(
+        state.sources.some((s) => s.path === `upload://${realPath.split("/").pop()}`),
+        "the .cttc-record file's source(s) actually opened, not silently dropped"
+      );
+    } finally {
+      pickAnalysisFiles = realPick;
+      const opened = state.sources.filter((s) => s.path === `upload://${realPath.split("/").pop()}`);
+      for (const s of opened) await post("/close", { id: s.id });
+      await refreshAll();
+    }
+  });
+
   /* ── Recording (Start/Pause/Stop/Open Recording) ──────────────────────── */
 
   await T("Record -> Pause -> Resume -> Stop writes a real 2-segment .cttc-record, filename is only asked at Stop", async () => {
@@ -1647,11 +1682,13 @@
     await refreshAll();
   });
 
-  await T("Recording controls stay usable while viewing loaded metrics (br-REC-UI-001 regression)", async () => {
-    // #section-recording (Start/Pause/Stop/Open Recording) used to live
-    // inside #live-data-group, so it vanished the instant any sample was
-    // loaded (state.liveHidden true) -- silently blocking Open Recording
-    // (and Start Recording) from ever being clicked again.
+  await T("Recording controls hide along with live-data controls in analysis mode (ui-REC-013)", async () => {
+    // #section-recording (Start/Pause/Stop/Open Recording) lives outside
+    // #live-data-group in the DOM -- a structural fix for br-REC-UI-001 (it
+    // used to be nested there and vanish as an accidental side effect of
+    // that group's own hide toggle). It's still explicitly hidden together
+    // with the rest of the live-data controls in analysis mode, just via
+    // its own toggle in setLiveHidden rather than incidental DOM nesting.
     ok(
       !$("live-data-group").contains($("section-recording")),
       "#section-recording must live outside #live-data-group"
@@ -1661,7 +1698,7 @@
       { headers: authHeaders() }
     );
     const bytes = new Uint8Array(await res.arrayBuffer());
-    const realPath = "/tmp/cttc-e2e-recording-controls-visible.cttc-metric";
+    const realPath = "/tmp/cttc-e2e-recording-controls-hidden.cttc-metric";
     await window.cttc.writeBinaryFile(realPath, bytes);
     const r = await uploadAndResolveSegment(realPath);
     try {
@@ -1669,12 +1706,127 @@
       await refreshAll();
       eq(state.liveHidden, true, "now viewing loaded metrics");
       eq($("live-data-group").hidden, true, "Frequency/Live tracking hidden while viewing a sample");
-      eq($("section-recording").hidden, false, "Recording stays visible regardless");
-      eq($("btn-open-recording").hidden, false);
-      eq($("btn-open-recording").disabled, false);
+      eq($("section-recording").hidden, true, "Recording controls hidden too, by explicit design");
     } finally {
       for (const sid of r.opened) await post("/close", { id: sid });
       await refreshAll();
+      eq($("section-recording").hidden, false, "Recording controls visible again once back in live mode");
+    }
+  });
+
+  await T("Status-bar mode icon doesn't swap to analysis mode while actively recording", async () => {
+    const realStatus = recording.status;
+    setRecordingState({ status: "recording" });
+    const res = await fetch(
+      `${API}/files/download?from=${R.min_ts}&to=${R.max_ts}&include_host=0`,
+      { headers: authHeaders() }
+    );
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const realPath = "/tmp/cttc-e2e-recording-plus-metric.cttc-metric";
+    await window.cttc.writeBinaryFile(realPath, bytes);
+    const r = await uploadAndResolveSegment(realPath);
+    try {
+      ok(r.opened.length >= 1, "sample opened");
+      await refreshAll();
+      eq(state.liveHidden, true, "still functionally in analysis mode");
+      eq($("live-data-group").hidden, true, "live-data controls still hide normally");
+      eq(
+        $("status-bar-mode-live").hidden,
+        false,
+        "status-bar mode icon left showing live -- must not swap while actively recording"
+      );
+      eq($("status-bar-mode-record").hidden, true, "analysis-mode icon must not appear either, for the same reason");
+    } finally {
+      for (const sid of r.opened) await post("/close", { id: sid });
+      setRecordingState({ status: realStatus });
+      await refreshAll();
+    }
+  });
+
+  await T("centerViewOnLoadedStart centers on the earliest min_ts among just-opened sources", () => {
+    // A direct unit check against a fabricated state.sources entry, rather
+    // than a real upload: entity names are shared/reused across this whole
+    // long-running suite's many recordings, so a real source's reported
+    // min_ts reflects the earliest sample *ever* stored under that name
+    // this run, not just what this one test loaded -- exactly the kind of
+    // cross-source bleed this function must center past when it's the
+    // *live* feed doing the accumulating, but not what this unit itself
+    // should be judged against.
+    const realSources = state.sources;
+    const realView = state.view;
+    const fileStart = 1_700_000_000_000; // arbitrary, fixed, unrelated to any real fixture data
+    state.sources = [
+      ...state.sources,
+      { id: "e2e-fake-source", path: "upload://fake.cttc-metric", live: false, min_ts: fileStart, max_ts: fileStart + 30000 },
+    ];
+    try {
+      centerViewOnLoadedStart(["e2e-fake-source"]);
+      const center = (state.view.t0 + state.view.t1) / 2;
+      eq(center, fileStart, "view centered exactly on the fabricated source's min_ts");
+      eq(state.view.t1 - state.view.t0, DEFAULT_SPAN, "uses the default span width");
+    } finally {
+      state.sources = realSources;
+      state.view = realView;
+    }
+  });
+
+  await T("Returning to live mode restores the exact prior view instead of leaving it wherever analysis mode was", async () => {
+    const t0 = Date.now() - 999_000, t1 = Date.now() - 900_000; // a distinctive, non-default window
+    setView(t0, t1);
+    const wasLive = state.live;
+    eq(wasLive, false, "sanity: setView (no _follow) turns live-follow off");
+
+    const res = await fetch(
+      `${API}/files/download?from=${R.min_ts}&to=${R.max_ts}&include_host=0`,
+      { headers: authHeaders() }
+    );
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const realPath = "/tmp/cttc-e2e-restore-view.cttc-metric";
+    await window.cttc.writeBinaryFile(realPath, bytes);
+    const r = await uploadAndResolveSegment(realPath);
+    try {
+      ok(r.opened.length >= 1, "sample opened");
+      await refreshAll();
+      centerViewOnLoadedStart(r.opened); // matches what the real Load Analysis/Open Recording button flow does
+      eq(state.liveHidden, true, "now in analysis mode");
+      ok(
+        state.view.t0 !== t0 || state.view.t1 !== t1,
+        "analysis mode must actually change the view, not leave the old live window showing"
+      );
+    } finally {
+      for (const sid of r.opened) await post("/close", { id: sid });
+      await refreshAll();
+      eq(state.liveHidden, false, "back in live mode");
+      eq(state.view.t0, t0, "the exact prior view's start is restored");
+      eq(state.view.t1, t1, "the exact prior view's end is restored");
+      eq(state.live, wasLive, "the prior live-follow flag is restored too");
+    }
+  });
+
+  await T("Loading a single (non-segmented) metric still populates the metric(s) dropdown with one entry", async () => {
+    // Generalizes what #record-sections used to only do for a real
+    // multi-segment .cttc-record: it now always reflects whatever is
+    // currently loaded, even a plain single .cttc-metric with no segment
+    // ambiguity at all -- previously this case called
+    // setActiveRecordSections(null), hiding the dropdown outright.
+    const res = await fetch(
+      `${API}/files/download?from=${R.min_ts}&to=${R.max_ts}&include_host=0`,
+      { headers: authHeaders() }
+    );
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const realPath = "/tmp/cttc-e2e-single-metric-dropdown.cttc-metric";
+    await window.cttc.writeBinaryFile(realPath, bytes);
+    const r = await uploadAndResolveSegment(realPath);
+    try {
+      ok(r.opened.length >= 1, "sample opened");
+      await until(() => !$("record-sections").hidden, "metric(s) dropdown shown even for a single metric");
+      eq($("record-sections").options.length, 1, "exactly one entry -- nothing else to switch to");
+      eq($("record-sections").title, "metric(s)");
+      eq(activeRecordSections.activeIndex, 0);
+    } finally {
+      for (const sid of r.opened) await post("/close", { id: sid });
+      await refreshAll();
+      eq($("record-sections").hidden, true, "hidden again once back in live mode");
     }
   });
 
@@ -1819,6 +1971,51 @@
       $("app-status-bar-text").textContent.includes("something else happened in the meantime"),
       "the newer message must survive the stale cap timer, not get clobbered back to blank"
     );
+  });
+
+  await T("notifyEvent auto-clears after the configured statusBarClearSecs", async () => {
+    const real = statusBarClearSecs;
+    statusBarClearSecs = 0.2; // 200ms -- the real UI only allows whole seconds >= 1
+    try {
+      notifyEvent("e2e general auto-clear test message");
+      ok($("app-status-bar-text").textContent.includes("e2e general auto-clear test message"));
+      await sleep(350);
+      eq($("app-status-bar-text").textContent, "", "cleared without needing notifyEventWithCap's own separate cap");
+    } finally {
+      statusBarClearSecs = real;
+    }
+  });
+
+  await T("setStatusBarClearSecs clamps below 1 and persists", () => {
+    const real = statusBarClearSecs;
+    try {
+      setStatusBarClearSecs(0);
+      eq(statusBarClearSecs, 1, "clamped up to the 1s floor");
+      setStatusBarClearSecs(12);
+      eq(statusBarClearSecs, 12);
+      eq($("status-bar-clear-secs-sidebar").value, "12");
+      eq(prefs.get("statusBarClearSecs", null), 12, "persisted");
+    } finally {
+      setStatusBarClearSecs(real);
+      prefs.set("statusBarClearSecs", real);
+    }
+  });
+
+  await T("notifyEvent appends after a separator instead of replacing while actively recording", () => {
+    const realStatus = recording.status;
+    try {
+      setRecordingState({ status: "recording" });
+      notifyEvent("first message while recording");
+      const first = $("app-status-bar-text").textContent;
+      ok(first.includes("first message while recording"));
+      notifyEvent("second message while recording");
+      const second = $("app-status-bar-text").textContent;
+      ok(second.startsWith(first), "the first message must survive, not get replaced");
+      ok(second.includes(" | "), "joined by a single bar separator");
+      ok(second.includes("second message while recording"));
+    } finally {
+      setRecordingState({ status: realStatus });
+    }
   });
 
   await T("status bar History records notifyEvent/flashStatus and renders newest-first", () => {

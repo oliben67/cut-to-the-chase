@@ -215,6 +215,9 @@ let liveTrackEnabled = prefs.get("liveTrackEnabled", true);
 // its own (seconds). 0 disables auto-resume -- stays paused until the user
 // clicks "now" themselves, matching drag/context-menu zoom.
 let dblclickResumeSecs = prefs.get("dblclickResumeSecs", 10);
+// How long a non-persistent bottom status-bar message (notifyEvent) stays
+// before auto-clearing (seconds) -- see notifyEvent/scheduleStatusBarClear.
+let statusBarClearSecs = prefs.get("statusBarClearSecs", 5);
 
 // bytes/sec -> the largest unit (GB/MB/kB/B) that keeps the number >= 1,
 // one decimal place -- used for the NET strip's axis labels and tooltip.
@@ -2805,14 +2808,24 @@ async function uploadFile(localPath, segment) {
 // Shared by "Load metrics" and "Open Recording": upload once, and if the
 // server comes back asking which segment (a multi-segment recording, see
 // merge_sample_bytes/MultiSegmentSample), load the first recorded segment
-// automatically -- no prompt -- and remember the full list via
-// setActiveRecordSections so the #record-sections dropdown (right of Back
-// to live tracking) is populated immediately and lets the user switch to
-// any of the *other* segments afterward.
+// automatically -- no prompt. Either way, remember it via
+// setActiveRecordSections so the #record-sections "metric(s)" dropdown
+// (right of Back to live tracking) is always populated with whatever is
+// currently loaded -- one entry for a plain single metric, one per segment
+// for a multi-segment recording -- and lets the user switch to any of the
+// *other* entries afterward.
 async function uploadAndResolveSegment(path) {
   const first = await uploadFile(path);
   if (!first.needs_selection?.length) {
-    setActiveRecordSections(null);
+    if (!first.opened?.length) {
+      setActiveRecordSections(null);
+      return first;
+    }
+    // No real segment metadata for a plain, non-ambiguous file -- a single
+    // synthetic entry labeled with the filename still gives the dropdown
+    // something to show, per its "always reflects what's loaded" contract.
+    const segments = [{ index: 0, label: basename(path) }];
+    setActiveRecordSections({ path, segments, activeIndex: 0, openedIds: first.opened });
     return first;
   }
   const segments = first.needs_selection[0].segments;
@@ -2822,17 +2835,16 @@ async function uploadAndResolveSegment(path) {
   return res;
 }
 
-// Tracks the most recently opened multi-segment .cttc-record/.cttc-metric
-// file (null once there isn't one, or it only had a single segment) so
-// #record-sections can offer switching to any OTHER segment without
-// re-running the one-shot picker -- see uploadAndResolveSegment above and
-// this dropdown's own onchange handler below.
+// Tracks the currently loaded metric(s)/recording segment(s) (null once
+// nothing loaded is open) so #record-sections can offer switching to any
+// OTHER entry without re-running the upload -- see uploadAndResolveSegment
+// above and this dropdown's own onchange handler below.
 let activeRecordSections = null; // {path, segments, activeIndex, openedIds}
 
 function setActiveRecordSections(next) {
   activeRecordSections = next;
   const sel = $("record-sections");
-  if (!next || next.segments.length < 2) {
+  if (!next) {
     sel.hidden = true;
     sel.innerHTML = "";
     return;
@@ -2841,7 +2853,7 @@ function setActiveRecordSections(next) {
   for (const seg of next.segments) {
     const opt = document.createElement("option");
     opt.value = String(seg.index);
-    opt.textContent = `${fmtIso(seg.from)} — ${fmtIso(seg.to)}`;
+    opt.textContent = seg.label ?? `${fmtIso(seg.from)} — ${fmtIso(seg.to)}`;
     sel.appendChild(opt);
   }
   sel.value = String(next.activeIndex);
@@ -2860,24 +2872,57 @@ $("record-sections").onchange = async () => {
   await refreshAll();
 };
 
-$("btn-load-sample").onclick = async () => {
-  let paths = [];
-  if (window.cttc?.pickFiles) paths = await window.cttc.pickFiles();
-  else {
-    const p = prompt("Path to .cttc-metric file:");
-    if (p) paths = [p];
+// Same pattern as pickRecordingSavePath: a named wrapper around the native
+// picker so tests can substitute canned paths instead of driving a real
+// file dialog (which can't run headlessly) -- see ui-EXPORT-011.
+async function pickAnalysisFiles() {
+  if (!window.cttc?.pickFiles) {
+    const p = prompt("Path to .cttc-metric or .cttc-record file:");
+    return p ? [p] : [];
   }
+  return window.cttc.pickFiles("Load Analysis", [
+    { name: "CTTC analysis files", extensions: ["cttc-metric", "cttc-record"] },
+  ]);
+}
+
+// Centers the view on the earliest min_ts among just-opened sources,
+// instead of resetZoom()'s "fit the combined range" -- recording keeps
+// ingesting live data in the background regardless of what's shown (see
+// ui-REC-013), so the combined /range can span from the loaded file's own
+// history all the way to "now", making the file itself look like a sliver
+// (or vice versa) rather than showing what was actually just loaded.
+// Reads from state.sources (already refreshed by the caller's own
+// refreshAll(), which is /sources-backed and so already carries min_ts).
+function centerViewOnLoadedStart(openedIds) {
+  const opened = new Set(openedIds);
+  const starts = state.sources
+    .filter((s) => opened.has(s.id) && s.min_ts != null)
+    .map((s) => s.min_ts);
+  if (!starts.length) return;
+  const start = Math.min(...starts);
+  setView(start - DEFAULT_SPAN / 2, start + DEFAULT_SPAN / 2);
+}
+
+$("btn-load-sample").onclick = async () => {
+  const paths = await pickAnalysisFiles();
   const open = openPaths();
   const files = paths.filter(
-    (p) => p.endsWith(".cttc-metric") && !open.has(`upload://${basename(p)}`)
+    (p) =>
+      (p.endsWith(".cttc-metric") || p.endsWith(".cttc-record")) &&
+      !open.has(`upload://${basename(p)}`)
   );
   if (!files.length) return;
   try {
     const errors = [];
-    for (const path of files) errors.push(...((await uploadAndResolveSegment(path)).errors || []));
+    const openedIds = [];
+    for (const path of files) {
+      const res = await uploadAndResolveSegment(path);
+      errors.push(...(res.errors || []));
+      openedIds.push(...(res.opened || []));
+    }
     if (errors.length) alert(errors.map((e) => `${e.path}: ${e.error}`).join("\n"));
     await refreshAll(); // also switches into analysis mode -- see setLiveHidden
-    resetZoom(); // show the full timeline, including the newly loaded metrics
+    centerViewOnLoadedStart(openedIds);
   } catch (err) {
     alert(String(err.message || err));
   }
@@ -3124,8 +3169,11 @@ async function stopRecording() {
 
 async function openRecording() {
   let paths = [];
-  if (window.cttc?.pickFiles) paths = await window.cttc.pickFiles("Open Recording");
-  else {
+  if (window.cttc?.pickFiles) {
+    paths = await window.cttc.pickFiles("Open Recording", [
+      { name: "CTTC recording", extensions: ["cttc-record"] },
+    ]);
+  } else {
     const p = prompt("Path to a recorded .cttc-record file:");
     if (p) paths = [p];
   }
@@ -3133,10 +3181,15 @@ async function openRecording() {
   if (!files.length) return;
   try {
     const errors = [];
-    for (const path of files) errors.push(...((await uploadAndResolveSegment(path)).errors || []));
+    const openedIds = [];
+    for (const path of files) {
+      const res = await uploadAndResolveSegment(path);
+      errors.push(...(res.errors || []));
+      openedIds.push(...(res.opened || []));
+    }
     if (errors.length) alert(errors.map((e) => `${e.path}: ${e.error}`).join("\n"));
     await refreshAll(); // also switches into analysis mode -- see setLiveHidden
-    resetZoom();
+    centerViewOnLoadedStart(openedIds);
   } catch (err) {
     alert(String(err.message || err));
   }
@@ -3318,8 +3371,35 @@ if (!POPOUT_KIND) {
   syncStatusBarVisibility();
 }
 function notifyEvent(text) {
-  $("app-status-bar-text").textContent = `${new Date().toLocaleTimeString()} — ${text}`;
+  const entry = `${new Date().toLocaleTimeString()} — ${text}`;
+  const el = $("app-status-bar-text");
+  // Recording keeps capturing the live feed regardless of analysis mode
+  // (see setLiveHidden) -- while actively recording, a new notification
+  // must not blow away whatever's already shown there; append it after a
+  // single bar separator instead of replacing outright.
+  if ((recording.status === "recording" || recording.status === "paused") && el.textContent) {
+    el.textContent = `${el.textContent} | ${entry}`;
+  } else {
+    el.textContent = entry;
+  }
   recordStatusBarHistory(text);
+  scheduleStatusBarClear();
+}
+
+// Auto-clears the bottom status bar after the configured
+// statusBarClearSecs, unless something else has already overwritten it by
+// then (checked, not just timed, so a fast follow-up message isn't cut
+// short by an earlier message's own timer) -- every notifyEvent call goes
+// through this. Ongoing/ticking statuses (the live-resume countdown, see
+// updateLiveResumeUI) write app-status-bar-text directly, bypassing
+// notifyEvent entirely, so they're unaffected by this timer.
+let statusBarClearTimer = null;
+function scheduleStatusBarClear() {
+  clearTimeout(statusBarClearTimer);
+  const shown = $("app-status-bar-text").textContent;
+  statusBarClearTimer = setTimeout(() => {
+    if ($("app-status-bar-text").textContent === shown) $("app-status-bar-text").textContent = "";
+  }, statusBarClearSecs * 1000);
 }
 
 // Same as notifyEvent, but force-clears the status bar after `ms` unless
@@ -3327,6 +3407,9 @@ function notifyEvent(text) {
 // "application starting" (see this app's own boot block, ui-SBAR-006) so a
 // quiet boot with nothing else to report doesn't leave it on screen
 // indefinitely instead of being cleared shortly past the app's own render.
+// Independent of the general statusBarClearSecs setting above: this is a
+// specific, already-documented "max 3 seconds" requirement, not the
+// general default.
 function notifyEventWithCap(text, ms) {
   notifyEvent(text);
   const shown = $("app-status-bar-text").textContent;
@@ -3932,6 +4015,18 @@ function setDblclickResumeSecs(v) {
 }
 setDblclickResumeSecs(dblclickResumeSecs); // apply the persisted value on load
 $("dblclick-resume-secs-sidebar").oninput = (e) => setDblclickResumeSecs(e.target.value);
+
+// How long a non-persistent bottom status-bar message stays before
+// auto-clearing -- see notifyEvent. Never below 1s (0 would mean "never
+// actually show", not "clear immediately").
+function setStatusBarClearSecs(v) {
+  const secs = Math.max(1, Math.floor(Number(v)) || 1);
+  statusBarClearSecs = secs;
+  prefs.set("statusBarClearSecs", secs);
+  $("status-bar-clear-secs-sidebar").value = secs;
+}
+setStatusBarClearSecs(statusBarClearSecs); // apply the persisted value on load
+$("status-bar-clear-secs-sidebar").oninput = (e) => setStatusBarClearSecs(e.target.value);
 
 // Settings and Preferences, one dialog: a left-hand pane list (mac System
 // Settings-style, see .mac-settings in style.css) with the selected pane's
@@ -4958,14 +5053,62 @@ $("splitter").addEventListener("mousedown", (e) => {
 // refreshAll() based on whether any sample/recording source is actually
 // present, so it always matches reality rather than only the instant a
 // file finishes uploading.
+// Set right before entering analysis mode so "Back to live tracking" can
+// restore the exact prior view instead of leaving it wherever analysis
+// mode happened to pan/zoom to -- see setLiveHidden below.
+let savedLiveView = null; // {t0, t1, live}
+
 function setLiveHidden(hidden) {
+  const wasHidden = state.liveHidden;
   state.liveHidden = hidden;
   $("toolbar-mode-live").hidden = hidden;
   $("toolbar-mode-record").hidden = !hidden;
   $("live-data-group").hidden = hidden;
+  // ui-REC-013: recording controls (Start/Pause/Stop/Open Recording) hide
+  // along with the rest of the live-data controls while in analysis mode --
+  // reversed from the earlier "stay visible regardless" fix, per explicit
+  // user direction, since the app should read as fully in analysis mode,
+  // not a hybrid.
+  $("section-recording").hidden = hidden;
   $("btn-back-to-live").hidden = !hidden;
-  $("status-bar-mode-live").hidden = hidden;
-  $("status-bar-mode-record").hidden = !hidden;
+  // Recording keeps capturing the live feed in the background regardless
+  // of analysis mode -- if a metric/recording gets loaded while actively
+  // recording, the status bar's mode icon must NOT swap to "Analysis
+  // mode": leave it (and the recording dot/glyph/text right next to it)
+  // exactly as-is instead of presenting a confusing hybrid state. Any
+  // other message that still needs the status bar goes through
+  // notifyEvent, which appends after a separator rather than replacing --
+  // see its own docstring.
+  if (recording.status !== "recording" && recording.status !== "paused") {
+    $("status-bar-mode-live").hidden = hidden;
+    $("status-bar-mode-record").hidden = !hidden;
+  }
+  if (hidden && !wasHidden) {
+    // Entering analysis mode: remember the live view so returning to it
+    // restores exactly this, rather than whatever analysis mode leaves it
+    // panned/zoomed to.
+    savedLiveView = state.view ? { t0: state.view.t0, t1: state.view.t1, live: state.live } : null;
+  } else if (!hidden && wasHidden) {
+    // Leaving analysis mode: restore the saved view (resuming live-follow
+    // too, if it was on) rather than leaving the view stuck wherever
+    // analysis mode was last panned/zoomed to. No saved view (e.g. the
+    // very first transition) falls back to the normal "jump to now".
+    if (savedLiveView) {
+      state.live = savedLiveView.live;
+      setView(savedLiveView.t0, savedLiveView.t1, { _follow: true });
+      if (state.live) followNow();
+    } else {
+      goLive();
+    }
+    savedLiveView = null;
+    // Any leftover analysis-mode notification (e.g. an upload error) has
+    // no bearing on live mode -- clear it outright rather than waiting out
+    // its own auto-clear timer. #status-bar-recording-text is a separate
+    // element, untouched by this, so an actually-still-running recording's
+    // own status is unaffected.
+    clearTimeout(statusBarClearTimer);
+    $("app-status-bar-text").textContent = "";
+  }
   // Back live -- #record-sections' own self-heal (refreshAll, above) only
   // fires once its tracked sources are actually gone, which isn't
   // necessarily true the instant this specific call happens (a caller

@@ -13,6 +13,7 @@ const {
   hostFromTarget,
 } = require("./lib/connection-config");
 const { hasLocalDocker, canBeServerLocally } = require("./lib/docker-check");
+const { shouldShowSkipButton } = require("./lib/gateway-setup-visibility");
 const { writeKeyFile, copyKeyFile } = require("./lib/ssh-key-file");
 const {
   ensureLocalContainer,
@@ -633,10 +634,11 @@ async function createWindow() {
   }
 }
 
-ipcMain.handle("pick-files", async (_e, title) => {
+ipcMain.handle("pick-files", async (_e, title, filters) => {
   const r = await dialog.showOpenDialog({
     title: title || "Open log / stats files",
     properties: ["openFile", "multiSelections"],
+    filters: filters || [{ name: "All Files", extensions: ["*"] }],
   });
   return r.canceled ? [] : r.filePaths;
 });
@@ -1067,7 +1069,7 @@ async function connectRemoteGateway(cfg, { onLog, forceTunnel = false } = {}) {
 }
 
 let wizardWindow = null;
-function runSetupWizard() {
+function runSetupWizard(dockerDetected) {
   return new Promise((resolve, reject) => {
     let settled = false;
     wizardWindow = new BrowserWindow({
@@ -1100,7 +1102,10 @@ function runSetupWizard() {
     });
     wizardWindow.setMenuBarVisibility(false);
     attachEditContextMenu(wizardWindow);
-    wizardWindow.loadFile(path.join(__dirname, "renderer", "gateway-setup.html"), { search: "mode=new" });
+    const showSkip = shouldShowSkipButton({ mode: "new", dockerDetected });
+    wizardWindow.loadFile(path.join(__dirname, "renderer", "gateway-setup.html"), {
+      search: `mode=new&skip=${showSkip ? "1" : "0"}`,
+    });
     wizardWindow.on("closed", () => {
       // The splash was already closed once this window's own 'ready-to-show'
       // fired, so this window closing (successfully submitted, or
@@ -1775,7 +1780,12 @@ app.whenReady().then(async () => {
     narrate("checking for a local Docker installation...");
     if (cfg.mode === "embedded" && !(await canBeServerLocally())) {
       try {
-        await runSetupWizard();
+        // A separate, more granular probe than canBeServerLocally() (which
+        // also requires ssh, needed for reaching *other* Docker hosts, not
+        // just running the gateway locally) -- "Skip -- use this machine"
+        // inside the wizard only makes sense to offer when Docker itself is
+        // actually present to fall back to.
+        await runSetupWizard(await hasLocalDocker());
       } catch {
         // declined (Skip, or just closed the window) -- give local docker a
         // genuine try (docker compose up) rather than trusting the earlier
