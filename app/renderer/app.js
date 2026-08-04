@@ -555,7 +555,7 @@ function hostTelemetryLabel() {
   const src = state.sources.find((s) => s.kind === "stats" && s.is_host);
   const name = String(src?.name || "");
   const host = name.startsWith("host@") ? name.slice("host@".length) : "";
-  if (!host || host === "local") return "Host telemetry — this machine";
+  if (!host || host === "local") return "Host telemetry — localhost";
   return `Host telemetry — ${host}`;
 }
 
@@ -1202,23 +1202,26 @@ function hasDockerDaemon() {
   return state.sources.some((s) => /^docker:\/\//.test(s.path || ""));
 }
 
-// Edit/Remove Docker Host only make sense once something is actually
-// being watched -- enabling them regardless invited editing/removing a
-// daemon that doesn't exist (Edit would show a locked, empty form; Remove
-// had nothing to close). Called after every state.sources refresh.
+// Remove Docker Host only makes sense once something is actually saved --
+// enabling it regardless would have nothing to forget. Connect Docker Host
+// stays enabled either way now: with a host already active it opens
+// straight into that host's locked edit view instead of a blank create
+// form (see btn-set/enterDockerHostEditMode below) -- there's no separate
+// Edit button left to gate. Called after every state.sources refresh.
 function syncDockerDaemonButtons() {
-  const active = hasDockerDaemon();
-  $("btn-edit-docker-daemon").disabled = !active;
-  $("btn-clear-sources").disabled = !active;
-  // Only one Docker host can be watched at a time -- Set Docker Host
-  // is for defining the first one; once one exists, use Edit Docker
-  // Daemon (or Disconnect it first) instead of starting a second one.
-  $("btn-set").disabled = active;
+  $("btn-clear-sources").disabled = !hasDockerDaemon();
   // Remove Docker Host (permanently forgetting a saved one) is independent
   // of whether anything is currently connected -- it operates on the saved
   // catalog (savedDockerDaemons), not on state.sources.
   $("btn-remove-docker-daemon").disabled = Object.keys(prefs.get("savedDockerDaemons", {})).length === 0;
+  refreshDockerHostPill();
 }
+
+// Reassigned by the Docker host pill IIFE further down (its DOM doesn't
+// exist yet here) -- called on every state.sources refresh so the pill's
+// dot/tooltip reflect the current connection without needing the dropdown
+// to be opened first.
+let refreshDockerHostPill = () => {};
 
 const dlgExport = $("dlg-export");
 
@@ -1988,7 +1991,7 @@ class Panel {
     const close = document.createElement("button");
     close.className = "close";
     close.textContent = "✕";
-    close.title = "Disable this container's telemetry (logs + chart) -- keeps collecting in the background, still Set Docker Host-synced";
+    close.title = "Disable this container's telemetry (logs + chart) -- keeps collecting in the background, still Connect Docker Host-synced";
     // Same hide as switching it off from the Telemetry legend -- not an
     // actual /close: collection keeps running server-side, and re-enabling
     // it (from the legend) brings this exact panel back at the same spot,
@@ -2493,9 +2496,35 @@ function openPaths() {
 // Fetch has shown what's actually on the host.
 let dockerFormFetched = false;
 
+// Whether a Fetch/Refresh attempt has completed at least once for the
+// *current* dialog session, success or failure -- unlike dockerFormFetched
+// (success only, gates the checklist), this gates Show activity: a failed
+// attempt still has an activity log worth seeing (arguably more worth
+// seeing than a successful one), so it shouldn't stay locked out just
+// because the connection didn't work. Reset on every dialog open (see
+// btn-set's create and edit-mode branches), set in listContainers()'s finally.
+let dockerFetchAttempted = false;
+
+// Show activity has nothing to show until a remote target has actually
+// been probed (br-DHOST-001/BUG-0067) -- but an empty Docker host is a
+// complete, valid target on its own (the gateway's local daemon, nothing
+// to type), so it's exempt: only a *non-empty* host with no fetch attempt
+// yet counts as "not entered". Deliberately disables rather than hides --
+// ui-DHOST-016 ("Show activity always visible") is about the control never
+// disappearing, not about it always being clickable.
+function syncActivityToggleEnabled() {
+  const remoteNotYetTested = $("docker-host").value.trim() !== "" && !dockerFetchAttempted;
+  $("activity-toggle").disabled = remoteNotYetTested;
+  if (remoteNotYetTested) {
+    $("activity-toggle").checked = false;
+    $("docker-activity").hidden = true;
+  }
+}
+$("docker-host").addEventListener("input", syncActivityToggleEnabled);
+
 // Whether the dialog is currently in "Edit Docker Host" mode -- listContainers()'s
 // finally-block needs this so a Refresh doesn't unlock the host/ssh-key
-// fields that Edit mode deliberately locked (see btn-edit-docker-daemon
+// fields that Edit mode deliberately locked (see enterDockerHostEditMode
 // below): Fetch (create mode) and Refresh (edit mode) share the exact same
 // listContainers() function, so the difference has to be tracked here
 // rather than duplicated per-caller.
@@ -2517,7 +2546,7 @@ const DEFAULT_ON_TRANSFORMS = new Set(["json_message", "parse_level"]);
 // the moment Edit Docker Host opens, and what the checklist's checked
 // defaults/missing-detection are driven by from then on (not state.track,
 // which is a this-session-only, in-memory legend concern). Reset to empty
-// by Set Docker Host -- a fresh daemon starts with nothing preselected,
+// by Connect Docker Host -- a fresh daemon starts with nothing preselected,
 // never carrying over a stale file from some earlier, unrelated session.
 let selectedTargets = { containers: new Set(), services: new Set() };
 
@@ -2543,8 +2572,8 @@ async function saveSelectedTargets(hostKey, { containers, services }) {
 }
 
 // Every daemon ever successfully Set/Updated (see savedDockerDaemons' write
-// site further down), newest-used first -- backs both the "Load daemon"
-// dropdown here and the Remove Docker Host picker.
+// site further down), newest-used first -- backs both the "Load Docker
+// Host" dropdown here and the Remove Docker Host picker.
 function dockerHostHistory() {
   const saved = prefs.get("savedDockerDaemons", {});
   return Object.entries(saved)
@@ -2552,36 +2581,60 @@ function dockerHostHistory() {
     .sort((a, b) => (b.lastUsed || 0) - (a.lastUsed || 0));
 }
 
-// Fills the Set Docker Host dialog's "Load daemon" dropdown -- hidden
-// entirely (rather than just empty) when there's no history yet, so a
-// first-time user isn't shown a picker with nothing useful in it.
+// Fills the Connect Docker Host dialog's "Load Docker Host" dropdown --
+// hidden entirely (rather than just empty) when there's no history yet, so
+// a first-time user isn't shown a picker with nothing useful in it.
 function populateDockerHostHistory() {
   const history = dockerHostHistory();
   $("docker-host-history-row").hidden = history.length === 0;
   const select = $("docker-host-history");
-  select.innerHTML = '<option value="">— pick a previously used daemon —</option>';
+  select.innerHTML = '<option value="">— pick a previously used Docker host —</option>';
   for (const entry of history) {
     const opt = document.createElement("option");
     opt.value = entry.hostKey;
-    opt.textContent = entry.hostKey === "local" ? "This machine" : entry.hostKey.replace(/^ssh:\/\//, "");
+    opt.textContent = entry.hostKey === "local" ? "localhost" : entry.hostKey.replace(/^ssh:\/\//, "");
     select.appendChild(opt);
   }
   select.value = "";
 }
-$("docker-host-history").onchange = () => {
+
+// Picking a previously-used Docker host here now does what a separate Edit
+// Docker Host button used to, for a *disconnected* one: pre-fills its ssh
+// key and whatever containers/services it last had selected, then
+// immediately re-probes it live. Host/ssh-key stay editable here (unlike
+// enterDockerHostEditMode below) since nothing is actually connected yet --
+// there's no live identity that needs protecting from being changed.
+$("docker-host-history").onchange = async () => {
   const hostKey = $("docker-host-history").value;
   if (!hostKey) return;
   const entry = dockerHostHistory().find((e) => e.hostKey === hostKey);
   if (!entry) return;
   $("docker-host").value = hostKey === "local" ? "" : hostKey.replace(/^ssh:\/\//, "");
   $("docker-ssh-key").value = entry.ssh_key || "";
+  // Loading a *different* saved host supersedes whatever the current
+  // dialog session already fetched (if anything) -- that answer was for the
+  // host just replaced, not this one.
+  dockerFetchAttempted = false;
+  selectedTargets = await loadSelectedTargets(hostKey);
+  const { containers, services } = currentlyTrackedTargets(hostKey);
+  renderDockerTargets(containers, services, hostKey);
+  syncActivityToggleEnabled();
+  await listContainers();
 };
 
 // Every control except Docker host / SSH key / Fetch starts empty and
 // disabled -- there's nothing to configure until Fetch has actually shown
 // what's running on the host currently typed in (see setDockerFormEnabled),
-// so nothing here is populated or enabled speculatively.
-$("btn-set").onclick = () => {
+// so nothing here is populated or enabled speculatively. With a Docker host
+// already active there's nothing new to create, so this opens straight
+// into that host's locked edit view instead (see enterDockerHostEditMode) --
+// the same place a separate Edit Docker Host button used to lead.
+$("btn-set").onclick = async () => {
+  if (hasDockerDaemon()) {
+    dlg.showModal();
+    await enterDockerHostEditMode(currentDockerHost() || "local");
+    return;
+  }
   dockerDaemonEditMode = false;
   // A fresh daemon starts with nothing preselected -- never carries over
   // some earlier, unrelated host's persisted selection.
@@ -2591,34 +2644,33 @@ $("btn-set").onclick = () => {
   $("docker-ssh-key").value = "";
   $("docker-ssh-key").disabled = false;
   $("docker-ssh-key-browse").disabled = false;
-  $("dlg-set-title").textContent = "Set Docker Host";
+  $("dlg-set-title").textContent = "Connect Docker Host";
   $("btn-ps-refresh-label").textContent = "Fetch Sources";
-  $("dlg-ok").textContent = "Set Docker Host";
+  $("dlg-ok").textContent = "Connect Docker Host";
   $("docker-targets").innerHTML = "";
   $("transforms-list").innerHTML = "none found in server/transforms/";
   $("docker-error").textContent = "";
   setDockerFormEnabled(false);
   renderActivityLog(null);
+  dockerFetchAttempted = false;
+  syncActivityToggleEnabled();
   populateDockerHostHistory();
   dlg.showModal();
 };
 
-// Reopens the same dialog pre-pointed at whatever Docker host is
-// currently active (see currentDockerHost()/dockerHostKeys) -- host and ssh
-// key are locked (this is "reconfigure/refresh what's already set", not
-// "pick a new target": use Set Docker Host for that), and Fetch becomes
-// Refresh, since it's re-probing a known daemon rather than connecting to a
-// new one. Submitting still goes through the same dlg-ok handler as the
-// create flow -- disabled inputs' .value reads normally, so nothing there
-// needs to branch on which button opened the dialog.
-$("btn-edit-docker-daemon").onclick = async () => {
+// Reopens the dialog pre-pointed at hostKey -- host and ssh key are locked
+// (this is "reconfigure/refresh what's already set", not "pick a new
+// target": use the Load Docker Host dropdown above for that instead), and
+// Fetch becomes Refresh, since it's re-probing a known daemon rather than
+// connecting to a new one. Only ever called for the currently-active host
+// (see btn-set above) -- submitting still goes through the same dlg-ok
+// handler as the create flow, disabled inputs' .value reads normally.
+async function enterDockerHostEditMode(hostKey) {
   dockerDaemonEditMode = true;
-  const host = currentDockerHost();
-  const hostKey = host || "local";
-  // Load daemon only makes sense when picking a *new* target -- Edit's
-  // host/ssh-key are locked to the daemon already being edited.
+  // Load Docker Host only makes sense when picking a *new* target -- this
+  // host is already locked in, so it can't be replaced from the dropdown.
   $("docker-host-history-row").hidden = true;
-  $("docker-host").value = host ? host.replace(/^ssh:\/\//, "") : "";
+  $("docker-host").value = hostKey === "local" ? "" : hostKey.replace(/^ssh:\/\//, "");
   $("docker-host").disabled = true;
   $("docker-ssh-key").value = dockerHostKeys.get(hostKey) || "";
   $("docker-ssh-key").disabled = true;
@@ -2640,7 +2692,8 @@ $("btn-edit-docker-daemon").onclick = async () => {
   renderDockerTargets(containers, services, hostKey);
   setDockerFormEnabled(true);
   renderActivityLog(null);
-  dlg.showModal();
+  dockerFetchAttempted = false;
+  syncActivityToggleEnabled();
   // Edit Docker Host always opens onto the daemon's *actual* current
   // state, not a snapshot from whenever it was last set -- run the same
   // live probe Refresh does immediately, so a container that's since
@@ -2648,7 +2701,7 @@ $("btn-edit-docker-daemon").onclick = async () => {
   // renderDockerTargets' closeMissing) right away rather than only after
   // the user remembers to click Refresh themselves.
   await listContainers();
-};
+}
 
 // Toggles every "what to collect" control except Docker host/SSH key/Fetch
 // itself -- there's nothing meaningful to set until Fetch has shown what's
@@ -2680,30 +2733,36 @@ function updateDlgOkEnabled() {
 // Closes every open source for the currently-connected daemon and drops it
 // from the auto-reconnect-on-launch list (lastDockerSessions), so it
 // doesn't silently come right back next launch -- but keeps its entry in
-// savedDockerDaemons, so it still shows up in Load daemon (Set Docker
-// Daemon) and Remove Docker Host. "Disconnect", not "forget" -- use
+// savedDockerDaemons, so it still shows up in Load Docker Host (Connect
+// Docker Host) and Remove Docker Host. "Disconnect", not "forget" -- use
 // Remove Docker Host for that.
 $("btn-clear-sources").onclick = async () => {
   if (!state.sources.length) return; // nothing to clear -- no point asking
-  if (!confirm(`Close all ${state.sources.length} open source${state.sources.length === 1 ? "" : "s"}? You can reconnect it later via Load daemon.`)) return;
+  if (!confirm(`Close all ${state.sources.length} open source${state.sources.length === 1 ? "" : "s"}? You can reconnect it later via Load Docker Host.`)) return;
   const hostKey = currentDockerHost() || "local";
   try {
     await Promise.all(state.sources.map((s) => post("/close", { id: s.id })));
     const sessions = prefs.get("lastDockerSessions", []);
     prefs.set("lastDockerSessions", sessions.filter((s) => (s.host || "local") !== hostKey));
     await refreshAll();
-    // If Edit Docker Host is open on the daemon just cleared, it's left
-    // pointing at a host that no longer exists, with docker-host still
-    // locked disabled (see btn-edit-docker-daemon) -- nothing else re-opens
-    // or resets it, so without this it stays stuck disabled even after the
-    // toolbar's own Set Docker Host re-enables (bug: this used to be the
-    // only way stuck). Closing it is safe: its whole premise (editing the
-    // daemon that was just removed) is gone.
-    if (dlg.open) {
-      dlg.close();
-      dockerDaemonEditMode = false;
-      $("docker-host").disabled = false;
-    }
+    // #dlg-set is a showModal() dialog -- it's structurally impossible to
+    // reach this handler while it's open (the modal blocks the toolbar), so
+    // there's nothing to close here. What's real: dockerDaemonEditMode (and
+    // the host/ssh-key/browse .disabled flags it drives) is set by whichever
+    // branch of btn-set the dialog was *last* opened into (create mode or
+    // enterDockerHostEditMode), and only ever reset when *opened*, not when
+    // it's closed -- so a Cancel or successful submit out of Edit mode
+    // leaves it true. Disconnect is exactly the moment that
+    // staleness stops being harmless: the daemon it was tracking is gone,
+    // so unconditionally clearing it here (regardless of what refreshAll()
+    // above did or didn't manage to resync) guarantees the *next* open,
+    // whichever button reaches it, never inherits a stale lock
+    // (br-DHOST-001/BUG-0067 -- this used to be a `dlg.open`-gated partial
+    // reset that could never actually run).
+    dockerDaemonEditMode = false;
+    $("docker-host").disabled = false;
+    $("docker-ssh-key").disabled = false;
+    $("docker-ssh-key-browse").disabled = false;
   } catch (err) {
     alert(String(err.message || err));
   }
@@ -2724,7 +2783,7 @@ function populateRemoveDaemonSelect() {
   for (const entry of history) {
     const opt = document.createElement("option");
     opt.value = entry.hostKey;
-    opt.textContent = entry.hostKey === "local" ? "This machine" : entry.hostKey.replace(/^ssh:\/\//, "");
+    opt.textContent = entry.hostKey === "local" ? "localhost" : entry.hostKey.replace(/^ssh:\/\//, "");
     select.appendChild(opt);
   }
   select.value = "";
@@ -2742,7 +2801,7 @@ $("dlg-remove-daemon-close").onclick = () => dlgRemoveDaemon.close();
 $("dlg-remove-daemon-delete").onclick = async () => {
   const hostKey = $("remove-daemon-select").value;
   if (!hostKey) return;
-  if (!confirm(`Permanently forget the saved daemon "${hostKey === "local" ? "This machine" : hostKey}"? This can't be undone.`)) return;
+  if (!confirm(`Permanently forget the saved daemon "${hostKey === "local" ? "localhost" : hostKey}"? This can't be undone.`)) return;
   // If it's currently connected, close it first -- leaving it running while
   // its saved record vanishes would be a dangling, un-editable, un-
   // reconnectable daemon.
@@ -3537,7 +3596,7 @@ function setCheckedWithMark(cb, mark, checked) {
 
 // Builds one labelled group of checkboxes (Swarm services / Containers)
 // inside #docker-targets -- shared by listContainers()' live `docker ps`
-// result and btn-edit-docker-daemon's immediate pre-fill from already-open
+// result and enterDockerHostEditMode's immediate pre-fill from already-open
 // sources (see renderDockerTargets below), so both end up with the exact
 // same look/behavior. `wasChecked` (name -> bool) carries over whatever
 // the user had ticked/unticked in the checklist *before* this render -- a
@@ -3615,7 +3674,7 @@ function renderDockerTargetGroup(box, title, items, type, wasChecked, selectedNa
 // Repopulates #docker-targets from a {name, image?, replicas?}[] pair --
 // either a live `docker ps` result (listContainers) or, immediately on
 // opening Edit Docker Host (before any Refresh), whatever's already being
-// followed for this host (see btn-edit-docker-daemon below). Re-renders
+// followed for this host (see enterDockerHostEditMode below). Re-renders
 // are a diff against selectedTargets (the persisted record, see its own
 // comment), not a blind wipe: a Refresh that finds a *selected* container
 // gone (stopped/removed) marks it disabled rather than dropping it outright
@@ -3686,7 +3745,7 @@ function renderDockerTargets(containers, services, hostKey, { closeMissing = fal
 
 // The containers/services already being followed for `hostKey`, derived
 // from currently-open log sources (no live docker ps needed) -- what
-// btn-edit-docker-daemon pre-fills the checklist with immediately, before
+// enterDockerHostEditMode pre-fills the checklist with immediately, before
 // Refresh ever runs, so editing an existing daemon isn't a blank form.
 function currentlyTrackedTargets(hostKey) {
   // hostKey itself may be a full "ssh://user@host[:port]" (its own embedded
@@ -3804,7 +3863,7 @@ async function listContainers() {
       : `Could not reach the CTTC server itself at 127.0.0.1:${PORT} (${String(err.message || err)}) — check the connection/tunnel.`;
   } finally {
     // Edit mode locked host/ssh-key/browse on purpose (see
-    // btn-edit-docker-daemon) -- a Refresh re-probing the same daemon must
+    // enterDockerHostEditMode) -- a Refresh re-probing the same daemon must
     // leave them locked, not spring back open the moment the request ends.
     if (!dockerDaemonEditMode) {
       $("docker-host").disabled = false;
@@ -3812,6 +3871,11 @@ async function listContainers() {
       $("docker-ssh-key-browse").disabled = false;
     }
     $("btn-ps-refresh").disabled = false;
+    // Success or failure, the attempt is done and its activity log (if any)
+    // is in place above -- Show activity can unlock now regardless of which
+    // branch ran (see dockerFetchAttempted/syncActivityToggleEnabled).
+    dockerFetchAttempted = true;
+    syncActivityToggleEnabled();
   }
 }
 
@@ -3823,7 +3887,15 @@ $("docker-host").addEventListener("keydown", (e) => {
   }
 });
 
-$("dlg-cancel").onclick = () => dlg.close();
+// Cancelling out of Edit mode must not leave dockerDaemonEditMode stuck
+// true for the *next* time the dialog opens -- btn-set already overwrites it
+// unconditionally on open (both its create and edit-mode branches), so this is belt-and-braces
+// consistency (see br-DHOST-001/BUG-0067), not the fix for a currently
+// reachable bug on its own.
+$("dlg-cancel").onclick = () => {
+  dlg.close();
+  dockerDaemonEditMode = false;
+};
 
 $("dlg-ok").onclick = async () => {
   const transforms = chosenTransforms();
@@ -3878,11 +3950,21 @@ $("dlg-ok").onclick = async () => {
     // lastDockerSessions (an unde-duped auto-reconnect-on-launch list that
     // Disconnect Docker Host removes entries from), this is keyed by host
     // and never touched by Disconnect, only by Remove Docker Host -- see
-    // dockerHostHistory()/populateDockerHostHistory() (Load daemon) and
+    // dockerHostHistory()/populateDockerHostHistory() (Load Docker Host) and
     // removeDockerDaemon() below.
     const saved = prefs.get("savedDockerDaemons", {});
     saved[hostKey] = { ...collectReq, lastUsed: Date.now() };
     prefs.set("savedDockerDaemons", saved);
+    // gateways.json's own record of "which Docker hosts were created using
+    // this gateway" (see recordDockerHostForGateway) -- additive to
+    // savedDockerDaemons above, not a replacement for it; best-effort since
+    // there's nothing useful to do here if it fails (the connection above
+    // already succeeded, so this is purely bookkeeping).
+    try {
+      await window.cttc?.recordDockerHost?.({ hostKey, host, sshKey });
+    } catch (err) {
+      console.error("could not record Docker host against the active gateway:", err);
+    }
     // Every entry actually present in the checklist (checked or not, minus
     // the disabled/gone ones) gets its legend track state set explicitly to
     // match -- not just the checked ones. Only ever promoting to "sel" and
@@ -3933,9 +4015,9 @@ function setTimeWindowSecs(v) {
 // rather than waiting for blur/Enter.
 $("win-secs-sidebar").oninput = (e) => setTimeWindowSecs(e.target.value);
 
-// The toolbar's "Frequency" field -- how often (seconds) Set/Update Docker
-// Host polls the daemon for stats/logs. Persisted so it survives restarts;
-// applied to every future Set/Update Docker Host submission
+// The toolbar's "Frequency" field -- how often (seconds) Connect/Update
+// Docker Host polls the daemon for stats/logs. Persisted so it survives
+// restarts; applied to every future Connect/Update Docker Host submission
 // (dockerPollIntervalSecs, used in the dlg-ok handler above). Doesn't push
 // a live update to an already-open collector on its own -- Update Docker
 // Host (Edit) is still what applies a changed interval to one already
@@ -5225,7 +5307,6 @@ if (!POPOUT_KIND) {
 
   const RENDERER_ACTIONS = {
     "set-sources": () => $("btn-set").click(),
-    "edit-docker-daemon": () => $("btn-edit-docker-daemon").click(),
     "clear-sources": () => $("btn-clear-sources").click(),
     "remove-docker-daemon": () => $("btn-remove-docker-daemon").click(),
     "load-metrics": () => $("btn-load-sample").click(),
@@ -5472,15 +5553,18 @@ connectSSE();
 (() => {
   const el = $("server-status");
   if (!el) return;
+  const btn = $("server-status-btn");
   // Static for the life of this window (HOST/PORT are set once, from the
   // URL main.js loaded it with) -- where the gateway actually is, not just
   // whether it's reachable, matters most for "remote" mode (see
   // docs/architecture/remote-server.md), where it's easy to forget which
   // host is actually being talked to. HOST/PORT alone can't tell a tunneled
   // connection apart from a genuinely local one though (both are
-  // 127.0.0.1) -- getConnectionInfo (below) fills that gap.
+  // 127.0.0.1) -- getConnectionInfo (below) fills that gap. Kept out of the
+  // pill's own visible text (see setState) -- surfaced only as a tooltip,
+  // for anyone hovering, not printed inline next to the dot.
   const statusHost = HOST === "127.0.0.1" ? "localhost" : HOST;
-  $("server-status-location").textContent = PORT == null || PORT === "null" ? statusHost : `${statusHost}:${PORT}`;
+  let locationLabel = PORT == null || PORT === "null" ? statusHost : `${statusHost}:${PORT}`;
 
   // Tunneled connections talk over 127.0.0.1 (HOST/PORT above), but showing
   // "localhost" there would hide which gateway is actually active -- swap
@@ -5497,7 +5581,8 @@ connectSSE();
       const loc = connectionInfo.gatewayPort == null
         ? connectionInfo.gatewayHost
         : `${connectionInfo.gatewayHost}:${connectionInfo.gatewayPort}`;
-      $("server-status-location").textContent = `${loc} (tunnel)`;
+      locationLabel = `${loc} (tunnel)`;
+      btn.title = `${locationLabel} — Switch gateway…`;
     }
   }
   loadConnectionInfo();
@@ -5552,13 +5637,13 @@ connectSSE();
   });
 
   const HEALTH_POLL_MS = 5000;
-  const btn = $("server-status-btn");
-  // The status pill itself only ever shows a colored dot + "Switch
-  // gateway…" -- the actual failure text goes to the bottom status bar
-  // (notifyEvent), not a tooltip nobody's necessarily hovering over.
+  // The status pill itself only ever shows a colored dot -- the gateway
+  // location lives in this tooltip instead (see locationLabel above), and
+  // failure text goes to the bottom status bar (notifyEvent), not a
+  // tooltip nobody's necessarily hovering over.
   const setState = (state) => {
     el.dataset.state = state;
-    btn.title = "Switch gateway…";
+    btn.title = `${locationLabel} — Switch gateway…`;
   };
   let checking = false;
   // The last *confirmed* (up/down) state, for edge-detecting the
@@ -5670,6 +5755,95 @@ connectSSE();
     wrap.classList.add("open");
     dropdown.hidden = false;
     render(await window.cttc.getGateways());
+  };
+  document.addEventListener("click", (e) => {
+    if (!wrap.contains(e.target)) close();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") close();
+  });
+})();
+
+/* ── Docker host dropdown (click the pill beside the gateway one) ────────
+   Lists every Docker host ever Connected/Updated (dockerHostHistory(), the
+   same catalog behind Connect Docker Host's own "Load Docker Host" picker),
+   flagging whichever one is currently connected. Picking a different one
+   reuses that dialog's Load Docker Host step to pre-fill it -- since only
+   one Docker host is ever connected at a time (see currentDockerHost),
+   this confirms disconnecting the current one first via the same confirm()
+   Disconnect itself already asks, never silently dropping it. The pill's
+   dot/tooltip (syncPill) track the connection live, independent of the
+   dropdown ever having been opened -- see refreshDockerHostPill. */
+(() => {
+  const wrap = $("docker-host-status");
+  const btn = $("docker-host-status-btn");
+  const dropdown = $("docker-host-dropdown");
+  if (!wrap) return;
+
+  const close = () => {
+    wrap.classList.remove("open");
+    dropdown.hidden = true;
+  };
+
+  const openHost = async (hostKey) => {
+    close();
+    if (hasDockerDaemon()) {
+      await $("btn-clear-sources").onclick();
+      if (hasDockerDaemon()) return; // confirm declined -- leave the current host connected
+    }
+    $("btn-set").click(); // nothing connected now -- opens Connect Docker Host in create mode
+    $("docker-host-history").value = hostKey;
+    await $("docker-host-history").onchange();
+  };
+
+  const render = () => {
+    const active = syncPill();
+    dropdown.innerHTML = "";
+    const history = dockerHostHistory();
+    if (!history.length) {
+      const empty = document.createElement("div");
+      empty.className = "gateway-empty";
+      empty.textContent = "No Docker hosts yet — Connect Docker Host to add one.";
+      dropdown.appendChild(empty);
+      return;
+    }
+    for (const entry of history) {
+      const item = document.createElement("button");
+      item.type = "button";
+      item.className = "gateway-item";
+      item.dataset.active = String(entry.hostKey === active);
+      const label = document.createElement("span");
+      label.className = "gateway-item-label";
+      label.textContent = entry.hostKey === "local" ? "localhost" : entry.hostKey.replace(/^ssh:\/\//, "");
+      item.appendChild(label);
+      if (entry.hostKey !== active) item.onclick = () => openHost(entry.hostKey);
+      dropdown.appendChild(item);
+    }
+  };
+
+  // Updates the dot/tooltip alone -- cheap enough to run on every
+  // state.sources refresh (see refreshDockerHostPill), unlike render()'s
+  // full dropdown rebuild, which only needs to happen while it's open.
+  // Returns the active hostKey (or null), since render() needs it too.
+  const syncPill = () => {
+    const active = hasDockerDaemon() ? currentDockerHost() || "local" : null;
+    wrap.dataset.state = active ? "up" : "";
+    const label = active == null ? null : active === "local" ? "localhost" : active.replace(/^ssh:\/\//, "");
+    btn.title = label ? `${label} — Manage Docker hosts…` : "Manage Docker hosts…";
+    return active;
+  };
+  refreshDockerHostPill = syncPill;
+  syncPill(); // reflect whatever's already connected as of page load, before any click
+
+  btn.onclick = (e) => {
+    e.stopPropagation();
+    if (wrap.classList.contains("open")) {
+      close();
+      return;
+    }
+    wrap.classList.add("open");
+    dropdown.hidden = false;
+    render();
   };
   document.addEventListener("click", (e) => {
     if (!wrap.contains(e.target)) close();

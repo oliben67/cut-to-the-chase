@@ -166,8 +166,9 @@ body {
 #menubar .menu-list button:hover .acc { color: #fff; }
 
 /* margin-left:auto lives on #status now (the first of the #status/
-   #cursor-label/#server-status trailing cluster) -- a second auto margin
-   here would split the same leftover space into two gaps instead of one. */
+   #cursor-label/#server-status/#docker-host-status trailing cluster) -- a
+   second auto margin here would split the same leftover space into two
+   gaps instead of one. */
 .server-status {
   position: relative;
 }
@@ -197,11 +198,6 @@ body {
 .server-status[data-state="checking"] .server-status-dot { background: #f1c40f; }
 .server-status[data-state="down"] .server-status-dot { background: var(--critical); }
 .server-status[data-state="down"] .server-status-btn { color: var(--critical); }
-.server-status-location {
-  font-size: 11px;
-  color: var(--muted);
-  font-variant-numeric: tabular-nums;
-}
 .server-status-icon {
   width: 16px;
   height: 16px;
@@ -965,7 +961,7 @@ body {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  font-size: 11px; /* matches .server-status-location */
+  font-size: 11px;
   font-variant-numeric: tabular-nums;
   color: var(--text-secondary);
 }

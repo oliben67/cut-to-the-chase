@@ -33,6 +33,7 @@ contextBridge.exposeInMainWorld("cttc", {
   setSelectedContainers: (hostKey, names) => ipcRenderer.invoke("set-selected-containers", hostKey, names),
   deleteSelectedContainers: (hostKey) => ipcRenderer.invoke("delete-selected-containers", hostKey),
   getConnectionInfo: () => ipcRenderer.invoke("get-connection-info"),
+  recordDockerHost: (dockerHostEntry) => ipcRenderer.invoke("record-docker-host", dockerHostEntry),
   switchGateway: (entry) => ipcRenderer.invoke("switch-gateway", entry),
   checkGateway: (entry) => ipcRenderer.invoke("check-gateway", entry),
   openActionBarWindow: () => ipcRenderer.invoke("open-action-bar-window"),

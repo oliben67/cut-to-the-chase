@@ -1,6 +1,16 @@
 "use strict";
 
 const { app, BrowserWindow, dialog, ipcMain, Menu, shell, nativeTheme } = require("electron");
+// app.name otherwise falls back to package.json's "name" ("cttc-timeline"),
+// which is what an unpackaged dev run's Dock/taskbar hover tooltip and the
+// About dialog's title would show -- userData's default location is
+// derived from app.name too, so it's captured *before* renaming and pinned
+// back to it right after, or this would silently start a fresh, empty
+// profile (recording marker, saved daemons, gateways, etc.) under a new
+// path the very first time this runs.
+const defaultUserDataDir = app.getPath("userData");
+app.setName(`CTTC v${app.getVersion()}`);
+app.setPath("userData", defaultUserDataDir);
 const { spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
@@ -22,7 +32,7 @@ const {
   uninstallRemoteContainer,
   checkStillInstalled,
 } = require("./lib/server-provision");
-const { readGateways, recordGateway, removeGateway, gatewayKey } = require("./lib/gateway-registry");
+const { readGateways, recordGateway, removeGateway, gatewayKey, recordDockerHostForGateway } = require("./lib/gateway-registry");
 const { readSelectedContainers, writeSelectedContainers, deleteSelectedContainers } = require("./lib/container-selection");
 const { openSshTunnel, closeSshTunnel } = require("./lib/ssh-tunnel");
 const { recordTunnel, removeTunnel, killOrphanedTunnels } = require("./lib/tunnel-registry");
@@ -146,14 +156,17 @@ function recordCurrentGateway() {
 
 // Shared by get-gateways and switch-gateway's failure message (which needs
 // to name the gateway it's staying on).
-function listGatewaysWithActiveFlag() {
+async function listGatewaysWithActiveFlag() {
   const gateways = readGateways();
-  // "This machine" is always a selectable gateway, even if a local
-  // container has never actually been provisioned here (recordGateway only
-  // ever runs after one succeeds) -- it just won't have a real port yet, so
-  // there's nothing to re-verify/switch to until Edit Gateways' Save
-  // actually provisions one.
-  if (!gateways.some((g) => g.mode === "embedded")) {
+  // "This machine" is a selectable gateway even if a local container has
+  // never actually been provisioned here (recordGateway only ever runs
+  // after one succeeds) -- it just won't have a real port yet, so there's
+  // nothing to re-verify/switch to until Edit Gateways' Save actually
+  // provisions one. But it can only ever manage Docker hosts if Docker is
+  // actually installed here -- offering it regardless would send the user
+  // into gateway setup only to hit a dead end once Docker turns out to be
+  // missing.
+  if (!gateways.some((g) => g.mode === "embedded") && (await hasLocalDocker())) {
     gateways.unshift({ mode: "embedded", host: "127.0.0.1", port: null, label: "This machine" });
   }
   for (const g of gateways) g.active = isActiveGateway(g);
@@ -1249,6 +1262,21 @@ ipcMain.handle("get-connection-info", () => ({
   sshPort: activeSshPort,
 }));
 
+// Records a Docker host under the currently-active gateway's own catalog in
+// gateways.json (see recordDockerHostForGateway) -- called from the
+// renderer right after a Connect/Update Docker Host submission succeeds, so
+// gateways.json ends up holding every Docker host actually created/used
+// through it, not just the renderer's own gateway-agnostic history.
+ipcMain.handle("record-docker-host", (_e, dockerHostEntry) => {
+  // Embedded ("This machine") gateways are otherwise only ever written to
+  // gateways.json lazily, on switch-away (recordCurrentGateway) -- without
+  // this, a session that never switches gateways has no entry here at all
+  // for recordDockerHostForGateway to attach to.
+  recordCurrentGateway();
+  const key = gatewayKey({ host: activeGatewayHost, port: activeGatewayPort });
+  return recordDockerHostForGateway(key, dockerHostEntry);
+});
+
 // Read-only: lets the dropdown flag a gateway as unreachable without
 // switching to it or changing anything -- purely informational, including
 // for the currently-active entry (see switch-gateway's own health check for
@@ -1284,7 +1312,7 @@ ipcMain.handle("switch-gateway", async (_e, entry) => {
 
   if (entry.mode === "embedded") {
     if (!isUnprovisionedLocal && !(await checkGatewayReachable(entry))) {
-      const current = listGatewaysWithActiveFlag().find((g) => g.active);
+      const current = (await listGatewaysWithActiveFlag()).find((g) => g.active);
       const currentLabel = current?.label || (activeGatewayHost === "127.0.0.1" ? "This machine" : activeGatewayHost);
       return {
         ok: false,
