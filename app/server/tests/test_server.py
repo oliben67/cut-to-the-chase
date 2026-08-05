@@ -418,12 +418,15 @@ async def feed_stats(src, entries):
     return n
 
 
-async def stats_rows(redis_log_instance, svc):
+async def stats_rows(redis_log_instance, svc, sid="s2"):
     """Redis is the store now (see redis_log.py) -- test stand-in for what
     used to be a direct `src.series[svc]` read. `svc` is the bare/host-
-    qualified name a caller would pass to StatsSource._entity_for; the
-    "stats:" kind prefix (br-DEDUP-006) is added here to match."""
-    rows = await redis_log_instance.range_by_score_with_payload(f"stats:{svc}", 0, 10**15)
+    qualified name a caller would pass to StatsSource._entity_for. `sid`
+    must match stats_source()'s own (default "s2") -- a plain StatsSource
+    (no `host` attribute at all, unlike the Docker subclasses) is qualified
+    by its own id instead, so two unrelated file-based sources sharing a
+    service name never interleave (see LogSource._entity's docstring)."""
+    rows = await redis_log_instance.range_by_score_with_payload(server._entity_id("stats", svc, sid), 0, 10**15)
     return [(ts, p.get("cpu"), p.get("mem"), p.get("mem_bytes"), p.get("net")) for ts, p in rows]
 
 
@@ -2015,6 +2018,45 @@ class TestSampleRoundTrip:
             assert stt.live is False and lg.live is False
         finally:
             await st2.redis_log.stop()
+
+    async def test_load_sample_twice_does_not_collide_in_redis(self, state, tmp_path):
+        """br-DEDUP: two independent sample loads sharing the same
+        container name must not merge into the same Redis entity.
+        load_sample calls _entity_id(kind, name, None) unconditionally --
+        host is only ever set for live docker sources, so nothing
+        distinguishes one load from another. Reproduces with two entirely
+        separate exports (different files, different time ranges) that
+        both happen to contain a container named "svc"."""
+        f1 = tmp_path / "first"
+        f1.mkdir()
+        log1 = f1 / "svc.log"
+        log1.write_text("2026-01-02T03:00:00Z first-only\n")
+        state.open_file(str(log1), "auto", None, live=False, transforms=[])
+        await _flush()
+        t0, t1 = ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 5)
+        out1 = tmp_path / "first.cttc"
+        r1 = await state.export_sample(str(out1), t0, t1)
+        assert r1["sources"] == 1
+
+        f2 = tmp_path / "second"
+        f2.mkdir()
+        log2 = f2 / "svc.log"
+        log2.write_text("2026-01-02T04:00:00Z second-only\n")
+        state.open_file(str(log2), "auto", None, live=False, transforms=[])
+        await _flush()
+        t2_0, t2_1 = ms(2026, 1, 2, 4, 0, 0), ms(2026, 1, 2, 4, 0, 5)
+        out2 = tmp_path / "second.cttc"
+        r2 = await state.export_sample(str(out2), t2_0, t2_1)
+        assert r2["sources"] == 1
+
+        opened1 = await state.load_sample(str(out1))
+        opened2 = await state.load_sample(str(out2))
+        loaded1 = state.sources[opened1[0]]
+        loaded2 = state.sources[opened2[0]]
+        assert await loaded1.total() == 1, "first load's entity shows only its own row"
+        assert await loaded2.total() == 1, "second load's entity shows only its own row -- not merged with the first"
+        assert (await loaded1.slice(0, 1))[0]["text"] == "first-only"
+        assert (await loaded2.slice(0, 1))[0]["text"] == "second-only"
 
     async def test_export_empty_range(self, state, log_file, stats_file, tmp_path):
         state.open_file(str(log_file), "auto", None, live=False, transforms=[])

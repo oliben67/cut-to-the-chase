@@ -1561,6 +1561,38 @@
     }
   });
 
+  await T("Open Recording is deduped like Load Data -- re-opening an already-open file is a no-op, not a pile of duplicate sources", async () => {
+    // openRecording() used to call window.cttc.pickFiles directly with no
+    // dedup at all -- every click re-uploaded and opened a brand-new,
+    // independent set of sources for the same file, regardless of whether
+    // it was already open (reported: "keeps piling up every time I open
+    // it (containers repeat on the top above graph)").
+    const t0 = R.min_ts;
+    const res = await fetch(`${API}/sample/record`, {
+      method: "POST", body: new Uint8Array(0),
+      headers: { "X-CTTC-From": String(t0), "X-CTTC-To": String(t0 + 60000) },
+    });
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const realPath = "/tmp/cttc-e2e-open-recording-dedup.cttc-record";
+    await window.cttc.writeBinaryFile(realPath, bytes);
+
+    const realPick = pickRecordingFiles;
+    pickRecordingFiles = async () => [realPath];
+    try {
+      await openRecording();
+      const opened = state.sources.filter((s) => s.path === `upload://${realPath.split("/").pop()}`);
+      ok(opened.length > 0, "first open actually opened something");
+      await openRecording(); // re-open the exact same file
+      const stillOpen = state.sources.filter((s) => s.path === `upload://${realPath.split("/").pop()}`);
+      eq(stillOpen.length, opened.length, "re-opening the same file changed nothing -- no duplicate sources");
+    } finally {
+      pickRecordingFiles = realPick;
+      const opened = state.sources.filter((s) => s.path === `upload://${realPath.split("/").pop()}`);
+      for (const s of opened) await post("/close", { id: s.id });
+      await refreshAll();
+    }
+  });
+
   /* ── Recording (Start/Pause/Stop/Open Recording) ──────────────────────── */
 
   await T("Record -> Pause -> Resume -> Stop writes a real 2-segment .cttc-record, filename is only asked at Stop", async () => {

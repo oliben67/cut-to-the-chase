@@ -3253,17 +3253,29 @@ async function stopRecording() {
   await persistRecordingMarker();
 }
 
-async function openRecording() {
-  let paths = [];
-  if (window.cttc?.pickFiles) {
-    paths = await window.cttc.pickFiles("Open Recording", [
-      { name: "CTTC recording", extensions: ["cttc-record"] },
-    ]);
-  } else {
+// Same pattern as pickAnalysisFiles/pickRecordingSavePath: a named wrapper
+// around the native picker so tests can substitute canned paths.
+async function pickRecordingFiles() {
+  if (!window.cttc?.pickFiles) {
     const p = prompt("Path to a recorded .cttc-record file:");
-    if (p) paths = [p];
+    return p ? [p] : [];
   }
-  const files = paths.filter((p) => p.endsWith(".cttc-record"));
+  return window.cttc.pickFiles("Open Recording", [
+    { name: "CTTC recording", extensions: ["cttc-record"] },
+  ]);
+}
+
+async function openRecording() {
+  const paths = await pickRecordingFiles();
+  // Same dedup as Load Data (btn-load-sample) -- without it, re-clicking
+  // Open Recording on an already-open file re-uploads and opens a second,
+  // fully independent set of sources every time (each now correctly
+  // isolated in Redis, see LogSource._entity, so it's no longer a data
+  // *collision*, just a needless, ever-growing pile of duplicate sources).
+  const open = openPaths();
+  const files = paths.filter(
+    (p) => p.endsWith(".cttc-record") && !open.has(`upload://${basename(p)}`)
+  );
   if (!files.length) return;
   try {
     const errors = [];

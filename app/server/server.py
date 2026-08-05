@@ -284,7 +284,7 @@ class LogSource:
         self._pending_partial = lines.pop()  # incomplete trailing line, if any
         new = []
         redis_log = getattr(getattr(self, "_state", None), "redis_log", None)
-        entity = _entity_id("log", self.name, getattr(self, "host", None))
+        entity = self._entity
         for bline in lines:
             self.line_no += 1
             raw = bline.decode("utf-8", errors="replace").rstrip("\r")
@@ -382,8 +382,24 @@ class LogSource:
         `self.name` host-qualified when this source has one (see
         _entity_id/br-DEDUP-006). Distinct from `self.name` itself, which
         stays the bare display/grouping name everywhere else (API
-        responses, exported sample files)."""
-        return _entity_id("log", self.name, getattr(self, "host", None))
+        responses, exported sample files).
+
+        A plain LogSource (used directly by open_file/load_sample for a
+        local file or an imported .cttc sample) never sets `self.host` at
+        all -- only the Docker subclasses do, explicitly, even when it's
+        None for a local target. That's a real signal, not just an absent
+        one: `getattr(self, "host", None)` used to treat both cases alike,
+        so two unrelated file loads sharing a container name (the same
+        sample re-opened twice, or two different recordings whose
+        containers happen to share a name) silently interleaved into the
+        same bare entity -- there's no live local daemon here for a bare
+        name to unambiguously mean, unlike the one real local docker
+        target this bare-naming was actually meant for. Qualifying by this
+        source's own id instead (unique per load, never reused) keeps
+        every file-based load's data disjoint from any other's."""
+        if hasattr(self, "host"):
+            return _entity_id("log", self.name, self.host)
+        return _entity_id("log", self.name, self.id)
 
     # API helpers -- all Redis-backed now (see redis_log.py's module
     # docstring): Redis is the sole source of truth for reads, Source
@@ -584,8 +600,17 @@ class StatsSource:
         files) -- it's also the dict key both bucketed()/point_at() already
         return their per-service results under, so a caller reading two
         different sources' same-named service still tells them apart via
-        each response entry's own "sid", exactly as it does today."""
-        return _entity_id("stats", svc, getattr(self, "host", None))
+        each response entry's own "sid", exactly as it does today.
+
+        See LogSource._entity's matching docstring: a plain StatsSource
+        (open_file/load_sample) never sets `self.host` at all, unlike the
+        Docker subclasses, which set it explicitly even for a local
+        target -- qualify by this source's own id instead when it's
+        missing, so two unrelated file loads sharing a service name never
+        interleave into the same bare entity."""
+        if hasattr(self, "host"):
+            return _entity_id("stats", svc, self.host)
+        return _entity_id("stats", svc, self.id)
 
     def services(self):
         return sorted(self._services)
@@ -1932,7 +1957,7 @@ class State:
                         uid = make_uid(meta["name"], src.seq, text)
                         row = (ts, src.seq, uid, text)
                         src._last_row = row
-                        rows.append((_entity_id("log", meta["name"], None), ts, {"uid": uid, "text": text}))
+                        rows.append((src._entity, ts, {"uid": uid, "text": text}))
                 else:
                     src = StatsSource(sid, meta["name"], p, live=False)
                     src._state = self
@@ -1944,7 +1969,7 @@ class State:
                             src.count += 1
                             rows.append(
                                 (
-                                    _entity_id("stats", svc, None),
+                                    src._entity_for(svc),
                                     ts,
                                     {"cpu": cpu, "mem": mem, "mem_bytes": mem_bytes, "net": rate},
                                 )
