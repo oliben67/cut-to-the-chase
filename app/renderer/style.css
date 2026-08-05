@@ -172,6 +172,12 @@ body {
 .server-status {
   position: relative;
 }
+/* Gateway/Docker Host pills hide each other while either has an overlay
+   open (see app.js's syncPillPeerVisibility) -- visibility, not display,
+   so the toolbar's own layout doesn't reflow while one is hidden. */
+.server-status.peer-hidden {
+  visibility: hidden;
+}
 .server-status-btn {
   display: flex;
   align-items: center;
@@ -1117,6 +1123,9 @@ body.sample-armed .strip {
   box-shadow: var(--shadow-md);
 }
 #ctxmenu button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   border: none;
   background: none;
   text-align: left;
@@ -1124,6 +1133,18 @@ body.sample-armed .strip {
   border-radius: var(--radius-sm);
 }
 #ctxmenu button:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+/* Entries that pass an icon (see ctxMenu's optional 3rd tuple element) --
+   reuses whichever action-bar button's own .ab-icon markup it was given,
+   just sized down for a menu row instead of the sidebar. */
+.ctxmenu-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  flex: 0 0 auto;
+  color: var(--muted);
+}
+.ctxmenu-icon svg { width: 14px; height: 14px; }
 
 #charts { position: relative; }
 .strip { display: block; width: 100%; cursor: crosshair; }

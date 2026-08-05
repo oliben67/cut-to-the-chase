@@ -2790,20 +2790,26 @@
     }
   });
 
-  await T("right-clicking the Gateway pill opens New/Edit/Uninstall Gateway, not the info popup", () => {
+  await T("right-clicking the Gateway pill opens New/Edit/Uninstall Gateway, not the info popup", async () => {
     mouse($("server-status"), "mouseenter", 5);
     mouse($("server-status"), "contextmenu", 5);
     try {
       ok($("connection-info-popup").hidden, "info popup replaced by the actions menu, not shown alongside it");
       const menu = document.getElementById("ctxmenu");
       ok(menu, "actions menu open");
-      const labels = [...menu.querySelectorAll("button")].map((b) => b.textContent);
+      const buttons = [...menu.querySelectorAll("button")];
+      const labels = buttons.map((b) => b.textContent);
       ok(labels.some((l) => l.includes("New Gateway")), labels.join(", "));
       ok(labels.some((l) => l === "Edit Gateway"), labels.join(", "));
       ok(labels.some((l) => l.includes("Uninstall Gateway")), labels.join(", "));
+      ok(buttons.every((b) => b.querySelector(".ctxmenu-icon svg")), "every entry has an icon to the left of its label");
     } finally {
       document.body.click(); // close whatever the entry click may have opened
       if (dlgGatewaySetup.open) dlgGatewaySetup.close();
+      mouse($("server-status"), "mouseleave", 5);
+      // Restoration polls for the ctxmenu's removal (watchCtxMenuClose)
+      // rather than closing it synchronously -- give it a beat.
+      await until(() => !$("docker-host-status").classList.contains("peer-hidden"), "Docker Host pill restored once the actions menu closes");
     }
   });
 
@@ -2862,7 +2868,7 @@
     }
   });
 
-  await T("right-clicking the Docker Host pill opens New/Edit/Remove; Edit is a no-op with nothing connected", () => {
+  await T("right-clicking the Docker Host pill opens New/Edit/Remove; Edit is a no-op with nothing connected", async () => {
     ok(!hasDockerDaemon(), "sanity: nothing connected in this suite's baseline state");
     mouse($("docker-host-status"), "contextmenu", 5);
     try {
@@ -2873,11 +2879,15 @@
       ok(labels.some((l) => l.includes("New Docker Host")), labels.join(", "));
       ok(labels.some((l) => l === "Edit Docker Host"), labels.join(", "));
       ok(labels.some((l) => l.includes("Remove Docker Host")), labels.join(", "));
+      ok(buttons.every((b) => b.querySelector(".ctxmenu-icon svg")), "every entry has an icon to the left of its label");
       buttons.find((b) => b.textContent === "Edit Docker Host").click();
       eq(dlg.open, false, "no-op -- nothing connected to edit");
     } finally {
       document.body.click();
       if (dlg.open) dlg.close();
+      // Restoration polls for the ctxmenu's removal (watchCtxMenuClose)
+      // rather than closing it synchronously -- give it a beat.
+      await until(() => !$("server-status").classList.contains("peer-hidden"), "Gateway pill restored once the actions menu closes");
     }
   });
 
@@ -2903,6 +2913,9 @@
       state.sources = state.sources.filter((s) => s.id !== "__ctx_edit_test");
       syncDockerDaemonButtons();
       if (dlg.open) dlg.close();
+      // Restoration polls for the ctxmenu's removal (watchCtxMenuClose)
+      // rather than closing it synchronously -- give it a beat.
+      await until(() => !$("server-status").classList.contains("peer-hidden"), "Gateway pill restored once the actions menu closes");
     }
   });
 
@@ -2921,6 +2934,71 @@
     } finally {
       document.body.click();
       prefs.set("savedDockerDaemons", saved);
+    }
+  });
+
+  /* ── Gateway/Docker Host pills hide each other while either is engaged ─── */
+
+  await T("hovering the Docker Host pill hides the Gateway pill, restored on mouseleave", () => {
+    ok(!$("server-status").classList.contains("peer-hidden"), "sanity: visible before any interaction");
+    mouse($("docker-host-status"), "mouseenter", 5);
+    try {
+      ok($("server-status").classList.contains("peer-hidden"), "Gateway pill hidden while Docker Host is engaged");
+    } finally {
+      mouse($("docker-host-status"), "mouseleave", 5);
+      ok(!$("server-status").classList.contains("peer-hidden"), "Gateway pill restored once Docker Host is no longer engaged");
+    }
+  });
+
+  await T("hovering the Gateway pill hides the Docker Host pill, restored on mouseleave", async () => {
+    ok(!$("docker-host-status").classList.contains("peer-hidden"), "sanity: visible before any interaction");
+    mouse($("server-status"), "mouseenter", 5);
+    await sleep(20);
+    try {
+      ok($("docker-host-status").classList.contains("peer-hidden"), "Docker Host pill hidden while Gateway is engaged");
+    } finally {
+      mouse($("server-status"), "mouseleave", 5);
+      ok(!$("docker-host-status").classList.contains("peer-hidden"), "Docker Host pill restored once Gateway is no longer engaged");
+    }
+  });
+
+  await T("right-clicking the Docker Host pill hides the Gateway pill while the actions menu is open", async () => {
+    mouse($("docker-host-status"), "contextmenu", 5);
+    try {
+      ok($("server-status").classList.contains("peer-hidden"), "Gateway pill hidden while Docker Host's actions menu is open");
+    } finally {
+      document.body.click(); // closes the ctxmenu
+      // Restoration polls for the ctxmenu's removal (watchCtxMenuClose)
+      // rather than closing it synchronously -- give it a beat.
+      await until(() => !$("server-status").classList.contains("peer-hidden"), "Gateway pill restored once the actions menu closes");
+    }
+  });
+
+  await T("clicking the Docker Host pill's switcher hides the Gateway pill, restored on close", () => {
+    $("docker-host-status-btn").click();
+    try {
+      ok($("server-status").classList.contains("peer-hidden"), "Gateway pill hidden while Docker Host's switcher is open");
+    } finally {
+      document.body.click(); // outside click closes the switcher
+      ok(!$("server-status").classList.contains("peer-hidden"), "Gateway pill restored once the switcher closes");
+    }
+  });
+
+  await T("clicking or right-clicking a pill suppresses its own hover info while its menu stays open", () => {
+    // Reported: "when I clicked or right-clicked, as long as the menu is
+    // visible, the hovering message should not appear" -- mouseenter fires
+    // as the cursor arrives (browsers don't refire it while the mouse
+    // stays put), so the guard has to be checked at that single point:
+    // don't render/show the info popup if a menu from this same pill is
+    // already open.
+    $("docker-host-status-btn").click();
+    try {
+      ok(!$("docker-host-dropdown").hidden, "sanity: switcher open");
+      mouse($("docker-host-status"), "mouseenter", 5);
+      ok($("docker-host-info-popup").hidden, "hover info suppressed while the switcher is open");
+    } finally {
+      document.body.click();
+      mouse($("docker-host-status"), "mouseleave", 5);
     }
   });
 
