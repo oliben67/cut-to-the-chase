@@ -13,7 +13,10 @@ never did.
 
 Schema: one hash + one sorted-set index per entity (container name, or
 `host@<hostname>` for host telemetry -- matching the label scheme already
-used for Source.path in server.py):
+used for Source.path in server.py -- always prefixed with a "log:"/"stats:"
+kind discriminator, see server.py's _entity_id/br-DEDUP-006, so the same
+container's log entries and stats samples never land in the same entity
+even when their bare names are identical):
     cttc:log:<entity_id>   hash  field=timestamp(ms, str)  value=orjson record
     cttc:idx:<entity_id>   zset  member=same field          score=timestamp
     cttc:entities          set   every entity_id ever recorded (for set_ttl's

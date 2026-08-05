@@ -420,8 +420,10 @@ async def feed_stats(src, entries):
 
 async def stats_rows(redis_log_instance, svc):
     """Redis is the store now (see redis_log.py) -- test stand-in for what
-    used to be a direct `src.series[svc]` read."""
-    rows = await redis_log_instance.range_by_score_with_payload(svc, 0, 10**15)
+    used to be a direct `src.series[svc]` read. `svc` is the bare/host-
+    qualified name a caller would pass to StatsSource._entity_for; the
+    "stats:" kind prefix (br-DEDUP-006) is added here to match."""
+    rows = await redis_log_instance.range_by_score_with_payload(f"stats:{svc}", 0, 10**15)
     return [(ts, p.get("cpu"), p.get("mem"), p.get("mem_bytes"), p.get("net")) for ts, p in rows]
 
 
@@ -1207,8 +1209,10 @@ class FakeState:
 
 async def stats_rows_of(fake_state, svc):
     """Test stand-in for what used to be a direct `src.series[svc]` read
-    -- Redis is the store now (see redis_log.py)."""
-    rows = await fake_state.redis_log.range_by_score_with_payload(svc, 0, 10**15)
+    -- Redis is the store now (see redis_log.py). `svc` is the bare/host-
+    qualified name a caller would pass to StatsSource._entity_for; the
+    "stats:" kind prefix (br-DEDUP-006) is added here to match."""
+    rows = await fake_state.redis_log.range_by_score_with_payload(f"stats:{svc}", 0, 10**15)
     return [(ts, p.get("cpu"), p.get("mem"), p.get("mem_bytes"), p.get("net")) for ts, p in rows]
 
 
@@ -1217,27 +1221,36 @@ class TestEntityId:
     keys on (see LogSource._entity/StatsSource._entity_for)."""
 
     def test_bare_for_no_host(self):
-        assert server._entity_id("nginx", None) == "nginx"
-        assert server._entity_id("nginx", "") == "nginx"
+        assert server._entity_id("log", "nginx", None) == "log:nginx"
+        assert server._entity_id("log", "nginx", "") == "log:nginx"
 
     def test_qualified_for_a_remote_host(self):
-        assert server._entity_id("nginx", "ssh://u@h") == "nginx@h"
+        assert server._entity_id("log", "nginx", "ssh://u@h") == "log:nginx@h"
 
     def test_hostname_derivation_matches_the_rest_of_the_module(self):
         # same `host.split("@")[-1]` collect_docker itself already uses for
         # host@<hostname> naming -- consistent, even where that derivation
         # has its own separate known gap (br-DEDUP-007, ssh port handling).
-        assert server._entity_id("nginx", "ssh://u@h:2222") == "nginx@h:2222"
+        assert server._entity_id("log", "nginx", "ssh://u@h:2222") == "log:nginx@h:2222"
 
     def test_already_qualified_name_is_left_untouched(self):
         # HostStatsSource pre-builds "host@<hostname>" itself before ever
         # reaching ingest_row -- must not double-qualify into
         # "host@<hostname>@<hostname>".
-        assert server._entity_id("host@h", "ssh://u@h") == "host@h"
+        assert server._entity_id("stats", "host@h", "ssh://u@h") == "stats:host@h"
 
     def test_two_different_hosts_never_produce_the_same_entity_id(self):
-        assert server._entity_id("nginx", "ssh://u@h1") != server._entity_id("nginx", "ssh://u@h2")
-        assert server._entity_id("nginx", "ssh://u@h1") != server._entity_id("nginx", None)
+        assert server._entity_id("log", "nginx", "ssh://u@h1") != server._entity_id("log", "nginx", "ssh://u@h2")
+        assert server._entity_id("log", "nginx", "ssh://u@h1") != server._entity_id("log", "nginx", None)
+
+    def test_log_and_stats_never_collide_for_the_same_name_and_host(self):
+        # br-DEDUP-006 regression: a local container's log entity and its
+        # stats entity used to both resolve to the exact same bare name,
+        # sharing one Redis key -- every stats sample (no "text" field)
+        # then rendered as a blank-text row in that container's log panel,
+        # at the stats poll interval.
+        assert server._entity_id("log", "web", None) != server._entity_id("stats", "web", None)
+        assert server._entity_id("log", "web", "ssh://u@h") != server._entity_id("stats", "web", "ssh://u@h")
 
 
 class TestDockerStatsSource:
@@ -1605,8 +1618,8 @@ class TestDockerLogSource:
             assert remote_rows[0]["text"] == "from remote"
             # confirm they're actually different Redis entities, not just
             # coincidentally-consistent reads through each Source's own view
-            assert await redis_log_instance.total("web") == 1
-            assert await redis_log_instance.total("web@remotehost") == 1
+            assert await redis_log_instance.total("log:web") == 1
+            assert await redis_log_instance.total("log:web@remotehost") == 1
         finally:
             local_src.stop()
             remote_src.stop()

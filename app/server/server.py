@@ -210,7 +210,7 @@ def make_uid(source: str, line_no: int, raw: str) -> str:
     return hashlib.sha1(f"{source}\x00{line_no}\x00{raw}".encode(errors="replace")).hexdigest()[:16]
 
 
-def _entity_id(name: str, host: str | None) -> str:
+def _entity_id(kind: str, name: str, host: str | None) -> str:
     """The Redis entity id for one source's data (br-DEDUP-006): host-
     qualified for any remote docker target, so the same container/service
     name collected from two different hosts never collides into the same
@@ -224,17 +224,27 @@ def _entity_id(name: str, host: str | None) -> str:
     is what every caller still uses for display/grouping (API responses,
     exported sample files); only the Redis key changes here.
 
-    A `name` that already contains "@" is left untouched: HostStatsSource
-    builds its own already-unique `host@<hostname>` name up front (used as
-    both its display name *and* the single entity id it ever passes
-    through StatsSource.ingest_row), so qualifying it again here would
-    double up into `host@<hostname>@<hostname>`. "@" can't appear in a
-    real docker container/service name, so this is an unambiguous signal,
-    not a heuristic."""
+    `kind` ("log" or "stats") is always prefixed on top of that, because a
+    container's log entity and its stats entity used to collide on the
+    exact same bare name (e.g. a local container named "web" produced both
+    a LogSource and a StatsSource entity id of plain "web") -- both then
+    shared the very same cttc:log:web/cttc:idx:web Redis keys, so every
+    docker-stats sample (no "text" field) landed in that container's log
+    stream too, rendering as a blank-text row at the stats poll interval.
+    Prefixing by kind keeps the two namespaces disjoint even when the
+    bare name and host are identical.
+
+    A `name` that already contains "@" is left untouched (beyond the kind
+    prefix): HostStatsSource builds its own already-unique `host@<hostname>`
+    name up front (used as both its display name *and* the single entity id
+    it ever passes through StatsSource.ingest_row), so host-qualifying it
+    again here would double up into `host@<hostname>@<hostname>`. "@" can't
+    appear in a real docker container/service name, so this is an
+    unambiguous signal, not a heuristic."""
     if not host or "@" in name:
-        return name
+        return f"{kind}:{name}"
     hostname = host.split("@")[-1]
-    return f"{name}@{hostname}"
+    return f"{kind}:{name}@{hostname}"
 
 
 DOCKER_SVCLOG_PREFIX = re.compile(r"^(\S+\.\d+\.\S+@\S+|\S+)\s+\|\s?")
@@ -274,7 +284,7 @@ class LogSource:
         self._pending_partial = lines.pop()  # incomplete trailing line, if any
         new = []
         redis_log = getattr(getattr(self, "_state", None), "redis_log", None)
-        entity = _entity_id(self.name, getattr(self, "host", None))
+        entity = _entity_id("log", self.name, getattr(self, "host", None))
         for bline in lines:
             self.line_no += 1
             raw = bline.decode("utf-8", errors="replace").rstrip("\r")
@@ -373,7 +383,7 @@ class LogSource:
         _entity_id/br-DEDUP-006). Distinct from `self.name` itself, which
         stays the bare display/grouping name everywhere else (API
         responses, exported sample files)."""
-        return _entity_id(self.name, getattr(self, "host", None))
+        return _entity_id("log", self.name, getattr(self, "host", None))
 
     # API helpers -- all Redis-backed now (see redis_log.py's module
     # docstring): Redis is the sole source of truth for reads, Source
@@ -575,7 +585,7 @@ class StatsSource:
         return their per-service results under, so a caller reading two
         different sources' same-named service still tells them apart via
         each response entry's own "sid", exactly as it does today."""
-        return _entity_id(svc, getattr(self, "host", None))
+        return _entity_id("stats", svc, getattr(self, "host", None))
 
     def services(self):
         return sorted(self._services)
@@ -1922,7 +1932,7 @@ class State:
                         uid = make_uid(meta["name"], src.seq, text)
                         row = (ts, src.seq, uid, text)
                         src._last_row = row
-                        rows.append((meta["name"], ts, {"uid": uid, "text": text}))
+                        rows.append((_entity_id("log", meta["name"], None), ts, {"uid": uid, "text": text}))
                 else:
                     src = StatsSource(sid, meta["name"], p, live=False)
                     src._state = self
@@ -1934,7 +1944,7 @@ class State:
                             src.count += 1
                             rows.append(
                                 (
-                                    svc,
+                                    _entity_id("stats", svc, None),
                                     ts,
                                     {"cpu": cpu, "mem": mem, "mem_bytes": mem_bytes, "net": rate},
                                 )
