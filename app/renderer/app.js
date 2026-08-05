@@ -794,7 +794,11 @@ function drawVerticals(ctx, h) {
   }
   // "now" marker: real time progressing across the chart, independent of
   // the cursor/selection -- see Preferences > Appearance > "Now" line.
-  if (state.view) {
+  // Only meaningful while Live is the active view: a loaded metric/
+  // recording is static, already-captured data, and a line silently
+  // drifting across it as real time passes would read as something in the
+  // *file* were still moving (BUG-0078).
+  if (state.view && !state.liveHidden) {
     const nowX = tToX(Date.now());
     if (nowX >= MARGIN_L && nowX <= MARGIN_L + plotWidth()) {
       ctx.strokeStyle = nowLineColor;

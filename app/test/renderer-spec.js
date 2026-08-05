@@ -2053,6 +2053,57 @@
     }
   });
 
+  await T("The 'now' line does not advance/draw once a metric/recording is the active view (BUG-0078)", async () => {
+    // Spy on the canvas 2D stroke calls to detect whether drawVerticals'
+    // "now" marker (strokeStyle === nowLineColor) actually gets painted --
+    // it's otherwise only observable as pixels, not DOM state.
+    const realStroke = CanvasRenderingContext2D.prototype.stroke;
+    const strokeStyles = [];
+    CanvasRenderingContext2D.prototype.stroke = function (...args) {
+      strokeStyles.push(this.strokeStyle);
+      return realStroke.apply(this, args);
+    };
+    const realView = state.view;
+    try {
+      // A window guaranteed to straddle "now" regardless of where the
+      // demo data's own range happens to sit relative to it.
+      setView(Date.now() - 5 * 60000, Date.now() + 5 * 60000, { broadcast: false });
+
+      eq(state.liveHidden, false, "starts in Live -- baseline for this test");
+      strokeStyles.length = 0;
+      drawAll();
+      ok(strokeStyles.includes(nowLineColor), "now line drawn while Live is the active view (sanity check)");
+
+      const res = await fetch(
+        `${API}/files/download?from=${R.min_ts}&to=${R.max_ts}&include_host=0`,
+        { headers: authHeaders() }
+      );
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      const realPath = "/tmp/cttc-e2e-now-line-hidden.cttc-metric";
+      await window.cttc.writeBinaryFile(realPath, bytes);
+      const r = await uploadAndResolveSegment(realPath);
+      try {
+        ok(r.opened.length >= 1, "sample opened");
+        await refreshAll();
+        eq(state.liveHidden, true, "now viewing a loaded metric");
+        setView(Date.now() - 5 * 60000, Date.now() + 5 * 60000, { broadcast: false });
+
+        strokeStyles.length = 0;
+        drawAll();
+        ok(
+          !strokeStyles.includes(nowLineColor),
+          "now line must not be drawn while a metric/recording is the active view, even though the window still straddles 'now'"
+        );
+      } finally {
+        for (const sid of r.opened) await post("/close", { id: sid });
+        await refreshAll();
+      }
+    } finally {
+      CanvasRenderingContext2D.prototype.stroke = realStroke;
+      if (realView) setView(realView.t0, realView.t1, { broadcast: false });
+    }
+  });
+
   await T("Status-bar mode icon doesn't swap to analysis mode while actively recording", async () => {
     const realStatus = recording.status;
     setRecordingState({ status: "recording" });
