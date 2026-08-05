@@ -935,7 +935,7 @@ async function startTracking(s) {
           interval: dockerPollIntervalSecs,
         });
       } catch (err) {
-        setStatus(String(err.message || err));
+        notifyEvent(String(err.message || err));
       }
     }
   }
@@ -1286,7 +1286,7 @@ async function exportSample(t0, t1) {
         interval: dockerPollIntervalSecs,
       });
     } catch (err) {
-      setStatus("could not start host telemetry: " + (err.message || err));
+      notifyEvent("could not start host telemetry: " + (err.message || err));
     }
   }
   const name = `metrics-${new Date(t0).toISOString().slice(0, 19).replace(/[T:]/g, "-")}.cttc-metric`;
@@ -1302,11 +1302,11 @@ async function exportSample(t0, t1) {
     const sourceCount = Number(res.headers.get("X-CTTC-Source-Count") || 0);
     const bytes = new Uint8Array(await res.arrayBuffer());
     const path = await saveBinaryFile(name, bytes);
-    if (!path) { setStatus("metrics export canceled"); return; }
-    setStatus(sourceCount ? `metrics saved: ${path} (${sourceCount} sources)`
-                          : "metrics saved, but no data in the selected range");
+    if (!path) { notifyEvent("metrics export canceled"); return; }
+    notifyEvent(sourceCount ? `metrics saved: ${path} (${sourceCount} sources)`
+                            : "metrics saved, but no data in the selected range");
   } catch (err) {
-    setStatus("metrics export failed: " + (err.message || err));
+    notifyEvent("metrics export failed: " + (err.message || err));
   }
 }
 
@@ -1527,9 +1527,9 @@ $("dlg-snapshot-save").onclick = async () => {
   const json = JSON.stringify(currentSnapshot, null, 2);
   try {
     const path = window.cttc?.saveJson ? await window.cttc.saveJson(name, json) : null;
-    if (path) setStatus("snapshot saved: " + path);
+    if (path) notifyEvent("snapshot saved: " + path);
   } catch (err) {
-    setStatus("snapshot save failed: " + (err.message || err));
+    notifyEvent("snapshot save failed: " + (err.message || err));
   }
 };
 $("dlg-snapshot-save-txt").onclick = async () => {
@@ -1538,9 +1538,9 @@ $("dlg-snapshot-save-txt").onclick = async () => {
   const text = snapshotToText(currentSnapshot);
   try {
     const path = window.cttc?.saveText ? await window.cttc.saveText(name, text) : null;
-    if (path) setStatus("snapshot saved: " + path);
+    if (path) notifyEvent("snapshot saved: " + path);
   } catch (err) {
-    setStatus("snapshot save failed: " + (err.message || err));
+    notifyEvent("snapshot save failed: " + (err.message || err));
   }
 };
 
@@ -1887,7 +1887,7 @@ async function fetchSeries() {
       })
     );
   } catch (err) {
-    setStatus(String(err));
+    notifyEvent(String(err));
     return;
   }
   assignColorSlots();
@@ -2351,8 +2351,14 @@ function syncPanels() {
 
 /* ── refresh / SSE ──────────────────────────────────────────────────────── */
 
-// the single status-line message in the toolbar (server connectivity,
-// export/save results, ...) -- always replaces whatever was there before.
+// The toolbar's own status line, next to the timestamp/cursor controls --
+// deliberately narrow now: only armSampleCapture's "drag across a chart"
+// hint uses it, since that instruction is specifically about those
+// controls. Every other transient status/error (server connectivity,
+// export/save results, recording lifecycle, ...) goes through notifyEvent
+// instead, so it shows up in exactly one place, the bottom status bar --
+// showing it here too used to duplicate it right next to the timestamp
+// controls, which have nothing to do with most of those messages.
 function setStatus(msg) {
   $("status").textContent = msg || "";
 }
@@ -2408,9 +2414,9 @@ async function refreshAll() {
     }
     await fetchSeries();
     liveTrackTick();
-    setStatus(src.json_impl === "orjson" ? "" : "server running without orjson (slow parse)");
+    if (src.json_impl !== "orjson") notifyEvent("server running without orjson (slow parse)");
   } catch (err) {
-    setStatus("server unreachable: " + err.message);
+    notifyEvent("server unreachable: " + err.message);
   }
 }
 
@@ -2437,8 +2443,7 @@ function connectSSE() {
   const url = API_TOKEN ? `${API}/events?token=${encodeURIComponent(API_TOKEN)}` : `${API}/events`;
   const es = new EventSource(url);
   es.onmessage = () => scheduleRefresh();
-  es.onerror = () => setStatus("reconnecting to server…");
-  es.onopen = () => setStatus("");
+  es.onerror = () => notifyEvent("reconnecting to server…");
 }
 
 /* ── set-sources dialog (Docker) ────────────────────────────────────────── */
@@ -3133,7 +3138,7 @@ async function startRecording() {
   if (recording.status === "recording") return;
   if (recording.status === "idle") {
     if (!window.cttc?.getRecordingScratchPath && !window.cttc?.writeBinaryFile) {
-      setStatus("Recording needs desktop file access — unavailable here");
+      notifyEvent("Recording needs desktop file access — unavailable here");
       return;
     }
     // No save-path prompt here -- see main.js's RECORDING_SCRATCH_PATH
@@ -3142,17 +3147,14 @@ async function startRecording() {
     // the user before they even know how long they'll be recording.
     const path = await recordingScratchPath();
     setRecordingState({ status: "recording", path, segmentStart: Date.now(), segments: [] });
-    const msg = "Recording started";
-    setStatus(msg);
-    recordStatusBarHistory(msg);
+    notifyEvent("Recording started");
   } else if (recording.status === "paused") {
     // resume from paused: same (scratch) path, a new segment starts now,
     // leaving a genuine gap in the highlight between the just-completed
     // segment (already in recording.segments, see pauseRecording) and
     // this one.
     setRecordingState({ status: "recording", segmentStart: Date.now() });
-    setStatus("Recording resumed");
-    recordStatusBarHistory("Recording resumed");
+    notifyEvent("Recording resumed");
   } else {
     return; // "stopped" -- btn-start-recording is disabled here, nothing to do
   }
@@ -3172,12 +3174,9 @@ async function pauseRecording() {
       segments: [...recording.segments, { from: recording.segmentStart, to }],
       segmentStart: null,
     });
-    setStatus("Recording paused");
-    recordStatusBarHistory("Recording paused");
+    notifyEvent("Recording paused");
   } catch (err) {
-    const msg = `Could not pause recording: ${err.message || err}`;
-    setStatus(msg);
-    recordStatusBarHistory(msg);
+    notifyEvent(`Could not pause recording: ${err.message || err}`);
     return; // stay "recording" -- the segment wasn't actually flushed
   }
   await persistRecordingMarker();
@@ -3198,9 +3197,7 @@ async function stopRecording() {
     try {
       await flushRecordingSegment(Date.now());
     } catch (err) {
-      const msg = `Could not finalize recording: ${err.message || err}`;
-      setStatus(msg);
-      recordStatusBarHistory(msg);
+      notifyEvent(`Could not finalize recording: ${err.message || err}`);
       return; // stay "recording" -- the final segment wasn't actually flushed
     }
   }
@@ -3211,20 +3208,17 @@ async function stopRecording() {
   }
   const savePath = await pickRecordingSavePath();
   if (!savePath) {
-    setStatus("Recording stopped but not saved — click Stop again to choose a file");
+    notifyEvent("Recording stopped but not saved — click Stop again to choose a file");
     return; // stays "stopped"
   }
   try {
     const bytes = await readRecordingBytes(recording.path);
     await writeRecordingBytes(savePath, bytes);
   } catch (err) {
-    const msg = `Could not save recording: ${err.message || err}`;
-    setStatus(msg);
-    recordStatusBarHistory(msg);
+    notifyEvent(`Could not save recording: ${err.message || err}`);
     return; // stays "stopped" -- Stop can be clicked again to retry
   }
-  setStatus(`Recording stopped — saved to ${savePath}`);
-  recordStatusBarHistory(`Recording stopped — ${savePath}`);
+  notifyEvent(`Recording stopped — saved to ${savePath}`);
   setRecordingState({ status: "idle", path: null, segmentStart: null, segments: [] });
   await persistRecordingMarker();
 }
@@ -3290,9 +3284,9 @@ async function recoverInterruptedRecording() {
   });
   await persistRecordingMarker();
   if (wasInterrupted) {
-    setStatus("A previous recording was interrupted and is now paused — Resume to continue, or Stop to finalize.");
+    notifyEvent("A previous recording was interrupted and is now paused — Resume to continue, or Stop to finalize.");
   } else if (marker.status === "stopped") {
-    setStatus("A previous recording finished but wasn't saved yet — click Stop to choose where to save it.");
+    notifyEvent("A previous recording finished but wasn't saved yet — click Stop to choose where to save it.");
   }
 }
 recoverInterruptedRecording();
@@ -3481,17 +3475,19 @@ function notifyEventWithCap(text, ms) {
 }
 
 /* ── status bar history (status bar's own History button) ────────────────
-   Every discrete message that's ever been shown as feedback (notifyEvent's
-   background events, flashStatus's action confirmations, and the Record/
-   Pause/Resume/Stop lifecycle messages -- those go through setStatus, the
-   *toolbar's* status line, not the bottom bar, so they're logged here
-   explicitly rather than via notifyEvent/flashStatus) -- kept in-memory
-   only, capped so a long session can't grow this forever. Deliberately
-   excludes continuous/repeating state that also happens to render into
-   #app-status-bar-text (the live-resume countdown, ticking every second;
-   the "capture mode" reminder, and the persistent " recording ..."
-   suffix from syncRecordingMenu) -- those aren't discrete events and would
-   just flood this with near-duplicate noise. */
+   Every discrete message that's ever been shown as feedback -- notifyEvent's
+   background events (server connectivity, export/save results, Record/
+   Pause/Resume/Stop lifecycle, ...) all funnel through here via notifyEvent
+   itself, the one place any transient status or error is ever shown (see
+   setStatus, now reserved just for the capture-arm hint next to the
+   timestamp controls, which isn't a discrete event and was never logged
+   here) -- kept in-memory only, capped so a long session can't grow this
+   forever. Deliberately excludes continuous/repeating state that also
+   happens to render into #app-status-bar-text (the live-resume countdown,
+   ticking every second, see flashStatus; the "capture mode" reminder, and
+   the persistent " recording ..." suffix from syncRecordingMenu) -- those
+   aren't discrete events and would just flood this with near-duplicate
+   noise. */
 const STATUS_BAR_HISTORY_MAX = 500;
 const statusBarHistory = [];
 function recordStatusBarHistory(text) {
@@ -4496,22 +4492,19 @@ async function shipLogsViaMain() {
 // "Ship logs": gathers local .cttc-log files + the gateway's own docker
 // logs into one zip (main.js's "ship-logs", which also owns the Save
 // dialog and the erase-afterward confirmation), then reports the outcome
-// via the toolbar status + bottom status bar (a background-ish action, not
-// unlike an event trigger, so it gets the same "did something happen"
-// visibility there).
+// via the bottom status bar (a background-ish action, not unlike an event
+// trigger, so it gets the same "did something happen" visibility there).
 if (!POPOUT_KIND) {
   $("btn-ship-logs").onclick = async () => {
     try {
       const result = await shipLogsViaMain();
       if (!result) return;
-      if (result.canceled) { setStatus("ship logs canceled"); return; }
-      if (!result.ok) { setStatus(result.error || "could not ship logs"); return; }
-      const msg = `shipped ${result.fileCount} log file${result.fileCount === 1 ? "" : "s"} to ${result.path}` +
-        (result.erased ? " (local .cttc-log files erased)" : "");
-      setStatus(msg);
-      notifyEvent(msg);
+      if (result.canceled) { notifyEvent("ship logs canceled"); return; }
+      if (!result.ok) { notifyEvent(result.error || "could not ship logs"); return; }
+      notifyEvent(`shipped ${result.fileCount} log file${result.fileCount === 1 ? "" : "s"} to ${result.path}` +
+        (result.erased ? " (local .cttc-log files erased)" : ""));
     } catch (err) {
-      setStatus("ship logs failed: " + (err.message || err));
+      notifyEvent("ship logs failed: " + (err.message || err));
     }
   };
 }
@@ -4736,7 +4729,7 @@ $("dlg-event-create").onclick = async () => {
   const conditions = buildEventConditions();
   const action = buildEventAction();
   const match = $("event-match").value;
-  if (!conditions.length) { setStatus("add at least one condition"); return; }
+  if (!conditions.length) { notifyEvent("add at least one condition"); return; }
   // Gateway-hosted conditions are validated server-side (events.py's
   // _validate: a bad regex or a NaN-turned-null threshold both 400 there) --
   // UI-hosted ones have no server to reject them, so an invalid value would
@@ -4761,7 +4754,7 @@ $("dlg-event-create").onclick = async () => {
       if (type === "metric") {
         const raw = row.querySelector('[data-field="threshold"]').value;
         if (raw.trim() === "" || !Number.isFinite(Number(raw))) {
-          setStatus("threshold must be a valid number");
+          notifyEvent("threshold must be a valid number");
           return;
         }
       } else {
@@ -4769,7 +4762,7 @@ $("dlg-event-create").onclick = async () => {
         try {
           new RegExp(pattern);
         } catch {
-          setStatus(`invalid regex: ${pattern}`);
+          notifyEvent(`invalid regex: ${pattern}`);
           return;
         }
       }
@@ -4786,11 +4779,9 @@ $("dlg-event-create").onclick = async () => {
         if (ev) Object.assign(ev, { name, sourceIds, conditions, match, action });
         saveUiEvents(list);
       }
-      setStatus(`event "${name}" updated`);
       notifyEvent(`Event "${name}" updated`);
     } else if ($("event-hosted").value === "gateway") {
       await post("/events/create", { name, source_ids: sourceIds, conditions, match, action });
-      setStatus(`event "${name}" created`);
       notifyEvent(`Event "${name}" created`);
     } else {
       const list = loadUiEvents();
@@ -4802,12 +4793,11 @@ $("dlg-event-create").onclick = async () => {
         logCursors: {}, // {conditionIndex: {sourceId: rowsScanned}}
       });
       saveUiEvents(list);
-      setStatus(`event "${name}" created`);
       notifyEvent(`Event "${name}" created`);
     }
     dlgEventForm.close();
   } catch (err) {
-    setStatus(`could not ${editingEvent ? "update" : "create"} event: ` + (err.message || err));
+    notifyEvent(`could not ${editingEvent ? "update" : "create"} event: ` + (err.message || err));
   }
 };
 
@@ -4856,7 +4846,7 @@ function renderEventRow(ev, hosted) {
             await saveBinaryFile(artifactId.split("/").pop(), bytes);
           }
         } catch (err) {
-          setStatus("could not save event artifact: " + (err.message || err));
+          notifyEvent("could not save event artifact: " + (err.message || err));
         }
       }));
     }
@@ -4971,7 +4961,7 @@ async function fireUiEvent(ev, detail) {
       ev._pendingGatewaySessionId = session_id;
     }
   } catch (err) {
-    setStatus(`event "${ev.name}" trigger failed: ` + (err.message || err));
+    notifyEvent(`event "${ev.name}" trigger failed: ` + (err.message || err));
   }
   saveUiEvents(loadUiEvents().map((x) => (x.id === ev.id ? ev : x)));
 }
@@ -5729,9 +5719,9 @@ connectSSE();
       if (!g.active) {
         item.onclick = async () => {
           close();
-          setStatus(`Switching to ${g.label || g.host}…`);
+          notifyEvent(`Switching to ${g.label || g.host}…`);
           const r = await window.cttc.switchGateway(g);
-          if (!r.ok) setStatus(r.error);
+          if (!r.ok) notifyEvent(r.error);
         };
       }
       dropdown.appendChild(item);

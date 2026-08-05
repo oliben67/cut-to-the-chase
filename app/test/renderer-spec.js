@@ -1481,7 +1481,7 @@
       ok(saved.bytes instanceof Uint8Array && saved.bytes.length > 0, "got real bytes");
       eq(saved.bytes[0], 0x50, "PK zip magic byte 1"); // 'P'
       eq(saved.bytes[1], 0x4b, "PK zip magic byte 2"); // 'K'
-      ok($("status").textContent.includes("metrics saved"), $("status").textContent);
+      ok($("app-status-bar-text").textContent.includes("metrics saved"), $("app-status-bar-text").textContent);
     } finally {
       saveBinaryFile = realSave;
       askExportOptions = realAsk;
@@ -1495,7 +1495,7 @@
     askExportOptions = async () => ({ includeHost: false, hadHost: false });
     try {
       await exportSample(R.min_ts, R.min_ts + 5 * 60000);
-      ok($("status").textContent.includes("canceled"), $("status").textContent);
+      ok($("app-status-bar-text").textContent.includes("canceled"), $("app-status-bar-text").textContent);
     } finally {
       saveBinaryFile = realSave;
       askExportOptions = realAsk;
@@ -1764,7 +1764,7 @@
       await recoverInterruptedRecording();
       eq(recording.status, "paused");
       eq(recording.path, "/fake/stale.cttc-record");
-      ok($("status").textContent.includes("interrupted"), $("status").textContent);
+      ok($("app-status-bar-text").textContent.includes("interrupted"), $("app-status-bar-text").textContent);
       ok(lastSet && lastSet.status === "paused", "corrected marker persisted as paused");
     } finally {
       getRecordingMarkerFromDisk = realGetMarker;
@@ -1795,7 +1795,7 @@
       eq(recording.path, "/fake/stale-stopped.cttc-record");
       eq(recording.segments.length, 0, "nothing left to highlight -- the recording is already over");
       eq($("btn-start-recording").disabled, true, "can't resume into a finished recording");
-      ok($("status").textContent.includes("wasn't saved"), $("status").textContent);
+      ok($("app-status-bar-text").textContent.includes("wasn't saved"), $("app-status-bar-text").textContent);
       ok(lastSet && lastSet.status === "stopped", "marker persisted still as stopped, not paused");
     } finally {
       getRecordingMarkerFromDisk = realGetMarker;
@@ -2097,8 +2097,8 @@
     try {
       $("btn-ship-logs").click();
       await until(() => called, "shipLogs invoked");
-      await until(() => $("status").textContent.includes("/tmp/x.zip"), "status reflects the result");
-      ok($("status").textContent.includes("erased"));
+      await until(() => $("app-status-bar-text").textContent.includes("/tmp/x.zip"), "status reflects the result");
+      ok($("app-status-bar-text").textContent.includes("erased"));
     } finally {
       shipLogsViaMain = real;
     }
@@ -2109,7 +2109,7 @@
     shipLogsViaMain = async () => ({ canceled: true });
     try {
       $("btn-ship-logs").click();
-      await until(() => $("status").textContent.includes("canceled"), "status reflects the cancel");
+      await until(() => $("app-status-bar-text").textContent.includes("canceled"), "status reflects the cancel");
     } finally {
       shipLogsViaMain = real;
     }
@@ -2385,7 +2385,7 @@
       $("event-conditions").children[0].querySelector('[data-field="threshold"]').value = "abc";
       await $("dlg-event-create").onclick();
       eq(loadUiEvents().length, before, "must not be saved with an invalid threshold");
-      ok($("status").textContent.includes("threshold"), "status explains why");
+      ok($("app-status-bar-text").textContent.includes("threshold"), "status explains why");
       ok(dlgEventForm.open, "dialog stays open so the user can fix it");
     } finally {
       dlgEventForm.close();
@@ -2410,7 +2410,7 @@
       row.querySelector('[data-field="pattern"]').value = "(unclosed";
       await $("dlg-event-create").onclick();
       eq(loadUiEvents().length, before, "must not be saved with an invalid regex");
-      ok($("status").textContent.includes("invalid regex"), "status explains why");
+      ok($("app-status-bar-text").textContent.includes("invalid regex"), "status explains why");
       ok(dlgEventForm.open, "dialog stays open so the user can fix it");
     } finally {
       dlgEventForm.close();
