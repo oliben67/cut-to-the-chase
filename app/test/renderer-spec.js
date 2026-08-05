@@ -1456,10 +1456,11 @@
       const groups = sampleFileGroups();
       eq(groups.length, 1, "one sample file group");
       ok(groups[0].ids.size >= 2, "group covers its sources");
-      eq(isSampleHidden(sample.id), false);
-      state.hiddenSamples.add(sample.path);
-      eq(isSampleHidden(sample.id), true, "hide toggle honors path");
-      state.hiddenSamples.delete(sample.path);
+      eq(isSampleHidden(sample.id), false, "the only loaded file becomes the active view (refreshAll's self-heal)");
+      eq(state.activeSamplePath, sample.path, "sanity: refreshAll picked this file as the active view");
+      state.activeSamplePath = "/some/other/path";
+      eq(isSampleHidden(sample.id), true, "hidden once a *different* path is the active view");
+      state.activeSamplePath = sample.path;
       renderLegend();
       ok(document.getElementById("sample-files"), "sample chip row rendered");
     } finally {
@@ -3076,6 +3077,167 @@
       dlg.close();
       $("btn-set").click();
       dlg.close();
+    }
+  });
+
+  /* ── View pill: exactly one view (Live or one loaded file) at a time ──── */
+
+  await T("Load Data auto-switches to the newly opened file, hiding (not disposing) whatever was active before", async () => {
+    const out1 = "/tmp/cttc-e2e-view-a.cttc-metric";
+    const out2 = "/tmp/cttc-e2e-view-b.cttc-metric";
+    await post("/sample/export", { path: out1, from: R.min_ts, to: R.min_ts + 5 * 60000 });
+    await post("/sample/export", { path: out2, from: R.min_ts, to: R.min_ts + 5 * 60000 });
+    const realPick = pickAnalysisFiles;
+    try {
+      pickAnalysisFiles = async () => [out1];
+      await $("btn-load-sample").onclick();
+      const pathA = `upload://${basename(out1)}`;
+      let groupA = sampleFileGroups().find((g) => g.path === pathA);
+      ok(groupA, "file A opened");
+      eq(state.activeSamplePath, pathA, "A became the active view");
+      ok([...groupA.ids].every((id) => !isSampleHidden(id)), "A's sources visible");
+
+      pickAnalysisFiles = async () => [out2];
+      await $("btn-load-sample").onclick();
+      const pathB = `upload://${basename(out2)}`;
+      const groupB = sampleFileGroups().find((g) => g.path === pathB);
+      ok(groupB, "file B opened");
+      eq(state.activeSamplePath, pathB, "B became the active view");
+      ok([...groupB.ids].every((id) => !isSampleHidden(id)), "B's sources visible");
+      groupA = sampleFileGroups().find((g) => g.path === pathA);
+      ok([...groupA.ids].every((id) => isSampleHidden(id)), "A's sources now hidden");
+      ok(state.sources.some((s) => groupA.ids.has(s.id)), "A's sources still open server-side, not disposed");
+    } finally {
+      pickAnalysisFiles = realPick;
+      for (const s of state.sources.filter((s) => s.path === `upload://${basename(out1)}` || s.path === `upload://${basename(out2)}`)) {
+        await post("/close", { id: s.id });
+      }
+      await refreshAll();
+    }
+  });
+
+  await T("Re-opening an already-open file switches to its existing view instead of duplicating or no-op'ing", async () => {
+    const outA = "/tmp/cttc-e2e-view-reopen-a.cttc-metric";
+    const outB = "/tmp/cttc-e2e-view-reopen-b.cttc-metric";
+    await post("/sample/export", { path: outA, from: R.min_ts, to: R.min_ts + 5 * 60000 });
+    await post("/sample/export", { path: outB, from: R.min_ts, to: R.min_ts + 5 * 60000 });
+    const pathA = `upload://${basename(outA)}`;
+    const pathB = `upload://${basename(outB)}`;
+    const realPick = pickAnalysisFiles;
+    try {
+      pickAnalysisFiles = async () => [outA];
+      await $("btn-load-sample").onclick();
+      const idsA = new Set(state.sources.filter((s) => s.path === pathA).map((s) => s.id));
+
+      pickAnalysisFiles = async () => [outB];
+      await $("btn-load-sample").onclick(); // B becomes active, A hidden
+      eq(state.activeSamplePath, pathB, "sanity: B is active");
+
+      pickAnalysisFiles = async () => [outA]; // re-"open" A -- already open
+      await $("btn-load-sample").onclick();
+      eq(state.activeSamplePath, pathA, "switched back to A's existing view");
+      const idsAAfter = new Set(state.sources.filter((s) => s.path === pathA).map((s) => s.id));
+      eq(idsAAfter.size, idsA.size, "no duplicate sources -- same set as before");
+      ok([...idsAAfter].every((id) => idsA.has(id)), "exact same source ids, not re-uploaded");
+    } finally {
+      pickAnalysisFiles = realPick;
+      for (const s of state.sources.filter((s) => s.path === pathA || s.path === pathB)) {
+        await post("/close", { id: s.id });
+      }
+      await refreshAll();
+    }
+  });
+
+  await T("View pill dropdown lists Live + open files, picking one switches the active view", async () => {
+    const out = "/tmp/cttc-e2e-view-pill-dropdown.cttc-metric";
+    await post("/sample/export", { path: out, from: R.min_ts, to: R.min_ts + 5 * 60000 });
+    const path = `upload://${basename(out)}`;
+    const realPick = pickAnalysisFiles;
+    try {
+      pickAnalysisFiles = async () => [out];
+      await $("btn-load-sample").onclick();
+      eq(state.activeSamplePath, path, "sanity: the file is the active view");
+
+      $("view-status-btn").click();
+      const items = [...$("view-dropdown").querySelectorAll(".gateway-item")];
+      const labels = items.map((b) => b.querySelector(".gateway-item-label").textContent);
+      ok(labels.includes("Live"), labels.join(", "));
+      ok(labels.some((l) => l.includes(basename(out))), labels.join(", "));
+      const liveItem = items.find((b) => b.querySelector(".gateway-item-label").textContent === "Live");
+      eq(liveItem.dataset.active, "false", "Live isn't the active view -- the file is");
+      const fileItem = items.find((b) => b.querySelector(".gateway-item-label").textContent.includes(basename(out)));
+      eq(fileItem.dataset.active, "true", "the loaded file is marked active");
+
+      liveItem.click();
+      eq(state.liveHidden, false, "switched to Live");
+      $("view-status-btn").click();
+      const itemsAfter = [...$("view-dropdown").querySelectorAll(".gateway-item")];
+      const liveAfter = itemsAfter.find((b) => b.querySelector(".gateway-item-label").textContent === "Live");
+      eq(liveAfter.dataset.active, "true", "Live now marked active");
+      document.body.click();
+    } finally {
+      pickAnalysisFiles = realPick;
+      for (const s of state.sources.filter((s) => s.path === path)) await post("/close", { id: s.id });
+      await refreshAll();
+    }
+  });
+
+  await T("Close view disposes a .cttc-metric view's data, but never a .cttc-record view's", async () => {
+    const metricPath = "/tmp/cttc-e2e-view-close-metric.cttc-metric";
+    await post("/sample/export", { path: metricPath, from: R.min_ts, to: R.min_ts + 5 * 60000 });
+    const t0 = R.min_ts;
+    const res = await fetch(`${API}/sample/record`, {
+      method: "POST", body: new Uint8Array(0),
+      headers: { "X-CTTC-From": String(t0), "X-CTTC-To": String(t0 + 60000) },
+    });
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const recordPath = "/tmp/cttc-e2e-view-close-record.cttc-record";
+    await window.cttc.writeBinaryFile(recordPath, bytes);
+    const metricUploadPath = `upload://${basename(metricPath)}`;
+    const recordUploadPath = `upload://${basename(recordPath)}`;
+
+    const realPick = pickAnalysisFiles;
+    try {
+      pickAnalysisFiles = async () => [metricPath];
+      await $("btn-load-sample").onclick();
+      eq(state.activeSamplePath, metricUploadPath, "sanity: metric view active");
+      await closeActiveView();
+      ok(!state.sources.some((s) => s.path === metricUploadPath), "metric view's sources actually closed");
+      ok(!sampleFileGroups().some((g) => g.path === metricUploadPath), "no longer listed as a view");
+
+      pickAnalysisFiles = async () => [recordPath];
+      await $("btn-load-sample").onclick();
+      eq(state.activeSamplePath, recordUploadPath, "sanity: record view active");
+      const idsBefore = new Set(state.sources.filter((s) => s.path === recordUploadPath).map((s) => s.id));
+      await closeActiveView();
+      const idsAfter = new Set(state.sources.filter((s) => s.path === recordUploadPath).map((s) => s.id));
+      eq(idsAfter.size, idsBefore.size, "record view's sources were NOT disposed");
+      ok([...idsAfter].every((id) => idsBefore.has(id)));
+      eq(state.activeSamplePath, recordUploadPath, "record view still the active view -- Close view was a no-op");
+    } finally {
+      pickAnalysisFiles = realPick;
+      for (const s of state.sources.filter((s) => s.path === metricUploadPath || s.path === recordUploadPath)) {
+        await post("/close", { id: s.id });
+      }
+      await refreshAll();
+    }
+  });
+
+  await T("Close view is a no-op while viewing Live", async () => {
+    ok(!state.liveHidden, "sanity: Live is the active view in this suite's baseline state");
+    await closeActiveView();
+    ok(!state.liveHidden, "still Live -- nothing to close");
+  });
+
+  await T("clicking the View pill hides the Gateway and Docker Host pills too, restored on close", () => {
+    $("view-status-btn").click();
+    try {
+      ok($("server-status").classList.contains("peer-hidden"), "Gateway hidden while View's switcher is open");
+      ok($("docker-host-status").classList.contains("peer-hidden"), "Docker Host hidden while View's switcher is open");
+    } finally {
+      document.body.click();
+      ok(!$("server-status").classList.contains("peer-hidden"), "Gateway restored");
+      ok(!$("docker-host-status").classList.contains("peer-hidden"), "Docker Host restored");
     }
   });
 

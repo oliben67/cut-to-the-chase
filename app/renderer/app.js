@@ -112,7 +112,13 @@ const state = {
   series: null,           // /series payload for current view
   ticks: new Map(),       // log source id -> counts[]
   visible: new Map(),     // series name -> bool
-  hiddenSamples: new Set(), // loaded .cttc-metric/.cttc-record path -> hidden (whole-file toggle)
+  // Which one loaded .cttc-metric/.cttc-record file is the active view --
+  // exactly one file's data is ever visible/interactive at a time (see
+  // setActiveView), not the multi-select show/hide toggle this used to be
+  // (state.hiddenSamples, a Set of *hidden* paths -- any subset could be
+  // shown together). null until something is actually loaded, or once the
+  // active file's last source closes (see refreshAll's self-heal).
+  activeSamplePath: null,
   // Whole-app "analysis" mode -- true whenever a loaded
   // sample/recording should take over the display: the Recording/
   // Frequency/Live tracking toolbar group and every *live* source's
@@ -325,13 +331,13 @@ function sampleFileGroups() {
   }
   return [...byPath.values()];
 }
-// true if this source belongs to a loaded .cttc-metric/.cttc-record file the
-// user has toggled
-// off via the sample-files switch in the legend (see renderSampleFiles()) --
-// checked everywhere a sample-sourced series/lane/panel might need hiding.
+// true if this source belongs to a loaded .cttc-metric/.cttc-record file
+// that *isn't* the current active view (see setActiveView) -- exactly one
+// loaded file's sources are ever shown at a time now, checked everywhere a
+// sample-sourced series/lane/panel might need hiding.
 function isSampleHidden(sid) {
   const src = state.sources.find((s) => s.id === sid);
-  return !!(src && src.live === false && state.hiddenSamples.has(src.path));
+  return !!(src && src.live === false && src.path !== state.activeSamplePath);
 }
 // The inverse of isSampleHidden: true for a *live* source while the app is
 // in analysis mode (state.liveHidden) -- checked
@@ -984,46 +990,28 @@ function legendChip(text) {
   return chip;
 }
 
-// one row per loaded .cttc-metric/.cttc-record file, with a slide switch to
-// show/hide everything
-// from that file (charts, lanes, panels) in a single click
+// Read-only "currently viewing: <name>" line -- switching which loaded
+// file is active (or back to Live) now lives solely in the view-switcher
+// pill's dropdown (see setActiveView), not a per-file toggle here: two
+// controls for the same state is exactly how ui-LIVE-005 happened before.
 function renderSampleFiles() {
   const groups = sampleFileGroups();
   if (!groups.length) return;
   const box = document.createElement("div");
   box.id = "sample-files";
-  for (const g of groups) {
-    const hidden = state.hiddenSamples.has(g.path);
-    const row = document.createElement("label");
-    row.className = "ctl switch-row sample-file-row";
-    row.title = g.path;
-    const sw = document.createElement("span");
-    sw.className = "switch";
-    const cb = document.createElement("input");
-    cb.type = "checkbox";
-    cb.checked = !hidden;
-    cb.onchange = () => {
-      if (cb.checked) state.hiddenSamples.delete(g.path);
-      else state.hiddenSamples.add(g.path);
-      relist();
-    };
-    const track = document.createElement("span");
-    track.className = "switch-track";
-    const thumb = document.createElement("span");
-    thumb.className = "switch-thumb";
-    track.appendChild(thumb);
-    sw.append(cb, track);
-    const label = document.createElement("span");
-    label.textContent = `${basename(g.path)} ${hidden ? "(hidden)" : "(shown)"}`;
-    row.append(sw, label);
-    box.appendChild(row);
-  }
+  const active = groups.find((g) => g.path === state.activeSamplePath) || groups[0];
+  const row = document.createElement("div");
+  row.className = "ctl sample-file-row";
+  row.title = active.path;
+  row.textContent = `Viewing: ${basename(active.path)}`;
+  box.appendChild(row);
   legendEl.appendChild(box);
 }
 
 function relist() {
   renderLegend();
   drawAll();
+  refreshViewPill();
 }
 
 // the view/cursor handed to a new popout window so it opens on exactly the
@@ -1239,6 +1227,12 @@ function syncDockerDaemonButtons() {
 // dot/tooltip reflect the current connection without needing the dropdown
 // to be opened first.
 let refreshDockerHostPill = () => {};
+
+// Same pattern, reassigned by the View pill IIFE -- called from relist()
+// (every setActiveView/setLiveHidden already routes through it) so the
+// pill's dot/tooltip track the active view without needing its dropdown
+// opened first.
+let refreshViewPill = () => {};
 
 const dlgExport = $("dlg-export");
 
@@ -2412,6 +2406,23 @@ async function refreshAll() {
     ) {
       setActiveRecordSections(null);
     }
+    // Self-heals state.activeSamplePath the same way, and for the same
+    // reason: if the active view's own sources got closed some other way
+    // (Close view, a sidebar per-file close, ...) there's nothing left to
+    // show for it -- fall back to another still-open file if one exists,
+    // rather than isSampleHidden hiding every source with nothing switched
+    // to instead (see setActiveView).
+    const sampleGroups = sampleFileGroups();
+    if (!sampleGroups.some((g) => g.path === state.activeSamplePath)) {
+      // Covers both directions: activeSamplePath pointing at a file that's
+      // no longer open (fall back to another still-open one, or none),
+      // and activeSamplePath never having been set at all despite a
+      // sample now being open (e.g. opened via a path other than
+      // btn-load-sample/openRecording's own setActiveView call, such as a
+      // direct /open) -- either way, default to the first still-open file
+      // rather than leaving every sample hidden with nothing selected.
+      state.activeSamplePath = sampleGroups.length ? sampleGroups[0].path : null;
+    }
     if (hasSample !== state.liveHidden) setLiveHidden(hasSample);
     assignColorSlots(); // before anything draws, so slots don't depend on draw order
     const hadView = !!state.view;
@@ -3002,13 +3013,18 @@ function centerViewOnLoadedStart(openedIds) {
 
 $("btn-load-sample").onclick = async () => {
   const paths = await pickAnalysisFiles();
+  const isAnalysisFile = (p) => p.endsWith(".cttc-metric") || p.endsWith(".cttc-record");
   const open = openPaths();
-  const files = paths.filter(
-    (p) =>
-      (p.endsWith(".cttc-metric") || p.endsWith(".cttc-record")) &&
-      !open.has(`upload://${basename(p)}`)
-  );
-  if (!files.length) return;
+  const alreadyOpen = paths.filter((p) => isAnalysisFile(p) && open.has(`upload://${basename(p)}`));
+  const files = paths.filter((p) => isAnalysisFile(p) && !open.has(`upload://${basename(p)}`));
+  if (!files.length) {
+    // Every picked file is already open -- switch to the last one instead
+    // of silently doing nothing: opening an already-open file switches to
+    // its existing view, it never duplicates or no-ops quietly (see
+    // setActiveView).
+    if (alreadyOpen.length) setActiveView(`upload://${basename(alreadyOpen[alreadyOpen.length - 1])}`);
+    return;
+  }
   try {
     const errors = [];
     const openedIds = [];
@@ -3019,6 +3035,7 @@ $("btn-load-sample").onclick = async () => {
     }
     if (errors.length) alert(errors.map((e) => `${e.path}: ${e.error}`).join("\n"));
     await refreshAll(); // also switches into analysis mode -- see setLiveHidden
+    setActiveView(`upload://${basename(files[files.length - 1])}`);
     centerViewOnLoadedStart(openedIds);
   } catch (err) {
     alert(String(err.message || err));
@@ -3273,10 +3290,14 @@ async function openRecording() {
   // isolated in Redis, see LogSource._entity, so it's no longer a data
   // *collision*, just a needless, ever-growing pile of duplicate sources).
   const open = openPaths();
-  const files = paths.filter(
-    (p) => p.endsWith(".cttc-record") && !open.has(`upload://${basename(p)}`)
-  );
-  if (!files.length) return;
+  const alreadyOpen = paths.filter((p) => p.endsWith(".cttc-record") && open.has(`upload://${basename(p)}`));
+  const files = paths.filter((p) => p.endsWith(".cttc-record") && !open.has(`upload://${basename(p)}`));
+  if (!files.length) {
+    // Already open -- switch to it instead of silently doing nothing (see
+    // btn-load-sample's matching comment/setActiveView).
+    if (alreadyOpen.length) setActiveView(`upload://${basename(alreadyOpen[alreadyOpen.length - 1])}`);
+    return;
+  }
   try {
     const errors = [];
     const openedIds = [];
@@ -3287,6 +3308,7 @@ async function openRecording() {
     }
     if (errors.length) alert(errors.map((e) => `${e.path}: ${e.error}`).join("\n"));
     await refreshAll(); // also switches into analysis mode -- see setLiveHidden
+    setActiveView(`upload://${basename(files[files.length - 1])}`);
     centerViewOnLoadedStart(openedIds);
   } catch (err) {
     alert(String(err.message || err));
@@ -5235,6 +5257,43 @@ function setLiveHidden(hidden) {
   relist();
   syncPanels();
 }
+
+// The one entry point for "show exactly this, and nothing else" -- either
+// "live" or one loaded file's path (sampleFileGroups()'s own g.path, the
+// same value state.activeSamplePath and isSampleHidden compare against).
+// Thin wrapper around setLiveHidden, which already owns every side effect
+// of entering/leaving analysis mode (mode icon, recording controls,
+// saved-view restore, #record-sections cleanup) -- this only adds *which*
+// loaded file is the active one on top of that, and is safe to call even
+// when the requested view is already the active one (setLiveHidden no-ops
+// its own side effects when `hidden` doesn't actually change, but still
+// re-renders, so switching between two already-open files still works).
+function setActiveView(view) {
+  if (view === "live") {
+    setLiveHidden(false);
+    return;
+  }
+  state.activeSamplePath = view;
+  setLiveHidden(true);
+}
+
+// The View pill's right-click "Close view": disposes the active view's
+// data -- except Live (nothing to dispose, collection never stops
+// regardless of what's being viewed) and a .cttc-record-sourced view
+// (explicit user direction: closing that view must never discard a
+// recording's data, only a plain loaded .cttc-metric's). refreshAll's own
+// self-heal (see its activeSamplePath check) picks the next remaining
+// view, or falls back to Live if none are left -- nothing else to do here
+// after the sources are gone.
+async function closeActiveView() {
+  if (!state.liveHidden || !state.activeSamplePath) return; // Live -- nothing to close
+  if (state.activeSamplePath.endsWith(".cttc-record")) return; // recording data survives
+  const group = sampleFileGroups().find((g) => g.path === state.activeSamplePath);
+  if (!group) return;
+  await Promise.all([...group.ids].map((id) => post("/close", { id })));
+  await refreshAll();
+}
+
 // Closes every loaded sample/recording source outright (live collection,
 // per its own docstring, was never stopped -- there's nothing else "live"
 // to resume) -- setLiveHidden(false) then follows automatically from
@@ -5581,13 +5640,16 @@ refreshAll().then(async () => {
 });
 connectSSE();
 
-/* ── Gateway/Docker Host pills hide each other while either has an overlay
-   open (hover info popup, switcher dropdown, or right-click actions menu)
-   -- they sit side by side and each overlay anchors to its own wrapper's
-   right edge, so a wide one can otherwise visually run into its neighbor.
-   visibility (not display) keeps the toolbar's own layout stable while
-   hidden. Also doubles as the "don't show hover info while a menu from
-   this same pill is open" guard (see each pill's own mouseenter). */
+/* ── Gateway/Docker Host/View pills hide their siblings while any one of
+   them has an overlay open (hover info popup, switcher dropdown, or
+   right-click actions menu) -- they sit side by side in the toolbar and
+   each overlay anchors to its own wrapper's right edge, so a wide one can
+   otherwise visually run into a neighbor. visibility (not display) keeps
+   the toolbar's own layout stable while hidden. gatewayMenuOpen/
+   dockerHostMenuOpen also double as the "don't show hover info while a
+   menu from this same pill is open" guard (see each pill's own
+   mouseenter) -- the View pill has no hover popup, so its own hasOverlay
+   check is the same as its menuOpen check. */
 function gatewayMenuOpen() {
   const dropdown = $("gateway-dropdown");
   return (dropdown ? !dropdown.hidden : false) || document.getElementById("ctxmenu")?.dataset.owner === "gateway";
@@ -5604,9 +5666,22 @@ function dockerHostHasOverlay() {
   const popup = $("docker-host-info-popup");
   return (popup ? !popup.hidden : false) || dockerHostMenuOpen();
 }
+function viewMenuOpen() {
+  const dropdown = $("view-dropdown");
+  return (dropdown ? !dropdown.hidden : false) || document.getElementById("ctxmenu")?.dataset.owner === "view";
+}
+const TOOLBAR_PILLS = [
+  { id: "server-status", hasOverlay: gatewayHasOverlay },
+  { id: "docker-host-status", hasOverlay: dockerHostHasOverlay },
+  { id: "view-status", hasOverlay: viewMenuOpen },
+];
 function syncPillPeerVisibility() {
-  $("docker-host-status")?.classList.toggle("peer-hidden", gatewayHasOverlay());
-  $("server-status")?.classList.toggle("peer-hidden", dockerHostHasOverlay());
+  for (const pill of TOOLBAR_PILLS) {
+    const el = $(pill.id);
+    if (!el) continue;
+    const otherEngaged = TOOLBAR_PILLS.some((p) => p !== pill && p.hasOverlay());
+    el.classList.toggle("peer-hidden", otherEngaged);
+  }
 }
 // Right-click menus close via ctxMenu/closeCtxMenu's own shared, generic
 // listeners (any window click, Escape) -- rather than teach that shared
@@ -6016,6 +6091,98 @@ function watchCtxMenuClose(ownerId) {
     render();
     syncPillPeerVisibility();
   };
+  document.addEventListener("click", (e) => {
+    if (!wrap.contains(e.target)) close();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") close();
+  });
+})();
+
+/* ── View pill (click the pill right of Docker Host) ──────────────────────
+   Lists every open view -- "Live" plus one entry per loaded .cttc-metric/
+   .cttc-record file (sampleFileGroups(), already the one-group-per-path
+   dedup BUG-0073 relies on) -- and switches which one is the active view
+   (setActiveView) on pick. Right-click offers a single action, Close
+   view (closeActiveView) -- a no-op for Live or a .cttc-record-sourced
+   view, since neither's data is meant to be disposed this way. */
+(() => {
+  const wrap = $("view-status");
+  const btn = $("view-status-btn");
+  const dropdown = $("view-dropdown");
+  if (!wrap) return;
+
+  const close = () => {
+    wrap.classList.remove("open");
+    dropdown.hidden = true;
+    syncPillPeerVisibility();
+  };
+
+  const render = () => {
+    dropdown.innerHTML = "";
+    const entries = [
+      { key: "live", label: "Live", active: !state.liveHidden },
+      ...sampleFileGroups().map((g) => ({
+        key: g.path,
+        label: basename(g.path),
+        active: state.liveHidden && g.path === state.activeSamplePath,
+      })),
+    ];
+    entries.forEach((entry, i) => {
+      if (i > 0) {
+        const sep = document.createElement("div");
+        sep.className = "gateway-item-sep";
+        dropdown.appendChild(sep);
+      }
+      const item = document.createElement("button");
+      item.type = "button";
+      item.className = "gateway-item";
+      item.dataset.active = String(entry.active);
+      const label = document.createElement("span");
+      label.className = "gateway-item-label";
+      label.textContent = entry.label;
+      item.appendChild(label);
+      if (!entry.active) {
+        item.onclick = () => {
+          close();
+          setActiveView(entry.key);
+        };
+      }
+      dropdown.appendChild(item);
+    });
+  };
+
+  // Updates the dot/tooltip alone -- cheap enough to run on every
+  // relist() (which every setActiveView/setLiveHidden call already goes
+  // through), unlike render()'s full dropdown rebuild, which only needs
+  // to happen while it's open.
+  const syncPill = () => {
+    wrap.dataset.state = state.liveHidden ? "up" : "";
+    const activeGroup = state.liveHidden
+      ? sampleFileGroups().find((g) => g.path === state.activeSamplePath)
+      : null;
+    const label = state.liveHidden ? (activeGroup ? basename(activeGroup.path) : "…") : "Live";
+    btn.title = `${label} — Switch view…`;
+  };
+  refreshViewPill = syncPill;
+  syncPill();
+
+  btn.onclick = (e) => {
+    e.stopPropagation();
+    if (wrap.classList.contains("open")) {
+      close();
+      return;
+    }
+    wrap.classList.add("open");
+    dropdown.hidden = false;
+    render();
+    syncPillPeerVisibility();
+  };
+  wrap.addEventListener("contextmenu", (e) => {
+    ctxMenu(e, [["Close view", () => closeActiveView()]], "view");
+    syncPillPeerVisibility();
+    watchCtxMenuClose("view");
+  });
   document.addEventListener("click", (e) => {
     if (!wrap.contains(e.target)) close();
   });
