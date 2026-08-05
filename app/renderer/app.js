@@ -1203,13 +1203,14 @@ function hasDockerDaemon() {
 }
 
 // Remove Docker Host only makes sense once something is actually saved --
-// enabling it regardless would have nothing to forget. Connect Docker Host
-// stays enabled either way now: with a host already active it opens
-// straight into that host's locked edit view instead of a blank create
-// form (see btn-set/enterDockerHostEditMode below) -- there's no separate
-// Edit button left to gate. Called after every state.sources refresh.
+// enabling it regardless would have nothing to forget. New Docker Host
+// stays enabled regardless (always opens a blank create form -- multiple
+// hosts can be tracked at once). Edit Docker Host needs something actually
+// connected to edit (ui-DHOST-025). Called after every state.sources
+// refresh.
 function syncDockerDaemonButtons() {
   $("btn-clear-sources").disabled = !hasDockerDaemon();
+  $("btn-edit-docker-host").disabled = !hasDockerDaemon();
   // Remove Docker Host (permanently forgetting a saved one) is independent
   // of whether anything is currently connected -- it operates on the saved
   // catalog (savedDockerDaemons), not on state.sources.
@@ -2630,16 +2631,14 @@ $("docker-host-history").onchange = async () => {
 // Every control except Docker host / SSH key / Fetch starts empty and
 // disabled -- there's nothing to configure until Fetch has actually shown
 // what's running on the host currently typed in (see setDockerFormEnabled),
-// so nothing here is populated or enabled speculatively. With a Docker host
-// already active there's nothing new to create, so this opens straight
-// into that host's locked edit view instead (see enterDockerHostEditMode) --
-// the same place a separate Edit Docker Host button used to lead.
-$("btn-set").onclick = async () => {
-  if (hasDockerDaemon()) {
-    dlg.showModal();
-    await enterDockerHostEditMode(currentDockerHost() || "local");
-    return;
-  }
+// so nothing here is populated or enabled speculatively. Always opens a
+// blank create form, regardless of whatever else is already connected --
+// multiple Docker hosts can be tracked at once (dlg-ok only ever closes
+// sources for the *same* hostKey being submitted), so this never needs to
+// disconnect anything first. No "Load Docker Host" picker here (that's
+// specifically Edit Docker Host's job, see enterDockerHostEditMode) --
+// picking an existing host to reconnect/reconfigure means Edit, not New.
+function openNewDockerHostDialog() {
   dockerDaemonEditMode = false;
   // A fresh daemon starts with nothing preselected -- never carries over
   // some earlier, unrelated host's persisted selection.
@@ -2649,7 +2648,7 @@ $("btn-set").onclick = async () => {
   $("docker-ssh-key").value = "";
   $("docker-ssh-key").disabled = false;
   $("docker-ssh-key-browse").disabled = false;
-  $("dlg-set-title").textContent = "Connect Docker Host";
+  $("dlg-set-title").textContent = "New Docker Host";
   $("btn-ps-refresh-label").textContent = "Fetch Sources";
   $("dlg-ok").textContent = "Connect Docker Host";
   $("docker-targets").innerHTML = "";
@@ -2659,22 +2658,37 @@ $("btn-set").onclick = async () => {
   renderActivityLog(null);
   dockerFetchAttempted = false;
   syncActivityToggleEnabled();
+  // Still populates the underlying <select>'s options (some callers drive
+  // it programmatically, see the Docker Host pill's openHost) -- only the
+  // row itself stays hidden, since New Docker Host never shows this picker.
   populateDockerHostHistory();
+  $("docker-host-history-row").hidden = true;
   dlg.showModal();
-};
+}
+$("btn-set").onclick = openNewDockerHostDialog;
+
+// No-op with nothing connected (ui-DHOST-025) -- there's nothing to edit
+// yet; use New Docker Host instead.
+async function openEditDockerHostDialog() {
+  if (!hasDockerDaemon()) return;
+  dlg.showModal();
+  await enterDockerHostEditMode(currentDockerHost() || "local");
+}
 
 // Reopens the dialog pre-pointed at hostKey -- host and ssh key are locked
-// (this is "reconfigure/refresh what's already set", not "pick a new
-// target": use the Load Docker Host dropdown above for that instead), and
-// Fetch becomes Refresh, since it's re-probing a known daemon rather than
-// connecting to a new one. Only ever called for the currently-active host
-// (see btn-set above) -- submitting still goes through the same dlg-ok
-// handler as the create flow, disabled inputs' .value reads normally.
+// (this is "reconfigure/refresh what's already set", editing which
+// containers/services are followed for an already-identified host, not
+// its connection string itself), and Fetch becomes Refresh, since it's
+// re-probing a known daemon rather than connecting to a new one. Load
+// Docker Host stays visible+enabled here too (unlike before) -- picking a
+// different saved host from it re-targets the checklist to that host, but
+// never unlocks host/ssh-key: still Edit, just editing a different host's
+// checklist now, not its connection string either. Submitting still goes
+// through the same dlg-ok handler as the create flow, disabled inputs'
+// .value reads normally.
 async function enterDockerHostEditMode(hostKey) {
   dockerDaemonEditMode = true;
-  // Load Docker Host only makes sense when picking a *new* target -- this
-  // host is already locked in, so it can't be replaced from the dropdown.
-  $("docker-host-history-row").hidden = true;
+  populateDockerHostHistory();
   $("docker-host").value = hostKey === "local" ? "" : hostKey.replace(/^ssh:\/\//, "");
   $("docker-host").disabled = true;
   $("docker-ssh-key").value = dockerHostKeys.get(hostKey) || "";
@@ -5593,10 +5607,13 @@ connectSSE();
     row.append(l, v);
     return row;
   }
-  el.addEventListener("contextmenu", async (e) => {
-    e.preventDefault();
+  // Hover shows the same connection detail right-click used to (Connection/
+  // Gateway/ssh target/port) -- right-click is now the New/Edit/Uninstall
+  // Gateway actions menu instead (ui-GATE/SBAR reorg), so this info needs a
+  // trigger of its own.
+  el.addEventListener("mouseenter", async () => {
     if (!popup) return;
-    await loadConnectionInfo(); // refresh -- may have switched gateways since the last popup
+    await loadConnectionInfo(); // refresh -- may have switched gateways since the last hover
     popup.innerHTML = "";
     popup.appendChild(renderInfoRow("Connection", connectionInfo.connectionType));
     if (connectionInfo.connectionType !== "local") {
@@ -5612,21 +5629,19 @@ connectSSE();
     }
     popup.hidden = false;
   });
-  document.addEventListener("click", (e) => {
-    if (popup && !popup.hidden && !popup.contains(e.target)) popup.hidden = true;
+  el.addEventListener("mouseleave", () => {
+    if (popup) popup.hidden = true;
   });
-  // Right-clicking elsewhere doesn't fire a "click" event (only left-click
-  // does) -- without this, the popup would only ever close on a left click
-  // or Escape, staying stuck open through a right-click anywhere else.
-  document.addEventListener(
-    "contextmenu",
-    (e) => {
-      if (popup && !popup.hidden && !el.contains(e.target)) popup.hidden = true;
-    },
-    true
-  );
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && popup) popup.hidden = true;
+  // Right-click: New/Edit/Uninstall Gateway, the same actions the action
+  // bar's Gateway group already exposes (ctxMenu is the shared generic
+  // context-menu helper, also used by the legend/chart-time menus).
+  el.addEventListener("contextmenu", (e) => {
+    if (popup) popup.hidden = true; // don't show both at once if still hovering
+    ctxMenu(e, [
+      ["New Gateway…", () => openNewGatewayDialog()],
+      ["Edit Gateway", () => openEditGatewaysDialog()],
+      ["Uninstall Gateway…", () => openUninstallGatewayDialog()],
+    ]);
   });
 
   const HEALTH_POLL_MS = 5000;
@@ -5703,7 +5718,12 @@ connectSSE();
       dropdown.appendChild(empty);
       return;
     }
-    for (const g of gateways) {
+    gateways.forEach((g, i) => {
+      if (i > 0) {
+        const sep = document.createElement("div");
+        sep.className = "gateway-item-sep";
+        dropdown.appendChild(sep);
+      }
       const item = document.createElement("button");
       item.type = "button";
       item.className = "gateway-item";
@@ -5725,7 +5745,7 @@ connectSSE();
         };
       }
       dropdown.appendChild(item);
-    }
+    });
     // Passive per-item reachability, checked fresh every time the dropdown
     // opens -- purely informational (including for the active entry, if
     // it's the one that's gone down): never triggers a switch on its own,
@@ -5784,7 +5804,9 @@ connectSSE();
       await $("btn-clear-sources").onclick();
       if (hasDockerDaemon()) return; // confirm declined -- leave the current host connected
     }
-    $("btn-set").click(); // nothing connected now -- opens Connect Docker Host in create mode
+    openNewDockerHostDialog(); // nothing connected now -- opens New Docker Host (its "Load Docker Host"
+                               // select is still populated even though the row itself stays hidden, see
+                               // openNewDockerHostDialog -- driving it programmatically here is unaffected)
     $("docker-host-history").value = hostKey;
     await $("docker-host-history").onchange();
   };
@@ -5796,11 +5818,16 @@ connectSSE();
     if (!history.length) {
       const empty = document.createElement("div");
       empty.className = "gateway-empty";
-      empty.textContent = "No Docker hosts yet — Connect Docker Host to add one.";
+      empty.textContent = "No Docker hosts yet — New Docker Host to add one.";
       dropdown.appendChild(empty);
       return;
     }
-    for (const entry of history) {
+    history.forEach((entry, i) => {
+      if (i > 0) {
+        const sep = document.createElement("div");
+        sep.className = "gateway-item-sep";
+        dropdown.appendChild(sep);
+      }
       const item = document.createElement("button");
       item.type = "button";
       item.className = "gateway-item";
@@ -5811,8 +5838,60 @@ connectSSE();
       item.appendChild(label);
       if (entry.hostKey !== active) item.onclick = () => openHost(entry.hostKey);
       dropdown.appendChild(item);
-    }
+    });
   };
+
+  // Hover: SSH connection/key + which transforms are on for the connected
+  // host (see server/transforms/*.py -- exactly these three exist today),
+  // styled like the Gateway pill's own info popup (same shared CSS class).
+  const infoPopup = $("docker-host-info-popup");
+  const TRANSFORM_NAMES = ["drop_healthchecks", "json_message", "parse_level"];
+  function renderInfoRow(label, val) {
+    const row = document.createElement("div");
+    row.className = "cip-row";
+    const l = document.createElement("span");
+    l.className = "cip-label";
+    l.textContent = label;
+    const v = document.createElement("span");
+    v.className = "cip-val";
+    v.textContent = val;
+    row.append(l, v);
+    return row;
+  }
+  wrap.addEventListener("mouseenter", () => {
+    if (!infoPopup) return;
+    const active = hasDockerDaemon() ? currentDockerHost() || "local" : null;
+    infoPopup.innerHTML = "";
+    if (active == null) {
+      infoPopup.appendChild(renderInfoRow("Docker host", "not connected"));
+      infoPopup.hidden = false;
+      return;
+    }
+    const entry = prefs.get("savedDockerDaemons", {})[active];
+    const label = active === "local" ? "localhost" : active.replace(/^ssh:\/\//, "");
+    infoPopup.appendChild(renderInfoRow("SSH Connection", label));
+    infoPopup.appendChild(renderInfoRow("SSH Key", entry?.ssh_key || "---"));
+    const sep = document.createElement("div");
+    sep.className = "cip-sep";
+    infoPopup.appendChild(sep);
+    for (const name of TRANSFORM_NAMES) {
+      infoPopup.appendChild(renderInfoRow(name.replace(/_/g, " "), entry?.transforms?.includes(name) ? "True" : "False"));
+    }
+    infoPopup.hidden = false;
+  });
+  wrap.addEventListener("mouseleave", () => {
+    if (infoPopup) infoPopup.hidden = true;
+  });
+  // Right-click: New/Edit/Remove Docker Host -- the same actions the action
+  // bar's Docker Host group already exposes.
+  wrap.addEventListener("contextmenu", (e) => {
+    if (infoPopup) infoPopup.hidden = true; // don't show both at once if still hovering
+    ctxMenu(e, [
+      ["New Docker Host…", () => openNewDockerHostDialog()],
+      ["Edit Docker Host", () => openEditDockerHostDialog()],
+      ["Remove Docker Host…", () => $("btn-remove-docker-daemon").click()],
+    ]);
+  });
 
   // Updates the dot/tooltip alone -- cheap enough to run on every
   // state.sources refresh (see refreshDockerHostPill), unlike render()'s

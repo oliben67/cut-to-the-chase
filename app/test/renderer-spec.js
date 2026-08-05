@@ -711,17 +711,17 @@
     state.sources.push(fakeSrc);
     syncDockerDaemonButtons(); // a real app calls this via refreshAll() whenever state.sources changes
     dockerHostKeys.set("ssh://u@h", "/path/to/key");
-    // Opening Connect Docker Host with a daemon already active now always
-    // runs an immediate live Refresh (see enterDockerHostEditMode) --
-    // mocked here since this test isn't about that probe itself, just the
-    // form's fields/labels.
+    // Edit Docker Host runs an immediate live Refresh on open (see
+    // enterDockerHostEditMode) -- mocked here since this test isn't about
+    // that probe itself, just the form's fields/labels.
     const realPost = post;
     const realGet = get;
     post = async (path, body) => (path === "/docker/ps" ? { containers: [], services: [], log: [] } : realPost(path, body));
     get = async (path) => (path === "/transforms" ? { transforms: [] } : realGet(path));
     try {
       eq(currentDockerHost(), "ssh://u@h", "host resolved correctly (not truncated to 'ssh:')");
-      eq($("btn-set").disabled, false, "Connect Docker Host stays enabled once a daemon is being watched -- it opens straight into edit mode");
+      eq($("btn-set").disabled, false, "New Docker Host always stays enabled");
+      eq($("btn-edit-docker-host").disabled, false, "Edit Docker Host enabled once a daemon is being watched");
       eq($("btn-clear-sources").disabled, false, "Remove enabled once a daemon is being watched");
       await enterDockerHostEditMode(currentDockerHost() || "local");
       eq($("docker-host").value, "u@h", "host prefilled (scheme stripped for editing)");
@@ -744,10 +744,11 @@
     }
   });
 
-  await T("Connect/Remove Docker Host are disabled when no daemon is being watched", () => {
+  await T("Edit/Disconnect Docker Host are disabled when no daemon is being watched, New Docker Host stays enabled", () => {
     ok(!hasDockerDaemon(), "no docker:// source open in this suite's baseline state");
-    eq($("btn-set").disabled, false, "Connect Docker Host stays enabled -- opens the create-mode dialog with nothing to watch");
-    eq($("btn-clear-sources").disabled, true, "Remove disabled");
+    eq($("btn-set").disabled, false, "New Docker Host stays enabled -- always opens a blank create form");
+    eq($("btn-edit-docker-host").disabled, true, "nothing to edit yet");
+    eq($("btn-clear-sources").disabled, true, "nothing to disconnect yet");
   });
 
   await T("Remove Docker Host also forgets the daemon server-side, not just the local catalog (br-REDIS-017)", async () => {
@@ -833,10 +834,9 @@
     loadSelectedTargets = async () => ({ containers: new Set(["demo-c"]), services: new Set() });
     const realPost = post;
     const realGet = get;
-    // The live daemon still has both -- opening Connect Docker Host with a
-    // daemon already active runs this automatically (see
-    // enterDockerHostEditMode), so the pre-fill and the confirmed
-    // post-Refresh state should agree.
+    // The live daemon still has both -- Edit Docker Host runs an immediate
+    // live Refresh on open (see enterDockerHostEditMode), so the pre-fill
+    // and the confirmed post-Refresh state should agree.
     post = async (path, body) => {
       if (path === "/docker/ps") {
         return { containers: [{ id: "c", name: "demo-c" }], services: [{ id: "s", name: "demo-svc" }], log: [] };
@@ -1052,7 +1052,7 @@
     }
   });
 
-  await T("Connect Docker Host (create mode) is never left showing edit-mode labels/locks", () => {
+  await T("New Docker Host (create mode) is never left showing edit-mode labels/locks", () => {
     $("btn-set").click();
     try {
       eq($("docker-host").disabled, false, "host unlocked");
@@ -1060,19 +1060,20 @@
       eq($("docker-ssh-key-browse").disabled, false, "browse unlocked");
       eq($("btn-ps-refresh").textContent, "Fetch Sources", "Fetch Sources label restored");
       eq($("dlg-ok").textContent, "Connect Docker Host", "confirm label restored");
-      eq($("dlg-set-title").textContent, "Connect Docker Host", "dialog re-titled for creating, not editing");
+      eq($("dlg-set-title").textContent, "New Docker Host", "dialog re-titled for creating, not editing");
+      eq($("docker-host-history-row").hidden, true, "Load Docker Host never shown in New Docker Host");
     } finally {
       dlg.close();
     }
   });
 
-  await T("Connect Docker Host opens in create mode, never edit mode, when there's no daemon actually connected (br-DHOST-001/BUG-0067)", () => {
+  await T("New Docker Host always opens in create mode, never edit mode, regardless of whether a daemon is connected (br-DHOST-001/BUG-0067)", () => {
     ok(!hasDockerDaemon(), "sanity: baseline has no docker daemon connected");
     eq(dockerDaemonEditMode, false, "sanity: not already in edit mode from a prior test");
     $("btn-set").click();
     try {
       eq(dockerDaemonEditMode, false, "edit mode never entered -- nothing to edit");
-      eq($("dlg-set-title").textContent, "Connect Docker Host", "dialog opened in create mode");
+      eq($("dlg-set-title").textContent, "New Docker Host", "dialog opened in create mode");
     } finally {
       dlg.close();
     }
@@ -1110,14 +1111,16 @@
     }
   });
 
-  await T("Connect Docker Host after a real Disconnect opens unlocked, even with Load Docker Host history to show (reported regression)", async () => {
+  await T("New Docker Host after a real Disconnect opens unlocked, with Load Docker Host never shown (reported regression)", async () => {
     // Unlike the synthetic test above (which pre-sets dockerDaemonEditMode
     // and the .disabled flags directly), this drives the actual sequence a
     // user hits: really connected to a remote host (enterDockerHostEditMode
     // locks the fields for real) -> real Disconnect -> reopen via the real
-    // btn-set click. Reported as: after Disconnect, both Docker host and
-    // SSH key stayed disabled on reopen whenever Load Docker Host had a
-    // previously-used entry to show and the user didn't pick one.
+    // btn-set click. Originally reported as: after Disconnect, both Docker
+    // host and SSH key stayed disabled on reopen whenever Load Docker Host
+    // had a previously-used entry to show and the user didn't pick one --
+    // New Docker Host now never shows that picker at all (Edit Docker Host's
+    // job instead), but must still always unlock the fields regardless.
     const savedBefore = prefs.get("savedDockerDaemons", {});
     prefs.set("savedDockerDaemons", { ...savedBefore, "ssh://u@h": { lastUsed: Date.now(), ssh_key: "/path/to/key" } });
     const fakeSrc = { id: "__reconnect_test", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
@@ -1140,16 +1143,15 @@
       // Real Disconnect, through the actual button handler.
       await $("btn-clear-sources").onclick();
 
-      // Reopen via the real Connect Docker Host button -- no daemon left,
-      // so this must take the create-mode branch, not edit mode.
+      // Reopen via the real New Docker Host button -- no daemon left, so
+      // this must take the create-mode branch, not edit mode.
       $("btn-set").click();
       try {
         eq(dockerDaemonEditMode, false, "create mode, not edit mode -- nothing left to edit");
-        eq($("docker-host-history-row").hidden, false, "Load Docker Host is shown -- there is history to pick from");
-        eq($("docker-host-history").value, "", "nothing picked from Load Docker Host");
-        eq($("docker-host").disabled, false, "host stays editable when nothing was picked from Load Docker Host");
-        eq($("docker-ssh-key").disabled, false, "ssh key stays editable when nothing was picked from Load Docker Host");
-        eq($("docker-ssh-key-browse").disabled, false, "browse stays enabled when nothing was picked from Load Docker Host");
+        eq($("docker-host-history-row").hidden, true, "New Docker Host never shows Load Docker Host, history or not");
+        eq($("docker-host").disabled, false, "host stays editable");
+        eq($("docker-ssh-key").disabled, false, "ssh key stays editable");
+        eq($("docker-ssh-key-browse").disabled, false, "browse stays enabled");
       } finally {
         dlg.close();
       }
@@ -1264,14 +1266,14 @@
     }
   });
 
-  await T("Connect Docker Host stays enabled regardless of whether a daemon is currently being watched -- it opens edit mode instead of a blank form", () => {
+  await T("New Docker Host stays enabled regardless of whether a daemon is currently being watched -- always opens a blank create form, never edit mode", () => {
     ok(!hasDockerDaemon(), "no docker:// source open in this suite's baseline state");
     eq($("btn-set").disabled, false, "enabled -- nothing set yet");
     const fakeSrc = { id: "__setbtn_test", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
     state.sources.push(fakeSrc);
     syncDockerDaemonButtons(); // a real app calls this via refreshAll() whenever state.sources changes
     try {
-      eq($("btn-set").disabled, false, "still enabled once a daemon is already being watched -- Connect now doubles as Edit");
+      eq($("btn-set").disabled, false, "still enabled once a daemon is already being watched -- New Docker Host never depends on it");
     } finally {
       state.sources = state.sources.filter((s) => s.id !== "__setbtn_test");
       syncDockerDaemonButtons();
@@ -2761,6 +2763,210 @@
     document.body.click(); // outside click
     eq($("gateway-dropdown").hidden, true, "closes on outside click");
     ok(!$("server-status").classList.contains("open"), "wrapper no longer marked open");
+  });
+
+  await T("gateway dropdown separates each entry with a divider, one fewer than the row count", async () => {
+    $("server-status-btn").click();
+    await sleep(50);
+    try {
+      const items = $("gateway-dropdown").querySelectorAll(".gateway-item");
+      const seps = $("gateway-dropdown").querySelectorAll(".gateway-item-sep");
+      eq(seps.length, Math.max(0, items.length - 1), "one separator between each pair of entries, none trailing");
+    } finally {
+      document.body.click();
+    }
+  });
+
+  await T("hovering the Gateway pill shows the connection-info popup (moved off right-click)", async () => {
+    mouse($("server-status"), "mouseenter", 5);
+    await sleep(20); // loadConnectionInfo() is awaited before the popup renders
+    try {
+      ok(!$("connection-info-popup").hidden, "popup shown on hover");
+      const text = $("connection-info-popup").textContent;
+      ok(text.includes("Connection"), `Connection row present: ${text}`);
+    } finally {
+      mouse($("server-status"), "mouseleave", 5);
+      ok($("connection-info-popup").hidden, "popup hides on mouseleave");
+    }
+  });
+
+  await T("right-clicking the Gateway pill opens New/Edit/Uninstall Gateway, not the info popup", () => {
+    mouse($("server-status"), "mouseenter", 5);
+    mouse($("server-status"), "contextmenu", 5);
+    try {
+      ok($("connection-info-popup").hidden, "info popup replaced by the actions menu, not shown alongside it");
+      const menu = document.getElementById("ctxmenu");
+      ok(menu, "actions menu open");
+      const labels = [...menu.querySelectorAll("button")].map((b) => b.textContent);
+      ok(labels.some((l) => l.includes("New Gateway")), labels.join(", "));
+      ok(labels.some((l) => l === "Edit Gateway"), labels.join(", "));
+      ok(labels.some((l) => l.includes("Uninstall Gateway")), labels.join(", "));
+    } finally {
+      document.body.click(); // close whatever the entry click may have opened
+      if (dlgGatewaySetup.open) dlgGatewaySetup.close();
+    }
+  });
+
+  /* ── Docker Host pill: hover info, right-click actions, click separators ── */
+
+  await T("hovering the Docker Host pill shows 'not connected' when nothing is watched", () => {
+    ok(!hasDockerDaemon(), "sanity: nothing connected in this suite's baseline state");
+    mouse($("docker-host-status"), "mouseenter", 5);
+    try {
+      ok(!$("docker-host-info-popup").hidden, "popup shown on hover");
+      ok($("docker-host-info-popup").textContent.includes("not connected"), $("docker-host-info-popup").textContent);
+    } finally {
+      mouse($("docker-host-status"), "mouseleave", 5);
+      ok($("docker-host-info-popup").hidden, "popup hides on mouseleave");
+    }
+  });
+
+  await T("hovering the Docker Host pill shows SSH connection/key and which transforms are on", () => {
+    const saved = prefs.get("savedDockerDaemons", {});
+    prefs.set("savedDockerDaemons", { ...saved, "ssh://u@h": { ssh_key: "/path/to/key", transforms: ["json_message"], lastUsed: Date.now() } });
+    const fakeSrc = { id: "__hover_test", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
+    state.sources.push(fakeSrc);
+    syncDockerDaemonButtons();
+    try {
+      mouse($("docker-host-status"), "mouseenter", 5);
+      const text = $("docker-host-info-popup").textContent;
+      ok(text.includes("SSH Connection") && text.includes("u@h"), text);
+      ok(text.includes("SSH Key") && text.includes("/path/to/key"), text);
+      ok(text.includes("drop healthchecks") && text.includes("False"), text);
+      ok(text.includes("json message") && text.includes("True"), text);
+      ok(text.includes("parse level") && text.includes("False"), text);
+    } finally {
+      mouse($("docker-host-status"), "mouseleave", 5);
+      state.sources = state.sources.filter((s) => s.id !== "__hover_test");
+      syncDockerDaemonButtons();
+      prefs.set("savedDockerDaemons", saved);
+    }
+  });
+
+  await T("hovering the Docker Host pill shows '---' for an unset SSH key", () => {
+    const saved = prefs.get("savedDockerDaemons", {});
+    prefs.set("savedDockerDaemons", { ...saved, local: { transforms: [], lastUsed: Date.now() } });
+    const fakeSrc = { id: "__hover_local_test", path: "docker://local/stats", kind: "stats", live: true };
+    state.sources.push(fakeSrc);
+    syncDockerDaemonButtons();
+    try {
+      mouse($("docker-host-status"), "mouseenter", 5);
+      const text = $("docker-host-info-popup").textContent;
+      ok(text.includes("SSH Connection") && text.includes("localhost"), text);
+      ok(text.includes("SSH Key") && text.includes("---"), text);
+    } finally {
+      mouse($("docker-host-status"), "mouseleave", 5);
+      state.sources = state.sources.filter((s) => s.id !== "__hover_local_test");
+      syncDockerDaemonButtons();
+      prefs.set("savedDockerDaemons", saved);
+    }
+  });
+
+  await T("right-clicking the Docker Host pill opens New/Edit/Remove; Edit is a no-op with nothing connected", () => {
+    ok(!hasDockerDaemon(), "sanity: nothing connected in this suite's baseline state");
+    mouse($("docker-host-status"), "contextmenu", 5);
+    try {
+      const menu = document.getElementById("ctxmenu");
+      ok(menu, "actions menu open");
+      const buttons = [...menu.querySelectorAll("button")];
+      const labels = buttons.map((b) => b.textContent);
+      ok(labels.some((l) => l.includes("New Docker Host")), labels.join(", "));
+      ok(labels.some((l) => l === "Edit Docker Host"), labels.join(", "));
+      ok(labels.some((l) => l.includes("Remove Docker Host")), labels.join(", "));
+      buttons.find((b) => b.textContent === "Edit Docker Host").click();
+      eq(dlg.open, false, "no-op -- nothing connected to edit");
+    } finally {
+      document.body.click();
+      if (dlg.open) dlg.close();
+    }
+  });
+
+  await T("right-clicking the Docker Host pill's Edit Docker Host opens edit mode when a daemon is connected", async () => {
+    const fakeSrc = { id: "__ctx_edit_test", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
+    state.sources.push(fakeSrc);
+    syncDockerDaemonButtons();
+    const realPost = post;
+    const realGet = get;
+    post = async (path, body) => (path === "/docker/ps" ? { containers: [], services: [], log: [] } : realPost(path, body));
+    get = async (path) => (path === "/transforms" ? { transforms: [] } : realGet(path));
+    try {
+      mouse($("docker-host-status"), "contextmenu", 5);
+      const menu = document.getElementById("ctxmenu");
+      const editBtn = [...menu.querySelectorAll("button")].find((b) => b.textContent === "Edit Docker Host");
+      editBtn.click();
+      await sleep(20);
+      eq(dlg.open, true, "dialog opened");
+      eq($("dlg-set-title").textContent, "Edit Docker Host", "opened in edit mode");
+    } finally {
+      post = realPost;
+      get = realGet;
+      state.sources = state.sources.filter((s) => s.id !== "__ctx_edit_test");
+      syncDockerDaemonButtons();
+      if (dlg.open) dlg.close();
+    }
+  });
+
+  await T("Docker Host dropdown separates each entry with a divider", () => {
+    const saved = prefs.get("savedDockerDaemons", {});
+    prefs.set("savedDockerDaemons", {
+      "ssh://a@h": { lastUsed: 2, transforms: [] },
+      "ssh://b@h": { lastUsed: 1, transforms: [] },
+    });
+    try {
+      $("docker-host-status-btn").click();
+      const items = $("docker-host-dropdown").querySelectorAll(".gateway-item");
+      const seps = $("docker-host-dropdown").querySelectorAll(".gateway-item-sep");
+      eq(items.length, 2, "both saved hosts listed");
+      eq(seps.length, 1, "one divider between the two entries");
+    } finally {
+      document.body.click();
+      prefs.set("savedDockerDaemons", saved);
+    }
+  });
+
+  await T("Edit Docker Host: picking a different saved host from Load Docker Host swaps the checklist but leaves host/ssh-key locked", async () => {
+    // Confirmed behavior: unlike New Docker Host, Edit Docker Host's Load
+    // Docker Host stays visible+enabled, but picking a different entry only
+    // re-targets which host's checklist is being edited -- it must never
+    // unlock the connection-string fields, since editing is about which
+    // containers/services to follow for an already-identified host, not
+    // retyping its connection string.
+    const saved = prefs.get("savedDockerDaemons", {});
+    prefs.set("savedDockerDaemons", {
+      ...saved,
+      "ssh://u@h": { ssh_key: "/path/to/key", transforms: [], lastUsed: Date.now() },
+      "ssh://other@h2": { ssh_key: "/other/key", transforms: [], lastUsed: Date.now() - 1000 },
+    });
+    const fakeSrc = { id: "__editpick_test", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
+    state.sources.push(fakeSrc);
+    syncDockerDaemonButtons();
+    dockerHostKeys.set("ssh://u@h", "/path/to/key");
+    const realPost = post;
+    const realGet = get;
+    post = async (path, body) => (path === "/docker/ps" ? { containers: [], services: [], log: [] } : realPost(path, body));
+    get = async (path) => (path === "/transforms" ? { transforms: [] } : realGet(path));
+    try {
+      await enterDockerHostEditMode(currentDockerHost() || "local");
+      eq($("docker-host-history-row").hidden, false, "Load Docker Host visible in Edit mode");
+      eq($("docker-host").disabled, true, "sanity: locked while editing");
+      $("docker-host-history").value = "ssh://other@h2";
+      await $("docker-host-history").onchange();
+      eq($("docker-host").value, "other@h2", "checklist context switched to the picked host");
+      eq($("docker-ssh-key").value, "/other/key", "ssh key field reflects the picked host's own saved key");
+      eq($("docker-host").disabled, true, "still locked -- picking a host in Edit mode never unlocks the connection string");
+      eq($("docker-ssh-key").disabled, true, "ssh key still locked too");
+      eq($("docker-ssh-key-browse").disabled, true, "browse still locked too");
+    } finally {
+      post = realPost;
+      get = realGet;
+      dockerHostKeys.delete("ssh://u@h");
+      state.sources = state.sources.filter((s) => s.id !== "__editpick_test");
+      syncDockerDaemonButtons();
+      prefs.set("savedDockerDaemons", saved);
+      dlg.close();
+      $("btn-set").click();
+      dlg.close();
+    }
   });
 
   await T("host block shows the loading state before first host sample, titled for the local machine", () => {

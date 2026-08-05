@@ -256,11 +256,14 @@ body {
   color: var(--critical);
 }
 .gateway-dropdown .gateway-empty { padding: 6px 8px; font-size: 12px; color: var(--muted); }
+.gateway-dropdown .gateway-item-sep { border-top: 1px solid var(--border); margin: 2px 4px; }
 
-/* Right-click the status pill: connection type + (when tunneled) the ssh
-   details behind it -- see app.js's connection-info-popup block. Same
-   floating-card look as .gateway-dropdown, but read-only (no buttons/hover
-   state) since there's nothing to click here. */
+/* Hover the Gateway or Docker Host status pill: read-only connection detail
+   (Gateway: connection type + ssh details when tunneled; Docker Host: SSH
+   connection/key + which transforms are on) -- see app.js's
+   connection-info-popup/docker-host-info-popup blocks. Same floating-card
+   look as .gateway-dropdown, but no buttons/hover state, since there's
+   nothing to click here. */
 .connection-info-popup {
   display: flex;
   flex-direction: column;
