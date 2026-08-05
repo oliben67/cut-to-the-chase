@@ -212,6 +212,25 @@ async def _flush():
     await asyncio.sleep(0.15)
 
 
+def _restamp_gateway_id(cttc_path: Path, gateway_id: str) -> None:
+    """Test helper: rewrites every source entry's gateway_id in an
+    already-exported .cttc's manifest.json, simulating a sample collected
+    by a genuinely different gateway install rather than just a different
+    file -- the integrity hash is deliberately left stale (load_sample's
+    verification is warn-only, see _manifest_hash, not a load-blocking
+    gate), so this only needs to touch the one field under test."""
+    with zipfile.ZipFile(cttc_path, "r") as z:
+        members = {n: z.read(n) for n in z.namelist()}
+    man = json.loads(members["manifest.json"])
+    for seg in man["segments"]:
+        for src in seg["sources"]:
+            src["gateway_id"] = gateway_id
+    members["manifest.json"] = json.dumps(man).encode()
+    with zipfile.ZipFile(cttc_path, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, data in members.items():
+            z.writestr(name, data)
+
+
 def log_source(redis_log_instance, transforms=(), sid="s1"):
     src = server.LogSource(
         sid, "svc", Path("/nonexistent"), live=False, transforms=list(transforms)
@@ -2019,14 +2038,39 @@ class TestSampleRoundTrip:
         finally:
             await st2.redis_log.stop()
 
-    async def test_load_sample_twice_does_not_collide_in_redis(self, state, tmp_path):
-        """br-DEDUP: two independent sample loads sharing the same
-        container name must not merge into the same Redis entity.
-        load_sample calls _entity_id(kind, name, None) unconditionally --
-        host is only ever set for live docker sources, so nothing
-        distinguishes one load from another. Reproduces with two entirely
-        separate exports (different files, different time ranges) that
-        both happen to contain a container named "svc"."""
+    async def test_load_sample_twice_with_same_provenance_reuses_the_same_entity(
+        self, state, tmp_path
+    ):
+        """Content-addressed identity (System Observability spec's
+        "Collision Prevention": Gateway + Docker Host + Container):
+        the identical (gateway, docker host, container) loaded twice
+        resolves to the same Redis entity -- idempotent, not duplicated.
+        "Should not be able to re-open that data more than once" now holds
+        at the storage layer too, not just the client's own path-based
+        dedup (ui-EXPORT-017/018)."""
+        log = tmp_path / "svc.log"
+        log.write_text("2026-01-02T03:00:00Z only-line\n")
+        state.open_file(str(log), "auto", None, live=False, transforms=[])
+        await _flush()
+        t0, t1 = ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 5)
+        out = tmp_path / "sample.cttc"
+        r = await state.export_sample(str(out), t0, t1)
+        assert r["sources"] == 1
+
+        opened1 = await state.load_sample(str(out))
+        opened2 = await state.load_sample(str(out))
+        loaded1 = state.sources[opened1[0]]
+        loaded2 = state.sources[opened2[0]]
+        assert loaded1._entity == loaded2._entity, "same provenance -- same content-addressed entity"
+        assert await loaded1.total() == 1, "re-loading the identical file doesn't duplicate rows"
+        assert await loaded2.total() == 1
+
+    async def test_load_sample_different_gateway_provenance_does_not_collide(self, state, tmp_path):
+        """Two loads sharing a bare container name but genuinely different
+        provenance (a different gateway, here) must never collide --
+        content-addressing keeps them apart the same way host-qualification
+        already keeps two live docker hosts' same-named containers apart
+        (br-DEDUP-006)."""
         f1 = tmp_path / "first"
         f1.mkdir()
         log1 = f1 / "svc.log"
@@ -2048,15 +2092,96 @@ class TestSampleRoundTrip:
         out2 = tmp_path / "second.cttc"
         r2 = await state.export_sample(str(out2), t2_0, t2_1)
         assert r2["sources"] == 1
+        _restamp_gateway_id(out2, "a-genuinely-different-gateway")
 
         opened1 = await state.load_sample(str(out1))
         opened2 = await state.load_sample(str(out2))
         loaded1 = state.sources[opened1[0]]
         loaded2 = state.sources[opened2[0]]
+        assert loaded1._entity != loaded2._entity, "different gateway provenance -- must not collide"
         assert await loaded1.total() == 1, "first load's entity shows only its own row"
         assert await loaded2.total() == 1, "second load's entity shows only its own row -- not merged with the first"
         assert (await loaded1.slice(0, 1))[0]["text"] == "first-only"
         assert (await loaded2.slice(0, 1))[0]["text"] == "second-only"
+
+    async def test_manifest_carries_provenance_and_a_verifying_integrity_hash(
+        self, state, log_file, tmp_path
+    ):
+        """System Observability spec's "Manifest & Security": every
+        exported source is stamped with its gateway/docker-host/container
+        identity, and the manifest carries a hash of itself (everything
+        but the hash field) for tamper-evidence."""
+        state.open_file(str(log_file), "auto", None, live=False, transforms=[])
+        await _flush()
+        t0, t1 = ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 5)
+        out = tmp_path / "slice.cttc"
+        await state.export_sample(str(out), t0, t1)
+
+        man = json.loads(zipfile.ZipFile(out).read("manifest.json"))
+        assert man["version"] == 3
+        assert "integrity_sha256" in man
+        src = man["segments"][0]["sources"][0]
+        assert src["gateway_id"] == state.gateway_id
+        assert src["docker_host_id"] == "local"
+        assert src["container_id"] == "svc"
+
+        # Recomputing the same way load_sample does must match -- the hash
+        # actually verifies a clean export, not just "a field exists."
+        without_hash = dict(man)
+        without_hash.pop("integrity_sha256")
+        assert server._manifest_hash(without_hash) == man["integrity_sha256"]
+
+    async def test_tampered_manifest_hash_still_loads_but_logs_a_warning(
+        self, state, log_file, tmp_path, caplog
+    ):
+        """Tamper-evidence, not an access-control gate (confirmed with the
+        user): a manifest whose integrity hash no longer matches still
+        loads -- same bias toward a permissive read over a hard failure on
+        an unexpected file as the rest of this codebase -- but is logged
+        so the discrepancy isn't silent."""
+        state.open_file(str(log_file), "auto", None, live=False, transforms=[])
+        await _flush()
+        t0, t1 = ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 5)
+        out = tmp_path / "slice.cttc"
+        await state.export_sample(str(out), t0, t1)
+        _restamp_gateway_id(out, "tampered-after-the-hash-was-computed")
+
+        with caplog.at_level("WARNING", logger="cttc"):
+            opened = await state.load_sample(str(out))
+        assert len(opened) == 1, "still loads despite the mismatched hash"
+        assert any("integrity" in rec.message for rec in caplog.records)
+
+    async def test_load_sample_accepts_a_legacy_v2_manifest_with_no_provenance(
+        self, state, log_file, tmp_path
+    ):
+        """A pre-v3 export (no gateway_id/docker_host_id/container_id, no
+        integrity_sha256) must still load -- backward compatible, just
+        without content-addressed reuse (falls back to this gateway's own
+        id / "local" / the bare name, see load_sample)."""
+        state.open_file(str(log_file), "auto", None, live=False, transforms=[])
+        await _flush()
+        t0, t1 = ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 5)
+        out = tmp_path / "legacy.cttc"
+        await state.export_sample(str(out), t0, t1)
+
+        with zipfile.ZipFile(out, "r") as z:
+            members = {n: z.read(n) for n in z.namelist()}
+        man = json.loads(members["manifest.json"])
+        for seg in man["segments"]:
+            for src in seg["sources"]:
+                src.pop("gateway_id", None)
+                src.pop("docker_host_id", None)
+                src.pop("container_id", None)
+        man.pop("integrity_sha256", None)
+        man["version"] = 2
+        members["manifest.json"] = json.dumps(man).encode()
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+            for name, data in members.items():
+                z.writestr(name, data)
+
+        opened = await state.load_sample(str(out))
+        assert len(opened) == 1
+        assert await state.sources[opened[0]].total() == 1
 
     async def test_export_empty_range(self, state, log_file, stats_file, tmp_path):
         state.open_file(str(log_file), "auto", None, live=False, transforms=[])

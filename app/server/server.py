@@ -33,6 +33,7 @@ import re
 import shlex
 import sys
 import time
+import uuid
 import zipfile
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timezone
@@ -247,6 +248,73 @@ def _entity_id(kind: str, name: str, host: str | None) -> str:
     return f"{kind}:{name}@{hostname}"
 
 
+def _load_or_create_gateway_id(sessions_dir: Path) -> str:
+    """This gateway's own stable identity -- minted once on first boot and
+    persisted alongside its recording sessions (the one directory server.py
+    already treats as writable, per-instance, and durable across restarts),
+    so a Docker-deployed remote gateway, with no Electron main process to
+    source an id from, still gets one. Used to tell a sample this gateway
+    collected apart from an identically-named one collected by a different
+    gateway, once such samples start getting shared between installs (see
+    _content_entity_id)."""
+    path = sessions_dir / ".gateway-id"
+    try:
+        existing = path.read_text().strip()
+        if existing:
+            return existing
+    except FileNotFoundError:
+        pass
+    new_id = uuid.uuid4().hex
+    try:
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+        path.write_text(new_id)
+    except OSError as e:
+        # Non-fatal -- worst case this gateway mints a new id next boot too,
+        # which only costs content-addressing's idempotent-reload property
+        # (BUG-0073's per-load-unique fallback still keeps every sample's
+        # own data collision-free regardless).
+        logger.warning("could not persist gateway id to %s: %s", path, e)
+    return new_id
+
+
+def _content_entity_id(kind: str, name: str, content_key: tuple) -> str:
+    """The Redis entity id for a *loaded* sample's source (as opposed to a
+    live docker collector, see _entity_id) -- content-addressed by
+    (gateway id, docker host id, container/service id, segment start,
+    segment end) rather than qualified by anything ever-unique-per-load,
+    so re-loading the exact same recording/metric twice resolves to the
+    same entity: the second write just overwrites the same fields with
+    identical values, no duplicate storage, and "can't reopen the same
+    data more than once" holds at the storage layer, not just the
+    client's own path-based dedup (ui-EXPORT-017/018).
+
+    The time range *is* part of the key, deliberately -- two different
+    recordings/exports of "the same" container (same gateway/host/name,
+    different time windows) stay properly isolated, one entity per
+    recording, rather than silently accumulating into a single shared
+    timeline just because they happen to share a bare container name
+    (confirmed while testing this: a single long-running process, real
+    or a test suite, that loads several unrelated samples sharing common
+    container names like "web"/"api" over its lifetime would otherwise
+    merge all of them together). Re-loading the *identical* file still
+    resolves to the identical entity, since its segment's `from`/`to` are
+    always the same two values. `name` still prefixed by `kind` for the
+    same reason _entity_id's is (br-DEDUP-010)."""
+    digest = hashlib.sha256(repr(content_key).encode()).hexdigest()[:16]
+    return f"{kind}:sample:{digest}"
+
+
+def _manifest_hash(manifest_without_hash: dict) -> str:
+    """sha256 over the canonical (sorted-keys) JSON of a `.cttc` manifest,
+    excluding its own `integrity_sha256` field -- tamper-evidence, not an
+    access-control gate: load_sample recomputes and compares this, but
+    only ever logs a mismatch, never refuses to load (matches this
+    codebase's existing bias toward defensive/permissive reads over hard
+    failures on a stale/unexpected file, e.g. redis_log.py's stale-index
+    handling)."""
+    return hashlib.sha256(orjson.dumps(manifest_without_hash, option=orjson.OPT_SORT_KEYS)).hexdigest()
+
+
 DOCKER_SVCLOG_PREFIX = re.compile(r"^(\S+\.\d+\.\S+@\S+|\S+)\s+\|\s?")
 TS_FIELDS = ("timestamp", "ts", "time", "@timestamp", "datetime", "date")
 
@@ -384,19 +452,25 @@ class LogSource:
         stays the bare display/grouping name everywhere else (API
         responses, exported sample files).
 
-        A plain LogSource (used directly by open_file/load_sample for a
-        local file or an imported .cttc sample) never sets `self.host` at
-        all -- only the Docker subclasses do, explicitly, even when it's
-        None for a local target. That's a real signal, not just an absent
-        one: `getattr(self, "host", None)` used to treat both cases alike,
-        so two unrelated file loads sharing a container name (the same
-        sample re-opened twice, or two different recordings whose
-        containers happen to share a name) silently interleaved into the
-        same bare entity -- there's no live local daemon here for a bare
-        name to unambiguously mean, unlike the one real local docker
-        target this bare-naming was actually meant for. Qualifying by this
-        source's own id instead (unique per load, never reused) keeps
-        every file-based load's data disjoint from any other's."""
+        Three cases, checked in priority order:
+        1. `self._content_key` -- set by load_sample from the manifest's
+           own provenance (gateway/docker-host/container id). Content-
+           addressed (_content_entity_id): the identical recording/metric
+           loaded twice, or the same live source exported again later,
+           resolves to the same entity -- idempotent, no duplicate storage
+           (System Observability spec's "Collision Prevention"; supersedes
+           this rule's own prior sid-qualified fallback below for anything
+           that actually carries provenance).
+        2. `self.host` -- only the Docker subclasses ever set this
+           attribute at all (explicitly, even when it's None for a local
+           target); existing host-qualified behavior (br-DEDUP-006).
+        3. Neither: an arbitrary open_file with no docker/manifest
+           provenance at all (e.g. a plain local file opened directly, or
+           --static demo replay). Qualify by this source's own id (unique
+           per load, never reused) so two such loads sharing a name still
+           can't collide, even with no real identity to hash instead."""
+        if getattr(self, "_content_key", None) is not None:
+            return _content_entity_id("log", self.name, self._content_key)
         if hasattr(self, "host"):
             return _entity_id("log", self.name, self.host)
         return _entity_id("log", self.name, self.id)
@@ -602,12 +676,15 @@ class StatsSource:
         different sources' same-named service still tells them apart via
         each response entry's own "sid", exactly as it does today.
 
-        See LogSource._entity's matching docstring: a plain StatsSource
-        (open_file/load_sample) never sets `self.host` at all, unlike the
-        Docker subclasses, which set it explicitly even for a local
-        target -- qualify by this source's own id instead when it's
-        missing, so two unrelated file loads sharing a service name never
-        interleave into the same bare entity."""
+        See LogSource._entity's matching docstring for the full three-case
+        priority order (content-addressed via `self._content_key` when
+        load_sample set one from the manifest's own provenance, then
+        host-qualified for a real Docker collector, then this source's own
+        id as a last resort with no identity to hash instead) -- same
+        reasoning here, `svc` playing `self.name`'s role as the thing being
+        qualified."""
+        if getattr(self, "_content_key", None) is not None:
+            return _content_entity_id("stats", svc, self._content_key)
         if hasattr(self, "host"):
             return _entity_id("stats", svc, self.host)
         return _entity_id("stats", svc, self.id)
@@ -1580,12 +1657,12 @@ class State:
         self.listeners: list[asyncio.Queue] = []
         self.next_id = 1
         self.rolling_buffers = RollingBufferManager(self)
-        self.recording_sessions = RecordingSessionManager(
-            self, sessions_dir or transforms_dir / "sessions"
-        )
+        resolved_sessions_dir = sessions_dir or transforms_dir / "sessions"
+        self.recording_sessions = RecordingSessionManager(self, resolved_sessions_dir)
         self.scheduler = Scheduler(self.recording_sessions)
         self.events = EventManager(self, self.rolling_buffers, self.recording_sessions)
         self.redis_log = RedisLog(tcp_port=redis_tcp_port)
+        self.gateway_id = _load_or_create_gateway_id(resolved_sessions_dir)
 
     def broadcast(self, event: dict):
         for q in list(self.listeners):
@@ -1735,6 +1812,22 @@ class State:
             )
         return opened
 
+    def _provenance_of(self, s) -> tuple[str, str, str]:
+        """(gateway_id, docker_host_id, container_id) for one source,
+        recorded into every exported manifest entry (System Observability
+        spec, "Data Ownership & Hierarchy") -- preserved from a previously
+        loaded sample's own manifest if `s` came from load_sample
+        (re-exporting a loaded recording/metric keeps its original
+        provenance, not this gateway's own), otherwise this gateway's own:
+        a live docker collector's real host, or "local" for anything else
+        (the local daemon, or an arbitrary open_file with no docker/prior-
+        sample provenance at all)."""
+        content_key = getattr(s, "_content_key", None)
+        if content_key is not None:
+            return content_key
+        host = getattr(s, "host", None)
+        return (self.gateway_id, host or "local", s.name)
+
     async def _write_segment(
         self,
         z: zipfile.ZipFile,
@@ -1777,6 +1870,7 @@ class State:
 
         meta = []
         for (i, s), result in zip(items, results):
+            gateway_id, docker_host_id, container_id = self._provenance_of(s)
             if s.kind == "log":
                 rows = result
                 if not rows:
@@ -1788,7 +1882,10 @@ class State:
                         jdumps({"ts": ts, "text": payload.get("text", "")}) for ts, payload in rows
                     ),
                 )
-                meta.append({"type": "log", "name": s.name, "file": fn, "count": len(rows)})
+                meta.append({
+                    "type": "log", "name": s.name, "file": fn, "count": len(rows),
+                    "gateway_id": gateway_id, "docker_host_id": docker_host_id, "container_id": container_id,
+                })
             else:
                 ser = {
                     svc: [
@@ -1803,7 +1900,10 @@ class State:
                     continue
                 fn = f"seg{seg_idx}/stats/{i}.json"
                 z.writestr(fn, jdumps({"series": ser, "swarm": swarm}))
-                meta.append({"type": "stats", "name": s.name, "file": fn, "is_host": s.is_host})
+                meta.append({
+                    "type": "stats", "name": s.name, "file": fn, "is_host": s.is_host,
+                    "gateway_id": gateway_id, "docker_host_id": docker_host_id, "container_id": container_id,
+                })
         return meta
 
     async def build_sample_bytes(
@@ -1823,7 +1923,9 @@ class State:
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
             meta = await self._write_segment(z, 0, t0, t1, include_host, source_ids)
             segment = {"from": t0, "to": t1, "created": now_iso(), "sources": meta}
-            z.writestr("manifest.json", jdumps({"version": 2, "segments": [segment]}))
+            manifest = {"version": 3, "segments": [segment]}
+            manifest["integrity_sha256"] = _manifest_hash(manifest)
+            z.writestr("manifest.json", jdumps(manifest))
         return buf.getvalue(), meta
 
     @staticmethod
@@ -1883,7 +1985,9 @@ class State:
             segments_manifest.append(
                 {"from": t0, "to": t1, "created": now_iso(), "sources": new_meta}
             )
-            z.writestr("manifest.json", jdumps({"version": 2, "segments": segments_manifest}))
+            manifest = {"version": 3, "segments": segments_manifest}
+            manifest["integrity_sha256"] = _manifest_hash(manifest)
+            z.writestr("manifest.json", jdumps(manifest))
         return buf.getvalue(), new_meta, seg_idx
 
     async def export_sample(
@@ -1917,6 +2021,14 @@ class State:
         raw = p.read_bytes()
         with zipfile.ZipFile(io.BytesIO(raw)) as z:
             man = jloads(z.read("manifest.json"))
+            stored_hash = man.pop("integrity_sha256", None)
+            if stored_hash is not None and _manifest_hash(man) != stored_hash:
+                # Tamper-evidence, not an access-control gate -- still loads,
+                # same bias toward a permissive read over a hard failure on
+                # a stale/unexpected file as the rest of this codebase.
+                logger.warning(
+                    "manifest integrity hash mismatch for %s -- file may be corrupted or modified", p
+                )
             raw_segments = man.get("segments")
             if raw_segments is None:
                 raw_segments = [
@@ -1944,9 +2056,27 @@ class State:
             for meta in seg["sources"]:
                 sid = f"s{self.next_id}"
                 self.next_id += 1
+                # (gateway_id, docker_host_id, container_id, segment from,
+                # segment to) -- provenance fields absent on a legacy
+                # (pre-v3) manifest fall back to this gateway's own id and
+                # "local"/the bare name, same as a source with no recorded
+                # provenance at all would (see _provenance_of). Preserved on
+                # the source itself so re-exporting a loaded sample keeps
+                # its *original* provenance, not this load's. The segment's
+                # own from/to (shared by every source in it) keep two
+                # different recordings of "the same" container properly
+                # isolated -- see _content_entity_id.
+                content_key = (
+                    meta.get("gateway_id", self.gateway_id),
+                    meta.get("docker_host_id", "local"),
+                    meta.get("container_id", meta["name"]),
+                    seg["from"],
+                    seg["to"],
+                )
                 if meta["type"] == "log":
                     src = LogSource(sid, meta["name"], p, live=False, transforms=[])
                     src._state = self
+                    src._content_key = content_key
                     for line in z.read(meta["file"]).splitlines():
                         if not line.strip():
                             continue
@@ -1961,6 +2091,7 @@ class State:
                 else:
                     src = StatsSource(sid, meta["name"], p, live=False)
                     src._state = self
+                    src._content_key = content_key
                     d = jloads(z.read(meta["file"]))
                     for svc, lst in d["series"].items():
                         src._services.add(svc)

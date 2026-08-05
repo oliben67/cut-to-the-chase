@@ -1755,13 +1755,39 @@ setInterval(() => {
   }
 }, 1000);
 
+// The navigable time range for whatever's currently the active view
+// (ui-EXPORT-018) -- the full combined /range (state.range) while Live
+// is active, exactly as before, or just the active file's own sources'
+// min/max otherwise, so panning/zooming a loaded metric/recording can
+// never wander outside its own data (System Observability spec's
+// "Synchronization Continuity" -- the log viewer, already scoped to
+// whichever sources are visible via isSampleHidden, stays locked to the
+// same window as a natural consequence of sharing this same bound, no
+// separate log-specific logic needed).
+function activeViewRange() {
+  if (!state.liveHidden || !state.activeSamplePath) return state.range;
+  const group = sampleFileGroups().find((g) => g.path === state.activeSamplePath);
+  if (!group) return state.range;
+  const starts = [], ends = [];
+  for (const s of state.sources) {
+    if (group.ids.has(s.id) && s.min_ts != null) {
+      starts.push(s.min_ts);
+      ends.push(s.max_ts);
+    }
+  }
+  if (!starts.length) return state.range;
+  return { min_ts: Math.min(...starts), max_ts: Math.max(...ends) };
+}
+
 function resetZoom() {
-  if (!state.range || state.range.min_ts == null) return;
-  const pad = Math.max(1000, (state.range.max_ts - state.range.min_ts) * 0.01);
-  setView(state.range.min_ts - pad, state.range.max_ts + pad);
-  // place the cursor (and with it every log panel) on now, not mid-range --
-  // "now" is where a user resetting zoom almost always wants to look next
-  setCursor(Date.now());
+  const range = activeViewRange();
+  if (!range || range.min_ts == null) return;
+  const pad = Math.max(1000, (range.max_ts - range.min_ts) * 0.01);
+  setView(range.min_ts - pad, range.max_ts + pad);
+  // "now" only makes sense while Live -- a file view's own most recent
+  // point is the closest equivalent otherwise, never outside its own
+  // range (ui-EXPORT-018's "locked to this view's own window").
+  setCursor(!state.liveHidden ? Date.now() : range.max_ts);
 }
 
 // double-clicking anywhere on the timeline (charts or log density lanes)
@@ -1806,14 +1832,20 @@ function centerOnNow() {
 
 function totalSpanBounds() {
   const now = Date.now();
-  let lo = state.range?.min_ts, hi = state.range?.max_ts;
+  const range = activeViewRange();
+  let lo = range?.min_ts, hi = range?.max_ts;
   if (lo == null || hi == null) {
     lo = state.view ? state.view.t0 : now - DEFAULT_SPAN / 2;
     hi = state.view ? state.view.t1 : now + DEFAULT_SPAN / 2;
   }
   if (state.view) { lo = Math.min(lo, state.view.t0); hi = Math.max(hi, state.view.t1); }
-  lo = Math.min(lo, now);
-  hi = Math.max(hi, now);
+  // "now" only belongs in the navigator's own span while Live is active --
+  // stretching a historical file view's navigator out to today would
+  // contradict it staying locked to that file's own window (ui-EXPORT-018).
+  if (!state.liveHidden) {
+    lo = Math.min(lo, now);
+    hi = Math.max(hi, now);
+  }
   return { lo, hi: Math.max(hi, lo + 1) };
 }
 

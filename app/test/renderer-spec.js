@@ -3241,6 +3241,50 @@
     }
   });
 
+  await T("viewing a loaded file locks resetZoom/the navigator to that file's own range, not the combined one", async () => {
+    // System Observability spec's "Synchronization Continuity": the log
+    // viewer must always be locked to the current metric's own temporal
+    // window -- exercised here via resetZoom/totalSpanBounds, which the
+    // navigator and the log panel's own bounds both derive from.
+    const out = "/tmp/cttc-e2e-view-range-scope.cttc-metric";
+    await post("/sample/export", { path: out, from: R.min_ts, to: R.min_ts + 60000 });
+    const path = `upload://${basename(out)}`;
+    const realPick = pickAnalysisFiles;
+    try {
+      pickAnalysisFiles = async () => [out];
+      await $("btn-load-sample").onclick();
+      eq(state.activeSamplePath, path, "sanity: the narrow file is the active view");
+
+      const scoped = activeViewRange();
+      const fullSpan = R.max_ts - R.min_ts;
+      const scopedSpan = scoped.max_ts - scoped.min_ts;
+      ok(scopedSpan < fullSpan / 2, `scoped span (${scopedSpan}) should be far narrower than the full demo range (${fullSpan})`);
+
+      resetZoom();
+      ok(state.view.t1 - state.view.t0 < fullSpan / 2, "resetZoom fit only the active file's own range");
+      ok(state.view.t0 >= R.min_ts - fullSpan, "didn't drift into the unrelated combined range");
+
+      const { lo, hi } = totalSpanBounds();
+      ok(hi - lo < fullSpan / 2, "navigator span locked to the file, not stretched out to 'now'");
+
+      const liveItem = () => {
+        $("view-status-btn").click();
+        const item = [...$("view-dropdown").querySelectorAll(".gateway-item")]
+          .find((b) => b.querySelector(".gateway-item-label").textContent === "Live");
+        item.click();
+      };
+      liveItem();
+      eq(state.liveHidden, false, "sanity: back to Live");
+      const backToFull = activeViewRange();
+      eq(backToFull, state.range, "Live uses the full combined range again");
+    } finally {
+      pickAnalysisFiles = realPick;
+      for (const s of state.sources.filter((s) => s.path === path)) await post("/close", { id: s.id });
+      await refreshAll();
+      resetZoom();
+    }
+  });
+
   await T("host block shows the loading state before first host sample, titled for the local machine", () => {
     state.sources.push({ id: "__hload", kind: "stats", is_host: true,
                          path: "docker://local/host", live: true, name: "host@local" });

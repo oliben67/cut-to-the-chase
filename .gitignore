@@ -14,3 +14,8 @@ releases/windows/cttc-windows-deploy/
 .dev-instructions.json
 .catalyst-proj/*
 .vscode/*
+.claude/
+# server.py's own runtime data (recording sessions awaiting collection,
+# this gateway's persisted .gateway-id) -- instance-specific, never
+# meant to be committed (see br-DEDUP-012's gateway id).
+app/server/sessions/
