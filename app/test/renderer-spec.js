@@ -1110,6 +1110,101 @@
     }
   });
 
+  await T("Connect Docker Host after a real Disconnect opens unlocked, even with Load Docker Host history to show (reported regression)", async () => {
+    // Unlike the synthetic test above (which pre-sets dockerDaemonEditMode
+    // and the .disabled flags directly), this drives the actual sequence a
+    // user hits: really connected to a remote host (enterDockerHostEditMode
+    // locks the fields for real) -> real Disconnect -> reopen via the real
+    // btn-set click. Reported as: after Disconnect, both Docker host and
+    // SSH key stayed disabled on reopen whenever Load Docker Host had a
+    // previously-used entry to show and the user didn't pick one.
+    const savedBefore = prefs.get("savedDockerDaemons", {});
+    prefs.set("savedDockerDaemons", { ...savedBefore, "ssh://u@h": { lastUsed: Date.now(), ssh_key: "/path/to/key" } });
+    const fakeSrc = { id: "__reconnect_test", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
+    state.sources.push(fakeSrc);
+    syncDockerDaemonButtons();
+    const realPost = post;
+    const realGet = get;
+    const realConfirm = window.confirm;
+    post = async (path, body) =>
+      path === "/docker/ps" ? { containers: [], services: [], log: [] } : path === "/close" ? {} : realPost(path, body);
+    get = async (path) => (path === "/transforms" ? { transforms: [] } : realGet(path));
+    window.confirm = () => true;
+    try {
+      // Really connect/lock the fields first, same as opening Edit Docker
+      // Host on the currently-active host would.
+      await enterDockerHostEditMode(currentDockerHost() || "local");
+      eq($("docker-host").disabled, true, "sanity: locked while editing the live daemon");
+      dlg.close();
+
+      // Real Disconnect, through the actual button handler.
+      await $("btn-clear-sources").onclick();
+
+      // Reopen via the real Connect Docker Host button -- no daemon left,
+      // so this must take the create-mode branch, not edit mode.
+      $("btn-set").click();
+      try {
+        eq(dockerDaemonEditMode, false, "create mode, not edit mode -- nothing left to edit");
+        eq($("docker-host-history-row").hidden, false, "Load Docker Host is shown -- there is history to pick from");
+        eq($("docker-host-history").value, "", "nothing picked from Load Docker Host");
+        eq($("docker-host").disabled, false, "host stays editable when nothing was picked from Load Docker Host");
+        eq($("docker-ssh-key").disabled, false, "ssh key stays editable when nothing was picked from Load Docker Host");
+        eq($("docker-ssh-key-browse").disabled, false, "browse stays enabled when nothing was picked from Load Docker Host");
+      } finally {
+        dlg.close();
+      }
+    } finally {
+      post = realPost;
+      get = realGet;
+      window.confirm = realConfirm;
+      prefs.set("savedDockerDaemons", savedBefore);
+      dockerHostKeys.delete("ssh://u@h");
+      state.sources = state.sources.filter((s) => s.id !== "__reconnect_test");
+      syncDockerDaemonButtons();
+    }
+  });
+
+  await T("Disconnect still unlocks the dialog for next open even if closing one of several sources fails (reported regression)", async () => {
+    // Disconnect closes every open source with Promise.all(...post("/close"...))
+    // -- a remote host is disconnected precisely because it's flaky, so a
+    // single failing/timing-out close among several is a realistic real-
+    // world trigger, not a contrived one. The reset (dockerDaemonEditMode
+    // + unlocking host/ssh-key/browse) lived *after* that await, inside the
+    // same try -- one rejected close skipped straight to the catch's alert()
+    // and left the dialog locked for whatever opened next, contradicting
+    // ui-DHOST-026's "unconditionally clears" claim.
+    dockerDaemonEditMode = true;
+    $("docker-host").disabled = true;
+    $("docker-ssh-key").disabled = true;
+    $("docker-ssh-key-browse").disabled = true;
+    const srcA = { id: "__partial_a", path: "docker://ssh://u@h/container/a", kind: "log", live: true };
+    const srcB = { id: "__partial_b", path: "docker://ssh://u@h/container/b", kind: "log", live: true };
+    state.sources.push(srcA, srcB);
+    syncDockerDaemonButtons();
+    const realPost = post;
+    const realConfirm = window.confirm;
+    const realAlert = window.alert;
+    window.confirm = () => true;
+    window.alert = () => {};
+    post = async (path, body) => {
+      if (path === "/close" && body.id === "__partial_b") return Promise.reject(new Error("connection reset"));
+      return path === "/close" ? {} : realPost(path, body);
+    };
+    try {
+      await $("btn-clear-sources").onclick();
+      eq(dockerDaemonEditMode, false, "cleared even though one close call rejected");
+      eq($("docker-host").disabled, false, "host unlocked even though one close call rejected");
+      eq($("docker-ssh-key").disabled, false, "ssh key unlocked even though one close call rejected");
+      eq($("docker-ssh-key-browse").disabled, false, "browse unlocked even though one close call rejected");
+    } finally {
+      post = realPost;
+      window.confirm = realConfirm;
+      window.alert = realAlert;
+      state.sources = state.sources.filter((s) => s.id !== "__partial_a" && s.id !== "__partial_b");
+      syncDockerDaemonButtons();
+    }
+  });
+
   await T("Cancelling out of Edit Docker Host clears dockerDaemonEditMode, so it can't leak into a later stale-lock scenario", async () => {
     const fakeSrc = { id: "__cancel_test", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
     state.sources.push(fakeSrc);

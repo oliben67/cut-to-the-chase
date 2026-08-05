@@ -2745,6 +2745,9 @@ $("btn-clear-sources").onclick = async () => {
     const sessions = prefs.get("lastDockerSessions", []);
     prefs.set("lastDockerSessions", sessions.filter((s) => (s.host || "local") !== hostKey));
     await refreshAll();
+  } catch (err) {
+    alert(String(err.message || err));
+  } finally {
     // #dlg-set is a showModal() dialog -- it's structurally impossible to
     // reach this handler while it's open (the modal blocks the toolbar), so
     // there's nothing to close here. What's real: dockerDaemonEditMode (and
@@ -2754,17 +2757,17 @@ $("btn-clear-sources").onclick = async () => {
     // it's closed -- so a Cancel or successful submit out of Edit mode
     // leaves it true. Disconnect is exactly the moment that
     // staleness stops being harmless: the daemon it was tracking is gone,
-    // so unconditionally clearing it here (regardless of what refreshAll()
-    // above did or didn't manage to resync) guarantees the *next* open,
-    // whichever button reaches it, never inherits a stale lock
-    // (br-DHOST-001/BUG-0067 -- this used to be a `dlg.open`-gated partial
-    // reset that could never actually run).
+    // so unconditionally clearing it here -- in a `finally`, not just after
+    // a successful `await` -- guarantees the *next* open, whichever button
+    // reaches it, never inherits a stale lock, even if closing a source (a
+    // remote host is often disconnected precisely because it's flaky) or
+    // refreshAll() itself failed (br-DHOST-001/BUG-0067, BUG-0069 -- this
+    // used to be a `dlg.open`-gated partial reset that could never actually
+    // run, then a reset that only ran on the happy path).
     dockerDaemonEditMode = false;
     $("docker-host").disabled = false;
     $("docker-ssh-key").disabled = false;
     $("docker-ssh-key-browse").disabled = false;
-  } catch (err) {
-    alert(String(err.message || err));
   }
 };
 
