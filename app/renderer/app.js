@@ -3010,6 +3010,13 @@ $("record-sections").onchange = async () => {
   if (res.errors?.length) alert(res.errors.map((e) => `${e.path}: ${e.error}`).join("\n"));
   setActiveRecordSections({ path, segments, activeIndex: index, openedIds: res.opened || [] });
   await refreshAll();
+  // Without this, the view stays wherever it was left (the *previous*
+  // segment's own window) -- refreshAll() only ever sets an initial view
+  // when none exists yet (see its own "!hadView" check), so switching to a
+  // segment recorded at a different point in time left its data outside
+  // the visible window entirely: it looked empty even though it loaded
+  // correctly (BUG-0077).
+  centerViewOnLoadedStart(res.opened || []);
 };
 
 // Same pattern as pickRecordingSavePath: a named wrapper around the native
@@ -3225,6 +3232,15 @@ async function startRecording() {
     // to this fixed internal file instead, so starting never interrupts
     // the user before they even know how long they'll be recording.
     const path = await recordingScratchPath();
+    // RECORDING_SCRATCH_PATH is one fixed path reused by every recording,
+    // never deleted after a successful Stop (see stopRecording) -- without
+    // clearing it here, a brand-new recording's first flushRecordingSegment
+    // would read the *previous* recording's leftover bytes as "existing"
+    // and silently merge onto them, resurrecting already-saved segments
+    // that have nothing to do with this recording (BUG-0076). Resuming
+    // from "paused" (the other branch below) must NOT do this -- that one
+    // genuinely continues the same in-progress archive.
+    await writeRecordingBytes(path, new Uint8Array(0));
     setRecordingState({ status: "recording", path, segmentStart: Date.now(), segments: [] });
     notifyEvent("Recording started");
   } else if (recording.status === "paused") {

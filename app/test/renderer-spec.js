@@ -1698,6 +1698,96 @@
     }
   });
 
+  await T("Recording N sections then Stop while paused writes exactly N segments, not N+1", async () => {
+    const realScratch = recordingScratchPath,
+      realPick = pickRecordingSavePath,
+      realRead = readRecordingBytes,
+      realWrite = writeRecordingBytes;
+    const store = {};
+    const scratchPath = "/fake/scratch-n-sections.cttc-record";
+    recordingScratchPath = async () => scratchPath;
+    pickRecordingSavePath = async () => "/fake/e2e-n-sections.cttc-record";
+    readRecordingBytes = async (p) => {
+      if (!(p in store)) throw new Error("no such file");
+      return store[p];
+    };
+    writeRecordingBytes = async (p, bytes) => { store[p] = bytes; };
+    try {
+      if (recording.status !== "idle") await stopRecording(); // clean baseline
+      const N = 3;
+      for (let i = 0; i < N; i++) {
+        await startRecording(); // first iteration starts, rest resume
+        await pauseRecording();
+      }
+      eq(recording.status, "paused", "ends paused -- Stop must not add a further segment");
+      await stopRecording(); // pressed once, while already paused
+      eq(recording.status, "idle");
+
+      const finalBytes = store["/fake/e2e-n-sections.cttc-record"];
+      const realPath = "/tmp/cttc-e2e-n-sections.cttc-record";
+      await window.cttc.writeBinaryFile(realPath, finalBytes);
+      const openRes = await post("/open", { files: [{ path: realPath }] });
+      eq(openRes.needs_selection[0].segments.length, N, `expected exactly ${N} segments, one per Start/Pause cycle`);
+    } finally {
+      recordingScratchPath = realScratch;
+      pickRecordingSavePath = realPick;
+      readRecordingBytes = realRead;
+      writeRecordingBytes = realWrite;
+    }
+  });
+
+  await T("A brand-new recording does not inherit a previous recording's leftover segments from the shared scratch path (BUG-0076)", async () => {
+    const realScratch = recordingScratchPath,
+      realPick = pickRecordingSavePath,
+      realRead = readRecordingBytes,
+      realWrite = writeRecordingBytes;
+    const store = {};
+    // Both recordings reuse the *same* scratch path, matching real
+    // production behavior (main.js's RECORDING_SCRATCH_PATH is one fixed
+    // path for every recording, never re-chosen per session).
+    const scratchPath = "/fake/shared-scratch.cttc-record";
+    recordingScratchPath = async () => scratchPath;
+    readRecordingBytes = async (p) => {
+      if (!(p in store)) throw new Error("no such file");
+      return store[p];
+    };
+    writeRecordingBytes = async (p, bytes) => { store[p] = bytes; };
+    try {
+      if (recording.status !== "idle") await stopRecording(); // clean baseline
+
+      // First, complete and save a whole recording.
+      pickRecordingSavePath = async () => "/fake/e2e-first-recording.cttc-record";
+      await startRecording();
+      await pauseRecording();
+      await stopRecording();
+      eq(recording.status, "idle");
+      ok(store["/fake/e2e-first-recording.cttc-record"], "first recording saved");
+
+      // Second, completely independent recording -- the scratch path on
+      // disk still holds the first recording's finished bytes at this
+      // point (stopRecording never clears it).
+      pickRecordingSavePath = async () => "/fake/e2e-second-recording.cttc-record";
+      await startRecording();
+      await pauseRecording();
+      await stopRecording();
+      eq(recording.status, "idle");
+      const secondBytes = store["/fake/e2e-second-recording.cttc-record"];
+      ok(secondBytes, "second recording saved");
+
+      const realPath = "/tmp/cttc-e2e-second-recording.cttc-record";
+      await window.cttc.writeBinaryFile(realPath, secondBytes);
+      const openRes = await post("/open", { files: [{ path: realPath }] });
+      const segCount = openRes.needs_selection?.[0]?.segments?.length ?? 1;
+      ok(segCount === 1, `expected exactly 1 segment in the second recording, got ${segCount}: ${JSON.stringify(openRes.needs_selection)}`);
+      for (const id of openRes.opened) await post("/close", { id });
+    } finally {
+      recordingScratchPath = realScratch;
+      pickRecordingSavePath = realPick;
+      readRecordingBytes = realRead;
+      writeRecordingBytes = realWrite;
+    }
+  });
+
   await T("Stop without choosing a save path stays 'stopped' -- the recording itself isn't lost, Stop can be retried", async () => {
     const realScratch = recordingScratchPath,
       realPick = pickRecordingSavePath,
@@ -1912,6 +2002,20 @@
       ok(!state.sources.some((s) => s.id === sid), `segment 0's source ${sid} was closed on switch`);
     }
     ok(activeRecordSections.openedIds.length >= 1, "segment 1's sources opened");
+
+    // BUG-0077: switching segments used to leave the chart's view window
+    // wherever it was (segment 0's own range), so segment 1's data --
+    // genuinely loaded, per the assertions above -- fell entirely outside
+    // what was actually drawn and looked empty.
+    const seg1Starts = state.sources
+      .filter((s) => activeRecordSections.openedIds.includes(s.id) && s.min_ts != null)
+      .map((s) => s.min_ts);
+    ok(seg1Starts.length > 0, "segment 1 has real, datable sources to check the view against");
+    const seg1MinTs = Math.min(...seg1Starts);
+    ok(
+      state.view.t0 <= seg1MinTs && state.view.t1 >= seg1MinTs,
+      `view must re-center on segment 1's own data (min_ts=${seg1MinTs}) after switching, not stay on segment 0's -- got view [${state.view.t0}, ${state.view.t1}]`
+    );
 
     for (const sid of activeRecordSections.openedIds) await post("/close", { id: sid });
     await refreshAll();

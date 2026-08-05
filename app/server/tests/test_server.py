@@ -2318,6 +2318,36 @@ class TestMultiSegmentSample:
             await st2.redis_log.stop()
             await st3.redis_log.stop()
 
+    async def test_switching_segments_in_one_state_keeps_each_segments_own_data(
+        self, state, log_file, tmp_path
+    ):
+        """Regression for the recording feature's segment-switch path
+        (#record-sections' onchange -> uploadFile(path, index)): unlike
+        test_load_sample_with_explicit_segment_picks_that_one, this uses one
+        shared State/Redis for both loads (closing segment 0's sources
+        before loading segment 1), exactly like the real app switching
+        between recorded segments -- confirms content-addressing (see
+        _content_entity_id) keeps them from colliding even without two
+        separate Redis instances to fall back on."""
+        state.open_file(str(log_file), "auto", None, live=False, transforms=[])
+        await _flush()
+        t0, t1 = ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 5)
+        first, _m1, _i1 = await state.merge_sample_bytes(None, t0, t1)
+        t2, t3 = ms(2026, 1, 2, 3, 0, 5), ms(2026, 1, 2, 3, 0, 10)
+        merged, _m2, _i2 = await state.merge_sample_bytes(first, t2, t3)
+        out = tmp_path / "two-segments.cttc"
+        out.write_bytes(merged)
+
+        opened0 = await state.load_sample(str(out), segment=0)
+        await _flush()
+        assert (await state.sources[opened0[0]].slice(0, 1))[0]["text"] == "alpha"
+        for sid in opened0:
+            state.close_source(sid)
+
+        opened1 = await state.load_sample(str(out), segment=1)
+        await _flush()
+        assert (await state.sources[opened1[0]].slice(0, 1))[0]["text"] == "beta"
+
     async def test_single_segment_file_loads_without_a_segment_arg(self, state, log_file, tmp_path):
         state.open_file(str(log_file), "auto", None, live=False, transforms=[])
         await _flush()
