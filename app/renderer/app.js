@@ -1989,6 +1989,56 @@ async function setCursor(t, opts = {}) {
 
 /* ── log panels (virtual scroll) ────────────────────────────────────────── */
 
+// A log line that's itself a JSON object (some shippers JSON-encode it a
+// second time on top, e.g. `"{\"key\": \"val\"}"` as the literal line) reads
+// far better pretty-printed than as one dense escaped string -- used by the
+// row tooltip below, see formatLogEntryText/deepJsonParse.
+const LOG_LEVEL_KEYS = ["level", "lvl", "loglevel", "log_level", "severity", "syslog_severity"];
+const LOG_LEVEL_TOKENS = ["TRACE", "DEBUG", "INFO", "NOTICE", "WARN", "WARNING", "ERROR", "CRIT", "CRITICAL", "FATAL", "EMERG", "ALERT"];
+
+// Repeatedly JSON.parses a string result (handles a line JSON-encoded an
+// extra time by an upstream shipper on top of the record's own encoding) --
+// null if it's not JSON at all, or never bottoms out at a plain object
+// (arrays/primitives aren't "fields" to pretty-print).
+function deepJsonParse(text) {
+  let value = text;
+  for (let i = 0; i < 5 && typeof value === "string"; i++) {
+    try { value = JSON.parse(value); } catch { return null; }
+  }
+  return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+}
+
+// A well-known level-shaped key wins over a value that merely looks like a
+// level token (a field could legitimately hold "ERROR" as data, e.g. a
+// status name, without the line itself being at that level) -- "INFO" is
+// the fallback once neither signal is present, matching this app's own
+// default severity everywhere else a level isn't otherwise known.
+function detectLogLevel(entries) {
+  for (const [k, v] of entries) {
+    if (typeof v === "string" && LOG_LEVEL_KEYS.includes(k.toLowerCase())) return v.toUpperCase();
+  }
+  for (const [, v] of entries) {
+    if (typeof v === "string" && LOG_LEVEL_TOKENS.includes(v.toUpperCase())) return v.toUpperCase();
+  }
+  return "INFO";
+}
+
+// Tooltip-only (the compact virtualized row stays raw, see Panel.render) --
+// row.text unchanged unless it deserializes to a JSON object, in which case
+// it's rendered as one "key: value" line per field instead of raw escaped
+// JSON. Field values are shown exactly as deserialized, no further string
+// transformation of any kind -- URLs/paths in a value must reach the
+// tooltip byte-for-byte, only JSON's own escaping is undone by JSON.parse.
+function formatLogEntryText(text) {
+  const obj = deepJsonParse(text);
+  if (!obj) return text;
+  const entries = Object.entries(obj);
+  if (!entries.length) return text;
+  const level = detectLogLevel(entries);
+  const lines = entries.map(([k, v]) => `${k}: ${v !== null && typeof v === "object" ? JSON.stringify(v) : v}`);
+  return `${level}:  ${lines[0]}` + lines.slice(1).map((l) => `\n        ${l}`).join("");
+}
+
 const panels = new Map(); // source id -> Panel
 
 // One log source's virtual-scrolled panel: renders only the rows currently
@@ -2236,7 +2286,7 @@ class Panel {
       ts.textContent = fmtClock(row.ts, true);
       div.appendChild(ts);
       div.appendChild(document.createTextNode(row.text.split("\n")[0]));
-      div.title = new Date(row.ts).toISOString() + "\n" + row.text
+      div.title = new Date(row.ts).toISOString() + "\n" + formatLogEntryText(row.text)
         + "\n(ctrl/cmd-click to select, shift-click to select a range, right-click for actions)";
       div.onclick = (e) => {
         if (e.shiftKey && this.lastClickIdx != null) {

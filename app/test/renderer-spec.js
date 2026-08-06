@@ -480,6 +480,61 @@
     eq(none.index, null);
   });
 
+  /* ── formatLogEntryText: JSON log lines pretty-printed in the row tooltip
+     (the compact virtualized row itself stays raw, unaffected) ──────────── */
+
+  await T("formatLogEntryText leaves plain, non-JSON text alone", () => {
+    eq(formatLogEntryText("plain text, not JSON at all"), "plain text, not JSON at all");
+    eq(formatLogEntryText('{"unterminated": '), '{"unterminated": ');
+    eq(formatLogEntryText("[1, 2, 3]"), "[1, 2, 3]", "a JSON array isn't a set of fields to pretty-print");
+    eq(formatLogEntryText("{}"), "{}", "an empty object has no fields to show, left as-is");
+  });
+
+  await T("formatLogEntryText pretty-prints a plain JSON object, one 'key: value' line per field, defaulting to INFO", () => {
+    const text = JSON.stringify({ a: "1", b: "2", c: "3" });
+    eq(formatLogEntryText(text), "INFO:  a: 1\n        b: 2\n        c: 3");
+  });
+
+  await T("formatLogEntryText unwraps a log line that's been JSON-encoded an extra time by an upstream shipper", () => {
+    const doubleEncoded = JSON.stringify(JSON.stringify({ a: "1", b: "2" }));
+    eq(formatLogEntryText(doubleEncoded), "INFO:  a: 1\n        b: 2");
+  });
+
+  await T("formatLogEntryText prefers a well-known level-shaped key over a value that merely looks like a level token", () => {
+    eq(formatLogEntryText(JSON.stringify({ level: "warning", status: "OK" })), "WARNING:  level: warning\n        status: OK");
+    eq(formatLogEntryText(JSON.stringify({ lvl: "error", a: "1" })), "ERROR:  lvl: error\n        a: 1");
+  });
+
+  await T("formatLogEntryText falls back to scanning values for a recognized level token when no level-shaped key exists", () => {
+    eq(formatLogEntryText(JSON.stringify({ uwsgi_status: "200", note: "ERROR" })), 'ERROR:  uwsgi_status: 200\n        note: ERROR');
+  });
+
+  await T("formatLogEntryText never mangles URLs/paths in a field's value -- only JSON's own escaping is undone", () => {
+    const text = JSON.stringify({ uwsgi_uri: "/api/v2/pipeline/341074", uwsgi_referer: "https://cembalo.dev.finmod.eu.scor.local/r/" });
+    const out = formatLogEntryText(text);
+    ok(out.includes("uwsgi_uri: /api/v2/pipeline/341074"), out);
+    ok(out.includes("uwsgi_referer: https://cembalo.dev.finmod.eu.scor.local/r/"), out);
+  });
+
+  await T("formatLogEntryText stringifies a nested object/array value inline rather than recursing into it", () => {
+    eq(formatLogEntryText(JSON.stringify({ a: "1", tags: ["x", "y"] })), 'INFO:  a: 1\n        tags: ["x","y"]');
+  });
+
+  await T("a log row's tooltip uses formatLogEntryText's output, not the raw row text, alongside the ISO timestamp", async () => {
+    const p = [...panels.values()][0];
+    await p.render();
+    const firstRow = p.body.querySelector(".log-row");
+    ok(firstRow, "at least one row rendered");
+    // dataIndexAt(0), not page(0)[0] -- logs display newest-first by
+    // default (this.reversed), so the first *rendered* row is the highest
+    // data index, not the lowest.
+    const dataIdx = p.dataIndexAt(0);
+    const page = await p.page(Math.floor(dataIdx / PAGE));
+    const row = page[dataIdx % PAGE];
+    eq(firstRow.title, new Date(row.ts).toISOString() + "\n" + formatLogEntryText(row.text)
+      + "\n(ctrl/cmd-click to select, shift-click to select a range, right-click for actions)");
+  });
+
   await T("selecting log entries opens a time-anchored context menu, centered on their timestamps", async () => {
     const p = [...panels.values()][0];
     p.selected.clear();
