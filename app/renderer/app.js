@@ -3338,6 +3338,56 @@ $("btn-load-sample").onclick = async () => {
   }
 };
 
+/* ── Opened Data: switch the active view to one of the currently open
+   metric/recording files (see #btn-opened-data in the sidebar, and
+   #menu-opened-data in the File menu) -- purely a visibility flip via
+   setActiveView (sampleFileGroups(), same list Load Data's own
+   already-open dedup above draws from), no re-picking/re-uploading. */
+const dlgOpenedData = $("dlg-opened-data");
+
+function populateOpenedDataSelect() {
+  const select = $("opened-data-select");
+  const groups = sampleFileGroups();
+  select.innerHTML = "";
+  if (!groups.length) {
+    const opt = document.createElement("option");
+    opt.textContent = "No files currently open";
+    opt.disabled = true;
+    select.appendChild(opt);
+    select.disabled = true;
+    $("dlg-opened-data-open").disabled = true;
+    return;
+  }
+  select.disabled = false;
+  for (const g of groups) {
+    const opt = document.createElement("option");
+    opt.value = g.path;
+    opt.textContent = basename(g.path);
+    select.appendChild(opt);
+  }
+  // Pre-selects the active view's own file when it's one of these -- Live
+  // (or a hidden-in-background file that isn't the active view) falls back
+  // to the first entry instead of leaving the select on nothing.
+  select.value = groups.some((g) => g.path === state.activeSamplePath) ? state.activeSamplePath : groups[0].path;
+  $("dlg-opened-data-open").disabled = false;
+}
+$("btn-opened-data").onclick = () => {
+  populateOpenedDataSelect();
+  dlgOpenedData.showModal();
+};
+$("dlg-opened-data-cancel").onclick = () => dlgOpenedData.close();
+function openSelectedOpenedData() {
+  const select = $("opened-data-select");
+  if (select.disabled || !select.value) return;
+  dlgOpenedData.close();
+  setActiveView(select.value);
+}
+$("dlg-opened-data-open").onclick = openSelectedOpenedData;
+// Double-clicking the select control itself (once it already shows a
+// file -- native <select> options don't carry their own dblclick) opens
+// that selection directly, without an extra trip to the Open button.
+$("opened-data-select").ondblclick = openSelectedOpenedData;
+
 /* ── Recording (Start/Pause/Stop/Open Recording, Recording menu) ─────────
    Each Record→Pause span is flushed as one more segment into the same
    .cttc-record archive via /sample/record (byte-oriented, mirroring Capture
@@ -5673,7 +5723,7 @@ if (!POPOUT_KIND) {
   // #btn-load-sample is a sidebar button (icon wrapped in .ab-icon);
   // #btn-export-metrics is a plain toolbar .icon-btn (bare <svg>) --
   // either way, only the <svg> itself is cloned.
-  for (const [menuId, sourceSel] of [["menu-load-metrics", "#btn-load-sample"], ["menu-export-metrics", "#btn-export-metrics"]]) {
+  for (const [menuId, sourceSel] of [["menu-load-metrics", "#btn-load-sample"], ["menu-opened-data", "#btn-opened-data"], ["menu-export-metrics", "#btn-export-metrics"]]) {
     const svg = document.querySelector(sourceSel)?.querySelector("svg");
     if (svg) {
       const iconEl = document.createElement("span");
@@ -5713,6 +5763,7 @@ if (!POPOUT_KIND) {
     "clear-sources": () => $("btn-clear-sources").click(),
     "remove-docker-daemon": () => $("btn-remove-docker-daemon").click(),
     "load-metrics": () => $("btn-load-sample").click(),
+    "opened-data": () => $("btn-opened-data").click(),
     "export-metrics": () => $("btn-export-metrics").click(),
     "new-gateway": () => openNewGatewayDialog(),
     "edit-gateways": () => openEditGatewaysDialog(),

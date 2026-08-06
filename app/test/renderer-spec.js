@@ -2482,8 +2482,9 @@
      icon/disabled-state mirroring -- not the underlying flows themselves,
      which are already covered by the tests above/around btn-load-sample. */
 
-  await T("File > Load Data…/Export Metrics… carry an icon cloned from their action-bar/toolbar counterpart", () => {
+  await T("File > Load Data…/Opened Data…/Export Metrics… carry an icon cloned from their action-bar/toolbar counterpart", () => {
     ok($("menu-load-metrics").querySelector(".ctxmenu-icon svg"), "Load Data… has a cloned icon");
+    ok($("menu-opened-data").querySelector(".ctxmenu-icon svg"), "Opened Data… has a cloned icon");
     ok($("menu-export-metrics").querySelector(".ctxmenu-icon svg"), "Export Metrics… has a cloned icon");
   });
 
@@ -2531,6 +2532,96 @@
         await post("/close", { id: s.id });
       }
       await refreshAll();
+    }
+  });
+
+  /* ── Opened Data: switch among currently open files (#btn-opened-data in
+     the sidebar, #menu-opened-data in the File menu) ─────────────────────── */
+
+  // Exports and loads two distinct sample files, leaving both open -- B
+  // (loaded last) becomes the active view, same as Load Data's own
+  // behavior -- returns their upload:// paths for assertions/cleanup.
+  async function openTwoSamplesForOpenedDataTest(name) {
+    const outA = `/tmp/cttc-e2e-opened-data-${name}-a.cttc-metric`;
+    const outB = `/tmp/cttc-e2e-opened-data-${name}-b.cttc-metric`;
+    await post("/sample/export", { path: outA, from: R.min_ts, to: R.min_ts + 5 * 60000 });
+    await post("/sample/export", { path: outB, from: R.min_ts, to: R.min_ts + 5 * 60000 });
+    const realPick = pickAnalysisFiles;
+    try {
+      pickAnalysisFiles = async () => [outA];
+      await $("btn-load-sample").onclick();
+      pickAnalysisFiles = async () => [outB];
+      await $("btn-load-sample").onclick();
+    } finally {
+      pickAnalysisFiles = realPick;
+    }
+    return { pathA: `upload://${basename(outA)}`, pathB: `upload://${basename(outB)}` };
+  }
+  async function closeOpenedDataTestFiles(pathA, pathB) {
+    for (const s of state.sources.filter((s) => s.path === pathA || s.path === pathB)) {
+      await post("/close", { id: s.id });
+    }
+    await refreshAll();
+  }
+
+  // The two tests below share one upload of two files each (rather than
+  // each test uploading its own pair) -- e2e uploads are the slow part of
+  // this suite and the harness enforces a fixed wall-clock budget across
+  // the whole spec (see main.js's 120s "global timeout"), so duplicating
+  // that setup per assertion isn't free the way it would be in a unit test.
+
+  await T("Opened Data lists every currently open file, pre-selects the active view, and Open switches to the selection", async () => {
+    const { pathA, pathB } = await openTwoSamplesForOpenedDataTest("open-flow");
+    try {
+      eq(state.activeSamplePath, pathB, "sanity: B is the active view before switching");
+      $("btn-opened-data").click();
+      eq(dlgOpenedData.open, true, "dialog open");
+      const values = [...$("opened-data-select").options].map((o) => o.value);
+      ok(values.includes(pathA) && values.includes(pathB), "both open files listed");
+      eq($("opened-data-select").value, pathB, "pre-selects the active view (B, opened last)");
+      eq($("dlg-opened-data-open").disabled, false, "Open enabled once a file is open");
+
+      $("opened-data-select").value = pathA;
+      $("dlg-opened-data-open").click();
+      eq(dlgOpenedData.open, false, "dialog closed after Open");
+      eq(state.activeSamplePath, pathA, "switched to A");
+    } finally {
+      if (dlgOpenedData.open) dlgOpenedData.close();
+      await closeOpenedDataTestFiles(pathA, pathB);
+    }
+  });
+
+  await T("Cancel closes Opened Data without switching, and double-clicking the select opens the selection directly", async () => {
+    const { pathA, pathB } = await openTwoSamplesForOpenedDataTest("dblclick-cancel");
+    try {
+      $("btn-opened-data").click();
+      $("opened-data-select").value = pathA;
+      $("dlg-opened-data-cancel").click();
+      eq(dlgOpenedData.open, false, "dialog closed after Cancel");
+      eq(state.activeSamplePath, pathB, "still on B -- Cancel didn't switch");
+
+      $("btn-opened-data").click();
+      $("opened-data-select").value = pathA;
+      $("opened-data-select").dispatchEvent(new Event("dblclick"));
+      eq(dlgOpenedData.open, false, "dialog closed after double-click");
+      eq(state.activeSamplePath, pathA, "switched to A via double-click");
+    } finally {
+      if (dlgOpenedData.open) dlgOpenedData.close();
+      await closeOpenedDataTestFiles(pathA, pathB);
+    }
+  });
+
+  await T("Opened Data shows a disabled placeholder when nothing is open", () => {
+    const realGroups = sampleFileGroups;
+    try {
+      sampleFileGroups = () => [];
+      populateOpenedDataSelect();
+      eq($("opened-data-select").disabled, true, "select disabled with nothing open");
+      eq($("dlg-opened-data-open").disabled, true, "Open disabled with nothing open");
+      eq($("opened-data-select").options.length, 1, "one placeholder option");
+      eq($("opened-data-select").options[0].disabled, true, "placeholder itself isn't pickable");
+    } finally {
+      sampleFileGroups = realGroups;
     }
   });
 

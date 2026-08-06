@@ -21,6 +21,7 @@
              app.js), so they can't drift out of sync with the buttons they
              duplicate, same convention as ctxMenu's own icon cloning. -->
         <button id="menu-load-metrics" data-action="load-metrics"><span class="menu-item-label">Load Data…</span></button>
+        <button id="menu-opened-data" data-action="opened-data" title="Switch to one of the currently open metric/recording files"><span class="menu-item-label">Opened Data…</span></button>
         <button id="menu-export-metrics" data-action="export-metrics" disabled title="Export this metrics file's stats/logs as text or JSON"><span class="menu-item-label">Export Metrics…</span></button>
         <div class="menu-sep"></div>
         <button data-action="restart">Restart</button>
@@ -111,6 +112,7 @@
         </button>
         <div class="ab-group-body" hidden>
           <button id="btn-load-sample" title="Load an analysis file (.cttc-metric, possibly encrypted)"><span class="ab-icon"><svg fill="currentColor" viewBox="0 0 512 512" aria-hidden="true"><path d="m452 232h-219.64l-23.416-46.833c-10.228-20.458-30.792-33.167-53.665-33.167h-95.279c-33.084 0-60 26.916-60 60v240c0 33.084 26.916 60 60 60h392c33.084 0 60-26.916 60-60v-160c0-33.084-26.916-60-60-60zm20 220c0 11.028-8.972 20-20 20h-392c-11.028 0-20-8.972-20-20v-240c0-11.028 8.972-20 20-20h95.279c7.624 0 14.479 4.236 17.888 11.056l28.944 57.889c3.388 6.775 10.314 11.055 17.889 11.055h232c11.028 0 20 8.972 20 20z"/><path d="m100 112c11.046 0 20-8.954 20-20v-52h272v132c0 11.046 8.954 20 20 20s20-8.954 20-20v-152c0-11.046-8.954-20-20-20h-312c-11.046 0-20 8.954-20 20v72c0 11.046 8.954 20 20 20z"/><path d="m412 392h-80c-11.046 0-20 8.954-20 20s8.954 20 20 20h80c11.046 0 20-8.954 20-20s-8.954-20-20-20z"/></svg></span>Load Data…</button>
+          <button id="btn-opened-data" title="Switch to one of the currently open metric/recording files"><span class="ab-icon"><svg fill="currentColor" viewBox="0 0 512 512" aria-hidden="true"><path d="M403.995,27.498C363.93,9.765,311.372,0,256.002,0c-55.375,0-107.931,9.756-147.986,27.469 c-44.53,19.692-69.053,47.47-69.053,78.217c0,0.242,0.014,0.482,0.018,0.723c-0.004,0.149-0.022,0.294-0.022,0.443l0.004,304.974 c0,29.476,24.488,55.911,68.954,74.439C147.746,502.861,200.338,512,256.007,512c55.669,0,108.26-9.139,148.089-25.735 c44.465-18.528,68.843-44.964,68.843-74.439V105.739c0-0.058,0.104-0.112,0.102-0.17C472.951,74.89,448.441,47.169,403.995,27.498 z M121.522,58.007c35.895-15.874,83.654-24.616,134.48-24.616c50.817,0,98.576,8.751,134.478,24.641 c30.791,13.628,49.174,31.462,49.174,47.707s-18.383,34.079-49.174,47.707c-35.902,15.89-83.661,24.641-134.478,24.641 c-105.11,0-183.648-38.224-183.648-72.401C72.354,89.445,90.735,71.622,121.522,58.007z M439.659,411.826 c0,14.682-18.096,30.987-48.406,43.617c-35.853,14.938-83.885,23.166-135.246,23.166s-99.393-8.228-135.246-23.166 c-30.31-12.63-48.518-28.935-48.518-43.617v-45.178c9.831,7.149,21.84,13.68,35.675,19.445 c39.828,16.594,92.419,25.734,148.088,25.734c55.669,0,108.26-9.139,148.089-25.735c13.834-5.764,25.732-12.295,35.563-19.444 V411.826z M391.253,355.269c-35.853,14.938-83.885,23.166-135.246,23.166s-99.393-8.228-135.246-23.166 c-30.31-12.63-48.406-28.935-48.406-43.617c0-0.01-0.112-0.019-0.112-0.028l-0.001-45.152c9.832,7.149,21.841,13.68,35.676,19.446 c39.829,16.594,92.42,25.734,148.089,25.734c55.669,0,108.26-9.139,148.089-25.735c13.834-5.764,25.732-12.295,35.563-19.444 v45.178h0C439.659,326.334,421.563,342.639,391.253,355.269z M391.253,255.095c-35.853,14.938-83.885,23.166-135.246,23.166 s-99.393-8.228-135.246-23.166c-30.31-12.63-48.522-28.935-48.522-43.617c0-0.019,0.001-0.038,0.001-0.057l-0.001-48.105 c9.853,7.559,21.895,14.488,35.769,20.635c40.072,17.751,92.632,27.527,147.995,27.527c55.369,0,107.927-9.765,147.992-27.498 c13.877-6.142,25.809-13.069,35.664-20.626v48.124h0C439.659,226.16,421.563,242.465,391.253,255.095z"/></svg></span>Opened Data…</button>
           <div class="ab-sep ab-sep--dotted"></div>
           <button id="btn-event-create" data-action="event-create" title="Watch metrics/logs and automatically snapshot or record when a condition is met"><span class="ab-icon"><svg fill="currentColor" viewBox="0 0 511.999 511.999" aria-hidden="true"><path d="M403.889,203.213c-3.668-5.783-10.04-9.287-16.889-9.287H276V20c0-9.363-6.496-17.472-15.633-19.516c-9.142-2.043-18.47,2.524-22.46,10.994l-131,278.071c-2.919,6.195-2.465,13.453,1.204,19.236c3.668,5.783,10.04,9.287,16.889,9.287h111v173.925c0,9.363,6.496,17.473,15.633,19.518c9.199,2.054,18.494-2.577,22.46-10.995l131-278.071C408.012,216.254,407.558,208.996,403.889,203.213z M276,402.615V298.072c0-11.046-8.954-20-20-20h-99.47L236,109.383v104.543c0,11.046,8.954,20,20,20h99.47L276,402.615z"/></svg></span>Create Event…</button>
           <button id="btn-event-edit" data-action="event-edit" title="Update, disable/enable, or erase local and gateway events"><span class="ab-icon"><svg fill="currentColor" viewBox="0 0 512.001 512.001" aria-hidden="true"><path d="m511.403 487.149-40-160c-.881-3.526-2.738-6.768-5.261-9.291-3.399-3.399-304.052-304.052-312-312-7.811-7.81-20.474-7.81-28.284 0l-120 120c-7.811 7.811-7.811 20.474 0 28.284l312 312c2.623 2.623 5.931 4.421 9.292 5.261l160 40c6.896 1.724 14.085-.352 18.993-5.261 4.967-4.968 6.964-12.177 5.26-18.993zm-118.906-123.93-200.199-207.233 27.702-27.702 203.716 203.716zm-252.497-314.935 51.716 51.716-91.716 91.716-51.716-51.716zm24.009 135.991 200.199 207.233-32.208 32.208-203.716-203.716zm207.111 256.889c4.706-4.706 65.283-65.283 70.045-70.044l23.348 93.393z"/></svg></span>Edit Events…</button>
@@ -686,6 +688,22 @@
       <button id="dlg-snapshot-close" title="Close this snapshot">Close</button>
       <button id="dlg-snapshot-save-txt" title="Save this snapshot as a plain-text file">💾 Save as TXT…</button>
       <button id="dlg-snapshot-save" class="primary" hidden title="Save this snapshot as a JSON file">💾 Save as JSON…</button>
+    </div>
+  </dialog>
+
+  <!-- Opened Data (see #btn-opened-data in the sidebar's Analysis group, and
+       #menu-opened-data in the File menu) -- switches the active view to one
+       of the currently open .cttc-metric/.cttc-record files, without
+       re-picking/re-uploading it (see sampleFileGroups/setActiveView). -->
+  <dialog id="dlg-opened-data">
+    <h2>Opened Data</h2>
+    <p class="dlg-intro muted">Switch to one of the metric/recording files currently open.</p>
+    <label class="ctl block">File
+      <select id="opened-data-select"></select>
+    </label>
+    <div class="dlg-actions">
+      <button id="dlg-opened-data-cancel" title="Close without switching">Cancel</button>
+      <button id="dlg-opened-data-open" class="primary" title="Switch to the selected file">Open</button>
     </div>
   </dialog>
 
