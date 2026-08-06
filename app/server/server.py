@@ -745,6 +745,48 @@ class StatsSource:
             )
         return out
 
+    async def export_stats(self, t0: float, t1: float, granularity: str):
+        """Per service, every raw sample in [t0, t1] ("full") or a min/avg/max
+        summary over them ("summary") -- used by the "Export metrics" dialog's
+        stats option. Unlike bucketed()'s per-pixel max (chart rendering),
+        this reads the exact stored samples, not a downsampled envelope."""
+        services = sorted(self._services)
+        rows_per_service = await asyncio.gather(
+            *(self._redis.range_by_score_with_payload(self._entity_for(svc), t0, t1 + 1) for svc in services)
+        )
+        out = []
+        for svc, rows in zip(services, rows_per_service):
+            if not rows:
+                continue
+            if granularity == "full":
+                out.append({
+                    "name": svc,
+                    "host": self.is_host,
+                    "sid": self.id,
+                    "samples": [
+                        {"ts": ts, "cpu": p.get("cpu"), "mem": p.get("mem"),
+                         "mem_bytes": p.get("mem_bytes"), "net": p.get("net")}
+                        for ts, p in rows
+                    ],
+                })
+                continue
+
+            def agg(key):
+                vals = [p.get(key) for _, p in rows if p.get(key) is not None]
+                return {"min": min(vals), "avg": sum(vals) / len(vals), "max": max(vals)} if vals else None
+
+            out.append({
+                "name": svc,
+                "host": self.is_host,
+                "sid": self.id,
+                "count": len(rows),
+                "cpu": agg("cpu"),
+                "mem": agg("mem"),
+                "mem_bytes": agg("mem_bytes"),
+                "net": agg("net"),
+            })
+        return out
+
     async def point_at(self, t: float):
         """Per service, the single sample nearest time t — used to compare an
         arbitrary point (e.g. a loaded sample) against another point (e.g.
@@ -2566,6 +2608,22 @@ async def route_point(request: Request, t: str = ""):
         if s.kind == "stats":
             out.update(await s.point_at(tf))
     return {"t": tf, "services": out}
+
+
+@app.get("/stats_export")
+async def route_stats_export(
+    request: Request, from_: str = Query("", alias="from"), to: str = "", granularity: str = "summary"
+):
+    if not from_ or not to:
+        raise bad_request("'from' and 'to' are required")
+    if granularity not in ("summary", "full"):
+        raise bad_request("'granularity' must be 'summary' or 'full'")
+    t0, t1 = float(from_), float(to)
+    out = []
+    for s in get_state(request).sources.values():
+        if s.kind == "stats":
+            out.extend(await s.export_stats(t0, t1, granularity))
+    return {"from": t0, "to": t1, "granularity": granularity, "services": out}
 
 
 @app.get("/index_at")

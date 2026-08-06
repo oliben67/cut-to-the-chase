@@ -2546,6 +2546,50 @@ class TestHttpApi:
         _, j = get(base, f"/series?from={t0}&to={t0 + 1000}")
         assert j["px"] == 800
 
+    def test_stats_export_summary(self, api):
+        base, st = api
+        sid = next(s.id for s in st.sources.values() if s.kind == "stats")
+        t0 = ms(2026, 1, 2, 3, 0, 0)
+        _, j = get(base, f"/stats_export?from={t0}&to={t0 + 10000}&granularity=summary")
+        assert j["granularity"] == "summary"
+        assert [s["name"] for s in j["services"]] == ["api"]
+        svc = j["services"][0]
+        assert svc["sid"] == sid  # lets the client scope results to the active sample, like bucketed()'s own "sid"
+        assert svc["count"] == 3  # stats_file seeds 3 rows, see its own fixture
+        assert svc["cpu"] == {"min": 10.0, "avg": 10.0, "max": 10.0}
+        assert svc["mem"] == {"min": 20.0, "avg": 20.0, "max": 20.0}
+
+    def test_stats_export_full(self, api):
+        base, st = api
+        sid = next(s.id for s in st.sources.values() if s.kind == "stats")
+        t0 = ms(2026, 1, 2, 3, 0, 0)
+        _, j = get(base, f"/stats_export?from={t0}&to={t0 + 10000}&granularity=full")
+        assert j["granularity"] == "full"
+        svc = j["services"][0]
+        assert svc["sid"] == sid
+        assert len(svc["samples"]) == 3
+        assert svc["samples"][0]["cpu"] == 10.0
+        assert svc["samples"][0]["mem"] == 20.0
+
+    def test_stats_export_default_granularity_is_summary(self, api):
+        base, _ = api
+        t0 = ms(2026, 1, 2, 3, 0, 0)
+        _, j = get(base, f"/stats_export?from={t0}&to={t0 + 10000}")
+        assert j["granularity"] == "summary"
+
+    def test_stats_export_requires_from_and_to(self, api):
+        base, _ = api
+        status, _ = get(base, "/stats_export?from=1")
+        assert status == 400
+        status, _ = get(base, "/stats_export?to=1")
+        assert status == 400
+
+    def test_stats_export_rejects_a_bad_granularity(self, api):
+        base, _ = api
+        t0 = ms(2026, 1, 2, 3, 0, 0)
+        status, _ = get(base, f"/stats_export?from={t0}&to={t0 + 1000}&granularity=bogus")
+        assert status == 400
+
     def test_logs_index_ticks(self, api):
         base, st = api
         sid = next(s.id for s in st.sources.values() if s.kind == "log")

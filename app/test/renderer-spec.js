@@ -2297,6 +2297,184 @@
     }
   });
 
+  /* ── export metrics: the active file's stats/logs as text or JSON ───────── */
+
+  // Shared by every export-metrics test below: uploads the demo range as a
+  // real .cttc-metric and resolves it into the active view, same pattern as
+  // the metric(s)-dropdown/Back-to-live tests just above -- returns the
+  // opened source ids so the caller's own finally can close them.
+  async function loadMetricsFileForExportTest(name) {
+    const res = await fetch(`${API}/files/download?from=${R.min_ts}&to=${R.max_ts}&include_host=0`, { headers: authHeaders() });
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const realPath = `/tmp/cttc-e2e-${name}.cttc-metric`;
+    await window.cttc.writeBinaryFile(realPath, bytes);
+    const r = await uploadAndResolveSegment(realPath);
+    await refreshAll();
+    return r.opened;
+  }
+
+  await T("the export-metrics button is hidden while Live, shown once a metrics file is loaded", async () => {
+    eq($("btn-export-metrics").hidden, true, "sanity: hidden in live mode");
+    const opened = await loadMetricsFileForExportTest("visibility");
+    try {
+      eq($("btn-export-metrics").hidden, false, "shown once a metrics file is the active view");
+    } finally {
+      for (const sid of opened) await post("/close", { id: sid });
+      await refreshAll();
+      eq($("btn-export-metrics").hidden, true, "hidden again once back in live mode");
+    }
+  });
+
+  await T("the export-metrics dialog: Next is gated on at least one checkbox, and Back returns to step 1", async () => {
+    const opened = await loadMetricsFileForExportTest("flow");
+    try {
+      $("btn-export-metrics").click();
+      try {
+        eq(dlgExportMetrics.open, true, "dialog open");
+        eq($("export-metrics-step1").hidden, false, "starts on step 1");
+        eq($("export-metrics-step2").hidden, true);
+        eq($("dlg-export-metrics-next").disabled, false, "both stats and logs checked by default");
+
+        $("export-metrics-stats").checked = false;
+        $("export-metrics-stats").dispatchEvent(new Event("change"));
+        $("export-metrics-logs").checked = false;
+        $("export-metrics-logs").dispatchEvent(new Event("change"));
+        eq($("dlg-export-metrics-next").disabled, true, "Next disabled with nothing checked");
+
+        $("export-metrics-logs").checked = true;
+        $("export-metrics-logs").dispatchEvent(new Event("change"));
+        eq($("dlg-export-metrics-next").disabled, false, "Next enabled again once logs alone is checked");
+
+        // stats stays unchecked from above -- the granularity choice (only
+        // meaningful for stats) must not appear in step 2.
+        $("dlg-export-metrics-next").click();
+        eq($("export-metrics-step1").hidden, true);
+        eq($("export-metrics-step2").hidden, false);
+        eq($("export-metrics-granularity-row").hidden, true, "no granularity choice when stats isn't included");
+
+        $("dlg-export-metrics-back").click();
+        eq($("export-metrics-step1").hidden, false, "Back returns to step 1");
+        eq($("export-metrics-step2").hidden, true);
+
+        $("export-metrics-stats").checked = true;
+        $("export-metrics-stats").dispatchEvent(new Event("change"));
+        $("dlg-export-metrics-next").click();
+        eq($("export-metrics-granularity-row").hidden, false, "granularity choice shown once stats is included");
+      } finally {
+        dlgExportMetrics.close();
+      }
+    } finally {
+      for (const sid of opened) await post("/close", { id: sid });
+      await refreshAll();
+    }
+  });
+
+  await T("the export-metrics dialog's format/granularity toggles swap which button is primary", async () => {
+    const opened = await loadMetricsFileForExportTest("toggles");
+    try {
+      $("btn-export-metrics").click();
+      try {
+        $("dlg-export-metrics-next").click();
+        eq($("export-metrics-format-text").classList.contains("primary"), true, "text is the default format");
+        $("export-metrics-format-json").click();
+        eq($("export-metrics-format-json").classList.contains("primary"), true);
+        eq($("export-metrics-format-text").classList.contains("primary"), false);
+        eq(exportMetricsFormat, "json");
+
+        eq($("export-metrics-granularity-summary").classList.contains("primary"), true, "summary is the default granularity");
+        $("export-metrics-granularity-full").click();
+        eq($("export-metrics-granularity-full").classList.contains("primary"), true);
+        eq($("export-metrics-granularity-summary").classList.contains("primary"), false);
+        eq(exportMetricsGranularity, "full");
+      } finally {
+        dlgExportMetrics.close();
+        exportMetricsFormat = "text";
+        exportMetricsGranularity = "summary";
+      }
+    } finally {
+      for (const sid of opened) await post("/close", { id: sid });
+      await refreshAll();
+    }
+  });
+
+  // window.cttc is a contextBridge-exposed object -- read-only in the main
+  // world by design (context isolation), so its methods can't be monkey-
+  // patched the way plain app.js functions elsewhere in this file are.
+  // Same reasoning as snapshotToText's own test (below, unaffected by this
+  // change): exercise the formatting/data functions directly instead of
+  // clicking the real Export/Save button, which would need a real native
+  // save dialog. An earlier version of these three tests tried mocking
+  // window.cttc.saveText/saveJson directly -- the resulting "Cannot assign
+  // to read only property" throw happened *before* each test's own
+  // `finally`, leaking that test's uploaded source into every test that
+  // ran after it and cascading into unrelated failures elsewhere in the
+  // suite ("too many values to unpack").
+  await T("exportMetricsToText renders formatted content, including the stats field explanations", () => {
+    const text = exportMetricsToText({
+      generated_at: "2026-01-01T00:00:00.000Z",
+      from: R.min_ts,
+      to: R.max_ts,
+      stats: {
+        granularity: "summary",
+        services: [{ name: "api", host: false, sid: "s1", count: 3, cpu: { min: 1, avg: 2, max: 3 }, mem: { min: 4, avg: 5, max: 6 }, mem_bytes: null, net: { min: 0, avg: 0, max: 0 } }],
+      },
+      logs: [{ source: "api", path: "api.log", rows: [{ ts: R.min_ts, text: "hello" }] }],
+    });
+    ok(text.includes("Metrics export @ 2026-01-01T00:00:00.000Z"), text);
+    ok(text.includes("== Stats (summary) =="), text);
+    ok(text.includes("cpu: percent of one CPU core in use"), "stats field explanation present verbatim");
+    ok(text.includes("mem: percent of the container's own memory limit"), text);
+    ok(text.includes("[api]"), text);
+    ok(text.includes("cpu: min 1.0%  avg 2.0%  max 3.0%  (3 samples)"), text);
+    ok(text.includes("== Logs =="), text);
+    ok(text.includes("hello"), text);
+  });
+
+  await T("exportMetricsToText's full-time-series branch lists every sample instead of a summary", () => {
+    const text = exportMetricsToText({
+      generated_at: "2026-01-01T00:00:00.000Z", from: R.min_ts, to: R.max_ts,
+      stats: { granularity: "full", services: [{ name: "api", host: false, sid: "s1", samples: [{ ts: R.min_ts, cpu: 10, mem: 20, mem_bytes: 1000, net: 5 }] }] },
+    });
+    ok(text.includes("== Stats (full time series) =="), text);
+    ok(text.includes("cpu=10  mem=20  mem_bytes=1000  net=5"), text);
+  });
+
+  await T("gatherExportMetricsData scopes stats/logs to the active file's own range and sources", async () => {
+    const opened = await loadMetricsFileForExportTest("gather");
+    try {
+      const range = activeViewRange();
+      const data = await gatherExportMetricsData(true, true);
+      eq(data.from, range.min_ts);
+      eq(data.to, range.max_ts);
+      eq(data.stats.granularity, "summary");
+      ok(data.stats.services.length >= 1, "at least one service's stats included");
+      ok(data.stats.services.every((s) => !isSampleHidden(s.sid) && !isLiveDataHidden(s.sid)), "no stats from another loaded file or Live");
+      ok(Array.isArray(data.logs) && data.logs.length >= 1, "at least one log source included");
+      ok(data.logs.every((l) => l.rows.every((r) => r.ts >= range.min_ts && r.ts <= range.max_ts)), "every log row within the active file's range");
+
+      const statsOnly = await gatherExportMetricsData(true, false);
+      ok(statsOnly.stats && !statsOnly.logs, "logs omitted when not requested");
+      const logsOnly = await gatherExportMetricsData(false, true);
+      ok(!logsOnly.stats && logsOnly.logs, "stats omitted when not requested");
+    } finally {
+      for (const sid of opened) await post("/close", { id: sid });
+      await refreshAll();
+    }
+  });
+
+  await T("Cancel closes the export-metrics dialog", async () => {
+    const opened = await loadMetricsFileForExportTest("cancel");
+    try {
+      $("btn-export-metrics").click();
+      eq(dlgExportMetrics.open, true, "sanity: dialog open");
+      $("dlg-export-metrics-cancel").click();
+      eq(dlgExportMetrics.open, false, "dialog closed");
+    } finally {
+      for (const sid of opened) await post("/close", { id: sid });
+      await refreshAll();
+    }
+  });
+
   /* ── sidebar / appearance ──────────────────────────────────────────────── */
 
   await T("sidebar groups have no separator borders between them", () => {

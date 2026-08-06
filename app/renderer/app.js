@@ -1581,6 +1581,188 @@ $("dlg-snapshot-save-txt").onclick = async () => {
   }
 };
 
+/* ── Export metrics: the active file's stats/logs as text or JSON ────────
+   #btn-export-metrics (next to #record-sections, shown only while a
+   metrics file is the active view, see setLiveHidden) -- two steps: what
+   to include, then how. Covers the active view's own whole range
+   (activeViewRange()), not just the current zoom/pan window -- unlike
+   the point-in-time snapshot above, or exportSample's drag-selected
+   range. */
+
+const dlgExportMetrics = $("dlg-export-metrics");
+let exportMetricsFormat = "text"; // "text" | "json"
+let exportMetricsGranularity = "summary"; // "summary" | "full"
+
+// Next requires at least one of stats/logs checked -- same "disabled
+// until a valid choice exists" convention as e.g. ui-DHOST-012.
+function updateExportMetricsNextEnabled() {
+  $("dlg-export-metrics-next").disabled = !$("export-metrics-stats").checked && !$("export-metrics-logs").checked;
+}
+$("export-metrics-stats").onchange = updateExportMetricsNextEnabled;
+$("export-metrics-logs").onchange = updateExportMetricsNextEnabled;
+
+$("btn-export-metrics").onclick = () => {
+  $("export-metrics-step1").hidden = false;
+  $("export-metrics-step2").hidden = true;
+  updateExportMetricsNextEnabled();
+  dlgExportMetrics.showModal();
+};
+$("dlg-export-metrics-cancel").onclick = () => dlgExportMetrics.close();
+$("dlg-export-metrics-next").onclick = () => {
+  $("export-metrics-step1").hidden = true;
+  $("export-metrics-step2").hidden = false;
+  // The full-vs-summary choice only means anything if stats was checked.
+  $("export-metrics-granularity-row").hidden = !$("export-metrics-stats").checked;
+};
+$("dlg-export-metrics-back").onclick = () => {
+  $("export-metrics-step1").hidden = false;
+  $("export-metrics-step2").hidden = true;
+};
+$("export-metrics-format-text").onclick = () => {
+  exportMetricsFormat = "text";
+  $("export-metrics-format-text").classList.add("primary");
+  $("export-metrics-format-json").classList.remove("primary");
+};
+$("export-metrics-format-json").onclick = () => {
+  exportMetricsFormat = "json";
+  $("export-metrics-format-json").classList.add("primary");
+  $("export-metrics-format-text").classList.remove("primary");
+};
+$("export-metrics-granularity-summary").onclick = () => {
+  exportMetricsGranularity = "summary";
+  $("export-metrics-granularity-summary").classList.add("primary");
+  $("export-metrics-granularity-full").classList.remove("primary");
+};
+$("export-metrics-granularity-full").onclick = () => {
+  exportMetricsGranularity = "full";
+  $("export-metrics-granularity-full").classList.add("primary");
+  $("export-metrics-granularity-summary").classList.remove("primary");
+};
+
+// Shown once at the top of a text export's stats section, not repeated per
+// row -- matches server.py's own StatsSource field semantics (docker
+// stats' CPUPerc/MemPerc/NetIO, see ingest_row/_net_rate): cpu can exceed
+// 100% for a multi-core container (percent of one core, not the whole
+// machine); mem is percent of the container's own memory limit, not host
+// RAM; net is an instantaneous combined rx+tx throughput rate, not a
+// cumulative total.
+const STATS_FIELD_EXPLANATIONS = [
+  "cpu: percent of one CPU core in use (can exceed 100% for a multi-core container)",
+  "mem: percent of the container's own memory limit in use (not host RAM)",
+  "mem_bytes: memory in use, in bytes",
+  "net: combined rx+tx network throughput at that instant, in bytes/sec",
+];
+
+// Every raw log row in [t0, t1] for one source, paging through /logs (its
+// own count cap is 2000/request) starting from /index_at's nearest-t0
+// index -- unlike computeSlice's fixed-size context window above, this
+// keeps paging until it either passes t1 or the source runs out of rows.
+async function fetchLogRowsInRange(sourceId, t0, t1) {
+  let start;
+  try {
+    start = (await get(`/index_at?source=${sourceId}&t=${t0}`)).index;
+  } catch {
+    return [];
+  }
+  const rows = [];
+  for (;;) {
+    const page = await get(`/logs?source=${sourceId}&start=${start}&count=2000`);
+    for (const row of page.rows) {
+      if (row.ts > t1) return rows;
+      rows.push(row);
+    }
+    start += page.rows.length;
+    if (page.rows.length < 2000 || start >= page.total) return rows;
+  }
+}
+
+// stats_export's response, like /series's own, spans every open stats
+// source -- filtered down to just the active sample's own (isSampleHidden/
+// isLiveDataHidden, via each service's "sid") so an export doesn't pile up
+// data from other loaded-but-inactive files or from Live, same scoping
+// BUG-0082 already applies to the legend/chart/log panels.
+async function gatherExportMetricsData(includeStats, includeLogs) {
+  const range = activeViewRange();
+  const data = { generated_at: new Date().toISOString(), from: range.min_ts, to: range.max_ts };
+  if (includeStats) {
+    const r = await get(`/stats_export?from=${range.min_ts}&to=${range.max_ts}&granularity=${exportMetricsGranularity}`);
+    data.stats = {
+      granularity: exportMetricsGranularity,
+      services: r.services.filter((s) => !isSampleHidden(s.sid) && !isLiveDataHidden(s.sid)),
+    };
+  }
+  if (includeLogs) {
+    const logSources = state.sources.filter((s) => s.kind === "log" && !isSampleHidden(s.id) && !isLiveDataHidden(s.id));
+    data.logs = await Promise.all(logSources.map(async (s) => ({
+      source: s.name,
+      path: s.path,
+      rows: await fetchLogRowsInRange(s.id, range.min_ts, range.max_ts),
+    })));
+  }
+  return data;
+}
+
+function exportMetricsToText(data) {
+  const lines = [];
+  lines.push(`Metrics export @ ${data.generated_at}`);
+  lines.push(`Range: ${fmtIso(data.from)} — ${fmtIso(data.to)}`);
+  if (data.stats) {
+    lines.push("");
+    lines.push(data.stats.granularity === "summary" ? "== Stats (summary) ==" : "== Stats (full time series) ==");
+    lines.push(...STATS_FIELD_EXPLANATIONS);
+    for (const svc of data.stats.services) {
+      lines.push("");
+      lines.push(`[${(svc.host ? "* " : "") + svc.name}]`);
+      if (data.stats.granularity === "summary") {
+        const fmts = { cpu: (v) => v.toFixed(1) + "%", mem: (v) => v.toFixed(1) + "%", mem_bytes: fmtBytes, net: (v) => fmtBytes(v) + "/s" };
+        for (const key of ["cpu", "mem", "mem_bytes", "net"]) {
+          const s = svc[key];
+          if (!s) continue;
+          lines.push(`  ${key}: min ${fmts[key](s.min)}  avg ${fmts[key](s.avg)}  max ${fmts[key](s.max)}  (${svc.count} samples)`);
+        }
+      } else {
+        for (const s of svc.samples) {
+          lines.push(`  ${fmtClock(s.ts, true)}  cpu=${s.cpu ?? "-"}  mem=${s.mem ?? "-"}  mem_bytes=${s.mem_bytes ?? "-"}  net=${s.net ?? "-"}`);
+        }
+      }
+    }
+  }
+  if (data.logs) {
+    lines.push("");
+    lines.push("== Logs ==");
+    for (const l of data.logs) {
+      lines.push("");
+      lines.push(`[${l.source}]`);
+      for (const row of l.rows) lines.push(`  ${fmtClock(row.ts, true)}  ${row.text.split("\n")[0]}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+$("dlg-export-metrics-export").onclick = async () => {
+  const includeStats = $("export-metrics-stats").checked;
+  const includeLogs = $("export-metrics-logs").checked;
+  const btn = $("dlg-export-metrics-export");
+  btn.disabled = true;
+  try {
+    const data = await gatherExportMetricsData(includeStats, includeLogs);
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, "-");
+    if (exportMetricsFormat === "json") {
+      const name = `metrics-export-${stamp}.json`;
+      const path = window.cttc?.saveJson ? await window.cttc.saveJson(name, JSON.stringify(data, null, 2)) : null;
+      if (path) { notifyEvent("metrics exported: " + path); dlgExportMetrics.close(); }
+    } else {
+      const name = `metrics-export-${stamp}.txt`;
+      const path = window.cttc?.saveText ? await window.cttc.saveText(name, exportMetricsToText(data)) : null;
+      if (path) { notifyEvent("metrics exported: " + path); dlgExportMetrics.close(); }
+    }
+  } catch (err) {
+    notifyEvent("metrics export failed: " + (err.message || err));
+  } finally {
+    btn.disabled = false;
+  }
+};
+
 // Shared "time" context menu: capture metrics / take snapshot / zoom / reset,
 // anchored on time `t`. Used both by right-clicking a chart (t = the point
 // under the cursor) and by right-clicking selected log entries (t = the
@@ -5333,6 +5515,7 @@ function setLiveHidden(hidden) {
   // not a hybrid.
   $("section-recording").hidden = hidden;
   $("btn-back-to-live").hidden = !hidden;
+  $("btn-export-metrics").hidden = !hidden;
   // Recording keeps capturing the live feed in the background regardless
   // of analysis mode -- if a metric/recording gets loaded while actively
   // recording, the status bar's mode icon must NOT swap to "Analysis
