@@ -5516,6 +5516,10 @@ function setLiveHidden(hidden) {
   $("section-recording").hidden = hidden;
   $("btn-back-to-live").hidden = !hidden;
   $("btn-export-metrics").hidden = !hidden;
+  // File > Export Metrics… mirrors the toolbar button's own availability,
+  // disabled (not hidden -- it's a fixed menu, unlike the toolbar button
+  // that only exists once a metrics file is loaded) while still in live mode.
+  $("menu-export-metrics").disabled = !hidden;
   // Recording keeps capturing the live feed in the background regardless
   // of analysis mode -- if a metric/recording gets loaded while actively
   // recording, the status bar's mode icon must NOT swap to "Analysis
@@ -5663,6 +5667,22 @@ if (!POPOUT_KIND) {
     }
   }
 
+  // File > Load Data…/Export Metrics… clone their icon from the
+  // action-bar/toolbar button they duplicate (see ctxMenu's own icon
+  // cloning above) so the menu can never drift out of sync with it.
+  // #btn-load-sample is a sidebar button (icon wrapped in .ab-icon);
+  // #btn-export-metrics is a plain toolbar .icon-btn (bare <svg>) --
+  // either way, only the <svg> itself is cloned.
+  for (const [menuId, sourceSel] of [["menu-load-metrics", "#btn-load-sample"], ["menu-export-metrics", "#btn-export-metrics"]]) {
+    const svg = document.querySelector(sourceSel)?.querySelector("svg");
+    if (svg) {
+      const iconEl = document.createElement("span");
+      iconEl.className = "ctxmenu-icon";
+      iconEl.appendChild(svg.cloneNode(true));
+      $(menuId)?.querySelector(".menu-item-label")?.prepend(iconEl);
+    }
+  }
+
   let openMenu = null;
   function closeMenu() {
     if (!openMenu) return;
@@ -5693,6 +5713,7 @@ if (!POPOUT_KIND) {
     "clear-sources": () => $("btn-clear-sources").click(),
     "remove-docker-daemon": () => $("btn-remove-docker-daemon").click(),
     "load-metrics": () => $("btn-load-sample").click(),
+    "export-metrics": () => $("btn-export-metrics").click(),
     "new-gateway": () => openNewGatewayDialog(),
     "edit-gateways": () => openEditGatewaysDialog(),
     "uninstall-gateway": () => openUninstallGatewayDialog(),

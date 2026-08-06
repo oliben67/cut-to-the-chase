@@ -2475,6 +2475,65 @@
     }
   });
 
+  /* ── File menu: Load Data…/Export Metrics… ───────────────────────────────
+     Both entries duplicate an existing action-bar/toolbar button rather
+     than reimplementing it (#btn-load-sample / #btn-export-metrics), so
+     coverage here is about the menu's own wiring -- dispatch and the cloned
+     icon/disabled-state mirroring -- not the underlying flows themselves,
+     which are already covered by the tests above/around btn-load-sample. */
+
+  await T("File > Load Data…/Export Metrics… carry an icon cloned from their action-bar/toolbar counterpart", () => {
+    ok($("menu-load-metrics").querySelector(".ctxmenu-icon svg"), "Load Data… has a cloned icon");
+    ok($("menu-export-metrics").querySelector(".ctxmenu-icon svg"), "Export Metrics… has a cloned icon");
+  });
+
+  await T("File > Export Metrics… is disabled while Live, enabled once a metrics file is loaded", async () => {
+    eq($("menu-export-metrics").disabled, true, "sanity: disabled in live mode");
+    const opened = await loadMetricsFileForExportTest("menu-visibility");
+    try {
+      eq($("menu-export-metrics").disabled, false, "enabled once a metrics file is the active view");
+    } finally {
+      for (const sid of opened) await post("/close", { id: sid });
+      await refreshAll();
+      eq($("menu-export-metrics").disabled, true, "disabled again once back in live mode");
+    }
+  });
+
+  await T("File > Export Metrics… opens the same dialog as the toolbar button", async () => {
+    const opened = await loadMetricsFileForExportTest("menu-open-dialog");
+    try {
+      $("menu-export-metrics").click();
+      try {
+        eq(dlgExportMetrics.open, true, "dialog opened via the File menu entry");
+      } finally {
+        dlgExportMetrics.close();
+      }
+    } finally {
+      for (const sid of opened) await post("/close", { id: sid });
+      await refreshAll();
+    }
+  });
+
+  await T("File > Load Data… reuses the sidebar's Load Data flow", async () => {
+    const out = "/tmp/cttc-e2e-menu-load.cttc-metric";
+    await post("/sample/export", { path: out, from: R.min_ts, to: R.min_ts + 5 * 60000 });
+    const realPick = pickAnalysisFiles;
+    try {
+      pickAnalysisFiles = async () => [out];
+      $("menu-load-metrics").click();
+      await sleep(200);
+      const path = `upload://${basename(out)}`;
+      ok(sampleFileGroups().find((g) => g.path === path), "file opened via the File menu's Load Data… entry");
+      eq(state.activeSamplePath, path, "became the active view");
+    } finally {
+      pickAnalysisFiles = realPick;
+      for (const s of state.sources.filter((s) => s.path === `upload://${basename(out)}`)) {
+        await post("/close", { id: s.id });
+      }
+      await refreshAll();
+    }
+  });
+
   /* ── sidebar / appearance ──────────────────────────────────────────────── */
 
   await T("sidebar groups have no separator borders between them", () => {

@@ -16,6 +16,13 @@
     <div class="menu" data-menu="file">
       <button class="menu-label" type="button">File</button>
       <div class="menu-list" role="menu">
+        <!-- Icons cloned at startup from their action-bar/toolbar counterparts
+             (#btn-load-sample, #btn-export-metrics -- see the menubar setup in
+             app.js), so they can't drift out of sync with the buttons they
+             duplicate, same convention as ctxMenu's own icon cloning. -->
+        <button id="menu-load-metrics" data-action="load-metrics"><span class="menu-item-label">Load Data…</span></button>
+        <button id="menu-export-metrics" data-action="export-metrics" disabled title="Export this metrics file's stats/logs as text or JSON"><span class="menu-item-label">Export Metrics…</span></button>
+        <div class="menu-sep"></div>
         <button data-action="restart">Restart</button>
         <div class="menu-sep"></div>
         <button data-action="quit">Quit <span class="acc">Ctrl+Q</span></button>

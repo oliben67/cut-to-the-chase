@@ -148,8 +148,19 @@ body {
   font-size: 12px;
 }
 #menubar .menu-list button:hover { background: var(--accent); color: #fff; }
-#menubar .menu-list button:disabled:hover { background: none; color: var(--text-primary); }
+#menubar .menu-list button:disabled { color: var(--muted); cursor: default; }
+#menubar .menu-list button:disabled:hover { background: none; color: var(--muted); }
 #menubar .menu-list button.menu-indent { padding-left: 20px; }
+/* Wraps an icon (cloned from the action-bar/toolbar button it duplicates,
+   see menu-load-metrics/menu-export-metrics in index.html) together with its
+   label as a single flex child, so it stays grouped on the left even for
+   entries whose button also carries a trailing .acc pinned right via this
+   list's own justify-content: space-between. */
+.menu-item-label { display: inline-flex; align-items: center; gap: 8px; }
+/* .ctxmenu-icon's own "color: var(--muted)" would otherwise outlive the
+   hover/disabled color flips above -- same treatment as .acc just below. */
+#menubar .menu-list button:hover .ctxmenu-icon { color: #fff; }
+#menubar .menu-list button:disabled .ctxmenu-icon { color: var(--muted); }
 #menubar .menu-sub-label {
   padding: 3px 8px 1px;
   font-size: 10px;
@@ -761,6 +772,8 @@ body {
 #toolbar .icon-btn svg { width: 12px; height: 12px; }
 /* 20% larger than the shared 12px toolbar icon-btn default. */
 #btn-freq-help svg { width: 14.4px; height: 14.4px; }
+/* 45% larger than the shared 12px toolbar icon-btn default. */
+#btn-export-metrics svg { width: 17.4px; height: 17.4px; }
 /* keeps the row a single line under width pressure (many sections competing
    for space) instead of the flex item shrinking below its text's natural
    width and wrapping onto a second line, which was inflating the toolbar's
