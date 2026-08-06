@@ -378,7 +378,6 @@
     mouse(c, "mousedown", x);
     mouse(c, "mouseup", x);
     near(state.cursorT, MID, 60000, "cursor near clicked time");
-    ok($("cursor-label").textContent.includes("UTC"), "cursor label set");
   });
 
   await T("drag on a strip zooms to the selection", () => {
@@ -3346,102 +3345,6 @@
         await post("/close", { id: s.id });
       }
       await refreshAll();
-    }
-  });
-
-  await T("View pill dropdown lists Live + open files, picking one switches the active view", async () => {
-    const out = "/tmp/cttc-e2e-view-pill-dropdown.cttc-metric";
-    await post("/sample/export", { path: out, from: R.min_ts, to: R.min_ts + 5 * 60000 });
-    const path = `upload://${basename(out)}`;
-    const realPick = pickAnalysisFiles;
-    try {
-      pickAnalysisFiles = async () => [out];
-      await $("btn-load-sample").onclick();
-      eq(state.activeSamplePath, path, "sanity: the file is the active view");
-
-      $("view-status-btn").click();
-      const items = [...$("view-dropdown").querySelectorAll(".gateway-item")];
-      const labels = items.map((b) => b.querySelector(".gateway-item-label").textContent);
-      ok(labels.includes("Live"), labels.join(", "));
-      ok(labels.some((l) => l.includes(basename(out))), labels.join(", "));
-      const liveItem = items.find((b) => b.querySelector(".gateway-item-label").textContent === "Live");
-      eq(liveItem.dataset.active, "false", "Live isn't the active view -- the file is");
-      const fileItem = items.find((b) => b.querySelector(".gateway-item-label").textContent.includes(basename(out)));
-      eq(fileItem.dataset.active, "true", "the loaded file is marked active");
-
-      liveItem.click();
-      eq(state.liveHidden, false, "switched to Live");
-      $("view-status-btn").click();
-      const itemsAfter = [...$("view-dropdown").querySelectorAll(".gateway-item")];
-      const liveAfter = itemsAfter.find((b) => b.querySelector(".gateway-item-label").textContent === "Live");
-      eq(liveAfter.dataset.active, "true", "Live now marked active");
-      document.body.click();
-    } finally {
-      pickAnalysisFiles = realPick;
-      for (const s of state.sources.filter((s) => s.path === path)) await post("/close", { id: s.id });
-      await refreshAll();
-    }
-  });
-
-  await T("Close view disposes a .cttc-metric view's data, but never a .cttc-record view's", async () => {
-    const metricPath = "/tmp/cttc-e2e-view-close-metric.cttc-metric";
-    await post("/sample/export", { path: metricPath, from: R.min_ts, to: R.min_ts + 5 * 60000 });
-    const t0 = R.min_ts;
-    const res = await fetch(`${API}/sample/record`, {
-      method: "POST", body: new Uint8Array(0),
-      headers: { "X-CTTC-From": String(t0), "X-CTTC-To": String(t0 + 60000) },
-    });
-    const bytes = new Uint8Array(await res.arrayBuffer());
-    const recordPath = "/tmp/cttc-e2e-view-close-record.cttc-record";
-    await window.cttc.writeBinaryFile(recordPath, bytes);
-    const metricUploadPath = `upload://${basename(metricPath)}`;
-    const recordUploadPath = `upload://${basename(recordPath)}`;
-
-    const realPick = pickAnalysisFiles;
-    try {
-      pickAnalysisFiles = async () => [metricPath];
-      await $("btn-load-sample").onclick();
-      eq(state.activeSamplePath, metricUploadPath, "sanity: metric view active");
-      await closeActiveView();
-      ok(!state.sources.some((s) => s.path === metricUploadPath), "metric view's sources actually closed");
-      ok(!sampleFileGroups().some((g) => g.path === metricUploadPath), "no longer listed as a view");
-
-      pickAnalysisFiles = async () => [recordPath];
-      await $("btn-load-sample").onclick();
-      eq(state.activeSamplePath, recordUploadPath, "sanity: record view active");
-      const idsBefore = new Set(state.sources.filter((s) => s.path === recordUploadPath).map((s) => s.id));
-      await closeActiveView();
-      const idsAfter = new Set(state.sources.filter((s) => s.path === recordUploadPath).map((s) => s.id));
-      eq(idsAfter.size, idsBefore.size, "record view's sources were NOT disposed");
-      ok([...idsAfter].every((id) => idsBefore.has(id)));
-      eq(state.activeSamplePath, recordUploadPath, "record view still the active view -- Close view was a no-op");
-    } finally {
-      pickAnalysisFiles = realPick;
-      for (const s of state.sources.filter((s) => s.path === metricUploadPath || s.path === recordUploadPath)) {
-        await post("/close", { id: s.id });
-      }
-      await refreshAll();
-    }
-  });
-
-  await T("Close view is a no-op while viewing Live", async () => {
-    ok(!state.liveHidden, "sanity: Live is the active view in this suite's baseline state");
-    await closeActiveView();
-    ok(!state.liveHidden, "still Live -- nothing to close");
-  });
-
-  await T("clicking the View pill closes the Gateway and Docker Host pills' own popups, but never hides either pill", async () => {
-    mouse($("server-status"), "mouseenter", 5);
-    await sleep(20); // Gateway's mouseenter is async (loadConnectionInfo)
-    mouse($("docker-host-status"), "mouseenter", 5); // both left "open" -- neither pill got a mouseleave
-    $("view-status-btn").click();
-    try {
-      ok(pillVisible($("server-status")), "Gateway pill's own control stays fully visible");
-      ok(pillVisible($("docker-host-status")), "Docker Host pill's own control stays fully visible");
-    } finally {
-      document.body.click();
-      mouse($("server-status"), "mouseleave", 5);
-      mouse($("docker-host-status"), "mouseleave", 5);
     }
   });
 

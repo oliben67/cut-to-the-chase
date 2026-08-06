@@ -895,9 +895,8 @@ function closeCtxMenu() {
 // .ab-icon markup gets reused (cloned) to the left of the label, so the
 // menu's icon can never drift out of sync with the button it duplicates.
 // ownerId: opaque tag identifying which caller opened this menu (only the
-// Gateway/Docker Host/View pills currently pass one, see
-// syncPillPeerVisibility) -- left off entirely by the legend/chart-time
-// menus, which don't care.
+// Gateway/Docker Host pills currently pass one, see syncPillPeerVisibility)
+// -- left off entirely by the legend/chart-time menus, which don't care.
 function ctxMenu(e, entries, ownerId) {
   e.preventDefault();
   e.stopPropagation();
@@ -1005,7 +1004,6 @@ function renderSampleFiles() {
 function relist() {
   renderLegend();
   drawAll();
-  refreshViewPill();
 }
 
 // the view/cursor handed to a new popout window so it opens on exactly the
@@ -1227,12 +1225,6 @@ function syncDockerDaemonButtons() {
 // dot/tooltip reflect the current connection without needing the dropdown
 // to be opened first.
 let refreshDockerHostPill = () => {};
-
-// Same pattern, reassigned by the View pill IIFE -- called from relist()
-// (every setActiveView/setLiveHidden already routes through it) so the
-// pill's dot/tooltip track the active view without needing its dropdown
-// opened first.
-let refreshViewPill = () => {};
 
 const dlgExport = $("dlg-export");
 
@@ -1956,7 +1948,6 @@ function assignColorSlots() {
 async function setCursor(t, opts = {}) {
   state.cursorT = t;
   state.liveTrackCursor = !!opts.liveTrack;
-  $("cursor-label-text").textContent = "t = " + new Date(t).toISOString().replace("T", " ").replace("Z", " UTC");
   drawAll();
   for (const p of panels.values()) p.jumpTo(t);
   if (opts.broadcast !== false) window.cttc?.broadcastSync?.({ type: "cursor", t, liveTrack: !!opts.liveTrack });
@@ -5325,23 +5316,6 @@ function setActiveView(view) {
   setLiveHidden(true);
 }
 
-// The View pill's right-click "Close view": disposes the active view's
-// data -- except Live (nothing to dispose, collection never stops
-// regardless of what's being viewed) and a .cttc-record-sourced view
-// (explicit user direction: closing that view must never discard a
-// recording's data, only a plain loaded .cttc-metric's). refreshAll's own
-// self-heal (see its activeSamplePath check) picks the next remaining
-// view, or falls back to Live if none are left -- nothing else to do here
-// after the sources are gone.
-async function closeActiveView() {
-  if (!state.liveHidden || !state.activeSamplePath) return; // Live -- nothing to close
-  if (state.activeSamplePath.endsWith(".cttc-record")) return; // recording data survives
-  const group = sampleFileGroups().find((g) => g.path === state.activeSamplePath);
-  if (!group) return;
-  await Promise.all([...group.ids].map((id) => post("/close", { id })));
-  await refreshAll();
-}
-
 // Closes every loaded sample/recording source outright (live collection,
 // per its own docstring, was never stopped -- there's nothing else "live"
 // to resume) -- setLiveHidden(false) then follows automatically from
@@ -5688,17 +5662,15 @@ refreshAll().then(async () => {
 });
 connectSSE();
 
-/* ── Gateway/Docker Host (status bar)/View (top toolbar) pills close each
-   other's overlay (hover info popup, switcher dropdown, or right-click
-   actions menu) the moment one of them opens its own -- each overlay
-   anchors to its own wrapper's edge, so two open at once could otherwise
-   visually run into each other or into unrelated controls. The pill
-   (button) itself is never hidden -- only ever a *different* pill's
-   already-open overlay, never the one that just opened. gatewayMenuOpen/
-   dockerHostMenuOpen also double as the "don't show hover info while a
-   menu from this same pill is open" guard (see each pill's own
-   mouseenter) -- the View pill has no hover popup, so its own hasOverlay
-   check is the same as its menuOpen check. */
+/* ── Gateway/Docker Host pills (status bar) close each other's overlay
+   (hover info popup, switcher dropdown, or right-click actions menu) the
+   moment one of them opens its own -- each overlay anchors to its own
+   wrapper's edge, so two open at once could otherwise visually run into
+   each other or into unrelated controls. The pill (button) itself is
+   never hidden -- only ever a *different* pill's already-open overlay,
+   never the one that just opened. gatewayMenuOpen/dockerHostMenuOpen also
+   double as the "don't show hover info while a menu from this same pill
+   is open" guard (see each pill's own mouseenter). */
 function gatewayMenuOpen() {
   const dropdown = $("gateway-dropdown");
   return (dropdown ? !dropdown.hidden : false) || document.getElementById("ctxmenu")?.dataset.owner === "gateway";
@@ -5735,33 +5707,20 @@ function closeDockerHostOverlay() {
   }
   if (document.getElementById("ctxmenu")?.dataset.owner === "dockerhost") closeCtxMenu();
 }
-function viewMenuOpen() {
-  const dropdown = $("view-dropdown");
-  return (dropdown ? !dropdown.hidden : false) || document.getElementById("ctxmenu")?.dataset.owner === "view";
-}
-function closeViewOverlay() {
-  const dropdown = $("view-dropdown");
-  if (dropdown && !dropdown.hidden) {
-    dropdown.hidden = true;
-    $("view-status")?.classList.remove("open");
-  }
-  if (document.getElementById("ctxmenu")?.dataset.owner === "view") closeCtxMenu();
-}
 const TOOLBAR_PILLS = {
   gateway: { hasOverlay: gatewayHasOverlay, closeOverlay: closeGatewayOverlay },
   dockerhost: { hasOverlay: dockerHostHasOverlay, closeOverlay: closeDockerHostOverlay },
-  view: { hasOverlay: viewMenuOpen, closeOverlay: closeViewOverlay },
 };
-// Called right after a pill (actingId: "gateway"/"dockerhost"/"view")
-// opens its own overlay, closing every *other* pill's overlay -- never
-// its own, and never the pill (button) itself. Takes the acting pill
-// explicitly rather than inferring "whichever is engaged": a dropdown or
-// right-click menu, unlike a hover popup, doesn't self-close on
-// mouseleave, so it's entirely possible for a *different* pill's overlay
-// to still be genuinely open (not just stale) at the exact moment this
-// one opens -- inferring priority from array order would arbitrarily
-// close whichever one happened to come first instead of the one that
-// isn't the pill actually acting right now.
+// Called right after a pill (actingId: "gateway"/"dockerhost") opens its
+// own overlay, closing every *other* pill's overlay -- never its own, and
+// never the pill (button) itself. Takes the acting pill explicitly rather
+// than inferring "whichever is engaged": a dropdown or right-click menu,
+// unlike a hover popup, doesn't self-close on mouseleave, so it's entirely
+// possible for a *different* pill's overlay to still be genuinely open
+// (not just stale) at the exact moment this one opens -- inferring
+// priority from array order would arbitrarily close whichever one
+// happened to come first instead of the one that isn't the pill actually
+// acting right now.
 function syncPillPeerVisibility(actingId) {
   for (const [id, pill] of Object.entries(TOOLBAR_PILLS)) {
     if (id !== actingId && pill.hasOverlay()) pill.closeOverlay();
@@ -6150,97 +6109,6 @@ function syncPillPeerVisibility(actingId) {
     render();
     syncPillPeerVisibility("dockerhost");
   };
-  document.addEventListener("click", (e) => {
-    if (!wrap.contains(e.target)) close();
-  });
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") close();
-  });
-})();
-
-/* ── View pill (top toolbar -- Gateway/Docker Host now live in the status
-   bar instead, see the pill IIFEs above) ─────────────────────────────────
-   Lists every open view -- "Live" plus one entry per loaded .cttc-metric/
-   .cttc-record file (sampleFileGroups(), already the one-group-per-path
-   dedup BUG-0073 relies on) -- and switches which one is the active view
-   (setActiveView) on pick. Right-click offers a single action, Close
-   view (closeActiveView) -- a no-op for Live or a .cttc-record-sourced
-   view, since neither's data is meant to be disposed this way. */
-(() => {
-  const wrap = $("view-status");
-  const btn = $("view-status-btn");
-  const dropdown = $("view-dropdown");
-  if (!wrap) return;
-
-  const close = () => {
-    wrap.classList.remove("open");
-    dropdown.hidden = true;
-  };
-
-  const render = () => {
-    dropdown.innerHTML = "";
-    const entries = [
-      { key: "live", label: "Live", active: !state.liveHidden },
-      ...sampleFileGroups().map((g) => ({
-        key: g.path,
-        label: basename(g.path),
-        active: state.liveHidden && g.path === state.activeSamplePath,
-      })),
-    ];
-    entries.forEach((entry, i) => {
-      if (i > 0) {
-        const sep = document.createElement("div");
-        sep.className = "gateway-item-sep";
-        dropdown.appendChild(sep);
-      }
-      const item = document.createElement("button");
-      item.type = "button";
-      item.className = "gateway-item";
-      item.dataset.active = String(entry.active);
-      const label = document.createElement("span");
-      label.className = "gateway-item-label";
-      label.textContent = entry.label;
-      item.appendChild(label);
-      if (!entry.active) {
-        item.onclick = () => {
-          close();
-          setActiveView(entry.key);
-        };
-      }
-      dropdown.appendChild(item);
-    });
-  };
-
-  // Updates the dot/tooltip alone -- cheap enough to run on every
-  // relist() (which every setActiveView/setLiveHidden call already goes
-  // through), unlike render()'s full dropdown rebuild, which only needs
-  // to happen while it's open.
-  const syncPill = () => {
-    wrap.dataset.state = state.liveHidden ? "up" : "";
-    const activeGroup = state.liveHidden
-      ? sampleFileGroups().find((g) => g.path === state.activeSamplePath)
-      : null;
-    const label = state.liveHidden ? (activeGroup ? basename(activeGroup.path) : "…") : "Live";
-    btn.title = `${label} — Switch view…`;
-  };
-  refreshViewPill = syncPill;
-  syncPill();
-
-  btn.onclick = (e) => {
-    e.stopPropagation();
-    if (wrap.classList.contains("open")) {
-      close();
-      return;
-    }
-    wrap.classList.add("open");
-    dropdown.hidden = false;
-    render();
-    syncPillPeerVisibility("view");
-  };
-  wrap.addEventListener("contextmenu", (e) => {
-    ctxMenu(e, [["Close view", () => closeActiveView()]], "view");
-    syncPillPeerVisibility("view");
-  });
   document.addEventListener("click", (e) => {
     if (!wrap.contains(e.target)) close();
   });
