@@ -771,11 +771,11 @@ body {
    visible. */
 #toolbar { flex-wrap: nowrap; }
 #toolbar > * { flex-shrink: 0; }
-/* #status/#cursor-label/#view-status (View pill) read as one right-aligned
-   status cluster -- the margin-left:auto belongs on the first of the three
-   (here) so there's a single gap pushing the whole group right, not a
-   second auto margin further along competing for the same leftover space
-   and splitting it into two gaps. */
+/* #status/#cursor-label read as one right-aligned status cluster -- the
+   margin-left:auto belongs on the first of the two (here) so there's a
+   single gap pushing the whole group right, not a second auto margin
+   further along competing for the same leftover space and splitting it
+   into two gaps. */
 #toolbar #status {
   margin-left: auto;
   flex-shrink: 1;
