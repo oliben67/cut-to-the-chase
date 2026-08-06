@@ -903,8 +903,9 @@ function closeCtxMenu() {
 // .ab-icon markup gets reused (cloned) to the left of the label, so the
 // menu's icon can never drift out of sync with the button it duplicates.
 // ownerId: opaque tag identifying which caller opened this menu (only the
-// Gateway/Docker Host pills currently pass one, see syncPillPeerVisibility)
-// -- left off entirely by the legend/chart-time menus, which don't care.
+// Gateway/Docker Host/View pills currently pass one, see
+// syncPillPeerVisibility) -- left off entirely by the legend/chart-time
+// menus, which don't care.
 function ctxMenu(e, entries, ownerId) {
   e.preventDefault();
   e.stopPropagation();
@@ -2428,20 +2429,6 @@ async function refreshAll() {
     // never trip it, leaving live data shown right alongside the sample it
     // was supposed to hide behind.
     const hasSample = state.sources.some((s) => s.live === false);
-    // Self-heals #record-sections: if the tracked record's own sources got
-    // closed some other way (Back to live tracking, a sidebar per-file
-    // close, the dropdown's own onchange, ...) there's nothing left for it
-    // to switch between, so it shouldn't linger showing a stale file's
-    // segments. Checked unconditionally (not just inside setLiveHidden,
-    // below) since that only runs when state.liveHidden itself flips --
-    // with some OTHER sample still open, closing just this one wouldn't
-    // change it at all, and the dropdown would never get a chance to hide.
-    if (
-      activeRecordSections &&
-      !activeRecordSections.openedIds.some((id) => state.sources.some((s) => s.id === id))
-    ) {
-      setActiveRecordSections(null);
-    }
     // Self-heals state.activeSamplePath the same way, and for the same
     // reason: if the active view's own sources got closed some other way
     // (Close view, a sidebar per-file close, ...) there's nothing left to
@@ -2952,76 +2939,14 @@ async function uploadFile(localPath, segment) {
 // Shared by "Load metrics" and "Open Recording": upload once, and if the
 // server comes back asking which segment (a multi-segment recording, see
 // merge_sample_bytes/MultiSegmentSample), load the first recorded segment
-// automatically -- no prompt. Either way, remember it via
-// setActiveRecordSections so the #record-sections "metric(s)" dropdown
-// (right of Back to live tracking) is always populated with whatever is
-// currently loaded -- one entry for a plain single metric, one per segment
-// for a multi-segment recording -- and lets the user switch to any of the
-// *other* entries afterward.
+// automatically -- no prompt, and no way to switch to another one
+// afterward (BUG-0079).
 async function uploadAndResolveSegment(path) {
   const first = await uploadFile(path);
-  if (!first.needs_selection?.length) {
-    if (!first.opened?.length) {
-      setActiveRecordSections(null);
-      return first;
-    }
-    // No real segment metadata for a plain, non-ambiguous file -- a single
-    // synthetic entry labeled with the filename still gives the dropdown
-    // something to show, per its "always reflects what's loaded" contract.
-    const segments = [{ index: 0, label: basename(path) }];
-    setActiveRecordSections({ path, segments, activeIndex: 0, openedIds: first.opened });
-    return first;
-  }
-  const segments = first.needs_selection[0].segments;
-  const index = segments[0].index;
-  const res = await uploadFile(path, index);
-  setActiveRecordSections({ path, segments, activeIndex: index, openedIds: res.opened || [] });
-  return res;
+  if (!first.needs_selection?.length) return first;
+  const index = first.needs_selection[0].segments[0].index;
+  return uploadFile(path, index);
 }
-
-// Tracks the currently loaded metric(s)/recording segment(s) (null once
-// nothing loaded is open) so #record-sections can offer switching to any
-// OTHER entry without re-running the upload -- see uploadAndResolveSegment
-// above and this dropdown's own onchange handler below.
-let activeRecordSections = null; // {path, segments, activeIndex, openedIds}
-
-function setActiveRecordSections(next) {
-  activeRecordSections = next;
-  const sel = $("record-sections");
-  if (!next) {
-    sel.hidden = true;
-    sel.innerHTML = "";
-    return;
-  }
-  sel.innerHTML = "";
-  for (const seg of next.segments) {
-    const opt = document.createElement("option");
-    opt.value = String(seg.index);
-    opt.textContent = seg.label ?? `${fmtIso(seg.from)} — ${fmtIso(seg.to)}`;
-    sel.appendChild(opt);
-  }
-  sel.value = String(next.activeIndex);
-  sel.hidden = false;
-}
-
-$("record-sections").onchange = async () => {
-  if (!activeRecordSections) return;
-  const index = Number($("record-sections").value);
-  if (index === activeRecordSections.activeIndex) return;
-  const { path, segments, openedIds } = activeRecordSections;
-  await Promise.all(openedIds.map((id) => post("/close", { id })));
-  const res = await uploadFile(path, index);
-  if (res.errors?.length) alert(res.errors.map((e) => `${e.path}: ${e.error}`).join("\n"));
-  setActiveRecordSections({ path, segments, activeIndex: index, openedIds: res.opened || [] });
-  await refreshAll();
-  // Without this, the view stays wherever it was left (the *previous*
-  // segment's own window) -- refreshAll() only ever sets an initial view
-  // when none exists yet (see its own "!hadView" check), so switching to a
-  // segment recorded at a different point in time left its data outside
-  // the visible window entirely: it looked empty even though it loaded
-  // correctly (BUG-0077).
-  centerViewOnLoadedStart(res.opened || []);
-};
 
 // Same pattern as pickRecordingSavePath: a named wrapper around the native
 // picker so tests can substitute canned paths instead of driving a real
@@ -5300,12 +5225,6 @@ function setLiveHidden(hidden) {
     clearTimeout(statusBarClearTimer);
     $("app-status-bar-text").textContent = "";
   }
-  // Back live -- #record-sections' own self-heal (refreshAll, above) only
-  // fires once its tracked sources are actually gone, which isn't
-  // necessarily true the instant this specific call happens (a caller
-  // might flip liveHidden before closing them) -- clear it unconditionally
-  // here too so it never lingers into a live view.
-  if (!hidden) setActiveRecordSections(null);
   relist();
   syncPanels();
 }
@@ -5314,8 +5233,8 @@ function setLiveHidden(hidden) {
 // "live" or one loaded file's path (sampleFileGroups()'s own g.path, the
 // same value state.activeSamplePath and isSampleHidden compare against).
 // Thin wrapper around setLiveHidden, which already owns every side effect
-// of entering/leaving analysis mode (mode icon, recording controls,
-// saved-view restore, #record-sections cleanup) -- this only adds *which*
+// of entering/leaving analysis mode (mode icon, recording controls, saved-
+// view restore) -- this only adds *which*
 // loaded file is the active one on top of that, and is safe to call even
 // when the requested view is already the active one (setLiveHidden no-ops
 // its own side effects when `hidden` doesn't actually change, but still
@@ -5692,12 +5611,13 @@ refreshAll().then(async () => {
 });
 connectSSE();
 
-/* ── Gateway/Docker Host/View pills hide their siblings while any one of
-   them has an overlay open (hover info popup, switcher dropdown, or
-   right-click actions menu) -- they sit side by side in the toolbar and
-   each overlay anchors to its own wrapper's right edge, so a wide one can
-   otherwise visually run into a neighbor. visibility (not display) keeps
-   the toolbar's own layout stable while hidden. gatewayMenuOpen/
+/* ── Gateway/Docker Host (status bar)/View (top toolbar) pills close each
+   other's overlay (hover info popup, switcher dropdown, or right-click
+   actions menu) the moment one of them opens its own -- each overlay
+   anchors to its own wrapper's edge, so two open at once could otherwise
+   visually run into each other or into unrelated controls. The pill
+   (button) itself is never hidden -- only ever a *different* pill's
+   already-open overlay, never the one that just opened. gatewayMenuOpen/
    dockerHostMenuOpen also double as the "don't show hover info while a
    menu from this same pill is open" guard (see each pill's own
    mouseenter) -- the View pill has no hover popup, so its own hasOverlay
@@ -5710,6 +5630,16 @@ function gatewayHasOverlay() {
   const popup = $("connection-info-popup");
   return (popup ? !popup.hidden : false) || gatewayMenuOpen();
 }
+function closeGatewayOverlay() {
+  const popup = $("connection-info-popup");
+  if (popup) popup.hidden = true;
+  const dropdown = $("gateway-dropdown");
+  if (dropdown && !dropdown.hidden) {
+    dropdown.hidden = true;
+    $("server-status")?.classList.remove("open");
+  }
+  if (document.getElementById("ctxmenu")?.dataset.owner === "gateway") closeCtxMenu();
+}
 function dockerHostMenuOpen() {
   const dropdown = $("docker-host-dropdown");
   return (dropdown ? !dropdown.hidden : false) || document.getElementById("ctxmenu")?.dataset.owner === "dockerhost";
@@ -5718,41 +5648,53 @@ function dockerHostHasOverlay() {
   const popup = $("docker-host-info-popup");
   return (popup ? !popup.hidden : false) || dockerHostMenuOpen();
 }
+function closeDockerHostOverlay() {
+  const popup = $("docker-host-info-popup");
+  if (popup) popup.hidden = true;
+  const dropdown = $("docker-host-dropdown");
+  if (dropdown && !dropdown.hidden) {
+    dropdown.hidden = true;
+    $("docker-host-status")?.classList.remove("open");
+  }
+  if (document.getElementById("ctxmenu")?.dataset.owner === "dockerhost") closeCtxMenu();
+}
 function viewMenuOpen() {
   const dropdown = $("view-dropdown");
   return (dropdown ? !dropdown.hidden : false) || document.getElementById("ctxmenu")?.dataset.owner === "view";
 }
-const TOOLBAR_PILLS = [
-  { id: "server-status", hasOverlay: gatewayHasOverlay },
-  { id: "docker-host-status", hasOverlay: dockerHostHasOverlay },
-  { id: "view-status", hasOverlay: viewMenuOpen },
-];
-function syncPillPeerVisibility() {
-  for (const pill of TOOLBAR_PILLS) {
-    const el = $(pill.id);
-    if (!el) continue;
-    const otherEngaged = TOOLBAR_PILLS.some((p) => p !== pill && p.hasOverlay());
-    el.classList.toggle("peer-hidden", otherEngaged);
+function closeViewOverlay() {
+  const dropdown = $("view-dropdown");
+  if (dropdown && !dropdown.hidden) {
+    dropdown.hidden = true;
+    $("view-status")?.classList.remove("open");
+  }
+  if (document.getElementById("ctxmenu")?.dataset.owner === "view") closeCtxMenu();
+}
+const TOOLBAR_PILLS = {
+  gateway: { hasOverlay: gatewayHasOverlay, closeOverlay: closeGatewayOverlay },
+  dockerhost: { hasOverlay: dockerHostHasOverlay, closeOverlay: closeDockerHostOverlay },
+  view: { hasOverlay: viewMenuOpen, closeOverlay: closeViewOverlay },
+};
+// Called right after a pill (actingId: "gateway"/"dockerhost"/"view")
+// opens its own overlay, closing every *other* pill's overlay -- never
+// its own, and never the pill (button) itself. Takes the acting pill
+// explicitly rather than inferring "whichever is engaged": a dropdown or
+// right-click menu, unlike a hover popup, doesn't self-close on
+// mouseleave, so it's entirely possible for a *different* pill's overlay
+// to still be genuinely open (not just stale) at the exact moment this
+// one opens -- inferring priority from array order would arbitrarily
+// close whichever one happened to come first instead of the one that
+// isn't the pill actually acting right now.
+function syncPillPeerVisibility(actingId) {
+  for (const [id, pill] of Object.entries(TOOLBAR_PILLS)) {
+    if (id !== actingId && pill.hasOverlay()) pill.closeOverlay();
   }
 }
-// Right-click menus close via ctxMenu/closeCtxMenu's own shared, generic
-// listeners (any window click, Escape) -- rather than teach that shared
-// code (also used by the legend/chart-time menus) about these two pills
-// specifically, poll locally, just for the menu this call just opened,
-// until it's gone. Self-clearing, a few hundred ms at most in practice.
-function watchCtxMenuClose(ownerId) {
-  const iv = setInterval(() => {
-    const el = document.getElementById("ctxmenu");
-    if (el?.dataset.owner === ownerId) return;
-    clearInterval(iv);
-    syncPillPeerVisibility();
-  }, 120);
-}
 
-/* ── server status indicator (menu bar, flush right) ──────────────────────
+/* ── server status indicator (status bar, just left of History) ──────────
    Polls /health independently of connectSSE's own stream so it still shows
    "down" if the SSE connection itself is what's wedged. Only present in the
-   main window's menu bar -- harmless no-op elsewhere since $() returns null. */
+   main window -- harmless no-op elsewhere since $() returns null. */
 (() => {
   const el = $("server-status");
   if (!el) return;
@@ -5830,12 +5772,11 @@ function watchCtxMenuClose(ownerId) {
       popup.appendChild(renderInfoRow("forwarded port", `localhost:${connectionInfo.port}`));
     }
     popup.hidden = false;
-    syncPillPeerVisibility();
+    syncPillPeerVisibility("gateway");
   });
   el.addEventListener("mouseleave", () => {
     hoverToken++; // invalidate any mouseenter continuation still in flight
     if (popup) popup.hidden = true;
-    syncPillPeerVisibility();
   });
   // Right-click: New/Edit/Uninstall Gateway, the same actions the action
   // bar's Gateway group already exposes (ctxMenu is the shared generic
@@ -5848,8 +5789,7 @@ function watchCtxMenuClose(ownerId) {
       ["Edit Gateway", () => openEditGatewaysDialog(), '[data-action="edit-gateways"]'],
       ["Uninstall Gateway…", () => openUninstallGatewayDialog(), '[data-action="uninstall-gateway"]'],
     ], "gateway");
-    syncPillPeerVisibility();
-    watchCtxMenuClose("gateway");
+    syncPillPeerVisibility("gateway");
   });
 
   const HEALTH_POLL_MS = 5000;
@@ -5893,12 +5833,6 @@ function watchCtxMenuClose(ownerId) {
       }
     } finally {
       checking = false;
-      // Safety-net resync: a right-click menu closing (item picked, click
-      // elsewhere, Escape) doesn't itself call back into this pill, so
-      // without this the other pill could stay hidden until the next
-      // hover/click. Runs every HEALTH_POLL_MS regardless, cheap no-op
-      // whenever nothing needs to change.
-      syncPillPeerVisibility();
     }
   };
   check();
@@ -5921,7 +5855,6 @@ function watchCtxMenuClose(ownerId) {
   const close = () => {
     wrap.classList.remove("open");
     dropdown.hidden = true;
-    syncPillPeerVisibility();
   };
 
   const render = (gateways) => {
@@ -5985,7 +5918,7 @@ function watchCtxMenuClose(ownerId) {
     wrap.classList.add("open");
     dropdown.hidden = false;
     render(await window.cttc.getGateways());
-    syncPillPeerVisibility();
+    syncPillPeerVisibility("gateway");
   };
   document.addEventListener("click", (e) => {
     if (!wrap.contains(e.target)) close();
@@ -6014,7 +5947,6 @@ function watchCtxMenuClose(ownerId) {
   const close = () => {
     wrap.classList.remove("open");
     dropdown.hidden = true;
-    syncPillPeerVisibility();
   };
 
   const openHost = async (hostKey) => {
@@ -6084,7 +6016,7 @@ function watchCtxMenuClose(ownerId) {
     if (active == null) {
       infoPopup.appendChild(renderInfoRow("Docker host", "not connected"));
       infoPopup.hidden = false;
-      syncPillPeerVisibility();
+      syncPillPeerVisibility("dockerhost");
       return;
     }
     const entry = prefs.get("savedDockerDaemons", {})[active];
@@ -6098,11 +6030,10 @@ function watchCtxMenuClose(ownerId) {
       infoPopup.appendChild(renderInfoRow(name.replace(/_/g, " "), entry?.transforms?.includes(name) ? "True" : "False"));
     }
     infoPopup.hidden = false;
-    syncPillPeerVisibility();
+    syncPillPeerVisibility("dockerhost");
   });
   wrap.addEventListener("mouseleave", () => {
     if (infoPopup) infoPopup.hidden = true;
-    syncPillPeerVisibility();
   });
   // Right-click: New/Edit/Remove Docker Host -- the same actions the action
   // bar's Docker Host group already exposes.
@@ -6113,8 +6044,7 @@ function watchCtxMenuClose(ownerId) {
       ["Edit Docker Host", () => openEditDockerHostDialog(), "#btn-edit-docker-host"],
       ["Remove Docker Host…", () => $("btn-remove-docker-daemon").click(), "#btn-remove-docker-daemon"],
     ], "dockerhost");
-    syncPillPeerVisibility();
-    watchCtxMenuClose("dockerhost");
+    syncPillPeerVisibility("dockerhost");
   });
 
   // Updates the dot/tooltip alone -- cheap enough to run on every
@@ -6141,7 +6071,7 @@ function watchCtxMenuClose(ownerId) {
     wrap.classList.add("open");
     dropdown.hidden = false;
     render();
-    syncPillPeerVisibility();
+    syncPillPeerVisibility("dockerhost");
   };
   document.addEventListener("click", (e) => {
     if (!wrap.contains(e.target)) close();
@@ -6151,7 +6081,8 @@ function watchCtxMenuClose(ownerId) {
   });
 })();
 
-/* ── View pill (click the pill right of Docker Host) ──────────────────────
+/* ── View pill (top toolbar -- Gateway/Docker Host now live in the status
+   bar instead, see the pill IIFEs above) ─────────────────────────────────
    Lists every open view -- "Live" plus one entry per loaded .cttc-metric/
    .cttc-record file (sampleFileGroups(), already the one-group-per-path
    dedup BUG-0073 relies on) -- and switches which one is the active view
@@ -6167,7 +6098,6 @@ function watchCtxMenuClose(ownerId) {
   const close = () => {
     wrap.classList.remove("open");
     dropdown.hidden = true;
-    syncPillPeerVisibility();
   };
 
   const render = () => {
@@ -6228,12 +6158,11 @@ function watchCtxMenuClose(ownerId) {
     wrap.classList.add("open");
     dropdown.hidden = false;
     render();
-    syncPillPeerVisibility();
+    syncPillPeerVisibility("view");
   };
   wrap.addEventListener("contextmenu", (e) => {
     ctxMenu(e, [["Close view", () => closeActiveView()]], "view");
-    syncPillPeerVisibility();
-    watchCtxMenuClose("view");
+    syncPillPeerVisibility("view");
   });
   document.addEventListener("click", (e) => {
     if (!wrap.contains(e.target)) close();

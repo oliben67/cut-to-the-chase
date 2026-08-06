@@ -165,18 +165,11 @@ body {
 #menubar .acc { color: var(--muted); font-size: 11px; margin-left: 12px; }
 #menubar .menu-list button:hover .acc { color: #fff; }
 
-/* margin-left:auto lives on #status now (the first of the #status/
-   #cursor-label/#server-status/#docker-host-status trailing cluster) -- a
-   second auto margin here would split the same leftover space into two
-   gaps instead of one. */
+/* Also reused for the Gateway/Docker Host pills, relocated into the
+   status bar (see .app-status-bar's own overrides below) -- position:
+   relative anchors their dropdown/popup either way. */
 .server-status {
   position: relative;
-}
-/* Gateway/Docker Host pills hide each other while either has an overlay
-   open (see app.js's syncPillPeerVisibility) -- visibility, not display,
-   so the toolbar's own layout doesn't reflow while one is hidden. */
-.server-status.peer-hidden {
-  visibility: hidden;
 }
 .server-status-btn {
   display: flex;
@@ -778,11 +771,11 @@ body {
    visible. */
 #toolbar { flex-wrap: nowrap; }
 #toolbar > * { flex-shrink: 0; }
-/* #status/#cursor-label/#server-status read as one right-aligned status
-   cluster -- the margin-left:auto belongs on the first of the three (here)
-   so there's a single gap pushing the whole group right, not a second auto
-   margin further along competing for the same leftover space and splitting
-   it into two gaps. */
+/* #status/#cursor-label/#view-status (View pill) read as one right-aligned
+   status cluster -- the margin-left:auto belongs on the first of the three
+   (here) so there's a single gap pushing the whole group right, not a
+   second auto margin further along competing for the same leftover space
+   and splitting it into two gaps. */
 #toolbar #status {
   margin-left: auto;
   flex-shrink: 1;
@@ -877,13 +870,6 @@ body {
 }
 .flat-action:hover, .flat-action:active { background: none; text-decoration: underline; }
 .flat-action-icon { width: 14px; height: 14px; flex: 0 0 auto; }
-/* Segment picker for a loaded multi-segment .cttc-record -- only shown
-   once such a file is active (see app.js's setActiveRecordSections), so
-   it stays out of the way for the common single-segment case. */
-#record-sections {
-  padding: 3px 8px;
-  font-size: 12px;
-}
 .ts-label {
   font-size: 10px;
   font-weight: 600;
@@ -963,9 +949,8 @@ body {
 .switch input:checked + .switch-track { background: var(--accent); }
 .switch input:checked + .switch-track .switch-thumb { transform: translateX(16px); }
 .switch input:focus-visible + .switch-track { outline: 2px solid var(--accent); outline-offset: 2px; }
-/* margin-left:auto removed -- #server-status (now the last toolbar item)
-   already pushes the tail end right; keeping it here too just left a
-   second, redundant gap between this and the gateway pill beside it. */
+/* margin-left:auto removed -- #toolbar #status already pushes the tail
+   end right; keeping it here too just left a second, redundant gap. */
 .cursor-label {
   display: inline-flex;
   align-items: center;
@@ -1756,6 +1741,38 @@ body:has(#gateway-setup) { overflow-y: auto; background: var(--surface-1); }
   color: var(--muted);
   background: var(--surface-2);
   border-top: 1px solid var(--border);
+}
+/* Frames the Gateway/Docker Host pills (relocated here from the top
+   toolbar) as their own distinct little unit just left of History --
+   single bar before, double bar after, so the boundary with the free-
+   form status text on one side and History on the other both read
+   clearly. */
+.status-bar-divider {
+  width: 1px;
+  align-self: stretch;
+  background: var(--border);
+}
+.status-bar-divider-double {
+  width: 4px;
+  border-left: 1px solid var(--border);
+  border-right: 1px solid var(--border);
+  background: none;
+}
+/* The pills' own :hover/.open background (--surface-2) matches this bar's
+   background exactly -- invisible without this override. Their dropdown/
+   popup default to opening *below* (top: 100%, the correct direction in
+   the top toolbar they used to live in); down here at the bottom of the
+   window that would run off-screen, so they spring *up* instead, same as
+   .status-bar-history-popup already does. */
+.app-status-bar .server-status-btn:hover,
+.app-status-bar .server-status.open .server-status-btn {
+  background: var(--surface-3);
+}
+.app-status-bar .gateway-dropdown,
+.app-status-bar .connection-info-popup {
+  top: auto;
+  bottom: 100%;
+  margin-bottom: 6px;
 }
 #app-status-bar-text {
   flex: 1 1 auto;

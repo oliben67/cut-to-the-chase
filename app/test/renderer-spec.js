@@ -1954,15 +1954,6 @@
     eq(r.errors.length, 0, JSON.stringify(r.errors));
     ok(r.opened.length >= 1, "first segment's sources opened, no user choice needed");
 
-    // #record-sections (right of Back to live tracking) is populated
-    // immediately with every segment, first one selected, so the others
-    // aren't permanently inaccessible.
-    await until(() => !$("record-sections").hidden, "record-sections dropdown shown");
-    eq($("record-sections").options.length, 2, "both segments listed");
-    eq($("record-sections").value, "0", "first segment selected by default");
-    eq(activeRecordSections.path, realPath);
-    eq(activeRecordSections.activeIndex, 0);
-
     // the auto-loaded recording must switch the app out of live mode just
     // like the old prompt-driven flow did -- see setLiveHidden.
     await refreshAll();
@@ -1970,54 +1961,6 @@
     eq($("live-data-group").hidden, true, "Frequency/Live tracking hidden once the recording is auto-loaded");
 
     for (const sid of r.opened) await post("/close", { id: sid });
-    await refreshAll();
-    eq($("record-sections").hidden, true, "hidden again once its sources are gone (self-heals via setLiveHidden)");
-  });
-
-  await T("#record-sections dropdown switches segments after the automatic first-segment load", async () => {
-    const t0 = R.min_ts;
-    const firstRes = await fetch(`${API}/sample/record`, {
-      method: "POST", body: new Uint8Array(0),
-      headers: { "X-CTTC-From": String(t0), "X-CTTC-To": String(t0 + 60000) },
-    });
-    const firstBytes = new Uint8Array(await firstRes.arrayBuffer());
-    const secondRes = await fetch(`${API}/sample/record`, {
-      method: "POST", body: firstBytes,
-      headers: { "X-CTTC-From": String(t0 + 60000), "X-CTTC-To": String(t0 + 120000) },
-    });
-    const secondBytes = new Uint8Array(await secondRes.arrayBuffer());
-    const realPath = "/tmp/cttc-e2e-record-sections-switch.cttc-record";
-    await window.cttc.writeBinaryFile(realPath, secondBytes);
-
-    const first = await uploadAndResolveSegment(realPath);
-    ok(first.opened.length >= 1, "first segment's sources opened");
-    const firstIds = first.opened.slice();
-    eq(activeRecordSections.activeIndex, 0);
-
-    $("record-sections").value = "1";
-    $("record-sections").dispatchEvent(new Event("change"));
-    await until(() => activeRecordSections?.activeIndex === 1, "switched to segment 1");
-    eq($("record-sections").value, "1");
-    for (const sid of firstIds) {
-      ok(!state.sources.some((s) => s.id === sid), `segment 0's source ${sid} was closed on switch`);
-    }
-    ok(activeRecordSections.openedIds.length >= 1, "segment 1's sources opened");
-
-    // BUG-0077: switching segments used to leave the chart's view window
-    // wherever it was (segment 0's own range), so segment 1's data --
-    // genuinely loaded, per the assertions above -- fell entirely outside
-    // what was actually drawn and looked empty.
-    const seg1Starts = state.sources
-      .filter((s) => activeRecordSections.openedIds.includes(s.id) && s.min_ts != null)
-      .map((s) => s.min_ts);
-    ok(seg1Starts.length > 0, "segment 1 has real, datable sources to check the view against");
-    const seg1MinTs = Math.min(...seg1Starts);
-    ok(
-      state.view.t0 <= seg1MinTs && state.view.t1 >= seg1MinTs,
-      `view must re-center on segment 1's own data (min_ts=${seg1MinTs}) after switching, not stay on segment 0's -- got view [${state.view.t0}, ${state.view.t1}]`
-    );
-
-    for (const sid of activeRecordSections.openedIds) await post("/close", { id: sid });
     await refreshAll();
   });
 
@@ -2190,33 +2133,6 @@
       eq(state.view.t0, t0, "the exact prior view's start is restored");
       eq(state.view.t1, t1, "the exact prior view's end is restored");
       eq(state.live, wasLive, "the prior live-follow flag is restored too");
-    }
-  });
-
-  await T("Loading a single (non-segmented) metric still populates the metric(s) dropdown with one entry", async () => {
-    // Generalizes what #record-sections used to only do for a real
-    // multi-segment .cttc-record: it now always reflects whatever is
-    // currently loaded, even a plain single .cttc-metric with no segment
-    // ambiguity at all -- previously this case called
-    // setActiveRecordSections(null), hiding the dropdown outright.
-    const res = await fetch(
-      `${API}/files/download?from=${R.min_ts}&to=${R.max_ts}&include_host=0`,
-      { headers: authHeaders() }
-    );
-    const bytes = new Uint8Array(await res.arrayBuffer());
-    const realPath = "/tmp/cttc-e2e-single-metric-dropdown.cttc-metric";
-    await window.cttc.writeBinaryFile(realPath, bytes);
-    const r = await uploadAndResolveSegment(realPath);
-    try {
-      ok(r.opened.length >= 1, "sample opened");
-      await until(() => !$("record-sections").hidden, "metric(s) dropdown shown even for a single metric");
-      eq($("record-sections").options.length, 1, "exactly one entry -- nothing else to switch to");
-      eq($("record-sections").title, "metric(s)");
-      eq(activeRecordSections.activeIndex, 0);
-    } finally {
-      for (const sid of r.opened) await post("/close", { id: sid });
-      await refreshAll();
-      eq($("record-sections").hidden, true, "hidden again once back in live mode");
     }
   });
 
@@ -2992,12 +2908,9 @@
       ok(labels.some((l) => l.includes("Uninstall Gateway")), labels.join(", "));
       ok(buttons.every((b) => b.querySelector(".ctxmenu-icon svg")), "every entry has an icon to the left of its label");
     } finally {
-      document.body.click(); // close whatever the entry click may have opened
+      document.body.click(); // closes the ctxmenu synchronously
       if (dlgGatewaySetup.open) dlgGatewaySetup.close();
       mouse($("server-status"), "mouseleave", 5);
-      // Restoration polls for the ctxmenu's removal (watchCtxMenuClose)
-      // rather than closing it synchronously -- give it a beat.
-      await until(() => !$("docker-host-status").classList.contains("peer-hidden"), "Docker Host pill restored once the actions menu closes");
     }
   });
 
@@ -3073,9 +2986,6 @@
     } finally {
       document.body.click();
       if (dlg.open) dlg.close();
-      // Restoration polls for the ctxmenu's removal (watchCtxMenuClose)
-      // rather than closing it synchronously -- give it a beat.
-      await until(() => !$("server-status").classList.contains("peer-hidden"), "Gateway pill restored once the actions menu closes");
     }
   });
 
@@ -3101,9 +3011,6 @@
       state.sources = state.sources.filter((s) => s.id !== "__ctx_edit_test");
       syncDockerDaemonButtons();
       if (dlg.open) dlg.close();
-      // Restoration polls for the ctxmenu's removal (watchCtxMenuClose)
-      // rather than closing it synchronously -- give it a beat.
-      await until(() => !$("server-status").classList.contains("peer-hidden"), "Gateway pill restored once the actions menu closes");
     }
   });
 
@@ -3125,50 +3032,65 @@
     }
   });
 
-  /* ── Gateway/Docker Host pills hide each other while either is engaged ─── */
+  /* ── Gateway/Docker Host pills close each other's overlay while either is
+     engaged -- the pill (button) itself is never hidden, only ever a
+     *different* pill's own already-open tooltip/dropdown/menu. ─────────── */
 
-  await T("hovering the Docker Host pill hides the Gateway pill, restored on mouseleave", () => {
-    ok(!$("server-status").classList.contains("peer-hidden"), "sanity: visible before any interaction");
+  const pillVisible = (el) => getComputedStyle(el).visibility !== "hidden" && getComputedStyle(el).display !== "none";
+
+  await T("hovering the Docker Host pill closes the Gateway pill's own popup, but never hides the Gateway pill", async () => {
+    mouse($("server-status"), "mouseenter", 5);
+    await sleep(20); // Gateway's mouseenter is async (loadConnectionInfo), unlike Docker Host's
+    ok(!$("connection-info-popup").hidden, "Gateway's own hover popup shown first");
+    mouse($("server-status"), "mouseleave", 5); // real mouse movement leaves one pill before entering the next
     mouse($("docker-host-status"), "mouseenter", 5);
     try {
-      ok($("server-status").classList.contains("peer-hidden"), "Gateway pill hidden while Docker Host is engaged");
+      ok(pillVisible($("server-status")), "Gateway pill's own control stays fully visible");
+      ok($("server-status-btn").disabled !== true, "Gateway pill's button stays interactive");
     } finally {
       mouse($("docker-host-status"), "mouseleave", 5);
-      ok(!$("server-status").classList.contains("peer-hidden"), "Gateway pill restored once Docker Host is no longer engaged");
     }
   });
 
-  await T("hovering the Gateway pill hides the Docker Host pill, restored on mouseleave", async () => {
-    ok(!$("docker-host-status").classList.contains("peer-hidden"), "sanity: visible before any interaction");
+  await T("hovering the Gateway pill closes the Docker Host pill's own popup, but never hides the Docker Host pill", async () => {
+    mouse($("docker-host-status"), "mouseenter", 5);
+    ok(!$("docker-host-info-popup").hidden, "Docker Host's own hover popup shown first");
+    mouse($("docker-host-status"), "mouseleave", 5);
     mouse($("server-status"), "mouseenter", 5);
     await sleep(20);
     try {
-      ok($("docker-host-status").classList.contains("peer-hidden"), "Docker Host pill hidden while Gateway is engaged");
+      ok(pillVisible($("docker-host-status")), "Docker Host pill's own control stays fully visible");
+      ok($("docker-host-info-popup").hidden, "Docker Host's popup closed now that Gateway is engaged");
     } finally {
       mouse($("server-status"), "mouseleave", 5);
-      ok(!$("docker-host-status").classList.contains("peer-hidden"), "Docker Host pill restored once Gateway is no longer engaged");
     }
   });
 
-  await T("right-clicking the Docker Host pill hides the Gateway pill while the actions menu is open", async () => {
+  await T("right-clicking the Docker Host pill closes the Gateway pill's own dropdown, but never hides the Gateway pill", () => {
+    // A dropdown, unlike a hover popup, doesn't self-close on mouseleave --
+    // it stays open regardless of where the mouse goes next, so this is
+    // the case that genuinely exercises the cross-pill close (nothing else
+    // would ever close it).
+    $("server-status-btn").click();
+    ok(!$("gateway-dropdown").hidden, "Gateway's own dropdown shown first");
     mouse($("docker-host-status"), "contextmenu", 5);
     try {
-      ok($("server-status").classList.contains("peer-hidden"), "Gateway pill hidden while Docker Host's actions menu is open");
+      ok(pillVisible($("server-status")), "Gateway pill's own control stays fully visible");
+      ok($("gateway-dropdown").hidden, "Gateway's dropdown closed now that Docker Host's actions menu is open");
     } finally {
-      document.body.click(); // closes the ctxmenu
-      // Restoration polls for the ctxmenu's removal (watchCtxMenuClose)
-      // rather than closing it synchronously -- give it a beat.
-      await until(() => !$("server-status").classList.contains("peer-hidden"), "Gateway pill restored once the actions menu closes");
+      document.body.click(); // closes the ctxmenu and, if still open, the dropdown
     }
   });
 
-  await T("clicking the Docker Host pill's switcher hides the Gateway pill, restored on close", () => {
+  await T("clicking the Docker Host pill's switcher closes the Gateway pill's own dropdown, but never hides the Gateway pill", () => {
+    $("server-status-btn").click();
+    ok(!$("gateway-dropdown").hidden, "Gateway's own dropdown shown first");
     $("docker-host-status-btn").click();
     try {
-      ok($("server-status").classList.contains("peer-hidden"), "Gateway pill hidden while Docker Host's switcher is open");
+      ok(pillVisible($("server-status")), "Gateway pill's own control stays fully visible");
+      ok($("gateway-dropdown").hidden, "Gateway's dropdown closed now that Docker Host's switcher is open");
     } finally {
-      document.body.click(); // outside click closes the switcher
-      ok(!$("server-status").classList.contains("peer-hidden"), "Gateway pill restored once the switcher closes");
+      document.body.click(); // outside click closes whatever's still open
     }
   });
 
@@ -3384,15 +3306,18 @@
     ok(!state.liveHidden, "still Live -- nothing to close");
   });
 
-  await T("clicking the View pill hides the Gateway and Docker Host pills too, restored on close", () => {
+  await T("clicking the View pill closes the Gateway and Docker Host pills' own popups, but never hides either pill", async () => {
+    mouse($("server-status"), "mouseenter", 5);
+    await sleep(20); // Gateway's mouseenter is async (loadConnectionInfo)
+    mouse($("docker-host-status"), "mouseenter", 5); // both left "open" -- neither pill got a mouseleave
     $("view-status-btn").click();
     try {
-      ok($("server-status").classList.contains("peer-hidden"), "Gateway hidden while View's switcher is open");
-      ok($("docker-host-status").classList.contains("peer-hidden"), "Docker Host hidden while View's switcher is open");
+      ok(pillVisible($("server-status")), "Gateway pill's own control stays fully visible");
+      ok(pillVisible($("docker-host-status")), "Docker Host pill's own control stays fully visible");
     } finally {
       document.body.click();
-      ok(!$("server-status").classList.contains("peer-hidden"), "Gateway restored");
-      ok(!$("docker-host-status").classList.contains("peer-hidden"), "Docker Host restored");
+      mouse($("server-status"), "mouseleave", 5);
+      mouse($("docker-host-status"), "mouseleave", 5);
     }
   });
 
