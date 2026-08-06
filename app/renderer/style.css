@@ -165,9 +165,10 @@ body {
 #menubar .acc { color: var(--muted); font-size: 11px; margin-left: 12px; }
 #menubar .menu-list button:hover .acc { color: #fff; }
 
-/* Also reused for the Gateway/Docker Host pills, relocated into the
-   status bar (see .app-status-bar's own overrides below) -- position:
-   relative anchors their dropdown/popup either way. */
+/* Shared by the View pill (top toolbar) and the Gateway/Docker Host pills
+   (relocated into the status bar, see .app-status-bar's own overrides
+   below) -- position: relative anchors each one's own dropdown/popup
+   wherever it lives. */
 .server-status {
   position: relative;
 }
@@ -771,11 +772,11 @@ body {
    visible. */
 #toolbar { flex-wrap: nowrap; }
 #toolbar > * { flex-shrink: 0; }
-/* #status/#cursor-label read as one right-aligned status cluster -- the
-   margin-left:auto belongs on the first of the two (here) so there's a
-   single gap pushing the whole group right, not a second auto margin
-   further along competing for the same leftover space and splitting it
-   into two gaps. */
+/* #status/#cursor-label/#view-status (View pill) read as one right-aligned
+   status cluster -- the margin-left:auto belongs on the first of the three
+   (here) so there's a single gap pushing the whole group right, not a
+   second auto margin further along competing for the same leftover space
+   and splitting it into two gaps. */
 #toolbar #status {
   margin-left: auto;
   flex-shrink: 1;
@@ -870,6 +871,13 @@ body {
 }
 .flat-action:hover, .flat-action:active { background: none; text-decoration: underline; }
 .flat-action-icon { width: 14px; height: 14px; flex: 0 0 auto; }
+/* Segment picker for a loaded multi-segment .cttc-record -- only shown
+   once such a file is active (see app.js's setActiveRecordSections), so
+   it stays out of the way for the common single-segment case. */
+#record-sections {
+  padding: 3px 8px;
+  font-size: 12px;
+}
 .ts-label {
   font-size: 10px;
   font-weight: 600;

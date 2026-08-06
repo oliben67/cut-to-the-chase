@@ -1452,7 +1452,7 @@
       const sample = state.sources.find((s) => s.live === false);
       ok(sample, "sample source present and static");
       eq(isLiveSid(sample.id), false);
-      ok(sampleFileLabel(sample.id).includes("cttc-e2e-sample.cttc-metric"), "labeled with file");
+      ok(basename(sample.path).includes("cttc-e2e-sample.cttc-metric"), "source path reflects the loaded file");
       const groups = sampleFileGroups();
       eq(groups.length, 1, "one sample file group");
       ok(groups[0].ids.size >= 2, "group covers its sources");
@@ -1954,6 +1954,15 @@
     eq(r.errors.length, 0, JSON.stringify(r.errors));
     ok(r.opened.length >= 1, "first segment's sources opened, no user choice needed");
 
+    // #record-sections (right of Back to live tracking) is populated
+    // immediately with every segment, first one selected, so the others
+    // aren't permanently inaccessible.
+    await until(() => !$("record-sections").hidden, "record-sections dropdown shown");
+    eq($("record-sections").options.length, 2, "both segments listed");
+    eq($("record-sections").value, "0", "first segment selected by default");
+    eq(activeRecordSections.path, realPath);
+    eq(activeRecordSections.activeIndex, 0);
+
     // the auto-loaded recording must switch the app out of live mode just
     // like the old prompt-driven flow did -- see setLiveHidden.
     await refreshAll();
@@ -1961,6 +1970,54 @@
     eq($("live-data-group").hidden, true, "Frequency/Live tracking hidden once the recording is auto-loaded");
 
     for (const sid of r.opened) await post("/close", { id: sid });
+    await refreshAll();
+    eq($("record-sections").hidden, true, "hidden again once its sources are gone (self-heals via setLiveHidden)");
+  });
+
+  await T("#record-sections dropdown switches segments after the automatic first-segment load", async () => {
+    const t0 = R.min_ts;
+    const firstRes = await fetch(`${API}/sample/record`, {
+      method: "POST", body: new Uint8Array(0),
+      headers: { "X-CTTC-From": String(t0), "X-CTTC-To": String(t0 + 60000) },
+    });
+    const firstBytes = new Uint8Array(await firstRes.arrayBuffer());
+    const secondRes = await fetch(`${API}/sample/record`, {
+      method: "POST", body: firstBytes,
+      headers: { "X-CTTC-From": String(t0 + 60000), "X-CTTC-To": String(t0 + 120000) },
+    });
+    const secondBytes = new Uint8Array(await secondRes.arrayBuffer());
+    const realPath = "/tmp/cttc-e2e-record-sections-switch.cttc-record";
+    await window.cttc.writeBinaryFile(realPath, secondBytes);
+
+    const first = await uploadAndResolveSegment(realPath);
+    ok(first.opened.length >= 1, "first segment's sources opened");
+    const firstIds = first.opened.slice();
+    eq(activeRecordSections.activeIndex, 0);
+
+    $("record-sections").value = "1";
+    $("record-sections").dispatchEvent(new Event("change"));
+    await until(() => activeRecordSections?.activeIndex === 1, "switched to segment 1");
+    eq($("record-sections").value, "1");
+    for (const sid of firstIds) {
+      ok(!state.sources.some((s) => s.id === sid), `segment 0's source ${sid} was closed on switch`);
+    }
+    ok(activeRecordSections.openedIds.length >= 1, "segment 1's sources opened");
+
+    // BUG-0077: switching segments used to leave the chart's view window
+    // wherever it was (segment 0's own range), so segment 1's data --
+    // genuinely loaded, per the assertions above -- fell entirely outside
+    // what was actually drawn and looked empty.
+    const seg1Starts = state.sources
+      .filter((s) => activeRecordSections.openedIds.includes(s.id) && s.min_ts != null)
+      .map((s) => s.min_ts);
+    ok(seg1Starts.length > 0, "segment 1 has real, datable sources to check the view against");
+    const seg1MinTs = Math.min(...seg1Starts);
+    ok(
+      state.view.t0 <= seg1MinTs && state.view.t1 >= seg1MinTs,
+      `view must re-center on segment 1's own data (min_ts=${seg1MinTs}) after switching, not stay on segment 0's -- got view [${state.view.t0}, ${state.view.t1}]`
+    );
+
+    for (const sid of activeRecordSections.openedIds) await post("/close", { id: sid });
     await refreshAll();
   });
 
@@ -2133,6 +2190,33 @@
       eq(state.view.t0, t0, "the exact prior view's start is restored");
       eq(state.view.t1, t1, "the exact prior view's end is restored");
       eq(state.live, wasLive, "the prior live-follow flag is restored too");
+    }
+  });
+
+  await T("Loading a single (non-segmented) metric still populates the metric(s) dropdown with one entry", async () => {
+    // Generalizes what #record-sections used to only do for a real
+    // multi-segment .cttc-record: it now always reflects whatever is
+    // currently loaded, even a plain single .cttc-metric with no segment
+    // ambiguity at all -- previously this case called
+    // setActiveRecordSections(null), hiding the dropdown outright.
+    const res = await fetch(
+      `${API}/files/download?from=${R.min_ts}&to=${R.max_ts}&include_host=0`,
+      { headers: authHeaders() }
+    );
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const realPath = "/tmp/cttc-e2e-single-metric-dropdown.cttc-metric";
+    await window.cttc.writeBinaryFile(realPath, bytes);
+    const r = await uploadAndResolveSegment(realPath);
+    try {
+      ok(r.opened.length >= 1, "sample opened");
+      await until(() => !$("record-sections").hidden, "metric(s) dropdown shown even for a single metric");
+      eq($("record-sections").options.length, 1, "exactly one entry -- nothing else to switch to");
+      eq($("record-sections").title, "metric(s)");
+      eq(activeRecordSections.activeIndex, 0);
+    } finally {
+      for (const sid of r.opened) await post("/close", { id: sid });
+      await refreshAll();
+      eq($("record-sections").hidden, true, "hidden again once back in live mode");
     }
   });
 
@@ -3193,6 +3277,46 @@
     }
   });
 
+  await T("Legend and log panels show only the active view's own containers, never piling up across loads or live (BUG-0082)", async () => {
+    const out1 = "/tmp/cttc-e2e-legend-a.cttc-metric";
+    const out2 = "/tmp/cttc-e2e-legend-b.cttc-metric";
+    await post("/sample/export", { path: out1, from: R.min_ts, to: R.min_ts + 5 * 60000 });
+    await post("/sample/export", { path: out2, from: R.min_ts, to: R.min_ts + 5 * 60000 });
+    const realPick = pickAnalysisFiles;
+    try {
+      pickAnalysisFiles = async () => [out1];
+      await $("btn-load-sample").onclick();
+      renderLegend();
+      syncPanels();
+      const legendA = [...$("legend").querySelectorAll(".legend-item")].map((i) => i.textContent);
+      ok(new Set(legendA).size === legendA.length, `no duplicate legend entries after loading one file: ${legendA}`);
+      ok(legendA.length > 0, "sanity: the loaded file's own containers are listed");
+      ok(legendA.every((l) => !l.includes(".cttc-metric") && !l.includes(".cttc-record")), `legend labels must not append the originating file's name: ${legendA}`);
+      const visibleA = [...panels.values()].filter((p) => !p.el.hidden).map((p) => p.src.name);
+      ok(visibleA.length > 0, "sanity: at least one log panel visible for the loaded file");
+
+      pickAnalysisFiles = async () => [out2];
+      await $("btn-load-sample").onclick();
+      renderLegend();
+      syncPanels();
+      const legendB = [...$("legend").querySelectorAll(".legend-item")].map((i) => i.textContent);
+      eq(
+        legendB.length, legendA.length,
+        `switching to a second file must not accumulate the first file's (or Live's) legend entries -- was ${JSON.stringify(legendA)}, now ${JSON.stringify(legendB)}`
+      );
+      const visibleB = [...panels.values()].filter((p) => !p.el.hidden).map((p) => p.src.name);
+      eq(visibleB.length, visibleA.length, "same number of visible log panels for the newly active file, not accumulated");
+      const hiddenCount = [...panels.values()].filter((p) => p.el.hidden).length;
+      ok(hiddenCount >= visibleA.length, "the first file's (and Live's) panels still exist, just correctly hidden -- not disposed");
+    } finally {
+      pickAnalysisFiles = realPick;
+      for (const s of state.sources.filter((s) => s.path === `upload://${basename(out1)}` || s.path === `upload://${basename(out2)}`)) {
+        await post("/close", { id: s.id });
+      }
+      await refreshAll();
+    }
+  });
+
   await T("Re-opening an already-open file switches to its existing view instead of duplicating or no-op'ing", async () => {
     const outA = "/tmp/cttc-e2e-view-reopen-a.cttc-metric";
     const outB = "/tmp/cttc-e2e-view-reopen-b.cttc-metric";
@@ -3222,6 +3346,102 @@
         await post("/close", { id: s.id });
       }
       await refreshAll();
+    }
+  });
+
+  await T("View pill dropdown lists Live + open files, picking one switches the active view", async () => {
+    const out = "/tmp/cttc-e2e-view-pill-dropdown.cttc-metric";
+    await post("/sample/export", { path: out, from: R.min_ts, to: R.min_ts + 5 * 60000 });
+    const path = `upload://${basename(out)}`;
+    const realPick = pickAnalysisFiles;
+    try {
+      pickAnalysisFiles = async () => [out];
+      await $("btn-load-sample").onclick();
+      eq(state.activeSamplePath, path, "sanity: the file is the active view");
+
+      $("view-status-btn").click();
+      const items = [...$("view-dropdown").querySelectorAll(".gateway-item")];
+      const labels = items.map((b) => b.querySelector(".gateway-item-label").textContent);
+      ok(labels.includes("Live"), labels.join(", "));
+      ok(labels.some((l) => l.includes(basename(out))), labels.join(", "));
+      const liveItem = items.find((b) => b.querySelector(".gateway-item-label").textContent === "Live");
+      eq(liveItem.dataset.active, "false", "Live isn't the active view -- the file is");
+      const fileItem = items.find((b) => b.querySelector(".gateway-item-label").textContent.includes(basename(out)));
+      eq(fileItem.dataset.active, "true", "the loaded file is marked active");
+
+      liveItem.click();
+      eq(state.liveHidden, false, "switched to Live");
+      $("view-status-btn").click();
+      const itemsAfter = [...$("view-dropdown").querySelectorAll(".gateway-item")];
+      const liveAfter = itemsAfter.find((b) => b.querySelector(".gateway-item-label").textContent === "Live");
+      eq(liveAfter.dataset.active, "true", "Live now marked active");
+      document.body.click();
+    } finally {
+      pickAnalysisFiles = realPick;
+      for (const s of state.sources.filter((s) => s.path === path)) await post("/close", { id: s.id });
+      await refreshAll();
+    }
+  });
+
+  await T("Close view disposes a .cttc-metric view's data, but never a .cttc-record view's", async () => {
+    const metricPath = "/tmp/cttc-e2e-view-close-metric.cttc-metric";
+    await post("/sample/export", { path: metricPath, from: R.min_ts, to: R.min_ts + 5 * 60000 });
+    const t0 = R.min_ts;
+    const res = await fetch(`${API}/sample/record`, {
+      method: "POST", body: new Uint8Array(0),
+      headers: { "X-CTTC-From": String(t0), "X-CTTC-To": String(t0 + 60000) },
+    });
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const recordPath = "/tmp/cttc-e2e-view-close-record.cttc-record";
+    await window.cttc.writeBinaryFile(recordPath, bytes);
+    const metricUploadPath = `upload://${basename(metricPath)}`;
+    const recordUploadPath = `upload://${basename(recordPath)}`;
+
+    const realPick = pickAnalysisFiles;
+    try {
+      pickAnalysisFiles = async () => [metricPath];
+      await $("btn-load-sample").onclick();
+      eq(state.activeSamplePath, metricUploadPath, "sanity: metric view active");
+      await closeActiveView();
+      ok(!state.sources.some((s) => s.path === metricUploadPath), "metric view's sources actually closed");
+      ok(!sampleFileGroups().some((g) => g.path === metricUploadPath), "no longer listed as a view");
+
+      pickAnalysisFiles = async () => [recordPath];
+      await $("btn-load-sample").onclick();
+      eq(state.activeSamplePath, recordUploadPath, "sanity: record view active");
+      const idsBefore = new Set(state.sources.filter((s) => s.path === recordUploadPath).map((s) => s.id));
+      await closeActiveView();
+      const idsAfter = new Set(state.sources.filter((s) => s.path === recordUploadPath).map((s) => s.id));
+      eq(idsAfter.size, idsBefore.size, "record view's sources were NOT disposed");
+      ok([...idsAfter].every((id) => idsBefore.has(id)));
+      eq(state.activeSamplePath, recordUploadPath, "record view still the active view -- Close view was a no-op");
+    } finally {
+      pickAnalysisFiles = realPick;
+      for (const s of state.sources.filter((s) => s.path === metricUploadPath || s.path === recordUploadPath)) {
+        await post("/close", { id: s.id });
+      }
+      await refreshAll();
+    }
+  });
+
+  await T("Close view is a no-op while viewing Live", async () => {
+    ok(!state.liveHidden, "sanity: Live is the active view in this suite's baseline state");
+    await closeActiveView();
+    ok(!state.liveHidden, "still Live -- nothing to close");
+  });
+
+  await T("clicking the View pill closes the Gateway and Docker Host pills' own popups, but never hides either pill", async () => {
+    mouse($("server-status"), "mouseenter", 5);
+    await sleep(20); // Gateway's mouseenter is async (loadConnectionInfo)
+    mouse($("docker-host-status"), "mouseenter", 5); // both left "open" -- neither pill got a mouseleave
+    $("view-status-btn").click();
+    try {
+      ok(pillVisible($("server-status")), "Gateway pill's own control stays fully visible");
+      ok(pillVisible($("docker-host-status")), "Docker Host pill's own control stays fully visible");
+    } finally {
+      document.body.click();
+      mouse($("server-status"), "mouseleave", 5);
+      mouse($("docker-host-status"), "mouseleave", 5);
     }
   });
 
