@@ -258,10 +258,10 @@ body {
 .gateway-dropdown .gateway-empty { padding: 6px 8px; font-size: 12px; color: var(--muted); }
 .gateway-dropdown .gateway-item-sep { border-top: 1px solid var(--border); margin: 2px 4px; }
 
-/* Hover the Gateway or Docker Host status pill: read-only connection detail
-   (Gateway: connection type + ssh details when tunneled; Docker Host: SSH
-   connection/key + which transforms are on) -- see app.js's
-   connection-info-popup/docker-host-info-popup blocks. Same floating-card
+/* Right-click the Gateway or Docker Host status pill, "Current Status":
+   read-only connection detail (Gateway: connection type + ssh details when
+   tunneled; Docker Host: SSH connection/key + which transforms are on) --
+   see app.js's showGatewayStatus/showDockerHostStatus. Same floating-card
    look as .gateway-dropdown, but no buttons/hover state, since there's
    nothing to click here. */
 .connection-info-popup {
@@ -1126,8 +1126,12 @@ body.sample-armed .strip {
   border-radius: var(--radius-sm);
 }
 #ctxmenu button:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+/* Divider between groups of entries (see ctxMenu's "separator" sentinel) --
+   same look as .gateway-dropdown's own .gateway-item-sep. */
+.ctxmenu-sep { border-top: 1px solid var(--border); margin: 2px 4px; }
 /* Entries that pass an icon (see ctxMenu's optional 3rd tuple element) --
-   reuses whichever action-bar button's own .ab-icon markup it was given,
+   either reuses whichever action-bar button's own .ab-icon markup it was
+   given, or a raw inline SVG for an entry with no button to clone from;
    just sized down for a menu row instead of the sidebar. */
 .ctxmenu-icon {
   display: inline-flex;

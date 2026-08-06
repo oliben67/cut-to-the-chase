@@ -2964,24 +2964,20 @@
     }
   });
 
-  await T("hovering the Gateway pill shows the connection-info popup (moved off right-click)", async () => {
+  await T("hovering the Gateway pill shows nothing anymore", async () => {
     mouse($("server-status"), "mouseenter", 5);
-    await sleep(20); // loadConnectionInfo() is awaited before the popup renders
+    await sleep(20);
     try {
-      ok(!$("connection-info-popup").hidden, "popup shown on hover");
-      const text = $("connection-info-popup").textContent;
-      ok(text.includes("Connection"), `Connection row present: ${text}`);
+      ok($("connection-info-popup").hidden, "no popup on hover");
     } finally {
       mouse($("server-status"), "mouseleave", 5);
-      ok($("connection-info-popup").hidden, "popup hides on mouseleave");
     }
   });
 
-  await T("right-clicking the Gateway pill opens New/Edit/Uninstall Gateway, not the info popup", async () => {
-    mouse($("server-status"), "mouseenter", 5);
+  await T("right-clicking the Gateway pill opens New/Edit/Uninstall Gateway plus Current Status, separated by a divider", async () => {
     mouse($("server-status"), "contextmenu", 5);
     try {
-      ok($("connection-info-popup").hidden, "info popup replaced by the actions menu, not shown alongside it");
+      ok($("connection-info-popup").hidden, "info popup not shown just from opening the menu");
       const menu = document.getElementById("ctxmenu");
       ok(menu, "actions menu open");
       const buttons = [...menu.querySelectorAll("button")];
@@ -2989,36 +2985,75 @@
       ok(labels.some((l) => l.includes("New Gateway")), labels.join(", "));
       ok(labels.some((l) => l === "Edit Gateway"), labels.join(", "));
       ok(labels.some((l) => l.includes("Uninstall Gateway")), labels.join(", "));
+      ok(labels.some((l) => l === "Current Status"), labels.join(", "));
       ok(buttons.every((b) => b.querySelector(".ctxmenu-icon svg")), "every entry has an icon to the left of its label");
+      const statusBtn = buttons.find((b) => b.textContent === "Current Status");
+      ok(statusBtn.previousElementSibling?.classList.contains("ctxmenu-sep"), "Current Status is preceded by a divider, separating it from the action entries");
     } finally {
       document.body.click(); // closes the ctxmenu synchronously
       if (dlgGatewaySetup.open) dlgGatewaySetup.close();
-      mouse($("server-status"), "mouseleave", 5);
     }
   });
 
-  /* ── Docker Host pill: hover info, right-click actions, click separators ── */
+  await T("clicking Current Status on the Gateway pill's right-click menu shows the connection info above the button", async () => {
+    mouse($("server-status"), "contextmenu", 5);
+    const menu = document.getElementById("ctxmenu");
+    [...menu.querySelectorAll("button")].find((b) => b.textContent === "Current Status").click();
+    await sleep(20); // loadConnectionInfo() is awaited before the popup renders
+    try {
+      ok(!$("connection-info-popup").hidden, "popup shown after clicking Current Status");
+      const text = $("connection-info-popup").textContent;
+      ok(text.includes("Connection"), `Connection row present: ${text}`);
+      const popupRect = $("connection-info-popup").getBoundingClientRect();
+      const btnRect = $("server-status-btn").getBoundingClientRect();
+      ok(popupRect.bottom <= btnRect.top, `popup (bottom ${popupRect.bottom}) sits above the button (top ${btnRect.top})`);
+    } finally {
+      document.body.click();
+      ok($("connection-info-popup").hidden, "clicking outside closes the popup");
+    }
+  });
 
-  await T("hovering the Docker Host pill shows 'not connected' when nothing is watched", () => {
-    ok(!hasDockerDaemon(), "sanity: nothing connected in this suite's baseline state");
+  /* ── Docker Host pill: Current Status, right-click actions, click separators ── */
+
+  await T("hovering the Docker Host pill shows nothing anymore", () => {
     mouse($("docker-host-status"), "mouseenter", 5);
     try {
-      ok(!$("docker-host-info-popup").hidden, "popup shown on hover");
-      ok($("docker-host-info-popup").textContent.includes("not connected"), $("docker-host-info-popup").textContent);
+      ok($("docker-host-info-popup").hidden, "no popup on hover");
     } finally {
       mouse($("docker-host-status"), "mouseleave", 5);
-      ok($("docker-host-info-popup").hidden, "popup hides on mouseleave");
     }
   });
 
-  await T("hovering the Docker Host pill shows SSH connection/key and which transforms are on", () => {
+  const openDockerHostCurrentStatus = () => {
+    mouse($("docker-host-status"), "contextmenu", 5);
+    const menu = document.getElementById("ctxmenu");
+    [...menu.querySelectorAll("button")].find((b) => b.textContent === "Current Status").click();
+  };
+
+  await T("Current Status on the Docker Host pill shows 'not connected' when nothing is watched", async () => {
+    ok(!hasDockerDaemon(), "sanity: nothing connected in this suite's baseline state");
+    openDockerHostCurrentStatus();
+    await sleep(0); // the outside-click listener is registered via setTimeout(0) to dodge the same-click race (see showDockerHostStatus)
+    try {
+      ok(!$("docker-host-info-popup").hidden, "popup shown after clicking Current Status");
+      ok($("docker-host-info-popup").textContent.includes("not connected"), $("docker-host-info-popup").textContent);
+      const popupRect = $("docker-host-info-popup").getBoundingClientRect();
+      const btnRect = $("docker-host-status-btn").getBoundingClientRect();
+      ok(popupRect.bottom <= btnRect.top, `popup (bottom ${popupRect.bottom}) sits above the button (top ${btnRect.top})`);
+    } finally {
+      document.body.click();
+      ok($("docker-host-info-popup").hidden, "clicking outside closes the popup");
+    }
+  });
+
+  await T("Current Status on the Docker Host pill shows SSH connection/key and which transforms are on", () => {
     const saved = prefs.get("savedDockerDaemons", {});
     prefs.set("savedDockerDaemons", { ...saved, "ssh://u@h": { ssh_key: "/path/to/key", transforms: ["json_message"], lastUsed: Date.now() } });
     const fakeSrc = { id: "__hover_test", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
     state.sources.push(fakeSrc);
     syncDockerDaemonButtons();
     try {
-      mouse($("docker-host-status"), "mouseenter", 5);
+      openDockerHostCurrentStatus();
       const text = $("docker-host-info-popup").textContent;
       ok(text.includes("SSH Connection") && text.includes("u@h"), text);
       ok(text.includes("SSH Key") && text.includes("/path/to/key"), text);
@@ -3026,33 +3061,33 @@
       ok(text.includes("json message") && text.includes("True"), text);
       ok(text.includes("parse level") && text.includes("False"), text);
     } finally {
-      mouse($("docker-host-status"), "mouseleave", 5);
+      document.body.click();
       state.sources = state.sources.filter((s) => s.id !== "__hover_test");
       syncDockerDaemonButtons();
       prefs.set("savedDockerDaemons", saved);
     }
   });
 
-  await T("hovering the Docker Host pill shows '---' for an unset SSH key", () => {
+  await T("Current Status on the Docker Host pill shows '---' for an unset SSH key", () => {
     const saved = prefs.get("savedDockerDaemons", {});
     prefs.set("savedDockerDaemons", { ...saved, local: { transforms: [], lastUsed: Date.now() } });
     const fakeSrc = { id: "__hover_local_test", path: "docker://local/stats", kind: "stats", live: true };
     state.sources.push(fakeSrc);
     syncDockerDaemonButtons();
     try {
-      mouse($("docker-host-status"), "mouseenter", 5);
+      openDockerHostCurrentStatus();
       const text = $("docker-host-info-popup").textContent;
       ok(text.includes("SSH Connection") && text.includes("localhost"), text);
       ok(text.includes("SSH Key") && text.includes("---"), text);
     } finally {
-      mouse($("docker-host-status"), "mouseleave", 5);
+      document.body.click();
       state.sources = state.sources.filter((s) => s.id !== "__hover_local_test");
       syncDockerDaemonButtons();
       prefs.set("savedDockerDaemons", saved);
     }
   });
 
-  await T("right-clicking the Docker Host pill opens New/Edit/Remove; Edit is a no-op with nothing connected", async () => {
+  await T("right-clicking the Docker Host pill opens New/Edit/Remove plus Current Status, separated by a divider; Edit is a no-op with nothing connected", async () => {
     ok(!hasDockerDaemon(), "sanity: nothing connected in this suite's baseline state");
     mouse($("docker-host-status"), "contextmenu", 5);
     try {
@@ -3063,7 +3098,10 @@
       ok(labels.some((l) => l.includes("New Docker Host")), labels.join(", "));
       ok(labels.some((l) => l === "Edit Docker Host"), labels.join(", "));
       ok(labels.some((l) => l.includes("Remove Docker Host")), labels.join(", "));
+      ok(labels.some((l) => l === "Current Status"), labels.join(", "));
       ok(buttons.every((b) => b.querySelector(".ctxmenu-icon svg")), "every entry has an icon to the left of its label");
+      const statusBtn = buttons.find((b) => b.textContent === "Current Status");
+      ok(statusBtn.previousElementSibling?.classList.contains("ctxmenu-sep"), "Current Status is preceded by a divider, separating it from the action entries");
       buttons.find((b) => b.textContent === "Edit Docker Host").click();
       eq(dlg.open, false, "no-op -- nothing connected to edit");
     } finally {
@@ -3121,39 +3159,43 @@
 
   const pillVisible = (el) => getComputedStyle(el).visibility !== "hidden" && getComputedStyle(el).display !== "none";
 
-  await T("hovering the Docker Host pill closes the Gateway pill's own popup, but never hides the Gateway pill", async () => {
-    mouse($("server-status"), "mouseenter", 5);
-    await sleep(20); // Gateway's mouseenter is async (loadConnectionInfo), unlike Docker Host's
-    ok(!$("connection-info-popup").hidden, "Gateway's own hover popup shown first");
-    mouse($("server-status"), "mouseleave", 5); // real mouse movement leaves one pill before entering the next
-    mouse($("docker-host-status"), "mouseenter", 5);
+  const openGatewayCurrentStatus = () => {
+    mouse($("server-status"), "contextmenu", 5);
+    const menu = document.getElementById("ctxmenu");
+    [...menu.querySelectorAll("button")].find((b) => b.textContent === "Current Status").click();
+  };
+
+  await T("opening the Docker Host pill's Current Status closes the Gateway pill's own popup, but never hides the Gateway pill", async () => {
+    openGatewayCurrentStatus();
+    await sleep(20); // Gateway's Current Status is async (loadConnectionInfo), unlike Docker Host's
+    ok(!$("connection-info-popup").hidden, "Gateway's own status popup shown first");
+    openDockerHostCurrentStatus();
     try {
       ok(pillVisible($("server-status")), "Gateway pill's own control stays fully visible");
       ok($("server-status-btn").disabled !== true, "Gateway pill's button stays interactive");
+      ok($("connection-info-popup").hidden, "Gateway's popup closed now that Docker Host is engaged");
     } finally {
-      mouse($("docker-host-status"), "mouseleave", 5);
+      document.body.click();
     }
   });
 
-  await T("hovering the Gateway pill closes the Docker Host pill's own popup, but never hides the Docker Host pill", async () => {
-    mouse($("docker-host-status"), "mouseenter", 5);
-    ok(!$("docker-host-info-popup").hidden, "Docker Host's own hover popup shown first");
-    mouse($("docker-host-status"), "mouseleave", 5);
-    mouse($("server-status"), "mouseenter", 5);
+  await T("opening the Gateway pill's Current Status closes the Docker Host pill's own popup, but never hides the Docker Host pill", async () => {
+    openDockerHostCurrentStatus();
+    ok(!$("docker-host-info-popup").hidden, "Docker Host's own status popup shown first");
+    openGatewayCurrentStatus();
     await sleep(20);
     try {
       ok(pillVisible($("docker-host-status")), "Docker Host pill's own control stays fully visible");
       ok($("docker-host-info-popup").hidden, "Docker Host's popup closed now that Gateway is engaged");
     } finally {
-      mouse($("server-status"), "mouseleave", 5);
+      document.body.click();
     }
   });
 
   await T("right-clicking the Docker Host pill closes the Gateway pill's own dropdown, but never hides the Gateway pill", () => {
-    // A dropdown, unlike a hover popup, doesn't self-close on mouseleave --
-    // it stays open regardless of where the mouse goes next, so this is
-    // the case that genuinely exercises the cross-pill close (nothing else
-    // would ever close it).
+    // None of these overlays self-close on their own -- only an outside
+    // click or a peer pill engaging closes them -- so this genuinely
+    // exercises the cross-pill close (nothing else would ever close it).
     $("server-status-btn").click();
     ok(!$("gateway-dropdown").hidden, "Gateway's own dropdown shown first");
     mouse($("docker-host-status"), "contextmenu", 5);
@@ -3174,24 +3216,6 @@
       ok($("gateway-dropdown").hidden, "Gateway's dropdown closed now that Docker Host's switcher is open");
     } finally {
       document.body.click(); // outside click closes whatever's still open
-    }
-  });
-
-  await T("clicking or right-clicking a pill suppresses its own hover info while its menu stays open", () => {
-    // Reported: "when I clicked or right-clicked, as long as the menu is
-    // visible, the hovering message should not appear" -- mouseenter fires
-    // as the cursor arrives (browsers don't refire it while the mouse
-    // stays put), so the guard has to be checked at that single point:
-    // don't render/show the info popup if a menu from this same pill is
-    // already open.
-    $("docker-host-status-btn").click();
-    try {
-      ok(!$("docker-host-dropdown").hidden, "sanity: switcher open");
-      mouse($("docker-host-status"), "mouseenter", 5);
-      ok($("docker-host-info-popup").hidden, "hover info suppressed while the switcher is open");
-    } finally {
-      document.body.click();
-      mouse($("docker-host-status"), "mouseleave", 5);
     }
   });
 

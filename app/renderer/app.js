@@ -890,10 +890,13 @@ function closeCtxMenu() {
   ctxEl?.remove();
   ctxEl = null;
 }
-// entries: [label, fn] or [label, fn, iconSelector] -- iconSelector, when
-// given, is a CSS selector for an existing action-bar button whose own
-// .ab-icon markup gets reused (cloned) to the left of the label, so the
-// menu's icon can never drift out of sync with the button it duplicates.
+// entries: [label, fn] or [label, fn, icon] -- icon, when given, is either
+// a CSS selector for an existing action-bar button whose own .ab-icon
+// markup gets reused (cloned) to the left of the label (so the menu's icon
+// can never drift out of sync with the button it duplicates), or a raw
+// "<svg ...>...</svg>" string for an entry with no corresponding button to
+// clone from. The literal string "separator" in place of an entry renders
+// a thin divider instead (see Current Status's own entries below for both).
 // ownerId: opaque tag identifying which caller opened this menu (only the
 // Gateway/Docker Host pills currently pass one, see syncPillPeerVisibility)
 // -- left off entirely by the legend/chart-time menus, which don't care.
@@ -904,13 +907,31 @@ function ctxMenu(e, entries, ownerId) {
   ctxEl = document.createElement("div");
   ctxEl.id = "ctxmenu";
   if (ownerId) ctxEl.dataset.owner = ownerId;
-  for (const [label, fn, iconSelector] of entries) {
+  for (const entry of entries) {
+    if (entry === "separator") {
+      const sep = document.createElement("div");
+      sep.className = "ctxmenu-sep";
+      ctxEl.appendChild(sep);
+      continue;
+    }
+    const [label, fn, icon] = entry;
     const b = document.createElement("button");
-    const abIcon = iconSelector && document.querySelector(iconSelector)?.querySelector(".ab-icon");
-    if (abIcon) {
-      const icon = abIcon.cloneNode(true);
-      icon.className = "ctxmenu-icon";
-      b.appendChild(icon);
+    let iconEl = null;
+    if (icon?.startsWith?.("<svg")) {
+      // Wrapped in a <span>, same shape as the cloned .ab-icon <span> below
+      // -- keeps a single ".ctxmenu-icon svg" CSS rule working for both, and
+      // avoids setting .className directly on the parsed <svg> itself
+      // (SVGElement.className is a read-only SVGAnimatedString, unlike a
+      // plain HTMLElement's).
+      iconEl = document.createElement("span");
+      iconEl.innerHTML = icon;
+    } else {
+      const abIcon = icon && document.querySelector(icon)?.querySelector(".ab-icon");
+      if (abIcon) iconEl = abIcon.cloneNode(true);
+    }
+    if (iconEl) {
+      iconEl.className = "ctxmenu-icon";
+      b.appendChild(iconEl);
     }
     const text = document.createElement("span");
     text.textContent = label;
@@ -5663,14 +5684,12 @@ refreshAll().then(async () => {
 connectSSE();
 
 /* ── Gateway/Docker Host pills (status bar) close each other's overlay
-   (hover info popup, switcher dropdown, or right-click actions menu) the
+   (status popup, switcher dropdown, or right-click actions menu) the
    moment one of them opens its own -- each overlay anchors to its own
    wrapper's edge, so two open at once could otherwise visually run into
    each other or into unrelated controls. The pill (button) itself is
    never hidden -- only ever a *different* pill's already-open overlay,
-   never the one that just opened. gatewayMenuOpen/dockerHostMenuOpen also
-   double as the "don't show hover info while a menu from this same pill
-   is open" guard (see each pill's own mouseenter). */
+   never the one that just opened. */
 function gatewayMenuOpen() {
   const dropdown = $("gateway-dropdown");
   return (dropdown ? !dropdown.hidden : false) || document.getElementById("ctxmenu")?.dataset.owner === "gateway";
@@ -5714,18 +5733,23 @@ const TOOLBAR_PILLS = {
 // Called right after a pill (actingId: "gateway"/"dockerhost") opens its
 // own overlay, closing every *other* pill's overlay -- never its own, and
 // never the pill (button) itself. Takes the acting pill explicitly rather
-// than inferring "whichever is engaged": a dropdown or right-click menu,
-// unlike a hover popup, doesn't self-close on mouseleave, so it's entirely
-// possible for a *different* pill's overlay to still be genuinely open
-// (not just stale) at the exact moment this one opens -- inferring
-// priority from array order would arbitrarily close whichever one
-// happened to come first instead of the one that isn't the pill actually
-// acting right now.
+// than inferring "whichever is engaged": none of these overlays (dropdown,
+// right-click menu, status popup) self-close on their own, so it's
+// entirely possible for a *different* pill's overlay to still be
+// genuinely open (not just stale) at the exact moment this one opens --
+// inferring priority from array order would arbitrarily close whichever
+// one happened to come first instead of the one that isn't the pill
+// actually acting right now.
 function syncPillPeerVisibility(actingId) {
   for (const [id, pill] of Object.entries(TOOLBAR_PILLS)) {
     if (id !== actingId && pill.hasOverlay()) pill.closeOverlay();
   }
 }
+
+// Gateway/Docker Host pills' "Current Status" right-click entry -- no
+// action-bar button of its own to clone an icon from (ctxMenu's usual
+// convention), so this is passed as raw markup instead.
+const CLIPBOARD_ICON_SVG = '<svg viewBox="0 0 512 512" fill="currentColor" aria-hidden="true"><path d="M174.618,245.394c-5.857-5.858-15.355-5.858-21.213,0l-49.394,49.394l-19.394-19.394c-5.857-5.858-15.355-5.858-21.213,0 c-5.858,5.858-5.858,15.355,0,21.213l30.002,30c2.929,2.929,6.768,4.393,10.606,4.393s7.678-1.464,10.606-4.393l60-60 C180.476,260.749,180.476,251.252,174.618,245.394z"/><path d="M174.618,365.394c-5.857-5.858-15.355-5.858-21.213,0l-49.394,49.394l-19.394-19.394c-5.857-5.858-15.355-5.858-21.213,0 c-5.858,5.858-5.858,15.355,0,21.213l30.002,30c2.929,2.929,6.768,4.393,10.606,4.393s7.678-1.464,10.606-4.393l60-60 C180.476,380.749,180.476,371.252,174.618,365.394z"/><path d="M159.62,185.394L140.226,166l19.393-19.393c5.858-5.858,5.858-15.355,0-21.213c-5.857-5.858-15.355-5.858-21.213,0 l-19.394,19.394l-19.394-19.394c-5.857-5.858-15.355-5.858-21.213,0c-5.858,5.858-5.858,15.355,0,21.213L97.799,166 l-19.393,19.393c-5.858,5.858-5.858,15.356,0,21.214c5.857,5.857,15.355,5.858,21.213,0l19.394-19.394l19.394,19.394 c5.857,5.857,15.355,5.858,21.213,0C165.478,200.749,165.478,191.252,159.62,185.394z"/><path d="M498.833,149.62c-17.55-17.54-46.09-17.54-63.64,0c-2.73,2.73-69.69,69.7-73.18,73.18V75c0-24.81-20.19-45-45-45h-47.58 c-6.19-17.46-22.87-30-42.42-30h-92c-19.55,0-36.23,12.54-42.42,30h-47.58c-24.81,0-45,20.19-45,45v392c0,24.81,20.19,45,45,45 h272c24.81,0,45-20.19,45-45V350.08l83.79-83.79l10.6,10.61c5.87,5.86,5.87,15.35,0,21.21l-63.64,63.64 c-5.85,5.86-5.85,15.36,0,21.22c5.86,5.85,15.36,5.86,21.22,0l63.64-63.64c17.58-17.59,17.59-46.05,0-63.64l-10.61-10.61 l31.82-31.82C516.372,195.72,516.372,167.17,498.833,149.62z M135.012,30h92c8.27,0,15,6.73,15,15s-6.73,15-15,15h-92 c-8.27,0-15-6.73-15-15S126.742,30,135.012,30z M332.013,467c0,8.27-6.73,15-15,15h-272c-8.27,0-15-6.73-15-15V75 c0-8.27,6.73-15,15-15h47.58c6.19,17.46,22.87,30,42.42,30h92c19.55,0,36.23-12.54,42.42-30h47.58c8.27,0,15,6.73,15,15v177.8 l-108.95,108.95c-1.65,1.65-2.89,3.66-3.63,5.87l-21.21,63.64c-1.8,5.39-0.39,11.33,3.62,15.35c4.03,4.02,9.97,5.41,15.35,3.62 l63.64-21.21c2.21-0.74,4.22-1.98,5.87-3.63l21.21-21.21l24.1-24.1V467z M254.883,372.36l21.21,21.21l-8.1,8.11l-31.82,10.6 l10.61-31.82L254.883,372.36z M297.302,372.36l-21.21-21.21l127.28-127.28l21.21,21.21L297.302,372.36z M477.622,192.05 l-31.82,31.82l-21.22-21.22l31.82-31.82c5.85-5.84,15.37-5.84,21.22,0C483.472,176.68,483.472,186.2,477.622,192.05z"/></svg>';
 
 /* ── server status indicator (status bar, just left of History) ──────────
    Polls /health independently of connectSSE's own stream so it still shows
@@ -5781,49 +5805,49 @@ function syncPillPeerVisibility(actingId) {
     row.append(l, v);
     return row;
   }
-  // Hover shows the same connection detail right-click used to (Connection/
-  // Gateway/ssh target/port) -- right-click is now the New/Edit/Uninstall
-  // Gateway actions menu instead (ui-GATE/SBAR reorg), so this info needs a
-  // trigger of its own. Async (loadConnectionInfo awaits a real IPC round
-  // trip) -- hoverToken guards against this continuation resolving *after*
-  // the mouse has already left or a menu has opened, which would otherwise
-  // re-show the popup late, stuck open with nothing left to close it.
-  let hoverToken = 0;
-  el.addEventListener("mouseenter", async () => {
-    if (!popup || gatewayMenuOpen()) return; // dropdown/actions menu already open -- don't show info too
-    const token = ++hoverToken;
-    await loadConnectionInfo(); // refresh -- may have switched gateways since the last hover
-    if (token !== hoverToken || gatewayMenuOpen()) return; // stale, or a menu opened while this was in flight
-    popup.innerHTML = "";
-    popup.appendChild(renderInfoRow("Connection", connectionInfo.connectionType));
-    if (connectionInfo.connectionType !== "local") {
-      popup.appendChild(renderInfoRow("Gateway", `${connectionInfo.gatewayHost}:${connectionInfo.gatewayPort}`));
-    }
-    if (connectionInfo.connectionType === "remote-tunnel") {
-      const sep = document.createElement("div");
-      sep.className = "cip-sep";
-      popup.appendChild(sep);
-      popup.appendChild(renderInfoRow("ssh target", connectionInfo.sshTarget));
-      if (connectionInfo.sshPort) popup.appendChild(renderInfoRow("ssh port", String(connectionInfo.sshPort)));
-      popup.appendChild(renderInfoRow("forwarded port", `localhost:${connectionInfo.port}`));
-    }
-    popup.hidden = false;
-    syncPillPeerVisibility("gateway");
-  });
-  el.addEventListener("mouseleave", () => {
-    hoverToken++; // invalidate any mouseenter continuation still in flight
-    if (popup) popup.hidden = true;
-  });
+  // "Current Status" (right-click, see below): the same connection detail
+  // this used to show on hover (Connection/Gateway/ssh target/port) --
+  // moved behind a click per explicit user direction ("hover tag" showing
+  // nothing anymore). Async (loadConnectionInfo awaits a real IPC round
+  // trip) -- the popup itself only appears once that resolves, which
+  // naturally lands after the triggering click has finished dispatching,
+  // so the "click outside closes it" listener added at the end never sees
+  // that same click as the one that should close it.
+  function showGatewayStatus() {
+    if (!popup) return;
+    loadConnectionInfo().then(() => {
+      popup.innerHTML = "";
+      popup.appendChild(renderInfoRow("Connection", connectionInfo.connectionType));
+      if (connectionInfo.connectionType !== "local") {
+        popup.appendChild(renderInfoRow("Gateway", `${connectionInfo.gatewayHost}:${connectionInfo.gatewayPort}`));
+      }
+      if (connectionInfo.connectionType === "remote-tunnel") {
+        const sep = document.createElement("div");
+        sep.className = "cip-sep";
+        popup.appendChild(sep);
+        popup.appendChild(renderInfoRow("ssh target", connectionInfo.sshTarget));
+        if (connectionInfo.sshPort) popup.appendChild(renderInfoRow("ssh port", String(connectionInfo.sshPort)));
+        popup.appendChild(renderInfoRow("forwarded port", `localhost:${connectionInfo.port}`));
+      }
+      popup.hidden = false;
+      syncPillPeerVisibility("gateway");
+      document.addEventListener("click", function onOutside(e) {
+        if (!el.contains(e.target)) popup.hidden = true;
+      }, { once: true });
+    });
+  }
   // Right-click: New/Edit/Uninstall Gateway, the same actions the action
-  // bar's Gateway group already exposes (ctxMenu is the shared generic
-  // context-menu helper, also used by the legend/chart-time menus).
+  // bar's Gateway group already exposes, plus Current Status (ctxMenu is
+  // the shared generic context-menu helper, also used by the legend/
+  // chart-time menus).
   el.addEventListener("contextmenu", (e) => {
-    hoverToken++; // invalidate any mouseenter continuation still in flight
-    if (popup) popup.hidden = true; // don't show both at once if still hovering
+    if (popup) popup.hidden = true; // don't show both at once
     ctxMenu(e, [
       ["New Gateway…", () => openNewGatewayDialog(), '[data-action="new-gateway"]'],
       ["Edit Gateway", () => openEditGatewaysDialog(), '[data-action="edit-gateways"]'],
       ["Uninstall Gateway…", () => openUninstallGatewayDialog(), '[data-action="uninstall-gateway"]'],
+      "separator",
+      ["Current Status", showGatewayStatus, CLIPBOARD_ICON_SVG],
     ], "gateway");
     syncPillPeerVisibility("gateway");
   });
@@ -6028,9 +6052,11 @@ function syncPillPeerVisibility(actingId) {
     });
   };
 
-  // Hover: SSH connection/key + which transforms are on for the connected
-  // host (see server/transforms/*.py -- exactly these three exist today),
-  // styled like the Gateway pill's own info popup (same shared CSS class).
+  // "Current Status" (right-click, see below): SSH connection/key + which
+  // transforms are on for the connected host (see server/transforms/*.py
+  // -- exactly these three exist today), styled like the Gateway pill's
+  // own info popup (same shared CSS class) -- moved behind a click per
+  // explicit user direction ("hover tag" showing nothing anymore).
   const infoPopup = $("docker-host-info-popup");
   const TRANSFORM_NAMES = ["drop_healthchecks", "json_message", "parse_level"];
   function renderInfoRow(label, val) {
@@ -6045,40 +6071,47 @@ function syncPillPeerVisibility(actingId) {
     row.append(l, v);
     return row;
   }
-  wrap.addEventListener("mouseenter", () => {
-    if (!infoPopup || dockerHostMenuOpen()) return; // dropdown/actions menu already open -- don't show info too
+  function showDockerHostStatus() {
+    if (!infoPopup) return;
     const active = hasDockerDaemon() ? currentDockerHost() || "local" : null;
     infoPopup.innerHTML = "";
     if (active == null) {
       infoPopup.appendChild(renderInfoRow("Docker host", "not connected"));
-      infoPopup.hidden = false;
-      syncPillPeerVisibility("dockerhost");
-      return;
-    }
-    const entry = prefs.get("savedDockerDaemons", {})[active];
-    const label = active === "local" ? "localhost" : active.replace(/^ssh:\/\//, "");
-    infoPopup.appendChild(renderInfoRow("SSH Connection", label));
-    infoPopup.appendChild(renderInfoRow("SSH Key", entry?.ssh_key || "---"));
-    const sep = document.createElement("div");
-    sep.className = "cip-sep";
-    infoPopup.appendChild(sep);
-    for (const name of TRANSFORM_NAMES) {
-      infoPopup.appendChild(renderInfoRow(name.replace(/_/g, " "), entry?.transforms?.includes(name) ? "True" : "False"));
+    } else {
+      const entry = prefs.get("savedDockerDaemons", {})[active];
+      const label = active === "local" ? "localhost" : active.replace(/^ssh:\/\//, "");
+      infoPopup.appendChild(renderInfoRow("SSH Connection", label));
+      infoPopup.appendChild(renderInfoRow("SSH Key", entry?.ssh_key || "---"));
+      const sep = document.createElement("div");
+      sep.className = "cip-sep";
+      infoPopup.appendChild(sep);
+      for (const name of TRANSFORM_NAMES) {
+        infoPopup.appendChild(renderInfoRow(name.replace(/_/g, " "), entry?.transforms?.includes(name) ? "True" : "False"));
+      }
     }
     infoPopup.hidden = false;
     syncPillPeerVisibility("dockerhost");
-  });
-  wrap.addEventListener("mouseleave", () => {
-    if (infoPopup) infoPopup.hidden = true;
-  });
+    // Deferred to the next task: showDockerHostStatus runs synchronously
+    // as part of the ctxmenu item's own click, which is still bubbling
+    // when this returns -- attaching the listener before that finishes
+    // would let this same click immediately count as the "outside click"
+    // that closes what it just opened.
+    setTimeout(() => {
+      document.addEventListener("click", function onOutside(e) {
+        if (!wrap.contains(e.target)) infoPopup.hidden = true;
+      }, { once: true });
+    }, 0);
+  }
   // Right-click: New/Edit/Remove Docker Host -- the same actions the action
-  // bar's Docker Host group already exposes.
+  // bar's Docker Host group already exposes, plus Current Status.
   wrap.addEventListener("contextmenu", (e) => {
-    if (infoPopup) infoPopup.hidden = true; // don't show both at once if still hovering
+    if (infoPopup) infoPopup.hidden = true; // don't show both at once
     ctxMenu(e, [
       ["New Docker Host…", () => openNewDockerHostDialog(), "#btn-set"],
       ["Edit Docker Host", () => openEditDockerHostDialog(), "#btn-edit-docker-host"],
       ["Remove Docker Host…", () => $("btn-remove-docker-daemon").click(), "#btn-remove-docker-daemon"],
+      "separator",
+      ["Current Status", showDockerHostStatus, CLIPBOARD_ICON_SVG],
     ], "dockerhost");
     syncPillPeerVisibility("dockerhost");
   });
