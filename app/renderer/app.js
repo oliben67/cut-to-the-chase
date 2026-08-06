@@ -897,6 +897,13 @@ function closeCtxMenu() {
 // "<svg ...>...</svg>" string for an entry with no corresponding button to
 // clone from. The literal string "separator" in place of an entry renders
 // a thin divider instead (see Current Status's own entries below for both).
+// A selector-sourced entry also mirrors that button's own .disabled --
+// same reasoning as the icon: the sidebar button is the single source of
+// truth for whether the action is currently available, so the menu entry
+// that duplicates it must never claim to be clickable when the original
+// isn't (previously Edit Docker Host stayed clickable in the menu even
+// with nothing connected, silently no-op'ing when clicked instead of
+// reading as unavailable up front, same as its sidebar button already did).
 // ownerId: opaque tag identifying which caller opened this menu (only the
 // Gateway/Docker Host pills currently pass one, see syncPillPeerVisibility)
 // -- left off entirely by the legend/chart-time menus, which don't care.
@@ -917,6 +924,7 @@ function ctxMenu(e, entries, ownerId) {
     const [label, fn, icon] = entry;
     const b = document.createElement("button");
     let iconEl = null;
+    let sourceBtn = null;
     if (icon?.startsWith?.("<svg")) {
       // Wrapped in a <span>, same shape as the cloned .ab-icon <span> below
       // -- keeps a single ".ctxmenu-icon svg" CSS rule working for both, and
@@ -926,7 +934,8 @@ function ctxMenu(e, entries, ownerId) {
       iconEl = document.createElement("span");
       iconEl.innerHTML = icon;
     } else {
-      const abIcon = icon && document.querySelector(icon)?.querySelector(".ab-icon");
+      sourceBtn = icon && document.querySelector(icon);
+      const abIcon = sourceBtn?.querySelector(".ab-icon");
       if (abIcon) iconEl = abIcon.cloneNode(true);
     }
     if (iconEl) {
@@ -936,7 +945,11 @@ function ctxMenu(e, entries, ownerId) {
     const text = document.createElement("span");
     text.textContent = label;
     b.appendChild(text);
-    b.onclick = () => { closeCtxMenu(); fn(); };
+    if (sourceBtn?.disabled) {
+      b.disabled = true;
+    } else {
+      b.onclick = () => { closeCtxMenu(); fn(); };
+    }
     ctxEl.appendChild(b);
   }
   document.body.appendChild(ctxEl);

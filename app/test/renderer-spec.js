@@ -2987,6 +2987,7 @@
       ok(labels.some((l) => l.includes("Uninstall Gateway")), labels.join(", "));
       ok(labels.some((l) => l === "Current Status"), labels.join(", "));
       ok(buttons.every((b) => b.querySelector(".ctxmenu-icon svg")), "every entry has an icon to the left of its label");
+      ok(buttons.every((b) => !b.disabled), "the Gateway pill's action entries are never gated, mirroring their always-enabled sidebar buttons");
       const statusBtn = buttons.find((b) => b.textContent === "Current Status");
       ok(statusBtn.previousElementSibling?.classList.contains("ctxmenu-sep"), "Current Status is preceded by a divider, separating it from the action entries");
     } finally {
@@ -3087,26 +3088,44 @@
     }
   });
 
-  await T("right-clicking the Docker Host pill opens New/Edit/Remove plus Current Status, separated by a divider; Edit is a no-op with nothing connected", async () => {
+  await T("right-clicking the Docker Host pill opens New/Edit/Remove plus Current Status, separated by a divider; Edit/Remove mirror the sidebar's disabled state", async () => {
     ok(!hasDockerDaemon(), "sanity: nothing connected in this suite's baseline state");
-    mouse($("docker-host-status"), "contextmenu", 5);
+    // Forced empty rather than assumed -- by this point in the suite other
+    // tests may have legitimately left real saved hosts in the catalog
+    // (Set/Update Docker Host persists on a successful connect), so an
+    // un-isolated "sanity: nothing saved" assumption here would be flaky.
+    const saved = prefs.get("savedDockerDaemons", {});
+    prefs.set("savedDockerDaemons", {});
+    syncDockerDaemonButtons();
     try {
-      const menu = document.getElementById("ctxmenu");
-      ok(menu, "actions menu open");
-      const buttons = [...menu.querySelectorAll("button")];
-      const labels = buttons.map((b) => b.textContent);
-      ok(labels.some((l) => l.includes("New Docker Host")), labels.join(", "));
-      ok(labels.some((l) => l === "Edit Docker Host"), labels.join(", "));
-      ok(labels.some((l) => l.includes("Remove Docker Host")), labels.join(", "));
-      ok(labels.some((l) => l === "Current Status"), labels.join(", "));
-      ok(buttons.every((b) => b.querySelector(".ctxmenu-icon svg")), "every entry has an icon to the left of its label");
-      const statusBtn = buttons.find((b) => b.textContent === "Current Status");
-      ok(statusBtn.previousElementSibling?.classList.contains("ctxmenu-sep"), "Current Status is preceded by a divider, separating it from the action entries");
-      buttons.find((b) => b.textContent === "Edit Docker Host").click();
-      eq(dlg.open, false, "no-op -- nothing connected to edit");
+      ok($("btn-edit-docker-host").disabled, "sanity: sidebar's own Edit Docker Host is disabled with nothing connected");
+      ok($("btn-remove-docker-daemon").disabled, "sanity: sidebar's own Remove Docker Host is disabled with no saved hosts");
+      mouse($("docker-host-status"), "contextmenu", 5);
+      try {
+        const menu = document.getElementById("ctxmenu");
+        ok(menu, "actions menu open");
+        const buttons = [...menu.querySelectorAll("button")];
+        const labels = buttons.map((b) => b.textContent);
+        ok(labels.some((l) => l.includes("New Docker Host")), labels.join(", "));
+        ok(labels.some((l) => l === "Edit Docker Host"), labels.join(", "));
+        ok(labels.some((l) => l.includes("Remove Docker Host")), labels.join(", "));
+        ok(labels.some((l) => l === "Current Status"), labels.join(", "));
+        ok(buttons.every((b) => b.querySelector(".ctxmenu-icon svg")), "every entry has an icon to the left of its label");
+        const statusBtn = buttons.find((b) => b.textContent === "Current Status");
+        ok(statusBtn.previousElementSibling?.classList.contains("ctxmenu-sep"), "Current Status is preceded by a divider, separating it from the action entries");
+        const editBtn = buttons.find((b) => b.textContent === "Edit Docker Host");
+        const removeBtn = buttons.find((b) => b.textContent.includes("Remove Docker Host"));
+        ok(editBtn.disabled, "Edit Docker Host disabled in the menu, mirroring its sidebar button");
+        ok(removeBtn.disabled, "Remove Docker Host disabled in the menu, mirroring its sidebar button");
+        editBtn.click();
+        eq(dlg.open, false, "disabled -- clicking it does nothing, nothing connected to edit");
+      } finally {
+        document.body.click();
+        if (dlg.open) dlg.close();
+      }
     } finally {
-      document.body.click();
-      if (dlg.open) dlg.close();
+      prefs.set("savedDockerDaemons", saved);
+      syncDockerDaemonButtons();
     }
   });
 
@@ -3122,6 +3141,7 @@
       mouse($("docker-host-status"), "contextmenu", 5);
       const menu = document.getElementById("ctxmenu");
       const editBtn = [...menu.querySelectorAll("button")].find((b) => b.textContent === "Edit Docker Host");
+      ok(!editBtn.disabled, "Edit Docker Host enabled in the menu now that a daemon is connected");
       editBtn.click();
       await sleep(20);
       eq(dlg.open, true, "dialog opened");
@@ -3132,6 +3152,23 @@
       state.sources = state.sources.filter((s) => s.id !== "__ctx_edit_test");
       syncDockerDaemonButtons();
       if (dlg.open) dlg.close();
+    }
+  });
+
+  await T("right-clicking the Docker Host pill's Remove Docker Host is enabled once a host is saved", () => {
+    const saved = prefs.get("savedDockerDaemons", {});
+    prefs.set("savedDockerDaemons", { "ssh://u@h": { lastUsed: Date.now(), transforms: [] } });
+    syncDockerDaemonButtons();
+    try {
+      ok(!$("btn-remove-docker-daemon").disabled, "sanity: sidebar's own Remove Docker Host is enabled with a saved host");
+      mouse($("docker-host-status"), "contextmenu", 5);
+      const menu = document.getElementById("ctxmenu");
+      const removeBtn = [...menu.querySelectorAll("button")].find((b) => b.textContent.includes("Remove Docker Host"));
+      ok(!removeBtn.disabled, "Remove Docker Host enabled in the menu now that a host is saved");
+    } finally {
+      document.body.click();
+      prefs.set("savedDockerDaemons", saved);
+      syncDockerDaemonButtons();
     }
   });
 

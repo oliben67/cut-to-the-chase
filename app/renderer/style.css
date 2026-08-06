@@ -1126,6 +1126,7 @@ body.sample-armed .strip {
   border-radius: var(--radius-sm);
 }
 #ctxmenu button:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+#ctxmenu button:disabled:hover { background: none; }
 /* Divider between groups of entries (see ctxMenu's "separator" sentinel) --
    same look as .gateway-dropdown's own .gateway-item-sep. */
 .ctxmenu-sep { border-top: 1px solid var(--border); margin: 2px 4px; }
