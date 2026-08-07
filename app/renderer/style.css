@@ -355,7 +355,7 @@ body {
 }
 @keyframes recording-pulse {
   0%, 100% { opacity: 1; }
-  50% { opacity: 0.35; }
+  50% { opacity: 0.85; }
 }
 
 /* #app-body wraps #action-bar + #main-content (the pre-existing #toolbar +
@@ -1645,6 +1645,52 @@ dialog h2 { margin: 0 0 10px; font-size: 15px; }
 #transforms-list label { display: block; padding: 1px 0; color: var(--text-primary); }
 #transforms-list .tdoc { color: var(--muted); }
 .dlg-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
+
+/* Opened Metrics (#dlg-opened-data) -- same look/hover convention as
+   .gateway-dropdown's .gateway-item, but a static in-dialog list rather
+   than a floating popup, and each row carries its own Remove button
+   instead of a single shared action bar. */
+.opened-data-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 320px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 4px;
+}
+.opened-data-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 9px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.opened-data-row:hover { background: var(--accent); color: #fff; }
+.opened-data-row-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.opened-data-row[data-active="true"] .opened-data-row-name::after {
+  content: "● active";
+  font-weight: 400;
+  font-size: 10px;
+  margin-left: 6px;
+  color: #2ecc71;
+}
+.opened-data-row:hover .opened-data-row-name::after { color: inherit; }
+.opened-data-row-remove {
+  flex: 0 0 auto;
+  font-size: 11px;
+  padding: 3px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--text-primary);
+  cursor: pointer;
+}
+.opened-data-row:hover .opened-data-row-remove { background: var(--surface-1); }
+.opened-data-empty { padding: 6px 8px; font-size: 12px; color: var(--muted); }
 
 #dlg-snapshot { min-width: 560px; max-width: 760px; }
 #snapshot-view-switch { margin: 8px 0 6px; }

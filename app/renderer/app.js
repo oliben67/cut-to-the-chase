@@ -2990,6 +2990,7 @@ async function openEditDockerHostDialog() {
   dlg.showModal();
   await enterDockerHostEditMode(currentDockerHost() || "local");
 }
+$("btn-edit-docker-host").onclick = openEditDockerHostDialog;
 
 // Reopens the dialog pre-pointed at hostKey -- host and ssh key are locked
 // (this is "reconfigure/refresh what's already set", editing which
@@ -3139,11 +3140,16 @@ $("dlg-remove-daemon-close").onclick = () => dlgRemoveDaemon.close();
 $("dlg-remove-daemon-delete").onclick = async () => {
   const hostKey = $("remove-daemon-select").value;
   if (!hostKey) return;
+  // Business rule, 2026-08-07: removing the *active* Docker host abandons
+  // a running recording -- warn before the normal "are you sure" below.
+  // An inactive saved daemon can be safely forgotten without disturbing
+  // whatever's actually being recorded from right now.
+  const activeHostKey = currentDockerHost() || "local";
+  if (activeHostKey === hostKey && !(await confirmAbandonRecordingIfAny("Removing this Docker host"))) return;
   if (!confirm(`Permanently forget the saved daemon "${hostKey === "local" ? "localhost" : hostKey}"? This can't be undone.`)) return;
   // If it's currently connected, close it first -- leaving it running while
   // its saved record vanishes would be a dangling, un-editable, un-
   // reconnectable daemon.
-  const activeHostKey = currentDockerHost() || "local";
   if (activeHostKey === hostKey && state.sources.length) {
     await Promise.all(state.sources.map((s) => post("/close", { id: s.id })));
     await refreshAll();
@@ -3317,8 +3323,13 @@ $("btn-load-sample").onclick = async () => {
     // Every picked file is already open -- switch to the last one instead
     // of silently doing nothing: opening an already-open file switches to
     // its existing view, it never duplicates or no-ops quietly (see
-    // setActiveView).
-    if (alreadyOpen.length) setActiveView(`upload://${basename(alreadyOpen[alreadyOpen.length - 1])}`);
+    // setActiveView). resetZoom() restores that file's own range -- without
+    // it, the view stayed wherever it was left, reading as an empty graph/
+    // logs if that was a different (or out-of-range) file (BUG-0091).
+    if (alreadyOpen.length) {
+      setActiveView(`upload://${basename(alreadyOpen[alreadyOpen.length - 1])}`);
+      resetZoom();
+    }
     return;
   }
   try {
@@ -3330,6 +3341,14 @@ $("btn-load-sample").onclick = async () => {
       openedIds.push(...(res.opened || []));
     }
     if (errors.length) alert(errors.map((e) => `${e.path}: ${e.error}`).join("\n"));
+    if (!openedIds.length) {
+      // Uploaded fine (no errors), but the recorded/exported segment(s)
+      // held zero rows for every source. Without this, the call below
+      // still forced a switch into analysis mode with nothing in it,
+      // reading as "the file just vanished" (see BUG-0089).
+      if (!errors.length) alert("No data found in the selected file for its recorded time range.");
+      return;
+    }
     await refreshAll(); // also switches into analysis mode -- see setLiveHidden
     setActiveView(`upload://${basename(files[files.length - 1])}`);
     centerViewOnLoadedStart(openedIds);
@@ -3338,55 +3357,79 @@ $("btn-load-sample").onclick = async () => {
   }
 };
 
-/* ── Opened Data: switch the active view to one of the currently open
-   metric/recording files (see #btn-opened-data in the sidebar, and
-   #menu-opened-data in the File menu) -- purely a visibility flip via
-   setActiveView (sampleFileGroups(), same list Load Data's own
-   already-open dedup above draws from), no re-picking/re-uploading. */
+/* ── Opened Data: one row per currently open metric/recording file (see
+   #btn-opened-data in the sidebar, and #menu-opened-data in the File
+   menu). Clicking a row switches the active view to it -- setActiveView
+   is purely a visibility flip (sampleFileGroups(), same list Load Data's
+   own already-open dedup above draws from), so resetZoom() is what
+   actually restores that file's own range/chart/log data (see
+   BUG-0091 -- setActiveView alone left the previous file's stale, often
+   out-of-range view in place, reading as an empty graph/logs). Each
+   row's own Remove button drops that file from memory instead
+   (ui-EXPORT-023), uniformly for metric and recording files. */
 const dlgOpenedData = $("dlg-opened-data");
 
-function populateOpenedDataSelect() {
-  const select = $("opened-data-select");
+function openOpenedDataRow(path) {
+  dlgOpenedData.close();
+  setActiveView(path);
+  resetZoom();
+}
+
+// Applies uniformly to metric and recording files alike (per explicit
+// user direction, superseding the old View pill's .cttc-record exemption
+// -- see ui-EXPORT-019, retired). The underlying file on disk is never
+// touched -- re-opening it via Load Data/Open Recording brings it right
+// back. The dialog stays open afterward (unlike clicking a row) so
+// several files can be removed in one pass; refreshAll()'s existing
+// self-heal (ui-EXPORT-018) picks the next active view, or falls back to
+// Live, if the removed file was active.
+async function removeOpenedDataRow(path) {
+  const group = sampleFileGroups().find((g) => g.path === path);
+  if (!group) return;
+  await Promise.all([...group.ids].map((id) => post("/close", { id })));
+  await refreshAll();
+  populateOpenedDataList();
+}
+
+function populateOpenedDataList() {
+  const list = $("opened-data-list");
   const groups = sampleFileGroups();
-  select.innerHTML = "";
+  list.innerHTML = "";
   if (!groups.length) {
-    const opt = document.createElement("option");
-    opt.textContent = "No files currently open";
-    opt.disabled = true;
-    select.appendChild(opt);
-    select.disabled = true;
-    $("dlg-opened-data-open").disabled = true;
+    const empty = document.createElement("div");
+    empty.className = "opened-data-empty";
+    empty.textContent = "No files currently open";
+    list.appendChild(empty);
     return;
   }
-  select.disabled = false;
   for (const g of groups) {
-    const opt = document.createElement("option");
-    opt.value = g.path;
-    opt.textContent = basename(g.path);
-    select.appendChild(opt);
+    const row = document.createElement("div");
+    row.className = "opened-data-row";
+    row.dataset.path = g.path;
+    row.setAttribute("role", "option");
+    if (g.path === state.activeSamplePath) row.dataset.active = "true";
+    const name = document.createElement("span");
+    name.className = "opened-data-row-name";
+    name.textContent = basename(g.path);
+    row.appendChild(name);
+    const removeBtn = document.createElement("button");
+    removeBtn.className = "opened-data-row-remove";
+    removeBtn.textContent = "Remove";
+    removeBtn.title = "Remove from memory (the file itself is untouched)";
+    removeBtn.onclick = async (e) => {
+      e.stopPropagation();
+      await removeOpenedDataRow(g.path);
+    };
+    row.appendChild(removeBtn);
+    row.onclick = () => openOpenedDataRow(g.path);
+    list.appendChild(row);
   }
-  // Pre-selects the active view's own file when it's one of these -- Live
-  // (or a hidden-in-background file that isn't the active view) falls back
-  // to the first entry instead of leaving the select on nothing.
-  select.value = groups.some((g) => g.path === state.activeSamplePath) ? state.activeSamplePath : groups[0].path;
-  $("dlg-opened-data-open").disabled = false;
 }
 $("btn-opened-data").onclick = () => {
-  populateOpenedDataSelect();
+  populateOpenedDataList();
   dlgOpenedData.showModal();
 };
 $("dlg-opened-data-cancel").onclick = () => dlgOpenedData.close();
-function openSelectedOpenedData() {
-  const select = $("opened-data-select");
-  if (select.disabled || !select.value) return;
-  dlgOpenedData.close();
-  setActiveView(select.value);
-}
-$("dlg-opened-data-open").onclick = openSelectedOpenedData;
-// Double-clicking the select control itself (once it already shows a
-// file -- native <select> options don't carry their own dblclick) opens
-// that selection directly, without an extra trip to the Open button.
-$("opened-data-select").ondblclick = openSelectedOpenedData;
 
 /* ── Recording (Start/Pause/Stop/Open Recording, Recording menu) ─────────
    Each Record→Pause span is flushed as one more segment into the same
@@ -3625,6 +3668,42 @@ async function stopRecording() {
   await persistRecordingMarker();
 }
 
+// Erases the current in-progress/paused/stopped-but-unsaved recording
+// outright (business rule, 2026-08-07: editing or deleting the active
+// Gateway/Docker Host abandons whatever recording is running, since the
+// live data it was capturing no longer corresponds to a stable source --
+// see confirmAbandonRecordingIfAny below). Overwrites the scratch file
+// with nothing rather than leaving stale bytes for the next
+// startRecording to silently build on (the fixed-path design otherwise
+// merges onto whatever's already there, see flushRecordingSegment).
+async function discardRecording() {
+  if (recording.status === "idle") return;
+  try {
+    await writeRecordingBytes(recording.path, new Uint8Array(0));
+  } catch {
+    /* best-effort -- the state reset below still happens regardless */
+  }
+  setRecordingState({ status: "idle", path: null, segmentStart: null, segments: [] });
+  await persistRecordingMarker();
+  drawAll(); // clears the capture-range highlight immediately
+  notifyEvent("Recording discarded");
+}
+
+// Gate for any action that edits or deletes the *active* Gateway/Docker
+// Host: warns that doing so abandons an in-progress, paused, or
+// stopped-but-not-yet-saved recording, and only proceeds (discarding it)
+// if the user confirms. Returns true if the caller should continue with
+// its own action, false if it should abort. A no-op (returns true
+// immediately) when nothing is recording.
+async function confirmAbandonRecordingIfAny(actionLabel) {
+  if (recording.status === "idle") return true;
+  if (!confirm(`${actionLabel} will abandon the recording currently in progress -- it has not been saved and will be disposed. Continue?`)) {
+    return false;
+  }
+  await discardRecording();
+  return true;
+}
+
 // Same pattern as pickAnalysisFiles/pickRecordingSavePath: a named wrapper
 // around the native picker so tests can substitute canned paths.
 async function pickRecordingFiles() {
@@ -3649,8 +3728,11 @@ async function openRecording() {
   const files = paths.filter((p) => p.endsWith(".cttc-record") && !open.has(`upload://${basename(p)}`));
   if (!files.length) {
     // Already open -- switch to it instead of silently doing nothing (see
-    // btn-load-sample's matching comment/setActiveView).
-    if (alreadyOpen.length) setActiveView(`upload://${basename(alreadyOpen[alreadyOpen.length - 1])}`);
+    // btn-load-sample's matching comment/setActiveView/resetZoom).
+    if (alreadyOpen.length) {
+      setActiveView(`upload://${basename(alreadyOpen[alreadyOpen.length - 1])}`);
+      resetZoom();
+    }
     return;
   }
   try {
@@ -3662,6 +3744,15 @@ async function openRecording() {
       openedIds.push(...(res.opened || []));
     }
     if (errors.length) alert(errors.map((e) => `${e.path}: ${e.error}`).join("\n"));
+    if (!openedIds.length) {
+      // Uploaded fine (no errors), but the recorded segment(s) held zero
+      // rows for every source -- e.g. Stop was hit before any data had
+      // actually arrived. Without this, the call below still forced a
+      // switch into analysis mode with nothing in it, reading as "the
+      // recording just vanished" (see BUG-0089).
+      if (!errors.length) alert("No data found in the selected recording for its recorded time range.");
+      return;
+    }
     await refreshAll(); // also switches into analysis mode -- see setLiveHidden
     setActiveView(`upload://${basename(files[files.length - 1])}`);
     centerViewOnLoadedStart(openedIds);
@@ -4316,6 +4407,11 @@ $("dlg-cancel").onclick = () => {
 };
 
 $("dlg-ok").onclick = async () => {
+  // Editing the active Docker host (never New -- that's always a
+  // different/blank host, see openNewDockerHostDialog) can change/restart
+  // its collection -- business rule, 2026-08-07: warn that this abandons
+  // a running recording.
+  if (dockerDaemonEditMode && !(await confirmAbandonRecordingIfAny("Editing this Docker host"))) return;
   const transforms = chosenTransforms();
   try {
     const host = normalizeDockerHost($("docker-host").value);
@@ -4751,6 +4847,9 @@ $("gw-uninstall-close").onclick = () => dlgGatewayUninstall.close();
 $("gw-uninstall-delete").onclick = async () => {
   const g = gwUninstallSelectedGateway();
   if (!g) return;
+  // Business rule, 2026-08-07: uninstalling the *active* gateway abandons
+  // a running recording -- warn before the normal "are you sure" below.
+  if (g.active && !(await confirmAbandonRecordingIfAny("Uninstalling this gateway"))) return;
   if (!confirm(`Uninstall ${g.label || g.host}? This stops and removes its container.`)) return;
   $("gw-uninstall-error").hidden = true;
   $("gw-uninstall-select").disabled = true;
@@ -4783,6 +4882,12 @@ $("gw-form").onsubmit = async (e) => {
   e.preventDefault();
   const gw = gwMode === "edit" ? gwSelectedGateway() : null;
   if (gwMode === "edit" && !gw) return; // nothing picked yet -- button is disabled anyway
+  // Editing the *active* gateway can change/restart its connection --
+  // business rule, 2026-08-07: warn that this abandons a running recording.
+  // A New Gateway (gwMode === "new") never touches the active one, and
+  // editing an inactive saved gateway doesn't disturb the current
+  // connection either, so neither needs this check.
+  if (gwMode === "edit" && gw.active && !(await confirmAbandonRecordingIfAny("Editing this gateway"))) return;
   const isEmbeddedEdit = gwMode === "edit" && gw.mode === "embedded";
 
   $("gw-error").hidden = true;
@@ -5637,15 +5742,13 @@ function setActiveView(view) {
   setLiveHidden(true);
 }
 
-// Closes every loaded sample/recording source outright (live collection,
-// per its own docstring, was never stopped -- there's nothing else "live"
-// to resume) -- setLiveHidden(false) then follows automatically from
-// refreshAll() once no sample sources remain.
-$("btn-back-to-live").onclick = async () => {
-  const sampleSources = state.sources.filter((s) => s.live === false);
-  await Promise.all(sampleSources.map((s) => post("/close", { id: s.id })));
-  await refreshAll();
-};
+// A thin wrapper around setActiveView("live"), same as switching to any
+// other open file (ui-LIVE-016) -- does NOT close any loaded sample/
+// recording source. Live collection, per its own docstring, was never
+// stopped while viewing analysis mode, so there's nothing to "resume";
+// closing loaded data the moment you leave it for Live would just
+// discard state the user could still come back for via Opened Metrics.
+$("btn-back-to-live").onclick = () => setActiveView("live");
 
 /* ── boot ───────────────────────────────────────────────────────────────── */
 
@@ -6077,36 +6180,14 @@ const CLIPBOARD_ICON_SVG = '<svg viewBox="0 0 512 512" fill="currentColor" aria-
   const el = $("server-status");
   if (!el) return;
   const btn = $("server-status-btn");
-  // Static for the life of this window (HOST/PORT are set once, from the
-  // URL main.js loaded it with) -- where the gateway actually is, not just
-  // whether it's reachable, matters most for "remote" mode (see
-  // docs/architecture/remote-server.md), where it's easy to forget which
-  // host is actually being talked to. HOST/PORT alone can't tell a tunneled
-  // connection apart from a genuinely local one though (both are
-  // 127.0.0.1) -- getConnectionInfo (below) fills that gap. Kept out of the
-  // pill's own visible text (see setState) -- surfaced only as a tooltip,
-  // for anyone hovering, not printed inline next to the dot.
-  const statusHost = HOST === "127.0.0.1" ? "localhost" : HOST;
-  let locationLabel = PORT == null || PORT === "null" ? statusHost : `${statusHost}:${PORT}`;
-
-  // Tunneled connections talk over 127.0.0.1 (HOST/PORT above), but showing
-  // "localhost" there would hide which gateway is actually active -- swap
-  // in the real gateway host:port + a "(tunnel)" suffix once
-  // getConnectionInfo confirms that's what this connection is.
   // connectionType/gateway identity/ssh info aren't in the URL's host=&port=
   // to begin with (those are just the client-facing address), so they're
-  // fetched separately from main.js's connection state.
+  // fetched separately from main.js's connection state -- used by
+  // showGatewayStatus's "Current Status" popup below.
   let connectionInfo = null;
   async function loadConnectionInfo() {
     if (!window.cttc?.getConnectionInfo) return;
     connectionInfo = await window.cttc.getConnectionInfo();
-    if (connectionInfo.connectionType === "remote-tunnel") {
-      const loc = connectionInfo.gatewayPort == null
-        ? connectionInfo.gatewayHost
-        : `${connectionInfo.gatewayHost}:${connectionInfo.gatewayPort}`;
-      locationLabel = `${loc} (tunnel)`;
-      btn.title = `${locationLabel} — Switch gateway…`;
-    }
   }
   loadConnectionInfo();
 
@@ -6171,13 +6252,12 @@ const CLIPBOARD_ICON_SVG = '<svg viewBox="0 0 512 512" fill="currentColor" aria-
   });
 
   const HEALTH_POLL_MS = 5000;
-  // The status pill itself only ever shows a colored dot -- the gateway
-  // location lives in this tooltip instead (see locationLabel above), and
-  // failure text goes to the bottom status bar (notifyEvent), not a
-  // tooltip nobody's necessarily hovering over.
+  // The status pill itself only ever shows a colored dot, no tooltip --
+  // gateway location/connection detail is one right-click ("Current
+  // Status") away instead, and failure text goes to the bottom status bar
+  // (notifyEvent).
   const setState = (state) => {
     el.dataset.state = state;
-    btn.title = `${locationLabel} — Switch gateway…`;
   };
   let checking = false;
   // The last *confirmed* (up/down) state, for edge-detecting the
@@ -6434,15 +6514,13 @@ const CLIPBOARD_ICON_SVG = '<svg viewBox="0 0 512 512" fill="currentColor" aria-
     syncPillPeerVisibility("dockerhost");
   });
 
-  // Updates the dot/tooltip alone -- cheap enough to run on every
-  // state.sources refresh (see refreshDockerHostPill), unlike render()'s
-  // full dropdown rebuild, which only needs to happen while it's open.
-  // Returns the active hostKey (or null), since render() needs it too.
+  // Updates the dot alone -- cheap enough to run on every state.sources
+  // refresh (see refreshDockerHostPill), unlike render()'s full dropdown
+  // rebuild, which only needs to happen while it's open. Returns the
+  // active hostKey (or null), since render() needs it too.
   const syncPill = () => {
     const active = hasDockerDaemon() ? currentDockerHost() || "local" : null;
     wrap.dataset.state = active ? "up" : "";
-    const label = active == null ? null : active === "local" ? "localhost" : active.replace(/^ssh:\/\//, "");
-    btn.title = label ? `${label} — Manage Docker hosts…` : "Manage Docker hosts…";
     return active;
   };
   refreshDockerHostPill = syncPill;

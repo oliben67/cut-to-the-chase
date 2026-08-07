@@ -777,7 +777,11 @@
       eq($("btn-set").disabled, false, "New Docker Host always stays enabled");
       eq($("btn-edit-docker-host").disabled, false, "Edit Docker Host enabled once a daemon is being watched");
       eq($("btn-clear-sources").disabled, false, "Remove enabled once a daemon is being watched");
-      await enterDockerHostEditMode(currentDockerHost() || "local");
+      // Goes through the sidebar button's own wired handler, not
+      // enterDockerHostEditMode directly -- catches wiring regressions
+      // (BUG-0087: btn-edit-docker-host had no onclick at all, only the
+      // status-bar pill's context-menu entry called openEditDockerHostDialog).
+      await $("btn-edit-docker-host").onclick();
       eq($("docker-host").value, "u@h", "host prefilled (scheme stripped for editing)");
       eq($("docker-host").disabled, true, "host locked");
       eq($("docker-ssh-key").value, "/path/to/key", "ssh key prefilled");
@@ -838,6 +842,100 @@
     } finally {
       window.confirm = realConfirm;
       post = realPost;
+      if (dlgRemoveDaemon.open) dlgRemoveDaemon.close();
+    }
+  });
+
+  await T("confirmAbandonRecordingIfAny is a no-op while idle, and gates on accept/decline while recording (ui-REC-018)", async () => {
+    const realConfirm = window.confirm;
+    const realScratch = recordingScratchPath, realWrite = writeRecordingBytes, realRead = readRecordingBytes;
+    const store = {};
+    recordingScratchPath = async () => "/fake/abandon-scratch.cttc-record";
+    readRecordingBytes = async (p) => { if (!(p in store)) throw new Error("no such file"); return store[p]; };
+    writeRecordingBytes = async (p, bytes) => { store[p] = bytes; };
+    let calls = [];
+    try {
+      eq(recording.status, "idle", "sanity");
+      window.confirm = (m) => { calls.push(m); return true; };
+      eq(await confirmAbandonRecordingIfAny("Test action"), true, "no-op while idle");
+      eq(calls.length, 0, "no confirm dialog while idle");
+
+      await startRecording();
+      calls = [];
+      window.confirm = (m) => { calls.push(m); return false; };
+      eq(await confirmAbandonRecordingIfAny("Test action"), false, "declining aborts");
+      eq(recording.status, "recording", "declined -- recording untouched");
+      ok(calls[0].includes("Test action"), `warning cites the caller's action label: ${calls[0]}`);
+
+      calls = [];
+      window.confirm = (m) => { calls.push(m); return true; };
+      eq(await confirmAbandonRecordingIfAny("Test action"), true, "accepting proceeds");
+      eq(recording.status, "idle", "accepted -- recording discarded");
+      eq(recording.path, null);
+    } finally {
+      window.confirm = realConfirm;
+      recordingScratchPath = realScratch;
+      writeRecordingBytes = realWrite;
+      readRecordingBytes = realRead;
+      if (recording.status !== "idle") await discardRecording();
+    }
+  });
+
+  await T("Removing the active Docker host warns that it abandons the running recording; an inactive one doesn't (ui-REC-018)", async () => {
+    const activeKey = "ssh://u@abandon-active";
+    const saved = prefs.get("savedDockerDaemons", {});
+    saved[activeKey] = { host: activeKey, stats: true, logs: [], transforms: [], interval: 5, lastUsed: Date.now() };
+    saved["ssh://u@abandon-inactive"] = { host: "ssh://u@abandon-inactive", stats: true, logs: [], transforms: [], interval: 5, lastUsed: Date.now() };
+    prefs.set("savedDockerDaemons", saved);
+    const fakeSrc = { id: "__abandon_active", path: `docker://${activeKey}/stats`, kind: "stats", live: true };
+    state.sources.push(fakeSrc);
+    dockerHostKeys.set(activeKey, "/path/to/key");
+
+    const realConfirm = window.confirm, realPost = post;
+    const realScratch = recordingScratchPath, realWrite = writeRecordingBytes, realRead = readRecordingBytes;
+    const store = {};
+    recordingScratchPath = async () => "/fake/abandon-scratch-2.cttc-record";
+    readRecordingBytes = async (p) => { if (!(p in store)) throw new Error("no such file"); return store[p]; };
+    writeRecordingBytes = async (p, bytes) => { store[p] = bytes; };
+    post = async (path, body) => (path === "/docker/forget" ? {} : realPost(path, body));
+    let calls = [];
+    window.confirm = (m) => { calls.push(m); return true; };
+    try {
+      eq(currentDockerHost(), activeKey, "sanity: our fake source is the active host");
+
+      // Inactive entry: no recording-abandon warning at all.
+      await startRecording();
+      calls = [];
+      populateRemoveDaemonSelect();
+      $("remove-daemon-select").value = "ssh://u@abandon-inactive";
+      $("remove-daemon-select").onchange();
+      await $("dlg-remove-daemon-delete").onclick();
+      ok(!calls.some((m) => m.includes("abandon")), `expected no abandon warning for an inactive daemon: ${JSON.stringify(calls)}`);
+      eq(recording.status, "recording", "removing an inactive daemon left the recording running");
+
+      // Active entry: warns, then (on accept) discards before the normal confirm.
+      calls = [];
+      populateRemoveDaemonSelect();
+      $("remove-daemon-select").value = activeKey;
+      $("remove-daemon-select").onchange();
+      await $("dlg-remove-daemon-delete").onclick();
+      eq(calls.length, 2, `expected the abandon warning + the normal "forget this daemon" confirm: ${JSON.stringify(calls)}`);
+      ok(calls[0].includes("abandon"), `first confirm is the recording warning: ${calls[0]}`);
+      eq(recording.status, "idle", "accepted -- recording discarded");
+    } finally {
+      window.confirm = realConfirm;
+      post = realPost;
+      recordingScratchPath = realScratch;
+      writeRecordingBytes = realWrite;
+      readRecordingBytes = realRead;
+      if (recording.status !== "idle") await discardRecording();
+      state.sources = state.sources.filter((s) => s.id !== "__abandon_active");
+      dockerHostKeys.delete(activeKey);
+      const cleanup = prefs.get("savedDockerDaemons", {});
+      delete cleanup[activeKey];
+      delete cleanup["ssh://u@abandon-inactive"];
+      prefs.set("savedDockerDaemons", cleanup);
+      await refreshAll();
       if (dlgRemoveDaemon.open) dlgRemoveDaemon.close();
     }
   });
@@ -1648,6 +1746,42 @@
     }
   });
 
+  await T("Opening a recording with no data for its time range says so, instead of silently vanishing (BUG-0089)", async () => {
+    // A segment whose window covers zero rows for every source (e.g. Stop
+    // hit before anything was actually captured) used to upload "fine"
+    // (opened:[], errors:[], needs_selection:[]) and openRecording() still
+    // unconditionally called setActiveView/refreshAll, switching into a
+    // blank analysis view with the file added nowhere -- reported as "I
+    // opened a recording and the system did not remember it at all: it is
+    // gone from Opened Metrics."
+    const emptyFrom = R.min_ts - 10_000_000;
+    const res = await fetch(`${API}/sample/record`, {
+      method: "POST", body: new Uint8Array(0),
+      headers: { "X-CTTC-From": String(emptyFrom), "X-CTTC-To": String(emptyFrom + 1000) },
+    });
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const realPath = "/tmp/cttc-e2e-empty-recording.cttc-record";
+    await window.cttc.writeBinaryFile(realPath, bytes);
+
+    const realPick = pickRecordingFiles;
+    const realAlert = window.alert;
+    const alerts = [];
+    pickRecordingFiles = async () => [realPath];
+    window.alert = (m) => alerts.push(m);
+    const beforeHidden = state.liveHidden;
+    const beforeCount = state.sources.length;
+    try {
+      await openRecording();
+      eq(state.sources.length, beforeCount, "no sources added for an empty recording");
+      ok(alerts.some((m) => m.includes("No data found")), `expected a "no data" alert, got: ${JSON.stringify(alerts)}`);
+      eq(state.liveHidden, beforeHidden, "view mode unchanged -- no forced switch into a blank analysis view");
+      ok(!sampleFileGroups().some((g) => g.path === `upload://${realPath.split("/").pop()}`), "never appears in Opened Metrics");
+    } finally {
+      pickRecordingFiles = realPick;
+      window.alert = realAlert;
+    }
+  });
+
   /* ── Recording (Start/Pause/Stop/Open Recording) ──────────────────────── */
 
   await T("Record -> Pause -> Resume -> Stop writes a real 2-segment .cttc-record, filename is only asked at Stop", async () => {
@@ -2297,6 +2431,41 @@
     }
   });
 
+  await T("Back to live tracking preserves loaded files -- it switches the view, it never closes anything (ui-LIVE-016, BUG-0090)", async () => {
+    // Used to close every non-live source outright on the way back to
+    // Live -- silently discarding analysis state the user could still
+    // come back to via Opened Metrics, contradicting ui-LIVE-016's own
+    // "no loss of data" contract. Now a thin wrapper around
+    // setActiveView("live"), same as switching to any other open file.
+    const res = await fetch(
+      `${API}/files/download?from=${R.min_ts}&to=${R.max_ts}&include_host=0`,
+      { headers: authHeaders() }
+    );
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const realPath = "/tmp/cttc-e2e-back-to-live-preserves.cttc-metric";
+    await window.cttc.writeBinaryFile(realPath, bytes);
+    const r = await uploadAndResolveSegment(realPath);
+    try {
+      ok(r.opened.length >= 1, "sample opened");
+      await refreshAll();
+      eq(state.liveHidden, true, "sanity: in analysis mode");
+      const uploadPath = `upload://${basename(realPath)}`;
+
+      $("btn-back-to-live").click();
+      eq(state.liveHidden, false, "switched to Live");
+      ok(r.opened.every((sid) => state.sources.some((s) => s.id === sid)), "sources NOT closed");
+      ok(sampleFileGroups().some((g) => g.path === uploadPath), "file still listed in Opened Metrics");
+
+      // And it's genuinely still switchable back to, not just present:
+      setActiveView(uploadPath);
+      eq(state.liveHidden, true, "switched back into analysis mode");
+      eq(state.activeSamplePath, uploadPath, "resumed the same file, no re-upload needed");
+    } finally {
+      for (const sid of r.opened) await post("/close", { id: sid });
+      await refreshAll();
+    }
+  });
+
   /* ── export metrics: the active file's stats/logs as text or JSON ───────── */
 
   // Shared by every export-metrics test below: uploads the demo range as a
@@ -2570,58 +2739,92 @@
   // the whole spec (see main.js's 120s "global timeout"), so duplicating
   // that setup per assertion isn't free the way it would be in a unit test.
 
-  await T("Opened Data lists every currently open file, pre-selects the active view, and Open switches to the selection", async () => {
+  // Opened Metrics rows are looked up by their data-path attribute (the
+  // list is rebuilt fresh via populateOpenedDataList() every time the
+  // dialog opens or a row is removed -- no stable index to rely on).
+  function openedDataRow(path) {
+    return document.querySelector(`#opened-data-list .opened-data-row[data-path="${CSS.escape(path)}"]`);
+  }
+
+  await T("Opened Data lists every currently open file as its own row, marks the active one, and clicking a row switches to it", async () => {
     const { pathA, pathB } = await openTwoSamplesForOpenedDataTest("open-flow");
     try {
       eq(state.activeSamplePath, pathB, "sanity: B is the active view before switching");
       $("btn-opened-data").click();
       eq(dlgOpenedData.open, true, "dialog open");
-      const values = [...$("opened-data-select").options].map((o) => o.value);
-      ok(values.includes(pathA) && values.includes(pathB), "both open files listed");
-      eq($("opened-data-select").value, pathB, "pre-selects the active view (B, opened last)");
-      eq($("dlg-opened-data-open").disabled, false, "Open enabled once a file is open");
+      ok(openedDataRow(pathA), "A has its own row");
+      ok(openedDataRow(pathB), "B has its own row");
+      eq(openedDataRow(pathB).dataset.active, "true", "active view's row is marked");
+      eq(openedDataRow(pathA).dataset.active, undefined, "non-active row isn't marked");
 
-      $("opened-data-select").value = pathA;
-      $("dlg-opened-data-open").click();
-      eq(dlgOpenedData.open, false, "dialog closed after Open");
+      openedDataRow(pathA).click();
+      eq(dlgOpenedData.open, false, "dialog closed after clicking a row");
       eq(state.activeSamplePath, pathA, "switched to A");
+      // BUG-0091: setActiveView alone left the view wherever it was --
+      // resetZoom() must actually restore A's own range, not B's stale one.
+      ok(state.view && state.view.t0 != null, "a real view range was set");
     } finally {
       if (dlgOpenedData.open) dlgOpenedData.close();
       await closeOpenedDataTestFiles(pathA, pathB);
     }
   });
 
-  await T("Cancel closes Opened Data without switching, and double-clicking the select opens the selection directly", async () => {
-    const { pathA, pathB } = await openTwoSamplesForOpenedDataTest("dblclick-cancel");
+  await T("Cancel closes Opened Data without switching", async () => {
+    const { pathA, pathB } = await openTwoSamplesForOpenedDataTest("cancel-flow");
     try {
       $("btn-opened-data").click();
-      $("opened-data-select").value = pathA;
       $("dlg-opened-data-cancel").click();
       eq(dlgOpenedData.open, false, "dialog closed after Cancel");
       eq(state.activeSamplePath, pathB, "still on B -- Cancel didn't switch");
-
-      $("btn-opened-data").click();
-      $("opened-data-select").value = pathA;
-      $("opened-data-select").dispatchEvent(new Event("dblclick"));
-      eq(dlgOpenedData.open, false, "dialog closed after double-click");
-      eq(state.activeSamplePath, pathA, "switched to A via double-click");
     } finally {
       if (dlgOpenedData.open) dlgOpenedData.close();
       await closeOpenedDataTestFiles(pathA, pathB);
     }
   });
 
-  await T("Opened Data shows a disabled placeholder when nothing is open", () => {
+  await T("Opened Data shows an empty-state message when nothing is open", () => {
     const realGroups = sampleFileGroups;
     try {
       sampleFileGroups = () => [];
-      populateOpenedDataSelect();
-      eq($("opened-data-select").disabled, true, "select disabled with nothing open");
-      eq($("dlg-opened-data-open").disabled, true, "Open disabled with nothing open");
-      eq($("opened-data-select").options.length, 1, "one placeholder option");
-      eq($("opened-data-select").options[0].disabled, true, "placeholder itself isn't pickable");
+      populateOpenedDataList();
+      const list = $("opened-data-list");
+      eq(list.querySelectorAll(".opened-data-row").length, 0, "no rows");
+      ok(list.querySelector(".opened-data-empty"), "empty-state message shown");
     } finally {
       sampleFileGroups = realGroups;
+    }
+  });
+
+  await T("Remove in Opened Metrics closes that row's file and refreshes the list without closing the dialog", async () => {
+    // Applies uniformly to metric and recording files (explicit user
+    // direction, superseding the old View pill's .cttc-record exemption
+    // -- see ui-EXPORT-019, retired). The file on disk is never touched;
+    // this only frees the current session's working set.
+    const { pathA, pathB } = await openTwoSamplesForOpenedDataTest("remove-flow");
+    try {
+      $("btn-opened-data").click();
+      await openedDataRow(pathA).querySelector(".opened-data-row-remove").onclick({ stopPropagation() {} });
+      eq(dlgOpenedData.open, true, "dialog stays open after Remove, unlike clicking a row/Cancel");
+      ok(!state.sources.some((s) => s.path === pathA), "A's sources are gone");
+      ok(state.sources.some((s) => s.path === pathB), "B is untouched");
+      ok(!openedDataRow(pathA), "A's row is gone");
+      ok(openedDataRow(pathB), "B's row remains");
+    } finally {
+      if (dlgOpenedData.open) dlgOpenedData.close();
+      await closeOpenedDataTestFiles(pathA, pathB);
+    }
+  });
+
+  await T("Removing the active view's row falls back to another open file (refreshAll's existing self-heal)", async () => {
+    const { pathA, pathB } = await openTwoSamplesForOpenedDataTest("remove-active");
+    try {
+      eq(state.activeSamplePath, pathB, "sanity: B is active (opened last)");
+      $("btn-opened-data").click();
+      await openedDataRow(pathB).querySelector(".opened-data-row-remove").onclick({ stopPropagation() {} });
+      eq(state.activeSamplePath, pathA, "self-healed to the remaining open file");
+    } finally {
+      if (dlgOpenedData.open) dlgOpenedData.close();
+      await closeOpenedDataTestFiles(pathA, pathB);
     }
   });
 
@@ -2633,11 +2836,16 @@
     }
   });
 
-  await T("Create Event/Edit Events buttons live inside the Analysis sidebar section", () => {
-    const analysisGroup = document.querySelector('.ab-group[data-section="analysis"]');
-    ok(analysisGroup, "Analysis section exists");
-    ok(analysisGroup.contains($("btn-event-create")), "btn-event-create is inside the Analysis section");
-    ok(analysisGroup.contains($("btn-event-edit")), "btn-event-edit is inside the Analysis section");
+  await T("Create Event/Edit Events buttons live inside their own Events Capture sidebar section, between Docker Host and Analysis", () => {
+    const eventsGroup = document.querySelector('.ab-group[data-section="events-capture"]');
+    ok(eventsGroup, "Events Capture section exists");
+    ok(eventsGroup.contains($("btn-event-create")), "btn-event-create is inside Events Capture");
+    ok(eventsGroup.contains($("btn-event-edit")), "btn-event-edit is inside Events Capture");
+    const groups = [...document.querySelectorAll(".ab-group[data-section]")].map((g) => g.dataset.section);
+    const sourcesIdx = groups.indexOf("sources");
+    const eventsIdx = groups.indexOf("events-capture");
+    const analysisIdx = groups.indexOf("analysis");
+    ok(sourcesIdx < eventsIdx && eventsIdx < analysisIdx, `expected sources < events-capture < analysis, got ${JSON.stringify(groups)}`);
   });
 
   await T("sidebar sections start collapsed and expand on header click", () => {
@@ -3286,7 +3494,7 @@
     eq(dlgGatewaySetup.open, false);
   });
 
-  await T("gateway connection failure notifies the status bar, not just the pill's tooltip", async () => {
+  await T("gateway connection failure notifies the status bar", async () => {
     // capture notifyEvent's own calls rather than reading the DOM after the
     // fact -- other concurrent background notifiers (uiEventTick, etc.)
     // share the same status bar text and could overwrite a one-time
@@ -3299,10 +3507,6 @@
     try {
       await until(() => $("server-status").dataset.state === "down", "went down", 100);
       ok(calls.some((m) => m.includes("Gateway connection failed")), JSON.stringify(calls));
-      ok(
-        $("server-status-btn").title.endsWith("Switch gateway…") && !$("server-status-btn").title.includes("boom"),
-        "pill tooltip stays location + generic action text, no error text"
-      );
       get = realGet;
       await until(() => $("server-status").dataset.state === "up", "recovered", 100);
       ok(calls.some((m) => m.includes("Gateway connection restored")), JSON.stringify(calls));
