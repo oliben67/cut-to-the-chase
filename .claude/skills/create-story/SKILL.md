@@ -4,7 +4,7 @@ argument-hint: <description>
 ---
 
 Per `.catalyst-proj/work-items/rules-of-work-items.md` §1 and
-`.catalyst-proj/rules/rules-of-development.md` §3: create a new story
+`.catalyst-proj/CODE-OF-CONDUCT.md` §3: create a new story
 immediately from the description in `$0`, register it in
 `work-items/stories/stories.md`, and track it the same way as any other
 work item — don't just describe what you'd do, actually create the file.
@@ -31,4 +31,4 @@ work item — don't just describe what you'd do, actually create the file.
 
 Never create a story without a `REQ-`/`BUG-` doc behind it — that is the
 Scrum-layer expression of "no development without a targeted rule" (per
-`rules-of-development.md` §1).
+`CODE-OF-CONDUCT.md` §1).

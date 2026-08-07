@@ -3,7 +3,7 @@ description: Run the catalyst framework's analysis playbook to bootstrap rules/d
 argument-hint: [recipe or focus area]
 ---
 
-Per `.catalyst-proj/rules/rules-of-development.md` §3: open and run
+Per `.catalyst-proj/CODE-OF-CONDUCT.md` §3: open and run
 [`ANALYSIS-PLAYBOOK.md`](../../.vscode/development-framework/ANALYSIS-PLAYBOOK.md)
 against this project, following its steps and returning the resulting
 analysis summary. If the playbook file is missing from the mirror, report
@@ -22,11 +22,11 @@ that it's unavailable — do not invent its content from memory.
 4. Output of a rule-extraction pass is individual `REQ-NNNN-slug.md`
    files under `.catalyst-proj/requirements/` plus an index entry in
    `requirements/requirements.md` — never one bundled document (per
-   `rules-of-development.md`'s hard rule on individual files and
+   `CODE-OF-CONDUCT.md`'s hard rule on individual files and
    indexes).
 5. Any newly identified domain gets its own
    `.catalyst-proj/domains/<prefix>-<CODE>.md` file (copy
    `domains/TEMPLATE-DOMAIN.md`) and an entry in `domains/domains.md`,
-   per `rules-of-rules.md` §6, before any rule bullet cites it.
+   per `Rules-of-Rules.md` §7, before any rule bullet cites it.
 6. Report a summary of what was extracted/created — don't just say the
    playbook ran; name the specific files added or updated.

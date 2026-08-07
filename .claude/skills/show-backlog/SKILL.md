@@ -2,7 +2,7 @@
 description: Summarize open work, blockers, and missing links from BACKLOG.md and the artifact indexes
 ---
 
-Per `.catalyst-proj/rules/rules-of-development.md` §3: inspect
+Per `.catalyst-proj/CODE-OF-CONDUCT.md` §3: inspect
 `.catalyst-proj/development/BACKLOG.md` and the artifact indexes, then
 summarize the relevant open work and blockers — a read-only report, don't
 modify anything.
@@ -13,7 +13,7 @@ modify anything.
    `requirements/requirements.md`, and `development/house-keeping/house-keeping.md`
    — flag any open item present in an index but missing from
    `BACKLOG.md` (or vice versa), since `BACKLOG.md` doesn't replace the
-   indexes (per `rules-of-development.md` §2) but should stay consistent
+   indexes (per `CODE-OF-CONDUCT.md` §2) but should stay consistent
    with them for anything still open.
 3. If the Scrum layer is in use, also check
    `work-items/sprints/sprints.md` for the active sprint's committed

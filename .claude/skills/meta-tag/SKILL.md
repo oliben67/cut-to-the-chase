@@ -3,7 +3,7 @@ description: Create a meta-tag annotation linked to an existing artifact
 argument-hint: <artefact-id>
 ---
 
-Per `.catalyst-proj/rules/rules-of-development.md` §3: create a new
+Per `.catalyst-proj/CODE-OF-CONDUCT.md` §3: create a new
 meta-tag artifact immediately for the artifact ID in `$0`, save it, and
 link it to that artifact.
 

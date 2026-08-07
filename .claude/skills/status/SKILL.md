@@ -3,13 +3,13 @@ description: Update an artifact's Status field, with an optional force override
 argument-hint: <artefact-id> <status> [force]
 ---
 
-Per `.catalyst-proj/rules/rules-of-development.md` §3: update the
+Per `.catalyst-proj/CODE-OF-CONDUCT.md` §3: update the
 `Status` field of artifact `$0` to `$1`. If a third word `force` is
 present (`$2`), that's the force override.
 
 1. Resolve `$0` to an existing artifact file (search
    `.catalyst-proj/development/bugs/`, `.catalyst-proj/requirements/`,
-   `.catalyst-proj/development/house-keeping/`,
+   `.catalyst-proj/features/`, `.catalyst-proj/development/house-keeping/`,
    `.catalyst-proj/development/meta-tags/`, or `.catalyst-proj/work-items/`
    as appropriate for the ID's prefix). If nothing resolves, state that the
    artifact cannot be found and stop — do not modify anything.
