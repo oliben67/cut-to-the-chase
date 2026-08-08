@@ -8,6 +8,12 @@ services:
   cttc-gateway:
     image: cttc-gateway:latest
     restart: unless-stopped
+    # Redis's own graceful-shutdown RDB save (see redis_log.py's start())
+    # needs real time to complete under real data volumes -- Docker's
+    # default (10s) is tighter than ideal headroom over the ~256MB
+    # maxmemory cap's worst-case save time; see redis_log.py's stop() for
+    # the matching internal 15s backstop this is sized to exceed.
+    stop_grace_period: 30s
     # both required for accurate host telemetry (HostStatsSource uses
     # psutil, which without these only sees this container's own cgroup/
     # network-namespace view, not the physical host's):
@@ -39,3 +45,13 @@ services:
       # /dev/null (no-op) when the gateway was reached via agent/no explicit
       # key -- see docs/architecture/remote-server.md.
       - ${CTTC_ID_RSA:-/dev/null}:/root/.ssh/id_rsa:ro
+      # Redis's RDB/AOF persistence (see redis_log.py) -- MUST be host-
+      # mounted, not left on the container's writable layer, or a container
+      # recreation (image update, `docker compose down && up`, `docker rm`)
+      # silently loses it. Defaults to a directory beside this compose file;
+      # override with CTTC_REDIS_DATA_DIR for a real deploy that wants this
+      # on a specific disk/mount, same pattern as CTTC_ID_RSA above.
+      # Container-side path matches RedisLog's own Path(__file__).parent-
+      # relative default (/srv/cttc-gateway/redis-data) exactly, so no
+      # --redis-data-dir flag is needed in the image's own ENTRYPOINT.
+      - ${CTTC_REDIS_DATA_DIR:-./redis-data}:/srv/cttc-gateway/redis-data

@@ -19,3 +19,6 @@ releases/windows/cttc-windows-deploy/
 # this gateway's persisted .gateway-id) -- instance-specific, never
 # meant to be committed (see br-DEDUP-012's gateway id).
 app/server/sessions/
+# Redis's own RDB/AOF persistence files (see redis_log.py's DEFAULT_DATA_DIR)
+# -- instance-specific binary data, never meant to be committed.
+app/server/redis-data/

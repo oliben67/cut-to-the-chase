@@ -8,8 +8,26 @@ event conditions, recording-session exports -- see server.py's
 LogSource/StatsSource): Source objects keep no unbounded RAM history of
 their own, only small bounded bookkeeping (LogSource._last_row,
 StatsSource._services). Redis also bounds how long history is kept
-(default 3 days, live-configurable via /logs/ttl), which unbounded RAM
-never did.
+(sTTL, default 3 days -- read once at startup, see reconcile_ttl below;
+no longer runtime-mutable), which unbounded RAM never did.
+
+Persisted to disk (RDB + AOF, see start()) so a graceful shutdown or a
+crash both survive a restart -- graceful shutdown flushes a full RDB
+snapshot, AOF (`appendfsync everysec`) bounds a crash's loss window to
+~1s, matching sRate's own default cadence. Every record's TTL (a
+per-*field* HEXPIRE, not a key-level EXPIRE -- see the schema below)
+round-trips through both correctly: restored fields keep their original
+remaining TTL, and anything already past it at load time is dropped by
+Redis itself, not resurrected. See DEFAULT_DATA_DIR/data_dir below for
+where the persisted files live in each deployment mode.
+
+Live records are buffered in memory and flushed to Redis in one batched
+pipeline every `flush_interval_seconds` (sRate, default 1s, runtime-
+adjustable via set_flush_interval -- see server.py's POST /logs/rate) --
+decoupled from any individual source's own sampling interval
+(DockerStatsSource/HostStatsSource/LogSource keep polling/streaming on
+their own cadence; this only governs how often *this module* talks to
+Redis). See record()/_flush_loop().
 
 Schema: one hash + one sorted-set index per entity (container name, or
 `host@<hostname>` for host telemetry -- matching the label scheme already
@@ -19,12 +37,17 @@ container's log entries and stats samples never land in the same entity
 even when their bare names are identical):
     cttc:log:<entity_id>   hash  field=timestamp(ms, str)  value=orjson record
     cttc:idx:<entity_id>   zset  member=same field          score=timestamp
-    cttc:entities          set   every entity_id ever recorded (for set_ttl's
-                                  walk, and for the daemon-registry style
-                                  bootstrap when re-serving old history)
+    cttc:entities          set   every entity_id ever recorded (for
+                                  reconcile_ttl's walk, and for the
+                                  daemon-registry style bootstrap when
+                                  re-serving old history)
     cttc:daemons           hash  host -> the exact /docker/collect request
                                   body that opened it (used to reconnect
                                   remote hosts on the gateway's own restart)
+    config:sTTL             str  the sTTL (seconds) reconcile_ttl last
+                                  applied -- compared against the newly
+                                  configured value on every startup so an
+                                  unchanged sTTL stays a no-op.
 
 `redis-server` must be on PATH in every deployment mode this module runs
 in -- the containerized gateway image bundles it (see Dockerfile), and the
@@ -40,6 +63,7 @@ import asyncio
 import logging
 import shutil
 import tempfile
+import time
 from pathlib import Path
 
 import orjson
@@ -56,7 +80,28 @@ class RedisUnavailable(RuntimeError):
     in logs and by any caller that wants to handle it specifically."""
 
 
-DEFAULT_TTL_SECONDS = 3 * 24 * 3600.0  # 3 days
+DEFAULT_TTL_SECONDS = 3 * 24 * 3600.0  # 3 days (sTTL)
+
+DEFAULT_FLUSH_INTERVAL_SECONDS = 1.0
+# sRate: how often the whole in-memory record buffer is flushed to Redis in
+# one batched pipeline -- decoupled from any individual source's own
+# sampling interval (see module docstring). 1s keeps the common case
+# (Docker "Frequency" ~5s) imperceptibly close to the old near-immediate
+# visibility, while still batching bursts (many containers reporting near-
+# simultaneously, a fast log tail) into fewer, larger pipelines than the
+# old one-pipeline-per-record.
+MIN_FLUSH_INTERVAL_SECONDS = 0.01
+# set_flush_interval's floor -- flush_interval_seconds feeds straight into
+# asyncio.sleep(), which treats <=0 as "don't sleep at all"; this guards
+# against a fat-fingered 0/negative value turning the flush loop into a
+# tight spin hammering Redis.
+MAX_BUFFERED_RECORDS = 50_000
+# br-REDIS-019: with per-record writes gone, _enqueue() no longer has any
+# natural backpressure signal from a bounded asyncio.Queue -- this is the
+# in-memory buffer's own drop-and-warn ceiling (5x the old queue's 10_000,
+# since a slow flush interval now legitimately accumulates more between
+# flushes than the old per-record queue ever needed to hold at once).
+
 # TCP monitor port -- bound to 127.0.0.1 only (see start()), so an external
 # tool (redis-cli, RedisInsight) can inspect the store on the same machine
 # the gateway runs on, in both deployment modes. Loopback-only and
@@ -76,6 +121,17 @@ SOCKET_PATH = (
 )
 LUA_PATH = Path(__file__).parent / "logs.lua"
 
+# Where RDB/AOF persistence files live -- sibling to server.py, the same
+# Path(__file__).parent trick --sessions-dir already uses (server.py), so
+# this resolves correctly with zero extra config in both bare mode (a real
+# path in the dev checkout) and the containerized image (WORKDIR/COPY
+# --from=builder preserve the same relative layout, so this becomes
+# /srv/cttc-gateway/redis-data there -- see docker-compose's volumes:,
+# which bind-mounts exactly that path to a host directory). Deliberately
+# not nested inside sessions/ -- different concern (binary Redis files vs.
+# user-facing .cttc-record exports), different audience.
+DEFAULT_DATA_DIR = Path(__file__).parent / "redis-data"
+
 
 class RedisLog:
     """One instance lives on State (see server.py's State.__init__). Redis
@@ -85,7 +141,14 @@ class RedisLog:
 
     enabled = False
 
-    def __init__(self, socket_path: str | None = None, tcp_port: int | None = None):
+    def __init__(
+        self,
+        socket_path: str | None = None,
+        tcp_port: int | None = None,
+        ttl_seconds: float | None = None,
+        flush_interval_seconds: float | None = None,
+        data_dir: str | Path | None = None,
+    ):
         """`socket_path` defaults to the module-level SOCKET_PATH (every
         real deployment mode's one true instance) -- overridable purely so
         tests that need two genuinely independent Redis instances in the
@@ -95,15 +158,32 @@ class RedisLog:
         `tcp_port` similarly defaults to DEFAULT_TCP_PORT -- None here means
         "use the default", not "disabled": the TCP monitor listener is
         always on, only its port number is configurable (see server.py's
-        --redis-port)."""
+        --redis-port).
+
+        `ttl_seconds` (sTTL) is read once here, at construction, and never
+        mutated afterward -- retention is a startup-only setting now (see
+        reconcile_ttl); there is no runtime TTL mutator. `flush_interval_
+        seconds` (sRate) seeds the initial buffer-flush cadence but *is*
+        runtime-adjustable afterward (see set_flush_interval).
+
+        `data_dir` defaults to the module-level DEFAULT_DATA_DIR -- override
+        it (as every test here does, pointed at a tmp_path) so tests never
+        write real persistence files into the repo's own working tree, and
+        so two RedisLog instances sharing one process never collide on the
+        one real default path."""
         self._client = None
         self._proc: asyncio.subprocess.Process | None = None
-        self._queue: asyncio.Queue | None = None
-        self._pump_task: asyncio.Task | None = None
+        self._buffer: list[tuple[str, float, dict]] = []
+        self._flush_task: asyncio.Task | None = None
+        self._interval_changed: asyncio.Event | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
-        self.ttl_seconds = DEFAULT_TTL_SECONDS
+        self.ttl_seconds = ttl_seconds if ttl_seconds is not None else DEFAULT_TTL_SECONDS
+        self.flush_interval_seconds = (
+            flush_interval_seconds if flush_interval_seconds is not None else DEFAULT_FLUSH_INTERVAL_SECONDS
+        )
         self._socket_path = socket_path or SOCKET_PATH
         self._tcp_port = tcp_port or DEFAULT_TCP_PORT
+        self._data_dir = Path(data_dir) if data_dir is not None else DEFAULT_DATA_DIR
 
     # ── lifecycle ────────────────────────────────────────────────────────
 
@@ -121,6 +201,23 @@ class RedisLog:
                 "redis_log: redis-server is present but the `redis` python package isn't installed"
             ) from e
 
+        self._data_dir.mkdir(parents=True, exist_ok=True)  # redis-server won't create a missing --dir itself
+        manifest_path = self._data_dir / "appendonlydir" / "appendonly.aof.manifest"
+        rdb_path = self._data_dir / "dump.rdb"
+        if manifest_path.exists() or rdb_path.exists():
+            logger.info("redis_log: found existing persisted data at %s -- restoring on load", self._data_dir)
+        else:
+            logger.info(
+                "redis_log: no existing persisted data found at %s -- starting with an empty store",
+                self._data_dir,
+            )
+        log_path = self._data_dir / "redis-server.log"
+        # Redis appends to --logfile across restarts rather than truncating
+        # it -- read from this pre-spawn size, not "whole file", so a
+        # startup failure below never misattributes a stale prior run's log
+        # output to *this* attempt.
+        pre_spawn_log_size = log_path.stat().st_size if log_path.exists() else 0
+
         self._proc = await asyncio.create_subprocess_exec(
             "redis-server",
             "--unixsocket",
@@ -131,31 +228,83 @@ class RedisLog:
             "127.0.0.1",  # the actual control: loopback-only, no matter what network mode wraps us
             "--protected-mode",
             "no",  # redundant with --bind above, just avoids protected-mode surprises
+            "--dir",
+            str(self._data_dir),
+            "--dbfilename",
+            "dump.rdb",
             "--save",
-            "",  # ephemeral by design: TTL bounds it, a redeploy losing it is fine
+            # A non-empty save config is what makes a graceful SIGTERM
+            # actually write an RDB snapshot before exiting at all --
+            # confirmed empirically, `--save ""` (the old, deliberately
+            # ephemeral default) skips that entirely regardless of AOF.
+            # One conservative save point rather than Redis's stock
+            # multi-point defaults (`300 100`/`60 10000` etc.): AOF
+            # everysec below is the real bounded-loss mechanism for a
+            # crash, so frequent periodic BGSAVE forks under this
+            # workload's continuous per-second write volume would cost
+            # more (a fork() + full-dataset write every minute) than they'd
+            # add -- this one point still gives a periodically-fresh RDB as
+            # a secondary safety net, and (combined with AOF) guarantees
+            # the shutdown-time save requirement above.
+            "3600",
+            "1",
+            "--appendonly",
+            "yes",
+            # everysec: matches sRate's own default cadence (1s) -- bounds
+            # a crash's loss window to ~1s of writes, the number the user
+            # asked for explicitly. Do NOT read this as "RDB alone captures
+            # the crash instant" -- it doesn't; AOF is what does that.
+            "--appendfsync",
+            "everysec",
+            "--appenddirname",
+            "appendonlydir",
+            "--appendfilename",
+            "appendonly.aof",
+            "--logfile",
+            str(log_path),
             "--maxmemory",
             "256mb",
             "--maxmemory-policy",
             # br-REDIS-012: `volatile-*` policies only ever consider keys
             # that have a *key-level* EXPIRE -- but every record's TTL here
             # is a per-*field* HEXPIRE on the shared `cttc:log:<entity>`
-            # hash (see _write()), so none of `cttc:log:*`/`cttc:idx:*`/
+            # hash (see _write_rows()), so none of `cttc:log:*`/`cttc:idx:*`/
             # `cttc:entities`/`cttc:daemons` ever qualify. `volatile-ttl`
             # therefore finds nothing evictable and Redis falls back to
             # rejecting writes outright once the 256MB cap is hit, which
-            # _write()'s warning-and-drop path turns into every subsequent
-            # sample being silently, permanently lost. `allkeys-lru` can
-            # actually evict (whichever key -- any entity's full history --
-            # was least recently touched), trading "lose one entity's
-            # oldest history under sustained memory pressure" for "every
-            # gateway silently stops recording anything at all".
+            # _write_rows()'s warning-and-drop path turns into every
+            # subsequent sample being silently, permanently lost. `allkeys-
+            # lru` can actually evict (whichever key -- any entity's full
+            # history -- was least recently touched), trading "lose one
+            # entity's oldest history under sustained memory pressure" for
+            # "every gateway silently stops recording anything at all".
+            # Now that persistence is on, that eviction is durable across a
+            # restart too (it's just a DEL, appended to the AOF like any
+            # other write) -- not merely lost for this process's uptime, as
+            # it was when --save "" made the whole store ephemeral. The
+            # 256MB cap is still the real backstop either way; this doesn't
+            # change that, it's just no longer a free pass that resets on
+            # every restart.
             "allkeys-lru",
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
+        def _log_tail() -> str:
+            if not log_path.exists():
+                return ""
+            with log_path.open("rb") as f:
+                f.seek(pre_spawn_log_size)
+                return f.read().decode(errors="replace").strip()
+
         for _ in range(50):  # wait up to ~5s for the socket to appear
             if Path(self._socket_path).exists():
                 break
+            if self._proc.returncode is not None:
+                raise RedisUnavailable(
+                    f"redis_log: redis-server exited (code {self._proc.returncode}) before creating "
+                    f"{self._socket_path} -- likely a corrupt or unreadable persistence file at "
+                    f"{self._data_dir}: {_log_tail() or '(no log output captured)'}"
+                )
             await asyncio.sleep(0.1)
         else:
             raise RedisUnavailable(
@@ -167,94 +316,186 @@ class RedisLog:
             await client.ping()
             await client.function_load(LUA_PATH.read_text(), replace=True)
         except Exception as e:
+            # The unix socket file can exist for a brief window before a
+            # corrupt persistence file's fatal error actually kills the
+            # process (confirmed empirically: redis-server logs "Server
+            # initialized" -- which is when the socket gets bound -- before
+            # it gets to validating AOF/RDB content) -- so a connection
+            # failure here can *also* mean "the process died right after
+            # creating the socket", not just a generic client-side error.
+            # Surface the same rich diagnostic (with the log tail) in that
+            # case rather than a bare ConnectionError with no context. A
+            # brief bounded wait here in case the child has died but
+            # asyncio's SIGCHLD reaping hasn't caught up to set returncode
+            # yet -- still bounded, never hangs this on a genuinely-alive
+            # process (that just failed to answer a ping for some other,
+            # unrelated reason).
+            if self._proc.returncode is None:
+                try:
+                    await asyncio.wait_for(self._proc.wait(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    pass
+            if self._proc.returncode is not None:
+                raise RedisUnavailable(
+                    f"redis_log: redis-server exited (code {self._proc.returncode}) right after creating "
+                    f"{self._socket_path} -- likely a corrupt or unreadable persistence file at "
+                    f"{self._data_dir}: {_log_tail() or '(no log output captured)'}"
+                ) from e
             raise RedisUnavailable(
                 f"redis_log: could not initialize redis client/functions: {type(e).__name__}: {e}"
             ) from e
 
         self._client = client
-        self._queue = asyncio.Queue(maxsize=10_000)
+        self._buffer = []
         self._loop = asyncio.get_running_loop()
-        self._pump_task = asyncio.ensure_future(self._pump())
+        self._interval_changed = asyncio.Event()
+        self._flush_task = asyncio.ensure_future(self._flush_loop())
         self.enabled = True
         logger.info(
-            "redis_log: durable store enabled (ttl=%.0fs, tcp monitor port=%d, loopback-only)",
+            "redis_log: durable store enabled (ttl=%.0fs, flush interval=%.1fs, tcp monitor port=%d, "
+            "loopback-only, data dir=%s)",
             self.ttl_seconds,
+            self.flush_interval_seconds,
             self._tcp_port,
+            self._data_dir,
         )
 
     async def stop(self) -> None:
-        """Stops accepting new writes immediately, cancels the pump, then
-        drains whatever was still queued directly (rather than counting on
-        the now-cancelled pump to finish it) before tearing down
-        redis-server (br-REDIS-008): otherwise every orderly shutdown
-        silently lost up to 10,000 queued samples, and `enabled` staying
-        `True` meant a late record() kept enqueuing against a pump/server
-        that were about to die (or already had), never to be read."""
+        """Stops accepting new writes immediately, cancels the flush loop,
+        then flushes whatever was still buffered directly (rather than
+        counting on the now-cancelled loop to finish it) before tearing
+        down redis-server (br-REDIS-008): otherwise every orderly shutdown
+        silently lost up to MAX_BUFFERED_RECORDS buffered samples, and
+        `enabled` staying `True` meant a late record() kept buffering
+        against a flush loop/server that were about to die (or already
+        had), never to be read.
+
+        terminate() (SIGTERM) is what actually triggers redis-server's own
+        RDB-save-before-exit (see start()'s --save config) -- but that save
+        takes real time under real data volumes, and the *caller's* own
+        shutdown budget varies by deployment mode (main.js's bare-mode
+        killGraceMs, or a container's stop_grace_period) and isn't always
+        generous enough on its own. This wraps the wait in its own internal
+        deadline so a slow/stuck save can never hang shutdown indefinitely,
+        with a specific, diagnosable log line naming the actual failure mode
+        rather than a caller's generic timeout doing it blind."""
         self.enabled = False
-        if self._pump_task is not None:
-            self._pump_task.cancel()
+        if self._flush_task is not None:
+            self._flush_task.cancel()
             try:
-                await self._pump_task
+                await self._flush_task
             except asyncio.CancelledError:
                 pass
-        if self._queue is not None:
-            while not self._queue.empty():
-                entity_id, ts, payload = self._queue.get_nowait()
-                await self._write(entity_id, ts, payload)
+        await self._flush()
         if self._proc is not None:
             self._proc.terminate()
-            await self._proc.wait()
+            try:
+                await asyncio.wait_for(self._proc.wait(), timeout=15.0)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "redis_log: redis-server did not exit within 15s of SIGTERM -- an RDB save may "
+                    "not have completed; killing it (SIGKILL) rather than hanging shutdown "
+                    "indefinitely. Any data since the last completed AOF fsync may be lost."
+                )
+                self._proc.kill()
+                await self._proc.wait()
 
     # ── writing ──────────────────────────────────────────────────────────
 
     def record(self, entity_id: str, ts: float, payload: dict) -> None:
         """Non-blocking: called from hot ingestion paths (StatsSource.
         ingest_row, LogSource.ingest_chunk) that must never stall waiting on
-        Redis. Queues the write; _pump() does the actual I/O. Redis is the
-        sole store now (see this module's docstring) -- a write that never
+        Redis. Appends to the in-memory buffer; _flush_loop() does the
+        actual I/O every flush_interval_seconds (sRate). Redis is the sole
+        store now (see this module's docstring) -- a record that never
         makes it in is a real, permanent loss of that sample, not just a
-        missed durability copy, so both failure points below (a full queue,
-        a failed pipeline in _pump) log at `warning`, loud enough to show up
-        without debug logging enabled.
+        missed durability copy, so both failure points below (a full
+        buffer, a failed pipeline in _write_rows) log at `warning`, loud
+        enough to show up without debug logging enabled.
 
-        Uses call_soon_threadsafe rather than put_nowait directly: some
+        Uses call_soon_threadsafe rather than appending directly: some
         callers (DockerStatsSource/HostStatsSource) run their sampling via
-        asyncio.to_thread, i.e. off the event loop, where asyncio.Queue's
-        put_nowait isn't safe to call directly."""
+        asyncio.to_thread, i.e. off the event loop, where a plain list
+        append isn't safe to call directly (it could race _flush()'s
+        buffer swap, which also runs on the event loop thread)."""
         if not self.enabled:
             return
         self._loop.call_soon_threadsafe(self._enqueue, entity_id, ts, payload)
 
     def _enqueue(self, entity_id: str, ts: float, payload: dict) -> None:
-        try:
-            self._queue.put_nowait((entity_id, ts, payload))
-        except asyncio.QueueFull:
+        # br-REDIS-019: runs on the event loop thread (via
+        # call_soon_threadsafe), same thread _flush()'s buffer-swap runs
+        # on, so this can never race a concurrent flush mid-swap -- no lock
+        # needed.
+        if len(self._buffer) >= MAX_BUFFERED_RECORDS:
             logger.warning(
-                "redis_log: write queue full (Redis falling behind) -- dropping a sample for %s",
+                "redis_log: in-memory flush buffer full (%d records, flush interval=%.1fs) -- "
+                "dropping a sample for %s",
+                MAX_BUFFERED_RECORDS,
+                self.flush_interval_seconds,
                 entity_id,
             )
+            return
+        self._buffer.append((entity_id, ts, payload))
 
-    async def _pump(self) -> None:
+    async def _flush_loop(self) -> None:
+        """Runs for RedisLog's whole lifetime once start() launches it.
+        Waits on _interval_changed rather than a plain asyncio.sleep(): a
+        bare `await asyncio.sleep(self.flush_interval_seconds)` captures
+        its duration once, at the moment it's *called* -- a
+        set_flush_interval() midway through an already-in-progress long
+        sleep would otherwise have no effect until that stale sleep
+        finally finishes on its own, however much later that is (e.g.
+        shrinking sRate from 60s to 1s for more responsive event
+        conditions would still leave you waiting up to 60s for the first
+        post-change flush). Racing the wait against a set()-able Event
+        instead means a change wakes this immediately: it flushes whatever
+        old records had for it right then, then goes back to sleeping
+        for the *new* interval from here on -- always "next cycle", never
+        "next cycle after this one finally, coincidentally elapses". A
+        change never touches self._buffer either way, so it can never drop
+        or interrupt whatever's already buffered."""
         while True:
-            entity_id, ts, payload = await self._queue.get()
-            await self._write(entity_id, ts, payload)
+            self._interval_changed.clear()
+            try:
+                await asyncio.wait_for(self._interval_changed.wait(), timeout=self.flush_interval_seconds)
+            except asyncio.TimeoutError:
+                pass
+            await self._flush()
+
+    async def _flush(self) -> None:
+        """Atomically swaps out whatever's currently buffered -- no
+        `await` between the read and the reassignment, so a concurrently-
+        running _enqueue (same event loop thread) can never see a
+        half-swapped buffer or lose a record in the gap -- and writes it
+        to Redis in chunked pipelines (see _write_rows)."""
+        if not self._buffer:
+            return
+        pending, self._buffer = self._buffer, []
+        await self._write_rows(pending)
 
     async def bulk_record(self, rows: list[tuple[str, float, dict]]) -> None:
         """For batch imports (State.load_sample loading a whole .cttc-record/
         .cttc-metric archive) rather than the hot ingestion paths record()
         serves: writes everything directly in chunked pipelines, awaited
-        here, instead of going through the bounded live-ingestion queue.
+        here, instead of going through the buffered live-ingestion path.
 
-        record()'s queue (maxsize=10_000, see start()) is sized for the drip
-        of real-time samples arriving one at a time -- a bulk load can hand
-        it tens of thousands of rows in one synchronous burst (every row of
-        every source in the archive, enqueued faster than _pump() can drain
-        real Redis round trips), overflowing it and silently, permanently
-        dropping the excess (br-REDIS-018). Blocking here for the duration
-        of an explicit, user-initiated "Open" is correct, unlike record()'s
-        callers, which must never stall."""
+        record()'s buffer (MAX_BUFFERED_RECORDS, see start()) is sized for
+        the drip of real-time samples accumulating between flushes -- a
+        bulk load can hand it tens of thousands of rows in one synchronous
+        burst (every row of every source in the archive), overflowing it
+        and silently, permanently dropping the excess (br-REDIS-018).
+        Blocking here for the duration of an explicit, user-initiated
+        "Open" is correct, unlike record()'s callers, which must never
+        stall."""
         if not self.enabled or not rows:
             return
+        await self._write_rows(rows)
+
+    async def _write_rows(self, rows: list[tuple[str, float, dict]]) -> None:
+        """Writes `rows` to Redis in chunked pipelines -- shared by
+        bulk_record (one-shot batch import, awaited directly) and _flush
+        (the periodic buffered-write path, i.e. sRate)."""
         chunk_size = 500
         for i in range(0, len(rows), chunk_size):
             chunk = rows[i : i + chunk_size]
@@ -271,80 +512,101 @@ class RedisLog:
             try:
                 await pipe.execute()
             except Exception as e:
-                # Broad on purpose, same reasoning as _write(): this must
-                # keep importing later batches even after one bad batch, but
-                # since Redis is the sole store, a batch that doesn't land
-                # here is permanently gone, so this must never be quieter
-                # than `warning`.
+                # Broad on purpose: this must keep writing later batches
+                # even after one bad batch (a malformed payload, a
+                # transient Redis hiccup) -- but since Redis is the sole
+                # store, a batch that doesn't land here is permanently
+                # gone, so this must never be quieter than `warning`.
                 logger.warning(
-                    "redis_log: bulk write failed, %d samples lost: %s: %s",
+                    "redis_log: write failed, %d samples lost: %s: %s",
                     len(chunk),
                     type(e).__name__,
                     e,
                 )
 
-    async def _write(self, entity_id: str, ts: float, payload: dict) -> None:
-        """The actual I/O for one queued write -- shared by _pump() (the
-        normal path) and stop() (draining whatever _pump didn't get to)."""
-        field = str(ts)
-        try:
-            pipe = self._client.pipeline(transaction=False)
-            pipe.hset(f"cttc:log:{entity_id}", field, orjson.dumps(payload))
-            pipe.zadd(f"cttc:idx:{entity_id}", {field: ts})
-            pipe.hexpire(f"cttc:log:{entity_id}", int(self.ttl_seconds), field)
-            pipe.sadd("cttc:entities", entity_id)
-            await pipe.execute()
-        except Exception as e:
-            # Broad on purpose: this loop must keep pumping later
-            # samples even after one bad write (a malformed payload, a
-            # transient Redis hiccup) -- but since Redis is the sole
-            # store, a write that doesn't land here is permanently
-            # gone, so this must never be quieter than `warning`.
-            logger.warning(
-                "redis_log: write failed, sample for %s@%s lost: %s: %s",
-                entity_id,
-                ts,
-                type(e).__name__,
-                e,
-            )
+    # ── sRate ────────────────────────────────────────────────────────────
 
-    # ── TTL ──────────────────────────────────────────────────────────────
-
-    async def set_ttl(self, seconds: float) -> None:
-        """Changes the default for future writes, and re-applies HEXPIRE to
-        every already-stored field across every known entity -- "even live:
-        changes to this configuration would trigger a new ttl for future
-        and existing entries" per the original ask. Uses HSCAN, not
-        HKEYS/KEYS, so this doesn't block Redis on a large hash.
-
-        br-REDIS-013: rejects anything that would truncate below 1 whole
-        second -- HEXPIRE (here and in _write()) takes an integer TTL via
-        `int(seconds)`, and Redis treats a TTL <= 0 as "expire this field
-        right now". Checking the *truncated* value (not just `seconds <= 0`)
-        matters: 0.5 alone passes a bare positivity check but still
-        truncates to 0, instantly and irrecoverably wiping every
-        already-stored record across every entity, and would keep doing
-        the same to every future write from then on."""
-        if int(seconds) < 1:
+    def set_flush_interval(self, seconds: float) -> None:
+        """Runtime-adjustable without a restart (sRate, see server.py's
+        POST /logs/rate). Unlike the old set_ttl, this touches no Redis at
+        all -- it's a plain attribute -- so it's synchronous, not async,
+        and never blocks. Setting _interval_changed wakes _flush_loop
+        immediately even if it's mid-sleep on a now-stale (long) interval,
+        rather than leaving the change to only take effect once that old
+        sleep happens to finish on its own (see _flush_loop's own
+        docstring) -- but never drops or interrupts whatever's currently
+        buffered, since waking early just runs an ordinary _flush() a
+        little sooner than it otherwise would have."""
+        if seconds < MIN_FLUSH_INTERVAL_SECONDS:
             raise ValueError(
-                f"TTL must be at least 1 second, got {seconds!r} -- anything less would "
-                "instantly and irrecoverably expire all stored history"
+                f"flush interval must be at least {MIN_FLUSH_INTERVAL_SECONDS}s, got {seconds!r} -- "
+                "anything smaller risks a tight loop hammering Redis every cycle"
             )
-        self.ttl_seconds = seconds
+        self.flush_interval_seconds = seconds
+        if self._interval_changed is not None:
+            self._interval_changed.set()
+
+    # ── sTTL ─────────────────────────────────────────────────────────────
+
+    async def reconcile_ttl(self) -> None:
+        """Startup-only retention reconciliation (br-REDIS-020). sTTL is
+        read-only after construction now, so the only time it can ever
+        change is between one gateway startup and the next. Compares this
+        startup's self.ttl_seconds against whatever was durably recorded
+        last time (`config:sTTL`) -- a no-op if unchanged. If changed,
+        walks every entity in cttc:entities via logs.lua's reconcileTTL
+        Redis Function, called once per HSCAN cursor step per entity (same
+        shape as the old set_ttl()'s own HSCAN loop) rather than one giant
+        atomic EVAL, so a large history never blocks Redis for longer than
+        one small batch.
+
+        Age-based, not a blanket reset (unlike the old set_ttl): each
+        field's name IS its creation timestamp (ms, see this module's
+        schema docstring) -- reconcileTTL uses that to compute each
+        record's *remaining* lifetime under the new sTTL, re-expiring it to
+        exactly that (not simply stamping the full new sTTL onto every
+        field, which would incorrectly extend already-old data), or
+        deleting it outright if the new, shorter retention means it's
+        already past its retention window."""
         if not self.enabled:
             return
-        entities = await self._client.smembers("cttc:entities")
-        for raw in entities:
+        new_ttl = self.ttl_seconds
+        stored = await self._client.get("config:sTTL")
+        if stored is not None and float(stored) == new_ttl:
+            logger.info("redis_log: sTTL unchanged (%.0fs) -- skipping retention reconciliation", new_ttl)
+            return
+        logger.info(
+            "redis_log: sTTL %s -> %.0fs -- reconciling retention across every known entity",
+            (stored.decode() if isinstance(stored, bytes) else stored) if stored is not None else "(none stored)",
+            new_ttl,
+        )
+        now_ms = time.time() * 1000.0
+        entities_raw = await self._client.smembers("cttc:entities")
+        total_kept = total_deleted = total_entities = 0
+        for raw in entities_raw:
             entity_id = raw.decode() if isinstance(raw, bytes) else raw
             hash_key = f"cttc:log:{entity_id}"
-            cursor = 0
+            zset_key = f"cttc:idx:{entity_id}"
+            cursor = "0"
             while True:
-                cursor, batch = await self._client.hscan(hash_key, cursor)
-                if batch:
-                    fields = list(batch.keys())
-                    await self._client.hexpire(hash_key, int(seconds), *fields)
-                if cursor == 0:
+                next_cursor, kept, deleted = await self._client.fcall(
+                    "reconcileTTL", 0, hash_key, zset_key, cursor, str(int(new_ttl)), str(int(now_ms))
+                )
+                total_kept += kept
+                total_deleted += deleted
+                cursor = next_cursor.decode() if isinstance(next_cursor, bytes) else str(next_cursor)
+                if cursor == "0":
                     break
+            total_entities += 1
+        await self._client.set("config:sTTL", str(new_ttl))
+        logger.info(
+            "redis_log: retention reconciliation complete across %d entities -- %d fields re-expired, "
+            "%d fields deleted (already past the new %.0fs retention)",
+            total_entities,
+            total_kept,
+            total_deleted,
+            new_ttl,
+        )
 
     # ── reading ──────────────────────────────────────────────────────────
     #

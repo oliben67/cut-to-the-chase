@@ -409,14 +409,68 @@ heuristic, `StatsSource._services` for which service names to query). Every
 read path this whole document describes (`/series`, `/logs`, `/range`,
 `/ticks`, `/point`, `/index_at`, `/logs/find`, rolling buffers, event
 conditions, recording-session exports) reads from Redis, `async`/`await`
-cascaded all the way from the FastAPI route handlers down. Retention
-defaults to 3 days, live-configurable via `POST /logs/ttl` (mirrors the
-existing `POST /session/ttl` pattern). This means `redis-server` is a hard
-dependency in every deployment mode, including the bare/embedded
-`uv run server.py` path `main.js` uses when Docker isn't present — the
-embedded server now fails fast at startup if `redis-server` isn't on PATH,
-the same way it already requires `uv` itself.
+cascaded all the way from the FastAPI route handlers down. This means
+`redis-server` is a hard dependency in every deployment mode, including the
+bare/embedded `uv run server.py` path `main.js` uses when Docker isn't
+present — the embedded server now fails fast at startup if `redis-server`
+isn't on PATH, the same way it already requires `uv` itself.
 
+**Retention (sTTL) is startup-only now, not live-configurable.** It reads
+once at boot (`--redis-ttl-seconds`, default 3 days = `259200`) — the old
+`POST /logs/ttl` runtime mutator is gone. Changing it between restarts
+triggers a one-time, age-based reconciliation pass (`RedisLog.
+reconcile_ttl()`, `redis_log.py`) over every already-stored record: each
+field's own name *is* its creation timestamp (ms) already, so no schema
+change was needed to compute `remaining = (created + newTTL) - now` per
+field — a still-valid field is re-`HEXPIRE`d to exactly that remaining
+lifetime (not blanket-stamped with the full new TTL, which would wrongly
+extend already-old data), an already-past-it field is deleted outright.
+Runs via a `reconcileTTL` Redis Function in `server/logs.lua` (same
+`FUNCTION LOAD` mechanism as `getRange`, see below), called once per HSCAN
+batch per entity rather than one keyspace-wide atomic `EVAL`, so it never
+blocks Redis for longer than one small batch even against a large history.
+Compares against a durable `config:sTTL` key so an unchanged sTTL is a
+no-op on every ordinary restart.
+
+**Live records are buffered and flushed in one batched pipeline every
+`flush_interval_seconds`** (sRate, default 1s, `--redis-flush-interval-
+seconds`) — decoupled from any individual source's own sampling interval
+(a Docker host's "Frequency" keeps polling `docker stats` on its own
+cadence; this only governs how often `redis_log.py` itself talks to Redis).
+Runtime-adjustable without a restart via `GET`/`POST /logs/rate`, which
+broadcasts a `{"type": "rate", ...}` SSE event to every connected client on
+change so their own poll-rate clamp (`cRate`, renderer's `shared/poll-
+rate/`) can react immediately. `RedisLog.stop()`'s wait for the flush loop
++ `redis-server` to exit now has its own internal deadline (15s) before it
+gives up and `SIGKILL`s, independent of whatever grace period the caller
+gives — see persistence below for why that matters.
+
+**Persisted to disk now — RDB + AOF, not `--save ""`.** A prior design
+deliberately made this store ephemeral ("a redeploy losing it is fine");
+the current one is the opposite: a graceful shutdown writes a full RDB
+snapshot (`--save "3600 1"` is what actually makes `SIGTERM` do this at
+all — confirmed empirically, `--save ""` skips it regardless of AOF), and
+`--appendonly yes --appendfsync everysec` bounds an ungraceful crash's loss
+window to ~1s of writes, matching sRate's own default cadence. Restored
+records keep their exact original per-field TTL (`HEXPIRE`, not a key-level
+`EXPIRE` — confirmed empirically that this round-trips correctly through
+both RDB and Redis 7's multi-part AOF format, since it's less traveled than
+classic key TTL); anything already past it at load time is dropped by
+Redis itself, not resurrected. Files live under `--redis-data-dir` (default:
+a directory beside `server.py`, resolving correctly with zero config in
+both bare mode and the container image, same `Path(__file__).parent` trick
+`--sessions-dir` already used) — **in containers this MUST be a host-mounted
+volume** (see `docker-compose.yml`'s `volumes:`), or persistence is
+silently lost on container recreation (image update, `docker compose down
+&& up`, `docker rm`); the container runs as root with no `USER` directive,
+so the bind-mounted host directory needs no chown/chmod. `stop_grace_period:
+30s` in `docker-compose.yml` and `killGraceMs` bumped to 8s in `main.js`'s
+bare-mode shutdown (`lib/graceful-stop.js`) both exist specifically to give
+a real save enough time to finish before something more forceful kills it.
+A missing persistence file at startup logs clearly (INFO, not silent) that
+it's starting empty; a corrupt one makes `start()` raise `RedisUnavailable`
+with the actual `redis-server.log` tail captured, rather than either
+silently starting empty or a bare unexplained timeout.
 - **Bundled, not a separate container** (for now): `redis-server` (7.4+, for
   per-hash-field TTL — `HEXPIRE`/`HTTL`) runs as a plain subprocess of
   `server.py`, bound to a unix socket (everything `server.py` itself does
@@ -430,9 +484,7 @@ the same way it already requires `uv` itself.
   container. Inside the containerized gateway image the binary is copied
   from the official `redis:7.4-alpine` image in the Dockerfile rather than
   relying on Alpine's own `apk` package version; the bare/embedded path
-  expects it already on the host's PATH, same as `uv`/`docker`. `--save ""`:
-  deliberately ephemeral, same as RAM always was — a redeploy losing it is
-  an accepted trade-off, not a regression.
+  expects it already on the host's PATH, same as `uv`/`docker`.
 - **Schema**: one hash + one sorted-set index per entity (container name, or
   `host@<hostname>`) — `cttc:log:<id>` (field=timestamp, value=orjson
   record) and `cttc:idx:<id>` (member=same field, score=timestamp), so a
@@ -457,16 +509,18 @@ the same way it already requires `uv` itself.
   independent of any client connection's lifetime once started, so "keeps
   pulling at all times" falls out of this for free — nothing changed in the
   loops themselves.
-- **No new secrets, effectively no API surface change** beyond the one TTL
+- **No new secrets, effectively no API surface change** beyond the rate
   endpoint: `/docker/collect`, `/series`, `/logs`, `/range` etc. all keep
   their exact existing request/response shapes.
 
-See `server/redis_log.py` for the implementation: `record`/`set_ttl` for
-writes, plus the read-query helpers backing every method above
-(`total`/`slice_by_rank`/`rank_at_score`/`nearest`/`latest`/`first_last`/
-`range_by_score`/`range_by_score_with_payload`/`find_text`). `start()` now
-raises rather than degrading to a disabled no-op handle — there is no RAM
-fallback left for any deployment mode to fall back to.
+See `server/redis_log.py` for the implementation: `record`/`_flush_loop`
+for buffered writes, `reconcile_ttl`/`set_flush_interval` for the two
+tunables' different mutability stories, plus the read-query helpers backing
+every method above (`total`/`slice_by_rank`/`rank_at_score`/`nearest`/
+`latest`/`first_last`/`range_by_score`/`range_by_score_with_payload`/
+`find_text`). `start()` now raises rather than degrading to a disabled
+no-op handle — there is no RAM fallback left for any deployment mode to
+fall back to.
 
 Known scope boundary, not solved by this: Source objects (and their `sid`)
 are recreated fresh on every gateway restart, while Redis entity IDs are
@@ -474,10 +528,12 @@ stable service/container names. Redis is the sole source of truth for
 reads *within a running gateway process's lifetime* — automatically
 re-attaching a *new* Source object to *pre-existing* Redis history from
 before a restart (so e.g. `/sources` shows old entities with no live
-collector yet) is a separate follow-up. Two Source objects that happen to
-share an entity name (e.g. two loaded samples of containers both named
-`web`) also share that entity's Redis history, since entities are keyed
-purely by name.
+collector yet) is a separate follow-up, and now matters more than it used
+to: before persistence, a restart wiped that history anyway, so an
+unattached entity was moot; now it durably survives, orphaned, until sTTL
+naturally expires it. Two Source objects that happen to share an entity
+name (e.g. two loaded samples of containers both named `web`) also share
+that entity's Redis history, since entities are keyed purely by name.
 
 ## File transfer (upload / download) — implemented
 

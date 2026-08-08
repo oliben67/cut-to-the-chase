@@ -652,7 +652,7 @@ class TestSniffAndTail:
     async def test_tail_loop_appends_truncates_and_skips(self, tmp_path):
         f = tmp_path / "t.log"
         f.write_text("2026-01-02T03:00:00Z one\n")
-        st = server.State(tmp_path)
+        st = server.State(tmp_path, redis_flush_interval_seconds=0.05, redis_data_dir=str(tmp_path / "redis-data"))
         await st.redis_log.start()
         src = st.open_file(str(f), "log", None, live=True, transforms=[])
         # non-Path source and vanished file are skipped without crashing
@@ -684,7 +684,7 @@ class TestSniffAndTail:
     async def test_tail_loop_survives_read_failure(self, tmp_path, monkeypatch):
         f = tmp_path / "r.log"
         f.write_text("2026-01-02T03:00:00Z one\n")
-        st = server.State(tmp_path)
+        st = server.State(tmp_path, redis_flush_interval_seconds=0.05, redis_data_dir=str(tmp_path / "redis-data"))
         await st.redis_log.start()
         src = st.open_file(str(f), "log", None, live=True, transforms=[])
 
@@ -712,7 +712,7 @@ class TestSniffAndTail:
         broken_path.write_text("2026-01-02T03:00:00Z one\n")
         healthy_path = tmp_path / "healthy.log"
         healthy_path.write_text("2026-01-02T03:00:00Z one\n")
-        st = server.State(tmp_path)
+        st = server.State(tmp_path, redis_flush_interval_seconds=0.05, redis_data_dir=str(tmp_path / "redis-data"))
         await st.redis_log.start()
         broken_src = st.open_file(str(broken_path), "log", None, live=True, transforms=[])
         healthy_src = st.open_file(str(healthy_path), "log", None, live=True, transforms=[])
@@ -1413,6 +1413,14 @@ class TestDockerStatsSource:
             assert "nginx" in local_src._services
             assert "nginx" in remote_src._services
 
+            # _services (in-memory) landing doesn't mean the matching
+            # record() call has been *flushed* to Redis yet (sRate, see
+            # redis_log.py) -- poll the actual read path too, not just the
+            # in-memory signal.
+            deadline = time.time() + 3
+            while not (await stats_rows_of(st, "nginx")) and time.time() < deadline:
+                await asyncio.sleep(0.02)
+
             # each Source's own read methods must see only its own host's data
             local_rows = await stats_rows_of(st, "nginx")
             remote_rows = await stats_rows_of(st, "nginx@remotehost")
@@ -1490,6 +1498,13 @@ class TestDockerLogSource:
         src = server.DockerLogSource("l1", "web", None, "container", "web", [], st)
         deadline = time.time() + 3
         while src.error is None and time.time() < deadline:
+            await asyncio.sleep(0.02)
+        # src.error lands as soon as the fake stream ends (in-memory,
+        # immediate) -- the matching record() calls still need their own
+        # flush cycle to actually land in Redis (sRate), so poll total()
+        # too rather than asserting on it right away.
+        deadline = time.time() + 3
+        while await src.total() < 2 and time.time() < deadline:
             await asyncio.sleep(0.02)
         assert await src.total() == 2
         assert src.error == "log stream ended -- reconnecting"
@@ -1764,7 +1779,7 @@ async def state(tmp_path):
         '    r["text"] = r["text"].upper()\n'
         "    return r\n"
     )
-    st = server.State(tdir)
+    st = server.State(tdir, redis_flush_interval_seconds=0.05, redis_data_dir=str(tdir / "redis-data"))
     await st.redis_log.start()
     yield st
     await st.redis_log.stop()
@@ -2018,10 +2033,12 @@ class TestSampleRoundTrip:
         # an entity name would collide if they shared one Redis (see
         # redis_log.py's module docstring on the sole-source-of-truth
         # scope boundary).
-        st2 = server.State(tmp_path)
+        st2 = server.State(tmp_path, redis_flush_interval_seconds=0.05, redis_data_dir=str(tmp_path / "redis-data"))
         st2.redis_log = redis_log.RedisLog(
             socket_path=f"/tmp/cttc-test-{uuid.uuid4().hex[:8]}.sock",
             tcp_port=unique_redis_tcp_port(),
+            flush_interval_seconds=0.05,
+            data_dir=tmp_path / "redis-data-2",
         )
         await st2.redis_log.start()
         try:
@@ -2200,7 +2217,7 @@ class TestSampleRoundTrip:
         t0 = ms(2026, 1, 2, 3, 0, 0)
         r = await state.export_sample(str(out), t0, t0 + 60000, include_host=False)
         assert r["sources"] == 0
-        st2 = server.State(tmp_path)
+        st2 = server.State(tmp_path, redis_flush_interval_seconds=0.05, redis_data_dir=str(tmp_path / "redis-data"))
         st2.redis_log = state.redis_log
         assert await st2.load_sample(str(out)) == []
 
@@ -2268,7 +2285,7 @@ class TestMultiSegmentSample:
         t2, t3 = ms(2026, 1, 2, 3, 0, 5), ms(2026, 1, 2, 3, 0, 10)
         merged, meta2, idx2 = await state.merge_sample_bytes(legacy, t2, t3)
         assert idx2 == 1 and len(meta2) == 1
-        st2 = server.State(tmp_path)
+        st2 = server.State(tmp_path, redis_flush_interval_seconds=0.05, redis_data_dir=str(tmp_path / "redis-data"))
         st2.redis_log = state.redis_log
         out = tmp_path / "merged.cttc"
         out.write_bytes(merged)
@@ -2292,16 +2309,20 @@ class TestMultiSegmentSample:
         # named "svc" (same original file), so sharing one Redis between
         # st2 and st3 would merge their histories under that one entity
         # name (see redis_log.py's sole-source-of-truth scope boundary).
-        st2 = server.State(tmp_path)
+        st2 = server.State(tmp_path, redis_flush_interval_seconds=0.05, redis_data_dir=str(tmp_path / "redis-data"))
         st2.redis_log = redis_log.RedisLog(
             socket_path=f"/tmp/cttc-test-{uuid.uuid4().hex[:8]}.sock",
             tcp_port=unique_redis_tcp_port(),
+            flush_interval_seconds=0.05,
+            data_dir=tmp_path / "redis-data-2",
         )
         await st2.redis_log.start()
-        st3 = server.State(tmp_path)
+        st3 = server.State(tmp_path, redis_flush_interval_seconds=0.05, redis_data_dir=str(tmp_path / "redis-data"))
         st3.redis_log = redis_log.RedisLog(
             socket_path=f"/tmp/cttc-test-{uuid.uuid4().hex[:8]}.sock",
             tcp_port=unique_redis_tcp_port(),
+            flush_interval_seconds=0.05,
+            data_dir=tmp_path / "redis-data-3",
         )
         await st3.redis_log.start()
         try:
@@ -2355,7 +2376,7 @@ class TestMultiSegmentSample:
         data, _meta, _idx = await state.merge_sample_bytes(None, t0, t1)
         out = tmp_path / "one-segment.cttc"
         out.write_bytes(data)
-        st2 = server.State(tmp_path)
+        st2 = server.State(tmp_path, redis_flush_interval_seconds=0.05, redis_data_dir=str(tmp_path / "redis-data"))
         st2.redis_log = state.redis_log
         assert len(await st2.load_sample(str(out))) == 1  # no MultiSegmentSample raised
 
@@ -2419,7 +2440,7 @@ def api(tmp_path, log_file, stats_file):
         '    r["text"] = r["text"].upper()\n'
         "    return r\n"
     )
-    state = server.State(tdir)
+    state = server.State(tdir, redis_flush_interval_seconds=0.05, redis_data_dir=str(tdir / "redis-data"))
     base, srv, t = boot_server(state)
     state.open_file(str(log_file), "auto", None, live=False, transforms=[])
     state.open_file(str(stats_file), "auto", None, live=False, transforms=[])
@@ -2524,7 +2545,7 @@ class TestHttpApi:
         assert match and " 400 " in match
 
     def test_range_empty(self, tmp_path):
-        base, srv, t = boot_server(server.State(tmp_path))
+        base, srv, t = boot_server(server.State(tmp_path, redis_flush_interval_seconds=0.05, redis_data_dir=str(tmp_path / "redis-data")))
         try:
             _, j = get(base, "/range")
             assert j == {"min_ts": None, "max_ts": None}
@@ -2996,7 +3017,7 @@ class TestHttpApi:
         assert st.listeners == []
 
     def test_shutdown_endpoint(self, tmp_path):
-        base, _srv, t = boot_server(server.State(tmp_path))
+        base, _srv, t = boot_server(server.State(tmp_path, redis_flush_interval_seconds=0.05, redis_data_dir=str(tmp_path / "redis-data")))
         code, j = post(base, "/shutdown")
         assert code == 200 and j["ok"] is True
         t.join(timeout=5)
@@ -3004,7 +3025,7 @@ class TestHttpApi:
 
 
 class TestBufferSessionSchedulerEndpoints:
-    """HTTP-level coverage for /buffer/*, /session/*, /logs/ttl, and
+    """HTTP-level coverage for /buffer/*, /session/*, /logs/rate, and
     /scheduler/* -- these managers (rolling_buffer.py, recording_session.py,
     scheduler.py) each have their own thorough unit tests, but none of that
     exercised the actual FastAPI routes wrapping them (request body
@@ -3091,36 +3112,46 @@ class TestBufferSessionSchedulerEndpoints:
         assert code == 200 and j["ok"] is True
         assert state.recording_sessions.default_ttl_seconds == 60
 
-    def test_logs_ttl(self, api):
+    def test_logs_rate_get_returns_current_flush_interval(self, api):
         base, state = api
-        code, j = post(base, "/logs/ttl", {"seconds": 120})
+        code, j = get(base, "/logs/rate")
+        assert code == 200 and j["seconds"] == state.redis_log.flush_interval_seconds
+
+    def test_logs_rate_post_updates_it(self, api):
+        base, state = api
+        code, j = post(base, "/logs/rate", {"seconds": 5.0})
         assert code == 200 and j["ok"] is True
-        assert state.redis_log.ttl_seconds == 120
+        assert state.redis_log.flush_interval_seconds == 5.0
+        code, j = get(base, "/logs/rate")
+        assert code == 200 and j["seconds"] == 5.0
 
-    def test_logs_ttl_rejects_zero_and_negative_values(self, api):
-        # br-REDIS-013: 0/negative used to truncate to a TTL that HEXPIREs
-        # every already-stored field immediately, irrecoverably wiping all
-        # history with no confirmation.
-        base, state = api
-        original = state.redis_log.ttl_seconds
-        _, before = get(base, "/sources")
-        for bad in (0, -1, -3600):
-            code, j = post(base, "/logs/ttl", {"seconds": bad})
-            assert code == 400, (bad, j)
-            assert "error" in j
-        assert state.redis_log.ttl_seconds == original, "rejected calls must not change the TTL"
-        _, after = get(base, "/sources")
-        assert after["sources"] == before["sources"], "rejected calls must not have touched any stored data"
+    def test_logs_rate_post_rejects_too_small_a_value(self, api):
+        import redis_log
 
-    def test_logs_ttl_rejects_a_fraction_that_truncates_to_zero(self, api):
-        # 0.5 alone passes a bare `seconds <= 0` check but int(0.5) == 0,
-        # which HEXPIREs just as instantly -- the check has to look at the
-        # truncated value, not the raw one.
         base, state = api
-        original = state.redis_log.ttl_seconds
-        code, j = post(base, "/logs/ttl", {"seconds": 0.5})
-        assert code == 400, j
-        assert state.redis_log.ttl_seconds == original
+        original = state.redis_log.flush_interval_seconds
+        code, j = post(base, "/logs/rate", {"seconds": redis_log.MIN_FLUSH_INTERVAL_SECONDS / 2})
+        assert code == 400 and "error" in j
+        assert state.redis_log.flush_interval_seconds == original, "rejected calls must not change the rate"
+
+    def test_logs_rate_post_broadcasts_a_rate_event(self, api):
+        base, st = api
+        host = base.split("//")[1]
+        conn = http.client.HTTPConnection(host, timeout=5)
+        conn.request("GET", "/events")
+        sock = conn.sock  # getresponse() may detach conn.sock
+        resp = conn.getresponse()
+        deadline = time.time() + 3
+        while not st.listeners and time.time() < deadline:
+            time.sleep(0.02)
+        code, j = post(base, "/logs/rate", {"seconds": 3.0})
+        assert code == 200 and j["ok"] is True
+        line = resp.readline()
+        assert line.startswith(b"data:") and b'"rate"' in line and b"3.0" in line
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        resp.close()
+        sock.close()
+        conn.close()
 
     def test_scheduler_create_status_cancel_one_shot(self, api):
         base, _ = api
@@ -3542,7 +3573,15 @@ class TestFilesEndpoints:
         sid = j["opened"][0]
         src = st.sources[sid]
         assert src.path == "upload://up.log"
-        _, logs_j = get(base, f"/logs?source={sid}")
+        # open_file's initial ingest goes through the same buffered
+        # record() path as live tailing (sRate) -- poll rather than assert
+        # on the very next request.
+        deadline = time.time() + 3
+        logs_j = {"total": 0}
+        while logs_j["total"] < 2 and time.time() < deadline:
+            _, logs_j = get(base, f"/logs?source={sid}")
+            if logs_j["total"] < 2:
+                time.sleep(0.02)
         assert logs_j["total"] == 2
 
     def test_upload_multi_segment_cttc_returns_needs_selection(self, api):
@@ -3588,7 +3627,13 @@ class TestFilesEndpoints:
         )
         assert code == 200
         sid = j["opened"][0]
-        _, logs_j = get(base, f"/logs?source={sid}&start=0&count=1")
+        # Same buffered-write settle reasoning as test_upload_plain_log above.
+        deadline = time.time() + 3
+        logs_j = {"rows": []}
+        while not logs_j["rows"] and time.time() < deadline:
+            _, logs_j = get(base, f"/logs?source={sid}&start=0&count=1")
+            if not logs_j["rows"]:
+                time.sleep(0.02)
         assert logs_j["rows"][0]["text"] == "HI"
 
     def test_upload_bad_data_reports_error_not_500(self, api):
@@ -3657,6 +3702,14 @@ class TestMain:
                 # default (56379) yet.
                 "--redis-port",
                 str(unique_redis_tcp_port()),
+                # Default sRate (1.0s) would make this test race the
+                # buffered flush of the CLI-opened file's own initial
+                # ingest against the /range check below -- a short interval
+                # keeps this test fast without weakening what it's actually
+                # regression-testing (CLI files opening after redis_log.
+                # start(), not the flush cadence itself).
+                "--redis-flush-interval-seconds",
+                "0.05",
                 "--naive-tz",
                 "local",
                 "--transforms-dir",
@@ -3697,7 +3750,15 @@ class TestMain:
         # to ever trigger a client re-check (an e2e-only symptom: the
         # renderer hung forever on "server data loaded"). Opening CLI files
         # now happens inside lifespan() itself, after redis_log.start().
-        _, j = get(f"http://127.0.0.1:{port}", "/range")
+        # The file's initial ingest still has to clear its own flush cycle
+        # (sRate, --redis-flush-interval-seconds above) before /range
+        # reflects it -- poll rather than assert on the very first request.
+        deadline = time.time() + 3
+        j = {"min_ts": None, "max_ts": None}
+        while j["min_ts"] is None and time.time() < deadline:
+            _, j = get(f"http://127.0.0.1:{port}", "/range")
+            if j["min_ts"] is None:
+                time.sleep(0.02)
         assert j["min_ts"] is not None and j["max_ts"] is not None
 
         post(f"http://127.0.0.1:{port}", "/shutdown")

@@ -21,15 +21,18 @@ def ms(y, mo, d, h=0, mi=0, s=0, us=0, tz=UTC):
 async def state(tmp_path):
     tdir = tmp_path / "transforms"
     tdir.mkdir()
-    st = server.State(tdir)
+    # redis_flush_interval_seconds=0.05 (sRate), not the 1.0s default -- see
+    # _flush() below.
+    st = server.State(tdir, redis_flush_interval_seconds=0.05, redis_data_dir=str(tdir / "redis-data"))
     await st.redis_log.start()
     yield st
     await st.redis_log.stop()
 
 
 async def _flush():
-    # record() enqueues via call_soon_threadsafe and is pumped
-    # asynchronously; give the pump a beat before reads that expect it.
+    # record() buffers in memory and is flushed to Redis every
+    # flush_interval_seconds (sRate, 0.05s for this fixture's State); give
+    # it a beat past that before reads that expect it.
     import asyncio
 
     await asyncio.sleep(0.15)

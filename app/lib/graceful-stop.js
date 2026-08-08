@@ -7,12 +7,18 @@
 // that sequencing that's unit-testable) after br-EMBED-002: the fallback
 // kill used to live on an uncoordinated `setTimeout` that the app's own
 // before-quit handler could (and did) race straight past, force-quitting the
-// whole app before the 1500ms timer ever got a chance to run and leaking an
+// whole app before the timer ever got a chance to run and leaking an
 // orphaned server (and its redis-server child) behind. Callers must now
 // `await` the returned promise before actually quitting, so the fallback is
 // guaranteed to either run to completion or never be needed (the process
 // already exited gracefully) before the app tears down for real.
-async function gracefulStop(proc, { stopUrl, fetchFn = fetch, killGraceMs = 1500, onLog } = {}) {
+//
+// killGraceMs's default (8000ms) is sized for redis-server's own graceful-
+// shutdown RDB save (see redis_log.py's start()/stop()) to actually finish,
+// not just the /shutdown HTTP round trip -- this is the *entire* shared
+// budget for that POST + uvicorn's own shutdown handling + redis_log.stop()'s
+// SIGTERM+wait, with no dedicated carve-out for Redis specifically.
+async function gracefulStop(proc, { stopUrl, fetchFn = fetch, killGraceMs = 8000, onLog } = {}) {
   if (!proc) return;
   await new Promise((resolve) => {
     let settled = false;

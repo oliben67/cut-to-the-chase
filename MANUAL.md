@@ -196,6 +196,17 @@ no password, same trust model as everything else this app runs locally.
 Configurable via server.py's `--redis-port` flag if 56379 ever collides with
 something else on your machine.
 
+That data now **survives a restart** — a graceful shutdown snapshots it to
+disk, and even an ungraceful crash loses at most a second or two of the most
+recent writes. Retention defaults to 3 days (`--redis-ttl-seconds`); how
+often new data is actually saved defaults to every second
+(`--redis-flush-interval-seconds`, live-adjustable without a restart) and
+where it's saved defaults to a folder next to the server
+(`--redis-data-dir`) — in a container, that folder needs to be on a
+host-mounted volume (already set up in the bundled `docker-compose.yml`) or
+it's lost whenever the container itself is recreated, same as any other
+container storage.
+
 **New Gateway…** (sidebar → Gateway) walks through adding a remote one:
 host, SSH key (a file already on this machine, or paste one directly), and
 which gateway image to use (a registry reference, or a local tarball for
@@ -731,15 +742,20 @@ port is printed on startup). All timestamps are epoch milliseconds.
 ```
 GET  /sources · /range · /series?from&to&px · /logs?source&start&count
      /index_at?source&t · /ticks?source&from&to&px · /logs/find?source&q&start&dir
-     /point?t · /transforms · /ssh/keys · /cttc/keys · /events (SSE)
+     /point?t · /transforms · /ssh/keys · /cttc/keys · /events (SSE) · /logs/rate
 POST /open · /close · /docker/ps · /docker/collect · /sample/export
      /cttc/keys/generate · /cttc/keys/import · /cttc/keys/delete · /shutdown
+     /logs/rate
 ```
 
 Highlights:
 
 - `/series` entries carry `host` (host-telemetry flag), `sid` (source id)
   and `ttype` (`container` | `service`).
+- `/logs/rate` (`GET`, or `POST` with `{"seconds": n}`) reads/sets how often
+  the durable store is actually flushed to disk — see [Connecting to a
+  Gateway](#connecting-to-a-gateway). A `POST` broadcasts the change over
+  `/events` so every connected client picks it up immediately.
 - `/docker/collect` accepts `host`, `stats`, `host_stats`,
   `logs: [{name, type}]`, `transforms`, `interval`, `ssh_key`.
 - `/sample/export` takes `{path, from, to, include_host, public_key}`;
@@ -776,6 +792,13 @@ without an internet connection. Two ways to reach it from inside the app:
   `brew install redis` on macOS, `apt install redis-server` on
   Debian/Ubuntu) and relaunch. Not needed for the local-Docker-container or
   remote-gateway modes, which already bundle it.
+- **The gateway refuses to start, citing a corrupt or unreadable
+  persistence file** — its saved data (in the folder from
+  `--redis-data-dir`, see [Connecting to a Gateway](#connecting-to-a-gateway))
+  didn't survive whatever stopped it last time cleanly enough to reload.
+  This fails loudly on purpose rather than silently starting empty. Moving
+  or deleting that folder's contents starts a fresh, empty store on the
+  next launch — everything in it is otherwise unrecoverable.
 - **"docker CLI not found on PATH"** — install the docker CLI, or use the
   app on files / `.cttc-metric` metrics only.
 - **The app opens as a plain terminal process / nothing appears** (VS Code

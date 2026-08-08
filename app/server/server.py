@@ -1693,6 +1693,9 @@ class State:
         transforms_dir: Path,
         sessions_dir: Path | None = None,
         redis_tcp_port: int | None = None,
+        redis_ttl_seconds: float | None = None,
+        redis_flush_interval_seconds: float | None = None,
+        redis_data_dir: str | None = None,
     ):
         self.sources: dict[str, Source] = {}
         self.registry = TransformRegistry(transforms_dir)
@@ -1703,7 +1706,12 @@ class State:
         self.recording_sessions = RecordingSessionManager(self, resolved_sessions_dir)
         self.scheduler = Scheduler(self.recording_sessions)
         self.events = EventManager(self, self.rolling_buffers, self.recording_sessions)
-        self.redis_log = RedisLog(tcp_port=redis_tcp_port)
+        self.redis_log = RedisLog(
+            tcp_port=redis_tcp_port,
+            ttl_seconds=redis_ttl_seconds,
+            flush_interval_seconds=redis_flush_interval_seconds,
+            data_dir=redis_data_dir,
+        )
         self.gateway_id = _load_or_create_gateway_id(resolved_sessions_dir)
 
     def broadcast(self, event: dict):
@@ -2291,6 +2299,15 @@ def bad_request(msg: str) -> ValueError:
 async def lifespan(app: FastAPI):
     state: State = app.state.cttc
     await state.redis_log.start()
+    # Retention reconciliation (sTTL) -- runs once, right here, strictly
+    # *before* any Source starts writing (cli_files/auto-collect below), so
+    # there are zero live writers for this run's sweep to race against.
+    # Broad except, like every other lifespan startup step here: a
+    # reconciliation failure must never block the gateway from serving.
+    try:
+        await state.redis_log.reconcile_ttl()
+    except Exception as e:
+        logger.warning("lifespan: sTTL reconciliation failed: %s", e)
     # Command-line files (uv run server.py file1 file2 ...) must be opened
     # only *after* redis_log.start() above -- Redis is the sole store now
     # (see redis_log.py's module docstring), and record() silently no-ops
@@ -2911,15 +2928,28 @@ async def route_session_ttl(request: Request):
     return {"ok": True}
 
 
-@app.post("/logs/ttl")
-async def route_logs_ttl(request: Request):
-    """Set the gateway's retention TTL (seconds) for the durable Redis-backed
-    log/telemetry store (see redis_log.py) -- default 3 days. Applies to
-    future writes *and* re-applies to every already-stored entry (a no-op,
-    like the rest of redis_log, when the durable store is disabled)."""
+@app.get("/logs/rate")
+async def route_logs_rate(request: Request):
+    """Current sRate (seconds between buffered flushes to the durable
+    Redis-backed store, see redis_log.py) -- read by the renderer client
+    to clamp its own refresh rate up to whatever the server can actually
+    produce new data at (polling faster than sRate would never see
+    anything new)."""
+    st = get_state(request)
+    return {"seconds": st.redis_log.flush_interval_seconds}
+
+
+@app.post("/logs/rate")
+async def route_logs_rate_set(request: Request):
+    """Set sRate at runtime, no restart needed -- takes effect on the
+    *next* flush cycle, never dropping or interrupting whatever's already
+    buffered (see RedisLog.set_flush_interval). Broadcasts the change to
+    every connected client so their own clamp can react immediately
+    rather than waiting for their next poll of this same route."""
     body = await request.json()
     st = get_state(request)
-    await st.redis_log.set_ttl(float(body["seconds"]))
+    st.redis_log.set_flush_interval(float(body["seconds"]))
+    st.broadcast({"type": "rate", "seconds": st.redis_log.flush_interval_seconds})
     return {"ok": True}
 
 
@@ -3232,6 +3262,32 @@ def main():
         "is unaffected by this",
     )
     ap.add_argument(
+        "--redis-ttl-seconds",
+        type=float,
+        default=redis_log.DEFAULT_TTL_SECONDS,
+        help="sTTL: retention for the durable Redis-backed log/telemetry store -- read once "
+        "at startup, no longer runtime-mutable (the old POST /logs/ttl was removed). "
+        "Changing this between restarts triggers a one-time reconciliation pass over every "
+        "already-stored record (see RedisLog.reconcile_ttl)",
+    )
+    ap.add_argument(
+        "--redis-flush-interval-seconds",
+        type=float,
+        default=redis_log.DEFAULT_FLUSH_INTERVAL_SECONDS,
+        help="sRate: how often (seconds) buffered live records are flushed to Redis in one "
+        "batched pipeline, decoupled from any individual source's own sampling interval -- "
+        "runtime-adjustable without a restart via POST /logs/rate",
+    )
+    ap.add_argument(
+        "--redis-data-dir",
+        default=str(redis_log.DEFAULT_DATA_DIR),
+        help="where Redis's RDB/AOF persistence files live -- defaults to a directory beside "
+        "this file (resolves correctly in both bare mode and the containerized image with no "
+        "override needed, same as --sessions-dir's own default). In containers, this must be "
+        "the container-side path a host volume is bind-mounted to (see docker-compose.yml's "
+        "volumes:) or persistence is silently lost on container recreation",
+    )
+    ap.add_argument(
         "--auto-collect",
         action="store_true",
         help="start collecting local Docker + local host telemetry immediately on boot "
@@ -3265,7 +3321,12 @@ async def _run(args):
     import socket as _socket
 
     state = State(
-        Path(args.transforms_dir), Path(args.sessions_dir), redis_tcp_port=args.redis_port
+        Path(args.transforms_dir),
+        Path(args.sessions_dir),
+        redis_tcp_port=args.redis_port,
+        redis_ttl_seconds=args.redis_ttl_seconds,
+        redis_flush_interval_seconds=args.redis_flush_interval_seconds,
+        redis_data_dir=args.redis_data_dir,
     )
     app.state.cttc = state
     app.state.auto_collect = args.auto_collect

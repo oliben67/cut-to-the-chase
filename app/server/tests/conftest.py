@@ -40,16 +40,30 @@ def pytest_collection_modifyitems(config, items):
 
 
 @pytest.fixture
-async def redis_log_instance():
+async def redis_log_instance(tmp_path):
     """A real, running RedisLog backed by a real redis-server subprocess --
     same launch pattern as RedisLog.start() itself (unix socket + loopback
-    TCP monitor port, `--save ""`). Every test that needs a Redis-backed
-    State/LogSource/StatsSource/EventManager/RecordingSessionManager takes
-    this instead of faking anything -- there's no disabled/no-op path left
-    to fall back to. A unique tcp_port per instance (not the real
-    DEFAULT_TCP_PORT) since a test can construct more than one of these
-    concurrently -- see unique_redis_tcp_port's docstring above."""
-    rl = redis_log_module.RedisLog(tcp_port=unique_redis_tcp_port())
+    TCP monitor port, real RDB+AOF persistence). Every test that needs a
+    Redis-backed State/LogSource/StatsSource/EventManager/
+    RecordingSessionManager takes this instead of faking anything -- there's
+    no disabled/no-op path left to fall back to. A unique tcp_port per
+    instance (not the real DEFAULT_TCP_PORT) since a test can construct more
+    than one of these concurrently -- see unique_redis_tcp_port's docstring
+    above.
+
+    data_dir=tmp_path/"redis-data", not the real module-wide DEFAULT_DATA_DIR
+    -- persistence is now real (see redis_log.py's start()), so without this
+    every test run would write actual RDB/AOF files into the repo's own
+    working tree and leak state *between* runs (a later "fresh" RedisLog
+    would restore a prior run's leftovers instead of starting empty)."""
+    # flush_interval_seconds=0.05 (sRate), not the 1.0s default: tests
+    # write via record() then assert on the result almost immediately --
+    # a slow flush interval here would make every one of them flaky/slow
+    # rather than exercising anything about the interval itself (see
+    # test_redis_log.py's own dedicated flush-interval tests for that).
+    rl = redis_log_module.RedisLog(
+        tcp_port=unique_redis_tcp_port(), flush_interval_seconds=0.05, data_dir=tmp_path / "redis-data"
+    )
     await rl.start()
     assert rl.enabled
     yield rl
