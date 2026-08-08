@@ -758,6 +758,13 @@
     </div>
   </dialog>
 
+  <!-- New per-domain modules (see docs/development/
+       renderer-refactor-implementation-plan.md), bundled by esbuild into
+       a classic-script IIFE -- loaded before app.js so app.js can safely
+       call anything a migrated domain re-exposes on window. Never
+       type="module": the e2e harness's whole substitution mechanism
+       depends on real global bindings, which an ES module would hide. -->
+  <script src="dist/modules.bundle.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
