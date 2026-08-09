@@ -110,6 +110,12 @@ MAX_BUFFERED_RECORDS = 50_000
 # since the containerized gateway's network_mode: host means a non-loopback
 # bind here would land directly on the real host's network interfaces.
 DEFAULT_TCP_PORT = 56379
+# redis-py silently defaults an unset max_connections to 100. describe()/
+# range()'s nested gather (every open source x every service x first_last's
+# two zrange calls) can burst well past that under concurrent /sources or
+# /range polling, so size explicit headroom here instead of relying on the
+# library default -- this is a local unix socket, connections are cheap.
+MAX_CLIENT_CONNECTIONS = 256
 # /run always exists (and is writable by root) inside the containerized
 # gateway image; the bare/embedded dev path (main.js, or this test suite)
 # runs as a regular user on whatever host OS is at hand, where /run may not
@@ -172,6 +178,11 @@ class RedisLog:
         so two RedisLog instances sharing one process never collide on the
         one real default path."""
         self._client = None
+        # Bounds concurrent in-flight fan-out reads (see first_last) app-wide,
+        # across every overlapping /sources and /range request -- keeps peak
+        # pool usage predictable regardless of how many sources/services get
+        # gathered over at once, well under MAX_CLIENT_CONNECTIONS.
+        self._fanout_limit = asyncio.Semaphore(64)
         self._proc: asyncio.subprocess.Process | None = None
         self._buffer: list[tuple[str, float, dict]] = []
         self._flush_task: asyncio.Task | None = None
@@ -311,7 +322,11 @@ class RedisLog:
                 f"redis_log: redis-server did not create {self._socket_path} in time"
             )
 
-        client = aioredis.Redis(unix_socket_path=self._socket_path, decode_responses=False)
+        client = aioredis.Redis(
+            unix_socket_path=self._socket_path,
+            decode_responses=False,
+            max_connections=MAX_CLIENT_CONNECTIONS,
+        )
         try:
             await client.ping()
             await client.function_load(LUA_PATH.read_text(), replace=True)
@@ -711,10 +726,16 @@ class RedisLog:
         """(first_ts, last_ts) for `entity_id`, or None if it has no
         records at all."""
         idx_key = f"cttc:idx:{entity_id}"
-        first, last = await asyncio.gather(
-            self._client.zrange(idx_key, 0, 0, withscores=True),
-            self._client.zrange(idx_key, -1, -1, withscores=True),
-        )
+        async with self._fanout_limit:
+            # Pipelined (one connection checkout, one round trip) rather than
+            # gather()'d over two separate commands (two checkouts) -- this
+            # is the innermost call in describe()/range()'s nested fan-out
+            # over every source x every service, so halving its pool
+            # pressure matters.
+            async with self._client.pipeline(transaction=False) as pipe:
+                pipe.zrange(idx_key, 0, 0, withscores=True)
+                pipe.zrange(idx_key, -1, -1, withscores=True)
+                first, last = await pipe.execute()
         if not first or not last:
             return None
         return first[0][1], last[0][1]
