@@ -210,6 +210,19 @@ let nowLineStyle = prefs.get("nowLineStyle", DEFAULT_NOW_STYLE);
 // from one the user picked themselves.
 const DEFAULT_LIVE_TRACK_COLOR = "#22c55e";
 let liveTrackColor = prefs.get("liveTrackColor", DEFAULT_LIVE_TRACK_COLOR);
+
+// Recording capture-range bands (Preferences > Appearance > "Recording
+// capture", see drawVerticals and ui-REC-004) -- previously a fixed
+// themeVar("--warning"), now user-configurable like the other canvas-drawn
+// markers above. Default matches --warning's own value (style.css) so
+// existing installs see no change until they actually pick a color.
+const DEFAULT_RECORDING_COLOR = "#fab219";
+let recordingBandColor = prefs.get("recordingBandColor", DEFAULT_RECORDING_COLOR);
+// Film-strip-style perforations along the top/bottom edge of the same
+// band (see drawVerticals) -- purely decorative, so on by default but
+// toggleable off (Preferences > Appearance > "Recording capture") for
+// anyone who finds them distracting against dense chart data.
+let recordingSprocketHoles = prefs.get("recordingSprocketHoles", true);
 // Offset (seconds, never positive -- see setLiveTrackSecs) added to
 // Date.now() on every refresh while live; see liveTrackTick() in
 // the refresh/SSE section below.
@@ -477,17 +490,17 @@ function drawAll() {
   $("btn-lanes-toggle").textContent = state.showLanes ? "\u25be" : "\u25b8";
   $("btn-lanes-toggle").title = state.showLanes ? "Hide log entry markers" : "Show log entry markers";
   stripH = computeStripH(chartsEl);
-  STRIPS.forEach((spec, i) => drawStrip(stripCanvases[i], spec, "svc", i === STRIPS.length - 1));
+  STRIPS.forEach((spec, i) => drawStrip(stripCanvases[i], spec, "svc", i === 0, i === STRIPS.length - 1));
   if (hasHost && state.showHost && !hostBlockEl.hidden) {
     stripH = computeStripH(hostChartsEl);
-    STRIPS.forEach((spec, i) => drawStrip(hostCanvases[i], spec, "host", i === STRIPS.length - 1));
+    STRIPS.forEach((spec, i) => drawStrip(hostCanvases[i], spec, "host", i === 0, i === STRIPS.length - 1));
   }
   if (state.showLanes) drawLanes();
   updateTimelineNav(chartNav);
   updateTimelineNav(hostNav);
 }
 
-function drawStrip(c, spec, group, isLast) {
+function drawStrip(c, spec, group, isFirst, isLast) {
   if (!c) return;
   const h = stripH + (isLast ? AXIS_H : 0);
   const ctx = sizeCanvas(c, h);
@@ -609,7 +622,7 @@ function drawStrip(c, spec, group, isLast) {
   }
 
   // crosshair (hover) + cursor (clicked)
-  drawVerticals(ctx, h);
+  drawVerticals(ctx, h, isFirst, isLast);
 }
 
 // A small filled circle marking a truly isolated data point (no neighbor
@@ -620,7 +633,7 @@ function dot(ctx, x, y) {
   ctx.arc(x, y, 1.5, 0, Math.PI * 2);
 }
 
-function drawVerticals(ctx, h) {
+function drawVerticals(ctx, h, isFirst = false, isLast = false) {
   // active drag selection band (zoom = accent, sample = warning)
   if (dragStart != null && dragX != null && Math.abs(dragX - dragStart) > 2) {
     ctx.fillStyle = themeVar(dragIsSample ? "--warning" : "--accent");
@@ -638,17 +651,50 @@ function drawVerticals(ctx, h) {
   // recording, one more live rect for the in-progress segment -- NOT one
   // single rect from the session's first Start to now, which would wrongly
   // paint straight through a pause's gap as if it had been captured too.
+  // One known exception (ui-REC-019/br-ORPHAN-005, REQ-0067): a segment
+  // resumed via the crash-recovery prompt's "Resume from the interruption
+  // point" option can span real dead time if the *gateway process itself*
+  // (not just the app UI) was down during part of it -- this band has no
+  // sub-range awareness, so that stretch still paints as fully captured
+  // even though the underlying data genuinely has a gap in it. Accepted
+  // for now: fixing it needs a new sub-range data shape plus an eager
+  // Redis query, disproportionate to what this pass needed.
   if ((recording.status === "recording" || recording.status === "paused") && state.view) {
     const ranges = recording.segments.slice();
     if (recording.status === "recording" && recording.segmentStart != null) {
       ranges.push({ from: recording.segmentStart, to: Date.now() });
     }
-    ctx.fillStyle = themeVar("--warning");
-    ctx.globalAlpha = 0.15;
+    ctx.fillStyle = recordingBandColor;
     for (const { from, to } of ranges) {
       const xLo = Math.max(MARGIN_L, Math.min(MARGIN_L + plotWidth(), tToX(from)));
       const xHi = Math.max(MARGIN_L, Math.min(MARGIN_L + plotWidth(), tToX(to)));
-      if (xHi > xLo) ctx.fillRect(xLo, 0, xHi - xLo, h);
+      if (xHi <= xLo) continue;
+      ctx.globalAlpha = 0.15;
+      ctx.fillRect(xLo, 0, xHi - xLo, h);
+      // Film-strip-style perforations, rounded-rect like a real 35mm strip's
+      // sprocket holes -- purely decorative (toggle: Preferences >
+      // Appearance > "Recording capture" > Sprocket holes). Bookends the
+      // whole CPU/MEM/NET strip group rather than repeating per strip: only
+      // the first strip (CPU) gets the top row, only the last (NET) gets
+      // the bottom row, so a 3-strip group shows exactly one of each, not
+      // three. Not drawn at all for calls that are neither (MEM; density
+      // lanes, which don't pass isFirst/isLast).
+      if (recordingSprocketHoles && (isFirst || isLast)) {
+        ctx.globalAlpha = 0.45;
+        const holeW = 15, holeH = 9, holeR = 3, spacing = 22, inset = 7;
+        for (let x = xLo + inset; x <= xHi - inset - holeW; x += spacing) {
+          if (isFirst) {
+            ctx.beginPath();
+            ctx.roundRect(x, inset, holeW, holeH, holeR);
+            ctx.fill();
+          }
+          if (isLast) {
+            ctx.beginPath();
+            ctx.roundRect(x, h - inset - holeH, holeW, holeH, holeR);
+            ctx.fill();
+          }
+        }
+      }
     }
     ctx.globalAlpha = 1;
   }
@@ -2958,6 +3004,10 @@ async function persistRecordingMarker() {
 }
 
 function setRecordingState(next) {
+  // Guards against a stale open resume-choice dialog (see
+  // recoverInterruptedRecording) leaking across a later state transition
+  // triggered some other way (e.g. a test calling startRecording directly).
+  if (dlgResumeChoice?.open) dlgResumeChoice.close();
   Object.assign(recording, next);
   syncRecordingMenu();
 }
@@ -3008,7 +3058,7 @@ async function flushRecordingSegment(t1) {
   await writeRecordingBytes(recording.path, bytes);
 }
 
-async function startRecording() {
+async function startRecording(segmentStartOverride) {
   if (recording.status === "recording") return;
   if (recording.status === "idle") {
     if (!window.cttc?.getRecordingScratchPath && !window.cttc?.writeBinaryFile) {
@@ -3032,11 +3082,14 @@ async function startRecording() {
     setRecordingState({ status: "recording", path, segmentStart: Date.now(), segments: [] });
     notifyEvent("Recording started");
   } else if (recording.status === "paused") {
-    // resume from paused: same (scratch) path, a new segment starts now,
-    // leaving a genuine gap in the highlight between the just-completed
+    // resume from paused: same (scratch) path, a new segment starts either
+    // now or, if the caller supplied one (the resume-choice dialog's two
+    // options -- see recoverInterruptedRecording), at that timestamp
+    // instead -- REQ-0067/ui-REC-019. Ordinary Resume (no override) still
+    // leaves a genuine gap in the highlight between the just-completed
     // segment (already in recording.segments, see pauseRecording) and
     // this one.
-    setRecordingState({ status: "recording", segmentStart: Date.now() });
+    setRecordingState({ status: "recording", segmentStart: segmentStartOverride ?? Date.now() });
     notifyEvent("Recording resumed");
   } else {
     return; // "stopped" -- btn-start-recording is disabled here, nothing to do
@@ -3199,6 +3252,16 @@ async function openRecording() {
   }
 }
 
+// Resume-choice prompt shown by recoverInterruptedRecording below (see
+// ui-REC-019/br-ORPHAN-005, REQ-0067) -- declared here (used only inside
+// that function and setRecordingState above) even though this file's
+// script executes top-to-bottom and recoverInterruptedRecording() itself
+// runs before window.onload; that's fine, since it's only ever invoked
+// from an event handler, well after this whole script (and the DOM it
+// queries) has finished loading -- same reasoning as recording/state
+// being referenced by drawVerticals despite being declared later.
+const dlgResumeChoice = $("dlg-recording-resume-choice");
+
 // Crash recovery: if the app went down mid-recording (crash, force-quit,
 // sleep/shutdown) without Pause/Stop ever running, the marker on disk
 // still says "recording" -- surfacing that as-is would either silently
@@ -3209,6 +3272,11 @@ async function openRecording() {
 // user can explicitly Resume or Stop from an honest state. A named
 // function (not an inline IIFE) so it's callable again from tests.
 async function recoverInterruptedRecording() {
+  // ui-REC-019: captured once, right here, at recovery time -- not
+  // re-read whenever the user actually clicks "Resume from now" below,
+  // however long they take to decide, so the decision window itself
+  // isn't silently absorbed into the resumed segment.
+  const restartTime = Date.now();
   const marker = await getRecordingMarkerFromDisk();
   if (!marker) return;
   const wasInterrupted = marker.status === "recording";
@@ -3225,14 +3293,43 @@ async function recoverInterruptedRecording() {
     // Whatever was already flushed (via a real Pause) before the crash --
     // markers written before this field existed just have none. The
     // segment that was actually in progress at crash time (if any) isn't
-    // added: its true end time is unknown and its data may not have
-    // survived a server restart either, so fabricating a highlighted range
-    // for it would show something that was never really captured.
+    // added here -- see the resume-choice prompt below, which is what
+    // lets the user actually continue it instead.
     segments: marker.status === "stopped" ? [] : (marker.segments ?? []),
   });
   await persistRecordingMarker();
   if (wasInterrupted) {
     notifyEvent("A previous recording was interrupted and is now paused — Resume to continue, or Stop to finalize.");
+    // ui-REC-019: offer an explicit choice instead of silently landing in
+    // paused. marker.segmentStart -- the interrupted segment's original
+    // start -- is only ever known right here, from this one stale marker
+    // (persistRecordingMarker() above already wrote the live `recording`
+    // state's own segmentStart back as null, like any ordinary paused
+    // recording); dismissing this prompt loses it for good, same as
+    // before this rule existed.
+    if (marker.segmentStart != null) {
+      $("dlg-recording-resume-choice-interruption").onclick = () => {
+        dlgResumeChoice.close();
+        // br-ORPHAN-005: no separate backfill call here -- resuming with
+        // segmentStart pinned back to the original interruption point is
+        // enough. The *next* Pause/Stop's existing, unmodified
+        // flushRecordingSegment naturally asks Redis for the whole
+        // [marker.segmentStart, thatTime) span, and Redis has been
+        // collecting continuously the whole time regardless of this
+        // feature's own state -- whatever genuinely survived (bounded by
+        // sTTL, see br-REDIS-021) comes back for free; whatever didn't
+        // stays a real, honest gap.
+        startRecording(marker.segmentStart).then(() =>
+          notifyEvent(`Resumed from the interruption point (continuing since ${new Date(marker.segmentStart).toLocaleString()})`)
+        );
+      };
+      $("dlg-recording-resume-choice-now").onclick = () => {
+        dlgResumeChoice.close();
+        startRecording(restartTime).then(() => notifyEvent("Resumed from now — the interruption is left as a gap"));
+      };
+      $("dlg-recording-resume-choice-later").onclick = () => dlgResumeChoice.close();
+      dlgResumeChoice.showModal();
+    }
   } else if (marker.status === "stopped") {
     notifyEvent("A previous recording finished but wasn't saved yet — click Stop to choose where to save it.");
   }
@@ -3315,6 +3412,8 @@ function prefillPreferencesPane() {
   $("theme-now-color").value = prefs.get("nowLineColor", DEFAULT_NOW_COLOR);
   syncNowStyleButtons(prefs.get("nowLineStyle", DEFAULT_NOW_STYLE));
   $("theme-live-track-color").value = prefs.get("liveTrackColor", DEFAULT_LIVE_TRACK_COLOR);
+  $("theme-recording-color").value = prefs.get("recordingBandColor", DEFAULT_RECORDING_COLOR);
+  $("theme-recording-sprockets-toggle").checked = prefs.get("recordingSprocketHoles", true);
 }
 $("theme-hl-color").oninput = (e) => applyHlColor(e.target.value); // live preview
 $("theme-now-color").oninput = (e) => { nowLineColor = e.target.value; drawAll(); }; // live preview
@@ -3322,6 +3421,8 @@ for (const b of $("theme-now-style-switch").querySelectorAll("button")) {
   b.onclick = () => { syncNowStyleButtons(b.dataset.style); nowLineStyle = b.dataset.style; drawAll(); };
 }
 $("theme-live-track-color").oninput = (e) => { applyLiveTrackColor(e.target.value); drawAll(); }; // live preview
+$("theme-recording-color").oninput = (e) => { recordingBandColor = e.target.value; drawAll(); }; // live preview
+$("theme-recording-sprockets-toggle").onchange = (e) => { recordingSprocketHoles = e.target.checked; drawAll(); }; // live preview
 $("dlg-theme-reset").onclick = () => {
   $("theme-hl-color").value = DEFAULT_HL_COLOR;
   applyHlColor(DEFAULT_HL_COLOR);
@@ -3332,6 +3433,10 @@ $("dlg-theme-reset").onclick = () => {
   nowLineStyle = DEFAULT_NOW_STYLE;
   $("theme-live-track-color").value = DEFAULT_LIVE_TRACK_COLOR;
   applyLiveTrackColor(DEFAULT_LIVE_TRACK_COLOR);
+  $("theme-recording-color").value = DEFAULT_RECORDING_COLOR;
+  recordingBandColor = DEFAULT_RECORDING_COLOR;
+  $("theme-recording-sprockets-toggle").checked = true;
+  recordingSprocketHoles = true;
   drawAll();
 };
 $("dlg-theme-save").onclick = () => {
@@ -3341,6 +3446,8 @@ $("dlg-theme-save").onclick = () => {
   prefs.set("nowLineColor", nowLineColor);
   prefs.set("nowLineStyle", nowLineStyle);
   prefs.set("liveTrackColor", liveTrackColor);
+  prefs.set("recordingBandColor", recordingBandColor);
+  prefs.set("recordingSprocketHoles", recordingSprocketHoles);
   dlgPreferences.close();
 };
 $("dlg-theme-close").onclick = () => {
@@ -3348,6 +3455,8 @@ $("dlg-theme-close").onclick = () => {
   nowLineColor = prefs.get("nowLineColor", DEFAULT_NOW_COLOR); // discard live preview
   nowLineStyle = prefs.get("nowLineStyle", DEFAULT_NOW_STYLE);
   applyLiveTrackColor(prefs.get("liveTrackColor", DEFAULT_LIVE_TRACK_COLOR)); // discard live preview
+  recordingBandColor = prefs.get("recordingBandColor", DEFAULT_RECORDING_COLOR); // discard live preview
+  recordingSprocketHoles = prefs.get("recordingSprocketHoles", true); // discard live preview
   drawAll();
   dlgPreferences.close();
 };

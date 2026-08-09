@@ -578,6 +578,20 @@
             </label>
           </fieldset>
           <fieldset class="keys-box">
+            <legend>Recording capture</legend>
+            <p class="dlg-section-help muted">The band marking time ranges a recording has already captured, on the charts and density lanes.</p>
+            <label class="ctl block">
+              <input id="theme-recording-color" type="color" value="#fab219" />
+            </label>
+            <label class="ctl switch-row">
+              <span class="switch">
+                <input id="theme-recording-sprockets-toggle" type="checkbox" checked />
+                <span class="switch-track"><span class="switch-thumb"></span></span>
+              </span>
+              <span>Sprocket holes</span>
+            </label>
+          </fieldset>
+          <fieldset class="keys-box">
             <legend>Status bar</legend>
             <p class="dlg-section-help muted">A slim bar at the bottom of the window reporting when an event is created or fires.</p>
             <label class="ctl switch-row">
@@ -713,6 +727,26 @@
     <div class="dlg-actions">
       <button id="dlg-opened-data-cancel" title="Close without switching">Cancel</button>
       <button id="dlg-opened-data-open" class="primary" title="Switch to the selected file">Open</button>
+    </div>
+  </dialog>
+
+  <!-- Resume-choice prompt (ui-REC-019/br-ORPHAN-005, REQ-0067) -- shown
+       once, right after recoverInterruptedRecording() resolves a stale
+       on-disk "recording" marker (genuinely mid-segment at crash time) to
+       "paused", offering an explicit choice instead of just landing there
+       silently. Dismissing (Decide later) leaves the recording exactly
+       "paused", same as before this dialog existed -- the ordinary
+       Resume/Stop toolbar buttons still work from there, and this dialog
+       will not reappear on the next relaunch once dismissed. -->
+  <dialog id="dlg-recording-resume-choice">
+    <h2>Recording interrupted</h2>
+    <p class="dlg-intro muted">A previous recording was interrupted before it could be paused or stopped. How would you like to resume it?</p>
+    <p class="dlg-intro muted"><strong>Resume from the interruption point</strong> continues the same segment from when it was interrupted — whatever telemetry was actually captured in the meantime will be included once you next Pause or Stop; anything genuinely missing (never collected, or past the retention window) stays a real gap.</p>
+    <p class="dlg-intro muted"><strong>Resume from now</strong> starts a fresh segment at the moment this app restarted, leaving the interruption itself as an honest, unhighlighted gap.</p>
+    <div class="dlg-actions">
+      <button id="dlg-recording-resume-choice-later" title="Leave the recording paused for now — Resume/Stop remain available">Decide later</button>
+      <button id="dlg-recording-resume-choice-now" title="Start a fresh segment at the moment the app restarted">Resume from now</button>
+      <button id="dlg-recording-resume-choice-interruption" class="primary" title="Continue the interrupted segment, backfilling whatever survived in Redis">Resume from the interruption point</button>
     </div>
   </dialog>
 

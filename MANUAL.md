@@ -521,7 +521,8 @@ as you adjust them.
 
 ![The Appearance pane: Mode (Light/Dark/System), Log highlight color, the
 "Now" line's color and Dotted/Dashed/Solid switch, Live tracking's color,
-and the Show status bar toggle](docs/images/dlg-appearance.png)
+Recording capture's color and Sprocket holes toggle, and the Show status
+bar toggle](docs/images/dlg-appearance.png)
 
 ### Live tracking
 
@@ -670,6 +671,28 @@ select after the fact).
   without losing or re-capturing anything.
 - **⏏ Open Recording…** opens one or more previously saved `.cttc-record`
   files — the same way as [Load Data…](#loading-and-switching-data-files).
+
+If CTTC closes or crashes while a recording is in progress (not a clean
+Pause/Stop), the next launch offers a choice instead of silently leaving it
+paused:
+
+- **Resume from the interruption point** continues the same segment from
+  where it was interrupted — whatever telemetry was actually captured in
+  the meantime is picked up the next time you Pause or Stop; anything
+  genuinely missing (never collected, or past the retention window) stays
+  an honest gap.
+- **Resume from now** starts a fresh segment at the moment the app
+  restarted, leaving the interruption itself as a gap.
+- **Decide later** leaves the recording paused, exactly as before — Resume
+  and Stop stay available from the toolbar.
+
+While recording, a band marks the captured time range(s) on every chart
+strip and log density lane. Its **color** is configurable in
+**Preferences → Appearance → "Recording capture"**, live-previewed as you
+adjust it; the same section's **sprocket holes** toggle adds film-strip-style
+perforations bookending each CPU/MEM/NET strip group — along the top of its
+first (CPU) strip and the bottom of its last (NET) strip, not repeated on
+every strip in between.
 
 Loading or recording data switches the app into **analysis mode** (see
 [The main window](#the-main-window)): the live-only toolbar controls hide,
@@ -835,7 +858,8 @@ Remove Docker Host…, but kept — just not auto-reconnected — by Disconnect
 Docker Host, see
 [Removing or disconnecting the Docker Host](#removing-or-disconnecting-the-docker-host)),
 the sidebar's dock position/collapsed state/size, the "now" line's color and
-style, the highlight-window color, whether the status bar is shown, the
+style, the highlight-window color, the recording capture-range band's color
+and its sprocket-holes toggle, whether the status bar is shown, the
 toolbar Frequency (poll interval), the highlight window size, Live tracking's
 on/off state and offset, the double-click live-tracking resume delay, and
 how long status-bar notifications stay visible.

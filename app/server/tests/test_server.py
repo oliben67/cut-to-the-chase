@@ -2380,6 +2380,40 @@ class TestMultiSegmentSample:
         st2.redis_log = state.redis_log
         assert len(await st2.load_sample(str(out))) == 1  # no MultiSegmentSample raised
 
+    async def test_merge_over_a_wide_range_only_returns_genuinely_captured_rows(self, state, log_file):
+        """br-ORPHAN-005 (REQ-0067): resuming a crash-interrupted recording
+        from its original segmentStart, however long ago, must never
+        fabricate data for the stretch where nothing was actually
+        collected -- it should just come back empty for that portion while
+        still picking up whatever genuinely exists. Simulates that by
+        requesting a segment far wider than the fixture's actual data
+        range, the same shape as flushRecordingSegment's real call once a
+        recording is resumed via "Resume from the interruption point"."""
+        state.open_file(str(log_file), "auto", None, live=False, transforms=[])
+        await _flush()
+        # log_file's only two rows are at 03:00:00 and 03:00:10 -- request
+        # a segment spanning a full hour around them, well past both ends.
+        t0, t1 = ms(2026, 1, 2, 2, 0, 0), ms(2026, 1, 2, 4, 0, 0)
+        data, meta, seg_idx = await state.merge_sample_bytes(None, t0, t1)
+        assert seg_idx == 0
+        assert len(meta) == 1
+        man = json.loads(zipfile.ZipFile(io.BytesIO(data)).read("manifest.json"))
+        # the manifest honestly records the full requested range as the
+        # segment's span (what the resumed recording's highlight band will
+        # show) ...
+        assert man["segments"][0]["from"] == t0 and man["segments"][0]["to"] == t1
+        # ... but the row content underneath is only ever the two rows
+        # that genuinely exist -- nothing fabricated for the empty hour on
+        # either side.
+        rows = (
+            zipfile.ZipFile(io.BytesIO(data))
+            .read(man["segments"][0]["sources"][0]["file"])
+            .decode()
+            .splitlines()
+        )
+        assert len(rows) == 2
+        assert [json.loads(r)["text"] for r in rows] == ["alpha", "beta"]
+
 
 # ── HTTP API ─────────────────────────────────────────────────────────────────
 

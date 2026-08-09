@@ -2079,7 +2079,9 @@
       eq(recording.path, "/fake/stale.cttc-record");
       ok($("app-status-bar-text").textContent.includes("interrupted"), $("app-status-bar-text").textContent);
       ok(lastSet && lastSet.status === "paused", "corrected marker persisted as paused");
+      ok(dlgResumeChoice.open, "ui-REC-019: a genuinely mid-segment interruption also offers the resume-choice prompt");
     } finally {
+      dlgResumeChoice.close();
       getRecordingMarkerFromDisk = realGetMarker;
       setRecordingMarkerOnDisk = realSetMarker;
       setRecordingState({ status: "idle", path: null, segmentStart: null });
@@ -2110,10 +2112,201 @@
       eq($("btn-start-recording").disabled, true, "can't resume into a finished recording");
       ok($("app-status-bar-text").textContent.includes("wasn't saved"), $("app-status-bar-text").textContent);
       ok(lastSet && lastSet.status === "stopped", "marker persisted still as stopped, not paused");
+      eq(dlgResumeChoice.open, false, "no resume-choice prompt for an already-finalized recording -- nothing left to resume into");
     } finally {
       getRecordingMarkerFromDisk = realGetMarker;
       setRecordingMarkerOnDisk = realSetMarker;
       setRecordingState({ status: "idle", path: null, segmentStart: null });
+      await persistRecordingMarker();
+    }
+  });
+
+  await T("'Resume from the interruption point' pins segmentStart to the original marker value (ui-REC-019)", async () => {
+    const realGetMarker = getRecordingMarkerFromDisk, realSetMarker = setRecordingMarkerOnDisk;
+    const interruptedFrom = 987654;
+    getRecordingMarkerFromDisk = async () => ({ path: "/fake/stale.cttc-record", status: "recording", segmentStart: interruptedFrom });
+    setRecordingMarkerOnDisk = async () => {};
+    try {
+      await recoverInterruptedRecording();
+      $("dlg-recording-resume-choice-interruption").click();
+      await until(() => recording.status === "recording", "resumed from interruption point");
+      eq(recording.segmentStart, interruptedFrom, "segmentStart pinned to the original interruption point, not now");
+      eq(dlgResumeChoice.open, false);
+    } finally {
+      getRecordingMarkerFromDisk = realGetMarker;
+      setRecordingMarkerOnDisk = realSetMarker;
+      setRecordingState({ status: "idle", path: null, segmentStart: null, segments: [] });
+      await persistRecordingMarker();
+    }
+  });
+
+  await T("resuming from the interruption point genuinely backfills whatever survived in Redis (br-ORPHAN-005)", async () => {
+    const realGetMarker = getRecordingMarkerFromDisk, realSetMarker = setRecordingMarkerOnDisk;
+    const scratchPath = "/tmp/cttc-e2e-resume-backfill.cttc-record";
+    await window.cttc.writeBinaryFile(scratchPath, new Uint8Array(0)); // clear any leftover from a prior run
+    getRecordingMarkerFromDisk = async () => ({ path: scratchPath, status: "recording", segmentStart: R.min_ts });
+    setRecordingMarkerOnDisk = async () => {};
+    let opened = [];
+    try {
+      await recoverInterruptedRecording();
+      $("dlg-recording-resume-choice-interruption").click();
+      await until(() => recording.status === "recording", "resumed from interruption point");
+      eq(recording.segmentStart, R.min_ts, "resumed with the original, pre-crash segment start");
+
+      // real flush -- flushRecordingSegment(Date.now()) posts to the real
+      // /sample/record, asking Redis for [R.min_ts, now) exactly like an
+      // ordinary Pause. No new backfill code exists to test directly --
+      // this proves the deferred-flush design genuinely recovers real data
+      // with zero new server calls.
+      await pauseRecording();
+      eq(recording.status, "paused");
+      eq(recording.segments.length, 1);
+      eq(recording.segments[0].from, R.min_ts, "the resumed segment's start is the original interruption point, not the restart time");
+
+      const r = await uploadAndResolveSegment(scratchPath);
+      eq(r.errors.length, 0, JSON.stringify(r.errors));
+      opened = r.opened;
+      ok(opened.length >= 1, "the backfilled segment holds real, genuinely-captured data from the fixture's Redis-stored range");
+    } finally {
+      for (const sid of opened) await post("/close", { id: sid });
+      await refreshAll();
+      getRecordingMarkerFromDisk = realGetMarker;
+      setRecordingMarkerOnDisk = realSetMarker;
+      setRecordingState({ status: "idle", path: null, segmentStart: null, segments: [] });
+      await persistRecordingMarker();
+    }
+  });
+
+  await T("'Resume from now' pins segmentStart to recovery time, not whenever the user actually clicks (ui-REC-019)", async () => {
+    const realGetMarker = getRecordingMarkerFromDisk, realSetMarker = setRecordingMarkerOnDisk;
+    getRecordingMarkerFromDisk = async () => ({ path: "/fake/stale.cttc-record", status: "recording", segmentStart: 123 });
+    setRecordingMarkerOnDisk = async () => {};
+    try {
+      const before = Date.now();
+      await recoverInterruptedRecording();
+      const afterRecover = Date.now();
+      await new Promise((r) => setTimeout(r, 250)); // simulate the user taking a moment to decide
+      $("dlg-recording-resume-choice-now").click();
+      await until(() => recording.status === "recording", "resumed from now");
+      ok(
+        recording.segmentStart >= before && recording.segmentStart <= afterRecover,
+        `segmentStart (${recording.segmentStart}) must be pinned to recovery time [${before}, ${afterRecover}], not the later click time`
+      );
+    } finally {
+      getRecordingMarkerFromDisk = realGetMarker;
+      setRecordingMarkerOnDisk = realSetMarker;
+      setRecordingState({ status: "idle", path: null, segmentStart: null, segments: [] });
+      await persistRecordingMarker();
+    }
+  });
+
+  await T("dismissing the resume-choice prompt ('Decide later') leaves the recording paused, unchanged (ui-REC-019)", async () => {
+    const realGetMarker = getRecordingMarkerFromDisk, realSetMarker = setRecordingMarkerOnDisk;
+    getRecordingMarkerFromDisk = async () => ({ path: "/fake/stale.cttc-record", status: "recording", segmentStart: 123 });
+    setRecordingMarkerOnDisk = async () => {};
+    try {
+      await recoverInterruptedRecording();
+      eq(dlgResumeChoice.open, true);
+      $("dlg-recording-resume-choice-later").click();
+      eq(dlgResumeChoice.open, false);
+      eq(recording.status, "paused", "declining the prompt leaves the recording exactly as before this dialog existed");
+    } finally {
+      getRecordingMarkerFromDisk = realGetMarker;
+      setRecordingMarkerOnDisk = realSetMarker;
+      setRecordingState({ status: "idle", path: null, segmentStart: null, segments: [] });
+      await persistRecordingMarker();
+    }
+  });
+
+  await T("Recording capture-range band uses the configurable recordingBandColor (Preferences > Appearance)", async () => {
+    // Spy on fillRect the same way the "now" line test spies on stroke --
+    // the band is otherwise only observable as pixels, not DOM state.
+    const realFillRect = CanvasRenderingContext2D.prototype.fillRect;
+    const fillStyles = [];
+    CanvasRenderingContext2D.prototype.fillRect = function (...args) {
+      fillStyles.push(this.fillStyle);
+      return realFillRect.apply(this, args);
+    };
+    const realView = state.view;
+    const realColor = recordingBandColor;
+    try {
+      setView(Date.now() - 5 * 60000, Date.now() + 5 * 60000, { broadcast: false });
+      $("theme-recording-color").oninput({ target: { value: "#ff00ff" } }); // live preview, matches dialog wiring
+      eq(recordingBandColor, "#ff00ff", "live preview applied");
+      setRecordingState({ status: "recording", path: "/fake/band-test.cttc-record", segmentStart: Date.now() - 60000, segments: [] });
+      fillStyles.length = 0;
+      drawAll();
+      ok(fillStyles.includes("#ff00ff"), "capture-range band painted in the configured color");
+    } finally {
+      CanvasRenderingContext2D.prototype.fillRect = realFillRect;
+      if (realView) setView(realView.t0, realView.t1, { broadcast: false });
+      recordingBandColor = realColor;
+      setRecordingState({ status: "idle", path: null, segmentStart: null, segments: [] });
+      await persistRecordingMarker();
+    }
+  });
+
+  await T("Recording capture-range band's sprocket holes bookend the strip group (isFirst/isLast), toggleable off", async () => {
+    // drawVerticals directly against a mock ctx, not drawAll() against the
+    // real canvas prototype: the full render draws plenty of other shapes
+    // too, and roundRect calls are otherwise only observable as pixels.
+    const mockCtx = {
+      fillStyle: null,
+      globalAlpha: 1,
+      strokeStyle: null,
+      lineWidth: 1,
+      roundRectCalls: [],
+      beginPath() {},
+      fillRect() {},
+      fill() {},
+      stroke() {},
+      setLineDash() {},
+      moveTo() {},
+      lineTo() {},
+      roundRect(...args) { this.roundRectCalls.push(args); },
+    };
+    const realView = state.view;
+    const realSprockets = recordingSprocketHoles;
+    try {
+      setView(Date.now() - 5 * 60000, Date.now() + 5 * 60000, { broadcast: false });
+      setRecordingState({ status: "recording", path: "/fake/sprocket-test.cttc-record", segmentStart: Date.now() - 60000, segments: [] });
+
+      $("theme-recording-sprockets-toggle").onchange({ target: { checked: true } });
+      eq(recordingSprocketHoles, true);
+
+      // CPU (isFirst only): top row only -- every call lands at the same
+      // (small, near-zero) y. Asserts the invariant, not exact pixel
+      // values, so tuning hole size/spacing later doesn't require also
+      // updating this test.
+      mockCtx.roundRectCalls.length = 0;
+      drawVerticals(mockCtx, 200, true, false);
+      ok(mockCtx.roundRectCalls.length > 0, "CPU strip (isFirst) draws holes");
+      const topY = mockCtx.roundRectCalls[0][1];
+      ok(mockCtx.roundRectCalls.every((args) => args[1] === topY), "CPU strip's holes all share one top-row y");
+      ok(topY < 20, `top row sits near the strip's top edge (y=${topY})`);
+
+      // NET (isLast only): bottom row only, at a single y well below the top row.
+      mockCtx.roundRectCalls.length = 0;
+      drawVerticals(mockCtx, 200, false, true);
+      ok(mockCtx.roundRectCalls.length > 0, "NET strip (isLast) draws holes");
+      const bottomY = mockCtx.roundRectCalls[0][1];
+      ok(mockCtx.roundRectCalls.every((args) => args[1] === bottomY), "NET strip's holes all share one bottom-row y");
+      ok(bottomY > 150, `bottom row sits near the strip's bottom edge (y=${bottomY})`);
+
+      // MEM (neither): no holes at all.
+      mockCtx.roundRectCalls.length = 0;
+      drawVerticals(mockCtx, 200, false, false);
+      eq(mockCtx.roundRectCalls.length, 0, "MEM strip (neither first nor last) draws no holes");
+
+      $("theme-recording-sprockets-toggle").onchange({ target: { checked: false } });
+      eq(recordingSprocketHoles, false);
+      mockCtx.roundRectCalls.length = 0;
+      drawVerticals(mockCtx, 200, true, true);
+      eq(mockCtx.roundRectCalls.length, 0, "no sprocket holes drawn once the toggle is off, even for isFirst/isLast");
+    } finally {
+      if (realView) setView(realView.t0, realView.t1, { broadcast: false });
+      recordingSprocketHoles = realSprockets;
+      setRecordingState({ status: "idle", path: null, segmentStart: null, segments: [] });
       await persistRecordingMarker();
     }
   });
