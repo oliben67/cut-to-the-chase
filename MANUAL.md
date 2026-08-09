@@ -689,10 +689,14 @@ paused:
 While recording, a band marks the captured time range(s) on every chart
 strip and log density lane. Its **color** is configurable in
 **Preferences → Appearance → "Recording capture"**, live-previewed as you
-adjust it; the same section's **sprocket holes** toggle adds film-strip-style
+adjust it; the same section's **sprocket holes** toggle adds a film-strip
+motif on top of it (strips only, not density lanes): rounded-rect
 perforations bookending each CPU/MEM/NET strip group — along the top of its
 first (CPU) strip and the bottom of its last (NET) strip, not repeated on
-every strip in between.
+every strip in between — plus faint **frame-division lines**, one every
+third perforation, running the full height of every strip in the group
+(including MEM, which has no perforations of its own) so they read as one
+continuous line down the whole group rather than just bookending it.
 
 Loading or recording data switches the app into **analysis mode** (see
 [The main window](#the-main-window)): the live-only toolbar controls hide,

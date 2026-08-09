@@ -2246,66 +2246,101 @@
     }
   });
 
-  await T("Recording capture-range band's sprocket holes bookend the strip group (isFirst/isLast), toggleable off", async () => {
+  await T("Recording capture-range band's sprocket holes and frame lines (isStrip), toggleable off", async () => {
     // drawVerticals directly against a mock ctx, not drawAll() against the
     // real canvas prototype: the full render draws plenty of other shapes
-    // too, and roundRect calls are otherwise only observable as pixels.
+    // too, and roundRect/line calls are otherwise only observable as pixels.
     const mockCtx = {
       fillStyle: null,
       globalAlpha: 1,
       strokeStyle: null,
       lineWidth: 1,
       roundRectCalls: [],
+      lineToCalls: [],
       beginPath() {},
       fillRect() {},
       fill() {},
       stroke() {},
       setLineDash() {},
       moveTo() {},
-      lineTo() {},
       roundRect(...args) { this.roundRectCalls.push(args); },
+      lineTo(...args) { this.lineToCalls.push(args); },
     };
     const realView = state.view;
     const realSprockets = recordingSprocketHoles;
+    const realCursorT = state.cursorT, realHoverX = state.hoverX, realLiveHidden = state.liveHidden;
     try {
       setView(Date.now() - 5 * 60000, Date.now() + 5 * 60000, { broadcast: false });
       setRecordingState({ status: "recording", path: "/fake/sprocket-test.cttc-record", segmentStart: Date.now() - 60000, segments: [] });
+      // Neither drawVerticals' own cursor, hover crosshair, nor "now" line
+      // use roundRect, so they never pollute roundRectCalls -- but all
+      // three also call lineTo (ending at the same y=h a frame line
+      // would), so they're neutralized here to keep lineToCalls
+      // attributable to this decoration alone.
+      state.cursorT = null;
+      state.hoverX = null;
+      state.liveHidden = true;
 
       $("theme-recording-sprockets-toggle").onchange({ target: { checked: true } });
       eq(recordingSprocketHoles, true);
 
-      // CPU (isFirst only): top row only -- every call lands at the same
-      // (small, near-zero) y. Asserts the invariant, not exact pixel
+      // CPU (isFirst, isStrip): top row of holes -- every call lands at the
+      // same (small, near-zero) y. Asserts the invariant, not exact pixel
       // values, so tuning hole size/spacing later doesn't require also
-      // updating this test.
+      // updating this test. Also draws frame-division lines spanning the
+      // strip's full height (endpoint y === h).
       mockCtx.roundRectCalls.length = 0;
-      drawVerticals(mockCtx, 200, true, false);
+      mockCtx.lineToCalls.length = 0;
+      drawVerticals(mockCtx, 200, true, false, true);
       ok(mockCtx.roundRectCalls.length > 0, "CPU strip (isFirst) draws holes");
       const topY = mockCtx.roundRectCalls[0][1];
       ok(mockCtx.roundRectCalls.every((args) => args[1] === topY), "CPU strip's holes all share one top-row y");
       ok(topY < 20, `top row sits near the strip's top edge (y=${topY})`);
+      ok(mockCtx.lineToCalls.length > 0, "CPU strip draws frame-division lines");
+      ok(mockCtx.lineToCalls.every((args) => args[1] === 200), "frame lines span the strip's full height");
 
-      // NET (isLast only): bottom row only, at a single y well below the top row.
+      // NET (isLast, isStrip): bottom row of holes, at a single y well
+      // below the top row, plus its own frame lines.
       mockCtx.roundRectCalls.length = 0;
-      drawVerticals(mockCtx, 200, false, true);
+      mockCtx.lineToCalls.length = 0;
+      drawVerticals(mockCtx, 200, false, true, true);
       ok(mockCtx.roundRectCalls.length > 0, "NET strip (isLast) draws holes");
       const bottomY = mockCtx.roundRectCalls[0][1];
       ok(mockCtx.roundRectCalls.every((args) => args[1] === bottomY), "NET strip's holes all share one bottom-row y");
       ok(bottomY > 150, `bottom row sits near the strip's bottom edge (y=${bottomY})`);
+      ok(mockCtx.lineToCalls.length > 0, "NET strip draws frame-division lines");
 
-      // MEM (neither): no holes at all.
+      // MEM (isStrip, but neither first nor last): no holes, but frame
+      // lines still draw -- at the same x-cadence as CPU/NET's own, since
+      // all three read the same view -- so the group's line reads as one
+      // continuous frame division once stacked, not just bookending ends.
       mockCtx.roundRectCalls.length = 0;
-      drawVerticals(mockCtx, 200, false, false);
+      mockCtx.lineToCalls.length = 0;
+      drawVerticals(mockCtx, 200, false, false, true);
       eq(mockCtx.roundRectCalls.length, 0, "MEM strip (neither first nor last) draws no holes");
+      ok(mockCtx.lineToCalls.length > 0, "MEM strip still draws frame-division lines, despite no holes");
+
+      // Density lane (isStrip omitted, same as the real drawLane() call):
+      // neither holes nor frame lines -- this decoration is strip-only.
+      mockCtx.roundRectCalls.length = 0;
+      mockCtx.lineToCalls.length = 0;
+      drawVerticals(mockCtx, 8);
+      eq(mockCtx.roundRectCalls.length, 0, "a density lane (not a strip) draws no holes");
+      eq(mockCtx.lineToCalls.length, 0, "a density lane (not a strip) draws no frame lines either");
 
       $("theme-recording-sprockets-toggle").onchange({ target: { checked: false } });
       eq(recordingSprocketHoles, false);
       mockCtx.roundRectCalls.length = 0;
-      drawVerticals(mockCtx, 200, true, true);
+      mockCtx.lineToCalls.length = 0;
+      drawVerticals(mockCtx, 200, true, true, true);
       eq(mockCtx.roundRectCalls.length, 0, "no sprocket holes drawn once the toggle is off, even for isFirst/isLast");
+      eq(mockCtx.lineToCalls.length, 0, "no frame lines drawn once the toggle is off either");
     } finally {
       if (realView) setView(realView.t0, realView.t1, { broadcast: false });
       recordingSprocketHoles = realSprockets;
+      state.cursorT = realCursorT;
+      state.hoverX = realHoverX;
+      state.liveHidden = realLiveHidden;
       setRecordingState({ status: "idle", path: null, segmentStart: null, segments: [] });
       await persistRecordingMarker();
     }

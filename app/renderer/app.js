@@ -622,7 +622,7 @@ function drawStrip(c, spec, group, isFirst, isLast) {
   }
 
   // crosshair (hover) + cursor (clicked)
-  drawVerticals(ctx, h, isFirst, isLast);
+  drawVerticals(ctx, h, isFirst, isLast, true);
 }
 
 // A small filled circle marking a truly isolated data point (no neighbor
@@ -633,7 +633,7 @@ function dot(ctx, x, y) {
   ctx.arc(x, y, 1.5, 0, Math.PI * 2);
 }
 
-function drawVerticals(ctx, h, isFirst = false, isLast = false) {
+function drawVerticals(ctx, h, isFirst = false, isLast = false, isStrip = false) {
   // active drag selection band (zoom = accent, sample = warning)
   if (dragStart != null && dragX != null && Math.abs(dragX - dragStart) > 2) {
     ctx.fillStyle = themeVar(dragIsSample ? "--warning" : "--accent");
@@ -671,28 +671,52 @@ function drawVerticals(ctx, h, isFirst = false, isLast = false) {
       if (xHi <= xLo) continue;
       ctx.globalAlpha = 0.15;
       ctx.fillRect(xLo, 0, xHi - xLo, h);
-      // Film-strip-style perforations, rounded-rect like a real 35mm strip's
-      // sprocket holes -- purely decorative (toggle: Preferences >
-      // Appearance > "Recording capture" > Sprocket holes). Bookends the
-      // whole CPU/MEM/NET strip group rather than repeating per strip: only
-      // the first strip (CPU) gets the top row, only the last (NET) gets
-      // the bottom row, so a 3-strip group shows exactly one of each, not
-      // three. Not drawn at all for calls that are neither (MEM; density
-      // lanes, which don't pass isFirst/isLast).
-      if (recordingSprocketHoles && (isFirst || isLast)) {
-        ctx.globalAlpha = 0.45;
+      // Film-strip-style decoration, purely cosmetic (toggle: Preferences >
+      // Appearance > "Recording capture" > Sprocket holes). Two parts,
+      // sharing one x-cadence (holeW/spacing/inset) so they line up:
+      if (recordingSprocketHoles && isStrip) {
         const holeW = 15, holeH = 9, holeR = 3, spacing = 22, inset = 7;
-        for (let x = xLo + inset; x <= xHi - inset - holeW; x += spacing) {
-          if (isFirst) {
-            ctx.beginPath();
-            ctx.roundRect(x, inset, holeW, holeH, holeR);
-            ctx.fill();
+        // 1. Perforations -- rounded-rect sprocket holes, like a real 35mm
+        // strip's edge. Bookends the whole CPU/MEM/NET strip group rather
+        // than repeating per strip: only the first strip (CPU) gets the top
+        // row, only the last (NET) gets the bottom row, so a 3-strip group
+        // shows exactly one of each, not three. Never drawn for density
+        // lanes (isStrip is false there).
+        if (isFirst || isLast) {
+          ctx.globalAlpha = 0.45;
+          for (let x = xLo + inset; x <= xHi - inset - holeW; x += spacing) {
+            if (isFirst) {
+              ctx.beginPath();
+              ctx.roundRect(x, inset, holeW, holeH, holeR);
+              ctx.fill();
+            }
+            if (isLast) {
+              ctx.beginPath();
+              ctx.roundRect(x, h - inset - holeH, holeW, holeH, holeR);
+              ctx.fill();
+            }
           }
-          if (isLast) {
-            ctx.beginPath();
-            ctx.roundRect(x, h - inset - holeH, holeW, holeH, holeR);
-            ctx.fill();
-          }
+        }
+        // 2. Frame-division lines -- one faint vertical every third
+        // perforation's gap (centered between two holes, never crossing
+        // one), spanning this strip's own full height. Unlike the
+        // perforations, drawn on *every* strip in the group -- including
+        // MEM, which gets no holes -- so the lines land at identical x
+        // positions on each strip's own canvas (same view, same tToX) and
+        // read as one continuous line once the group is stacked, the way a
+        // real frame line runs the full height between the two perforation
+        // rows rather than just bookending the strip.
+        ctx.globalAlpha = 0.25;
+        ctx.strokeStyle = recordingBandColor;
+        ctx.lineWidth = 1;
+        let i = 0;
+        for (let x = xLo + inset; x <= xHi - inset - holeW; x += spacing, i++) {
+          if (i % 3 !== 0) continue;
+          const lineX = Math.round(x + holeW + (spacing - holeW) / 2) + 0.5;
+          ctx.beginPath();
+          ctx.moveTo(lineX, 0);
+          ctx.lineTo(lineX, h);
+          ctx.stroke();
         }
       }
     }
