@@ -721,12 +721,9 @@
   <dialog id="dlg-opened-data">
     <h2>Opened Data</h2>
     <p class="dlg-intro muted">Switch to one of the metric/recording files currently open.</p>
-    <label class="ctl block">File
-      <select id="opened-data-select"></select>
-    </label>
+    <div id="opened-data-list" class="opened-data-list" role="listbox"></div>
     <div class="dlg-actions">
       <button id="dlg-opened-data-cancel" title="Close without switching">Cancel</button>
-      <button id="dlg-opened-data-open" class="primary" title="Switch to the selected file">Open</button>
     </div>
   </dialog>
 
