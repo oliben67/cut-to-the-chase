@@ -1874,7 +1874,10 @@ class State:
         sample provenance at all)."""
         content_key = getattr(s, "_content_key", None)
         if content_key is not None:
-            return content_key
+            # (gateway_id, docker_host_id, container_id, seg_from, seg_to) --
+            # only the first 3 are provenance, the segment window is for
+            # content-addressed identity (see where _content_key is set).
+            return content_key[:3]
         host = getattr(s, "host", None)
         return (self.gateway_id, host or "local", s.name)
 
