@@ -1812,6 +1812,7 @@
       eq($("btn-start-recording").disabled, true);
       eq($("btn-start-recording").title, "Recording");
       eq($("btn-pause-recording").disabled, false);
+      eq($("btn-pause-recording").title, "Pause Recording");
       eq($("btn-stop-recording").disabled, false);
       eq(recording.segments.length, 0, "no completed segment yet -- still recording the first one");
       const firstSegmentStart = recording.segmentStart;
@@ -1825,6 +1826,7 @@
       eq($("btn-start-recording").disabled, false);
       eq($("btn-start-recording").title, "Resume Recording");
       eq($("btn-pause-recording").disabled, true);
+      eq($("btn-pause-recording").title, "Recording Paused");
       eq($("btn-pause-recording").dataset.state, "paused");
       // br-REC-UI-004: paused reads via the glyphs themselves (record
       // button's ⏺ solid orange, pause button's/status bar's ⏸ blinking

@@ -2972,6 +2972,8 @@ function syncRecordingMenu() {
   // button while there's nothing left for it to do.
   $("btn-pause-recording").dataset.state = recording.status;
   $("btn-pause-recording").disabled = recording.status !== "recording";
+  $("btn-pause-recording").title =
+    recording.status === "paused" ? "Recording Paused" : "Pause Recording";
   $("btn-stop-recording").disabled = recording.status === "idle";
   // Bottom status bar's own recording indicator -- same dot, same colors/
   // blink, as the toolbar button (see .recording-dot in style.css), so
