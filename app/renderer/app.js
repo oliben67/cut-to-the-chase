@@ -2779,7 +2779,6 @@ $("record-sections").onchange = async () => {
   await Promise.all(openedIds.map((id) => post("/close", { id })));
   const res = await uploadFile(path, index);
   if (res.errors?.length) alert(res.errors.map((e) => `${e.path}: ${e.error}`).join("\n"));
-  setActiveRecordSections({ path, segments, activeIndex: index, openedIds: res.opened || [] });
   await refreshAll();
   // Without this, the view stays wherever it was left (the *previous*
   // segment's own window) -- refreshAll() only ever sets an initial view
@@ -2788,6 +2787,13 @@ $("record-sections").onchange = async () => {
   // the visible window entirely: it looked empty even though it loaded
   // correctly (BUG-0077).
   centerViewOnLoadedStart(res.opened || []);
+  // Flip activeIndex (and the dropdown) only now that the view is actually
+  // centered on the new segment -- this is the signal anything watching
+  // activeRecordSections uses to know the switch is done, so it must not
+  // go out before the view itself has caught up (otherwise there's a
+  // window where activeIndex already reads "segment 1" while the chart is
+  // still showing segment 0's stale range).
+  setActiveRecordSections({ path, segments, activeIndex: index, openedIds: res.opened || [] });
 };
 
 // Same pattern as pickRecordingSavePath: a named wrapper around the native
