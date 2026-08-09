@@ -2218,6 +2218,33 @@
     }
   });
 
+  await T("boot never auto-opens the Set Docker Host wizard while the resume-choice prompt is showing (dialog-stacking regression)", async () => {
+    // Both #dlg-set and #dlg-recording-resume-choice are native <dialog>s
+    // opened via showModal() -- stacking a second one on top silently
+    // buries the first (still "open" in the DOM per its own .open
+    // property, but no longer visible or reachable), which is exactly
+    // what a fresh/empty profile with an interrupted recording used to
+    // hit: the boot sequence's "no sources yet -> auto-open Set Docker
+    // Host" step didn't know or care that the resume-choice prompt was
+    // already open, and clicking #btn-set buried it. Caught via manual
+    // Electron + CDP verification (a fresh profile + a seeded interrupted
+    // marker, screenshotted): the resume-choice dialog was technically
+    // .open === true in the DOM the whole time, but invisible and
+    // unreachable underneath "New Docker Host". shouldPromptSetSourcesOnBoot
+    // is the extracted, directly-testable condition behind that fix.
+    const realSources = state.sources;
+    try {
+      state.sources = [];
+      dlgResumeChoice.showModal();
+      eq(shouldPromptSetSourcesOnBoot(), false, "resume-choice prompt showing -> never also open Set Docker Host, even with zero sources");
+      dlgResumeChoice.close();
+      eq(shouldPromptSetSourcesOnBoot(), true, "resume-choice prompt closed and still zero sources -> Set Docker Host is allowed to open");
+    } finally {
+      state.sources = realSources;
+      if (dlgResumeChoice.open) dlgResumeChoice.close();
+    }
+  });
+
   await T("Recording capture-range band uses the configurable recordingBandColor (Preferences > Appearance)", async () => {
     // Spy on fillRect the same way the "now" line test spies on stroke --
     // the band is otherwise only observable as pixels, not DOM state.

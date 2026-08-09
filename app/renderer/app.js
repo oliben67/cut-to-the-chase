@@ -683,7 +683,7 @@ function drawVerticals(ctx, h, isFirst = false, isLast = false, isStrip = false)
         // shows exactly one of each, not three. Never drawn for density
         // lanes (isStrip is false there).
         if (isFirst || isLast) {
-          ctx.globalAlpha = 0.45;
+          ctx.globalAlpha = 0.236; // 30% lighter than 0.45, then another 25% lighter still
           for (let x = xLo + inset; x <= xHi - inset - holeW; x += spacing) {
             if (isFirst) {
               ctx.beginPath();
@@ -4236,6 +4236,20 @@ if (!POPOUT_KIND) {
 }
 
 
+// Named (not inlined) so it's independently testable -- see the
+// dialog-stacking regression test in test/renderer-spec.js.
+function shouldPromptSetSourcesOnBoot() {
+  // Still nothing open: prompt right away -- unless the crash-recovery
+  // resume-choice prompt (recoverInterruptedRecording, ui-REC-019) is
+  // already showing. Both are native <dialog>s opened via showModal();
+  // stacking a second one on top silently buries the first (still "open"
+  // in the DOM, but no longer visible or reachable) -- deliberately not
+  // opened here in that case, rather than fixing it by closing/deferring
+  // the *other* one, since the interrupted-recording choice is the more
+  // consequential of the two and shouldn't be preempted by routine setup.
+  return state.sources.length === 0 && !dlgResumeChoice.open;
+}
+
 refreshAll().then(async () => {
   if (POPOUT_KIND) return; // popout windows never restore/set sources on their own
   if (state.sources.length === 0) {
@@ -4249,7 +4263,7 @@ refreshAll().then(async () => {
       } catch { /* remembered host(s) unreachable; fall through below */ }
     }
   }
-  if (state.sources.length === 0) $("btn-set").click(); // still nothing: prompt right away
+  if (shouldPromptSetSourcesOnBoot()) $("btn-set").click();
 });
 connectSSE();
 
