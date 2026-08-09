@@ -4,7 +4,7 @@
   "description": "Correlate container telemetry with service logs on a shared clickable timeline",
   "main": "main.js",
   "scripts": {
-    "prestart": "npm run build:renderer",
+    "prestart": "npm run build:renderer && npm run build:manual",
     "start": "electron .",
     "build:renderer": "node build/build-renderer.js",
     "watch:renderer": "node build/build-renderer.js --watch",

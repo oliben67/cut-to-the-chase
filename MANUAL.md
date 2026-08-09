@@ -18,9 +18,9 @@ executable (see [Getting help](#getting-help)) so it's available offline.
 - [Adding sources](#adding-sources)
   - [Collecting from Docker](#collecting-from-docker)
   - [Remote hosts over SSH](#remote-hosts-over-ssh)
-  - [Loading metrics files](#loading-metrics-files)
+  - [Loading and switching data files](#loading-and-switching-data-files)
   - [Opening files from the command line](#opening-files-from-the-command-line)
-  - [Removing the Docker Host](#removing-the-docker-daemon)
+  - [Removing or disconnecting the Docker Host](#removing-or-disconnecting-the-docker-host)
 - [Reading the telemetry](#reading-the-telemetry)
   - [Metric strips](#metric-strips)
   - [The container legend](#the-container-legend)
@@ -28,15 +28,17 @@ executable (see [Getting help](#getting-help)) so it's available offline.
   - [Host telemetry](#host-telemetry)
 - [Navigating time](#navigating-time)
   - [Live-following and the "now" line](#live-following-and-the-now-line)
-  - [The cursor and the frequency window](#the-cursor-and-the-frequency-window)
+  - [Live tracking](#live-tracking)
+  - [The cursor and the highlight window](#the-cursor-and-the-highlight-window)
   - [Zooming and panning](#zooming-and-panning)
   - [The timeline navigator](#the-timeline-navigator)
   - [The status bar](#the-status-bar)
 - [Working with logs](#working-with-logs)
 - [Snapshots](#snapshots)
+- [Recording](#recording)
 - [Capturing and sharing metrics (.cttc-metric)](#capturing-and-sharing-metrics-cttc-metric)
+- [Exporting metrics as text or JSON](#exporting-metrics-as-text-or-json)
 - [Automating with events](#automating-with-events)
-- [Encryption keys](#encryption-keys)
 - [Pop-out windows](#pop-out-windows)
 - [Transforms](#transforms)
 - [Interactions reference](#interactions-reference)
@@ -64,7 +66,7 @@ executable (see [Getting help](#getting-help)) so it's available offline.
   a `docker stats` collector, a host-telemetry collector, or an opened file.
 - **Cursor** — the currently selected point in time. Click anywhere on a
   chart or density lane at time *t* and **every log panel jumps to its
-  entries at *t***, highlighting the ± frequency window around it.
+  entries at *t***, highlighting the ± highlight window around it.
 - **Live vs. sample data** — live sources keep updating; data loaded from a
   `.cttc-metric` file is static and drawn grayed + dashed/hatched so it is
   always distinguishable from live series.
@@ -80,9 +82,9 @@ a **gateway setup wizard** may appear — see
 [Connecting to a Gateway](#connecting-to-a-gateway); skip it to use this
 machine's own Docker (or none) directly.
 
-With no sources open, the **Set Docker Host…** dialog (sidebar → Docker
-Daemon) attaches to a Docker host; or use **Load Metrics…** (sidebar →
-Metrics) to open a saved `.cttc-metric` file instead.
+With no sources open, **New Docker Host…** (sidebar → Docker Host) attaches
+to a Docker host; or use **Load Data…** (sidebar → Analysis) to open a saved
+`.cttc-metric` or `.cttc-record` file instead.
 
 If you collected from Docker before, the app **restores those collections on
 launch** automatically.
@@ -95,18 +97,22 @@ from the sidebar's **About CTTC** panel and the toolbar's `?` buttons — see
 
 The sidebar (visible on the left in the screenshot under
 [The main window](#the-main-window)) groups every action into four
-collapsible sections:
+collapsible sections, plus a flat **Preferences** entry:
 
-- **Gateway** — New Gateway…, Edit Gateway (see
+- **Gateway** — New Gateway…, Edit Gateway, Uninstall Gateway… (see
   [Connecting to a Gateway](#connecting-to-a-gateway)).
-- **Docker Host** — Set Docker Host…, Edit Docker Host…, Remove
-  Docker Host (see [Adding sources](#adding-sources)).
-- **Metrics** — Load Metrics…, Create Event…, Edit Events… (see
+- **Docker Host** — New Docker Host…, Edit Docker Host, Disconnect Docker
+  Host, Remove Docker Host… (see [Adding sources](#adding-sources)).
+- **Events Capture** — Create Event…, Edit Events… (see
   [Automating with events](#automating-with-events)).
-- **Preferences** — Appearance…, Settings… (see
-  [Live-following and the "now" line](#live-following-and-the-now-line) for
-  the now-line's color/style controls, and [Encryption keys](#encryption-keys)
-  for key management, reached from Settings).
+- **Analysis** — Load Data…, Opened Data… (see
+  [Loading and switching data files](#loading-and-switching-data-files)).
+- **Preferences** — one entry opens the combined Settings/Appearance dialog
+  (see [Live-following and the "now" line](#live-following-and-the-now-line)
+  for the now-line's color/style controls, and
+  [The cursor and the highlight window](#the-cursor-and-the-highlight-window)
+  for the Time window field); it opens on the Appearance pane, switch to
+  Settings from the pane list on the left.
 
 Click a section's header to expand/collapse it; click its chevron or title
 again to collapse. Below the sections, **About CTTC** and **Quit** are
@@ -114,33 +120,41 @@ always visible.
 
 The bar itself can be:
 
-- **docked** to any of the four edges of the window, or **detached** into
+- **docked** to the left or right edge of the window, or **detached** into
   its own floating window — use the small dock-position buttons at its top.
 - **collapsed** to a thin rail (the ◂/▸ button at the top-left of the bar)
   when you want the chart area at full width; every section hides, leaving
   just the rail to expand it again.
 - **resized** by dragging the thin splitter between the bar and the main
-  content — the size is remembered per axis (width for left/right docking,
-  height for top/bottom), independently of which edge it's currently docked
-  to.
+  content — the width is remembered independently of which edge it's
+  currently docked to.
 
 ## The main window
 
 ![The CTTC main window: the cursor sits on a c3_worker spike; both log
-panels have jumped to that moment, highlighting the ± frequency window,
+panels have jumped to that moment, highlighting the ± highlight window,
 with ERROR and WARN rows edge-colored, and the dotted "now" line visible on
 the charts](docs/images/app-overview.png)
 
 From top to bottom:
 
 1. **Toolbar** — recording transport (⏺/⏸/⏹/⏏, see
-   [Automating with events](#automating-with-events)), the **frequency**
-   control (labelled *Frequency* — not to be confused with how often the
-   server polls Docker for telemetry, which is a fixed rate, not
-   configurable here; this one only sizes the ± highlight window, see
-   [The cursor and the frequency window](#the-cursor-and-the-frequency-window)),
-   the 〜/▤ chart-style switch, the current **view range**, and the
-   cursor's UTC readout — see [The status bar](#the-status-bar).
+   [Recording](#recording)), the **frequency** control (labelled
+   *Frequency* — how often, in seconds, telemetry/logs are actually polled
+   from the Docker host; not to be confused with the ± highlight window
+   around the selected time, which is a separate, independently
+   configurable value — see
+   [The cursor and the highlight window](#the-cursor-and-the-highlight-window)),
+   the Live tracking toggle, the 〜/▤ chart-style switch, the current
+   **view range**, and the cursor's UTC readout — see
+   [The status bar](#the-status-bar). While a loaded metrics/recording file
+   is the active view (see
+   [Loading and switching data files](#loading-and-switching-data-files)),
+   the toolbar switches into **analysis mode**: the recording transport and
+   live-only controls hide, a **metric(s)** dropdown appears to switch
+   between a multi-segment recording's segments, an **export** icon opens
+   [Exporting metrics as text or JSON](#exporting-metrics-as-text-or-json),
+   and a **Back to live tracking** button returns to live data.
 2. **Telemetry** — the container legend, then the CPU % / MEM % / NET metric
    strips. In the screenshot the solid vertical line is the **cursor**,
    placed on one of `c3_worker`'s spikes; the **dotted line** further right
@@ -156,10 +170,15 @@ From top to bottom:
    own CPU/MEM/NET in a collapsible strip group with its own navigator.
 6. **Log panels** — one per log source, below the divider. Both panels above
    have jumped to the cursor's time: the blue-tinted rows are inside the ±
-   frequency window, and `c3_worker` shows why the spike happened —
+   highlight window, and `c3_worker` shows why the spike happened —
    edge-colored `WARN job … slow` and `ERROR … OutOfMemoryError` rows. A log
    panel's own **✕** hides it (and its matching legend entry) without
    stopping collection — see [The container legend](#the-container-legend).
+7. **Status bar** (bottom, not shown above — toggle in **Preferences →
+   Appearance → Show status bar**, on by default) — recording/analysis-mode
+   indicators, event notifications, the Gateway and Docker Host status
+   pills, and a **History** button. See
+   [The status bar](#the-status-bar) for what each of these does.
 
 Drag the divider between charts and log panels to trade chart height for log
 space; the position is remembered.
@@ -216,14 +235,20 @@ the choice above.
 **Edit Gateway** re-opens that same form for an existing entry — **"This
 machine"** (the embedded/local gateway) is never listed here, since it has
 no connection settings to change and can't be uninstalled; it's always
-available from the toolbar's gateway status button instead, which switches
-between every gateway you've connected to, including it.
+available from the status bar's gateway status pill instead (see
+[The status bar](#the-status-bar)), which switches between every gateway
+you've connected to, including it.
 
 **Uninstall** stops and removes the gateway's container **and its image**
 (not just the container), streaming progress to the same activity log New
 Gateway uses. If it reports an error, it also checks — and logs — whether
 the container is actually still there, since `docker compose down` can
 exit non-zero after partially succeeding.
+
+Editing or uninstalling the gateway you're **currently connected to** while
+a [recording](#recording) is running warns first — it will be abandoned,
+unsaved, since the gateway it was capturing from won't be the one you end
+up on.
 
 Uninstalling the gateway you're **currently connected to** immediately
 reconnects to this machine with no confirmation prompt: every open
@@ -241,35 +266,35 @@ reconnects — no action needed on your part.
 
 ### Collecting from Docker
 
-![The Set Docker Host dialog: docker host field and the Fetch button
+![The New Docker Host dialog: docker host field and the Fetch Sources button
 that lists containers/services to follow](docs/images/dlg-set-sources.png)
 
-Only one Docker host can be watched at a time, so **Set Docker
-Daemon…** is only enabled while none is defined yet — once one's set, use
-**Edit Docker Host…** (or **Remove Docker Host** first) instead of
-starting a second one.
+Only one Docker host can be watched at a time, so **New Docker Host…** is
+only enabled while none is defined yet — once one's set, use **Edit Docker
+Host** (or **Remove Docker Host…** first) instead of starting a second one.
 
-**Set Docker Host…** attaches to a Docker host. Leave the host field
+**New Docker Host…** attaches to a Docker host. Leave the host field
 empty for the local daemon (or the gateway's own host, if you're connected
 to a remote gateway). CPU/MEM/NET telemetry — both per-container
 (`docker stats`) and for the host machine itself — is always collected
-once a daemon is set, on a fixed poll interval; there's no separate
+once a daemon is set, on the poll interval set by the toolbar's/Settings'
+**Frequency** field (default 5s, live-adjustable); there's no separate
 opt-in for it. Only *selected* containers (see below) are actually
 *plotted*; the rest wait in the legend's *others* group (see
 [The container legend](#the-container-legend)).
 
-Click **Fetch** to list the running containers and swarm services for the
-entered host, grouped under **"Swarm services"** and **"Containers"**
-headings. **Nothing is ticked by default** — pick exactly what you want
-followed and plotted; ticking an item both starts following its logs
-(`docker logs -f -t`, or `docker service logs -f -t` for swarm services)
-*and* marks it *selected* so its telemetry plots immediately. You can
-always right-click a container later to track it (see
+Click **Fetch Sources** to list the running containers and swarm services
+for the entered host, grouped under **"Swarm services"** and
+**"Containers"** headings. **Nothing is ticked by default** — pick exactly
+what you want followed and plotted; ticking an item both starts following
+its logs (`docker logs -f -t`, or `docker service logs -f -t` for swarm
+services) *and* marks it *selected* so its telemetry plots immediately. You
+can always right-click a container later to track it (see
 [The container legend](#the-container-legend)). **Click a group's own
 heading** to select or deselect every checkbox in that group at once (a
 partially-ticked group selects all first, rather than deselecting).
 
-**Set Docker Host**/**Update Docker Host** stays disabled until at
+**Connect Docker Host**/**Update Docker Host** stays disabled until at
 least one container or service is actually checked — with nothing
 ticked there's nothing to collect.
 
@@ -277,8 +302,8 @@ An already-followed container or service looks exactly like any other
 entry in the list — same color, still enabled — the only cue is a **✔**
 mark next to it if it's currently ticked. Ticking/unticking toggles that
 mark live. Ticked transforms (see [Transforms](#transforms)) apply to the
-new log sources. **Set Docker Host** syncs exactly to what's checked
-here, and — on every successful **Set**/**Update Docker Host** —
+new log sources. **Connect Docker Host** syncs exactly to what's checked
+here, and — on every successful **Connect**/**Update Docker Host** —
 remembers exactly which containers/services were ticked in a small file
 at `~/.cttc/[user]@[gateway]-containers.json` (one file per Docker host
 you connect to), so this daemon's selection survives closing and
@@ -288,17 +313,21 @@ what's ticked — a newly-ticked container starts plotting immediately,
 and one you just unticked stops being selected right away, rather than
 staying stuck in the graph until separately unselected from the legend.
 
-**Edit Docker Host…** and **Remove Docker Host** are only enabled once
+**Edit Docker Host** and **Remove Docker Host…** are only enabled once
 a daemon is actually being watched — nothing to edit or remove otherwise.
-Once one is set, **Edit Docker Host…** re-opens this same form with the
-host and SSH key pre-filled and locked, **Fetch** relabelled **Refresh**
-(just re-probes for new containers/services rather than starting over),
-and the bottom button relabelled **Update Docker Host**. Opening it
-immediately runs that same live probe on its own — you don't have to
-remember to click Refresh yourself for the checklist to reflect what's
-actually running right now.
+Once one is set, **Edit Docker Host** re-opens this same form with the
+host and SSH key pre-filled and locked, **Fetch Sources** relabelled
+**Refresh Sources** (just re-probes for new containers/services rather than
+starting over), and the bottom button relabelled **Update Docker Host**.
+Opening it immediately runs that same live probe on its own — you don't
+have to remember to click Refresh Sources yourself for the checklist to
+reflect what's actually running right now. It also gains a **Load Docker
+Host** dropdown, listing any previously used (currently disconnected)
+Docker hosts — picking one pre-fills its SSH key and last-selected
+containers and immediately re-probes it live, letting you reconnect to a
+past host without retyping its connection details.
 
-Opening **Edit Docker Host…** reads that daemon's
+Opening **Edit Docker Host** reads that daemon's
 `[user]@[gateway]-containers.json` file first, and the checklist is built
 from it, not from whatever happens to be open in this session:
 
@@ -320,7 +349,7 @@ from it, not from whatever happens to be open in this session:
   unchanged server-side, keeps exactly that — Refresh never discards an
   in-progress edit.
 
-Clicking **Set**/**Update Docker Host** rewrites
+Clicking **Connect**/**Update Docker Host** rewrites
 `[user]@[gateway]-containers.json` to match exactly what's ticked (and
 not disabled) at that moment — this is the "on the way out" save that
 Edit Docker Host reads back next time.
@@ -336,18 +365,21 @@ elsewhere. The choice is remembered per host.
 Container logs and stats, and host telemetry (read from the remote's
 `/proc`), all go over that same SSH connection.
 
-### Loading metrics files
+### Loading and switching data files
 
-**Load Metrics…** (sidebar → Metrics) opens one or more `.cttc-metric` files
-previously captured with the app (see
-[Capturing and sharing metrics](#capturing-and-sharing-metrics-cttc-metric)).
-They open as **static** sources: their series draw grayed and dashed, their
-log panels carry a *sample* badge, and the legend gains one switch per loaded
-file to show/hide everything from that file at once.
+**Load Data…** (sidebar → Analysis) opens one or more `.cttc-metric` files
+(see [Capturing and sharing metrics](#capturing-and-sharing-metrics-cttc-metric))
+or `.cttc-record` files (see [Recording](#recording)) previously captured
+with the app. They open as **static** sources: their series draw grayed and
+dashed, their log panels carry a *sample* badge, and the legend gains one
+switch per loaded file to show/hide everything from that file at once.
+Loading any such file switches the whole app into **analysis mode** — see
+[The main window](#the-main-window)'s toolbar item.
 
-If a file is **encrypted**, you are prompted for the private key — give the
-name of a key stored in `~/.cttc/keys/` (see [Encryption keys](#encryption-keys))
-or paste a full PEM.
+**Opened Data…** (sidebar → Analysis, or File menu) lists every
+`.cttc-metric`/`.cttc-record` file currently open; click one to switch the
+active view to it without re-picking or re-uploading it, or use its
+**Remove** button to close a file from memory (without touching it on disk).
 
 ### Opening files from the command line
 
@@ -367,11 +399,19 @@ are handled. Start the server with `--static` to disable tailing, and with
 (otherwise naive timestamps are assumed UTC). Times render in your local
 timezone; the toolbar cursor readout shows UTC.
 
-### Removing the Docker Host
+### Removing or disconnecting the Docker Host
 
-**Remove Docker Host** (sidebar → Docker Host) closes every open source
-for the current daemon (collectors are stopped) and forgets the remembered
-docker session, giving you a clean slate.
+**Disconnect Docker Host** (sidebar → Docker Host) closes every open source
+for the current daemon and stops it auto-reconnecting on the next launch,
+but **keeps** its saved connection, SSH key, and selected containers — it
+still appears in **Remove Docker Host…** and in **Edit Docker Host**'s
+*Load Docker Host* list, so reconnecting to it later doesn't mean
+retyping everything.
+
+**Remove Docker Host…** (sidebar → Docker Host) permanently forgets a saved
+daemon: pick which one from the list, and its connection, SSH key, and
+selected containers are deleted for good — unlike Disconnect, this cannot
+be undone by reconnecting to it.
 
 ## Reading the telemetry
 
@@ -479,8 +519,9 @@ The now-line's **color and dash style** (dotted, dashed, or solid) are
 configurable in **Preferences → Appearance → "Now" line**, live-previewed
 as you adjust them.
 
-![The Appearance dialog's "Now" line section: a color swatch and a
-Dotted/Dashed/Solid switch](docs/images/dlg-appearance.png)
+![The Appearance pane: Mode (Light/Dark/System), Log highlight color, the
+"Now" line's color and Dotted/Dashed/Solid switch, Live tracking's color,
+and the Show status bar toggle](docs/images/dlg-appearance.png)
 
 ### Live tracking
 
@@ -496,18 +537,22 @@ log-shipping delay. Set it in the toolbar's **Live tracking** field or
 
 Unlike a manual click, a Live-tracking-driven cursor renders as a soft
 **green bar** on the charts (not the usual thin accent line), and log
-entries within the frequency window around it are highlighted in the same
+entries within the highlight window around it are highlighted in the same
 color instead of the ordinary highlight color — both a visual cue that
 this position was picked automatically, not by you. That color is
 configurable in **Preferences → Appearance → "Live tracking"**, right
 after the "Now" line section, the same way as the now-line's own color.
 
-### The cursor and the frequency window
+### The cursor and the highlight window
 
 Click any chart or lane to place the **cursor** at that time: every log
 panel scrolls to its entry nearest the cursor, and entries within the
-**frequency** window (± N seconds, set in the toolbar) are highlighted.
-Clicking a log row moves the cursor to that row's time instead.
+**highlight window** (± N seconds, set in **Preferences → Settings → Time
+window** — not the toolbar's *Frequency* field, which controls the
+Docker polling rate instead, see [The main window](#the-main-window)) are
+highlighted. Clicking a log row moves the cursor to that row's time
+instead. The highlighted log rows' color is configurable in **Preferences
+→ Appearance → Log highlight color**.
 
 ### Zooming and panning
 
@@ -517,6 +562,10 @@ Clicking a log row moves the cursor to that row's time instead.
   the OS's own page-zoom gesture). Hover a chart for a tooltip spelling out
   all three gestures.
 - **Double-click** to re-center the view on that time, keeping the span.
+  Like any pan/zoom, this pauses live-following; if it was on, **Live
+  tracking** resumes on its own after a configurable delay
+  (**Preferences → Settings → Live tracking → Double-click resume**,
+  default 10s — set to 0 to stay paused until you click "now" yourself).
 - **Right-click** a chart for `🔍+ Zoom in here`, `🔍− Zoom out here`,
   `↺ Reset zoom` (fits the whole data range and places the cursor on now —
   a one-off "fit everything" action, unlike live-follow which keeps
@@ -535,10 +584,29 @@ within the whole available time range:
 
 ### The status bar
 
-The toolbar's right-hand side shows both **the current view range** (its
-start and span, e.g. `view: 2026-07-27 15:30:26 UTC + 10m`) and **the
+The **toolbar's** right-hand side shows both **the current view range**
+(its start and span, e.g. `view: 2026-07-27 15:30:26 UTC + 10m`) and **the
 cursor's exact time**, so you always know both what window you're looking
 at and where the cursor sits within it — not just one or the other.
+
+A separate, optional **status bar** runs along the bottom of the window
+(**Preferences → Appearance → Show status bar**, on by default). Left to
+right:
+
+- a **live/analysis mode icon** and, while [recording](#recording), a
+  blinking recording indicator;
+- a **notification area** for transient messages (event fired, action
+  confirmed, connection lost/restored…) — how long these stay visible is
+  configurable in **Preferences → Settings → Status Bar**;
+- the **Gateway status pill** — a colored dot for reachability; click it to
+  switch between every gateway you've ever connected to, or right-click for
+  **New Gateway…**, **Edit Gateway**, **Uninstall Gateway…**, and
+  **Current Status** (connection type, host, and — for a remote/tunneled
+  gateway — its SSH target and forwarded port);
+- the **Docker Host status pill** — the same pattern, for the currently
+  watched Docker host;
+- a **History** button showing a running log of recent events (connects,
+  errors, event triggers, etc.), with a **Clear** button of its own.
 
 ## Working with logs
 
@@ -568,10 +636,11 @@ that instant, plus the nearby log entries from each source.
 ![A snapshot: per-source cpu/mem/net values at the chosen instant and the
 nearest log entry from each source](docs/images/dlg-snapshot.png)
 
-Options in the snapshot dialog:
+A snapshot always covers host telemetry (when collected) plus every
+currently **selected** container — not unselected/hidden ones (see
+[The container legend](#the-container-legend)). Options in the snapshot
+dialog:
 
-- **Include all open containers/hosts** — untick to keep only the currently
-  selected series;
 - **Include nearby log entries**;
 - **panorama** — enlarge the snapshot around the chosen time: by *entries*
   (wider log context per source) or by *seconds* (adds full extra slices N
@@ -579,6 +648,39 @@ Options in the snapshot dialog:
 
 View the result as a **Raw** table or as **JSON**, and save it with
 **💾 Save as TXT…** / **💾 Save as JSON…**.
+
+## Recording
+
+The toolbar's transport (⏺ **Start**, ⏸ **Pause**, ⏹ **Stop**, ⏏ **Open
+Recording…**) captures live telemetry and logs into a `.cttc-record` file
+for later analysis — a tape-recorder-style span of live time, as opposed to
+[a snapshot](#snapshots) (one instant) or
+[capturing metrics](#capturing-and-sharing-metrics-cttc-metric) (a range you
+select after the fact).
+
+- **⏺ Start** begins recording immediately — there's no save-path prompt
+  yet, so starting never interrupts you before you know how long you'll be
+  recording.
+- **⏸ Pause**/**⏺ Start again** can be repeated any number of times; each
+  Record-to-Pause span becomes its own segment in the same recording, with
+  genuine gaps (not interpolated) for the paused stretches in between.
+- **⏹ Stop** finalizes the recording, then asks where to save it. If you
+  cancel that save prompt (or it fails), the recording stays in a
+  *stopped, not yet saved* state — click **⏹ Stop** again to retry the save
+  without losing or re-capturing anything.
+- **⏏ Open Recording…** opens one or more previously saved `.cttc-record`
+  files — the same way as [Load Data…](#loading-and-switching-data-files).
+
+Loading or recording data switches the app into **analysis mode** (see
+[The main window](#the-main-window)): the live-only toolbar controls hide,
+and a **Back to live tracking** button returns you to live data — your
+place in analysis mode is remembered so returning to it later picks up
+right where you left off.
+
+Editing or removing the **active** Gateway or Docker Host while a recording
+is in progress, paused, or stopped-but-unsaved warns first and, if you
+confirm, discards it — the data it was capturing no longer corresponds to a
+stable source once that Gateway/Docker Host changes out from under it.
 
 ## Capturing and sharing metrics (.cttc-metric)
 
@@ -588,25 +690,43 @@ To save a time range for later analysis or to share it:
    **✂ Capture metrics**, then drag) — the selection shows as an orange band.
 2. In the **Save metrics** dialog choose whether to include host telemetry
    (if it isn't being collected yet, ticking the box starts it for future
-   captures) and, optionally, an **Encrypt for** key.
+   captures).
 3. Pick a destination — you get a single **`.cttc-metric`** file containing the
    logs *and* metrics of every open source, sliced to the selected range.
 
 A `.cttc-metric` file is a zip: a manifest, one JSONL file per log source, and the
-per-service metric series (host flag and swarm info preserved). If encrypted,
-the zip is wrapped in AES-256-GCM under a one-time key that only the chosen
-recipient's RSA private key can unwrap.
+per-service metric series (host flag and swarm info preserved).
 
-Load a `.cttc-metric` back with **Load Metrics…** — see
-[Loading metrics files](#loading-metrics-files) for how sampled data is
-displayed.
+Load a `.cttc-metric` back with **Load Data…** — see
+[Loading and switching data files](#loading-and-switching-data-files) for
+how sampled data is displayed.
+
+## Exporting metrics as text or JSON
+
+While a loaded metrics/recording file is the active view (see
+[The main window](#the-main-window)'s toolbar item), **Export Metrics…**
+(File menu, or the toolbar's export icon next to the metric(s) dropdown)
+exports that **entire file's** stats and/or logs as a flat text or JSON
+file — covering its whole time range, not just the current zoom/pan window.
+This is a different feature from [capturing metrics](#capturing-and-sharing-metrics-cttc-metric)
+above, which slices a *live* time range into a new `.cttc-metric` file;
+Export Metrics instead flattens an *already-captured* file into a
+plain-text/JSON report for reading or sharing outside CTTC.
+
+1. Choose what to include: **Stats** (CPU/MEM/NET telemetry) and/or
+   **Logs**.
+2. Choose the format: **Text** or **JSON**; for stats, also choose
+   **Summary** (per-container min/avg/max over the whole file) or
+   **Full time series** (every recorded sample).
+3. **💾 Export…** saves the result.
 
 ## Automating with events
 
-**Create Event…** (sidebar → Metrics) watches CPU/MEM/NET thresholds or a
-log regular expression on chosen systems, and automatically **takes a
-snapshot** or **starts a recording** the moment the condition is met — it
-keeps watching until you disable or delete it.
+**Create Event…** (sidebar → Events Capture) watches CPU/MEM/NET thresholds
+or a log regular expression on chosen systems, and automatically **takes a
+snapshot** or **starts a recording** (see [Recording](#recording)) the
+moment the condition is met — it keeps watching until you disable or
+delete it.
 
 - **Hosted on** — *the presently connected gateway* keeps watching even
   after this window closes (the gateway is a long-running server — see
@@ -621,30 +741,6 @@ keeps watching until you disable or delete it.
 
 **Edit Events…** lists every event — local and gateway alike — to update,
 enable/disable, or erase.
-
-## Encryption keys
-
-**Settings…** (sidebar → Preferences) → **Keys** manages the keys used to
-encrypt/decrypt `.cttc-metric` files. They are plain PEM files in
-`~/.cttc/keys/` (private keys are created owner-only, mode 600 — the same
-trust model as `~/.ssh`).
-
-![The Encryption keys dialog: a keypair with its public+private badge and
-copy/delete actions, plus the generate and import forms](docs/images/dlg-keys.png)
-
-- **Generate** — create an RSA-3072 keypair for yourself. Badge:
-  `public + private`.
-- **Import** — paste a public key someone shared with you, under a name of
-  your choice. Badge: `public only`.
-- **📋 Copy** — copy a public PEM to the clipboard, to share with others so
-  *they* can encrypt metrics for *you*.
-- **🗑 Delete** — remove a key. Deleting a keypair destroys the private key:
-  any metrics encrypted for it become permanently unreadable, and the app
-  warns loudly before doing it.
-
-Typical exchange: your teammate clicks *Generate*, then *Copy*, and sends
-you the PEM. You *Import* it under their name, capture metrics with
-*Encrypt for → their name*, and send them the `.cttc-metric`. Only they can open it.
 
 ## Pop-out windows
 
@@ -672,7 +768,7 @@ pop-outs are extra views, so nothing moves.
 
 Transforms are user-written Python modules applied to every log record at
 ingest. Drop a `.py` file into `app/server/transforms/` and it appears as a
-checkbox in the **Set Docker Host…** dialog. Modules are reloaded every time
+checkbox in the **New Docker Host…**/**Edit Docker Host** dialog. Modules are reloaded every time
 sources are opened — edit and re-add, no restart needed.
 
 ```python
@@ -695,7 +791,7 @@ error is recorded on the affected record instead.
 
 | Action | Effect |
 |---|---|
-| click chart / lane | set cursor at t; all panels jump to t and highlight the ± frequency window |
+| click chart / lane | set cursor at t; all panels jump to t and highlight the ± highlight window |
 | click log row | move cursor to that row's time |
 | ctrl/cmd-click log row | add/remove that row from the selection |
 | shift-click log row | select the range from the last-clicked row |
@@ -711,7 +807,9 @@ error is recorded on the affected record instead.
 | 〜 lines / ▤ histogram switch | change chart rendering style |
 | drag divider above log panels | resize charts vs. logs |
 | drag the sidebar splitter | resize the sidebar |
-| frequency | size of the ± highlight window around the cursor |
+| toolbar Frequency field | how often telemetry/logs are polled from the Docker host |
+| Settings → Time window | size of the ± highlight window around the cursor |
+| ⏺/⏸/⏹/⏏ recording transport | start/pause/stop/open a `.cttc-record` recording |
 | legend entry click | dim/undim a selected series, or hide/show its log panel |
 | legend entry right-click | track / unselect / hide a container, or open it in its own window |
 | drag a legend entry / log panel header | reorder it (and its counterpart, kept in sync) |
@@ -725,14 +823,22 @@ error is recorded on the affected record instead.
 | ✕ on a log panel | hide the panel (collection keeps running) |
 | ⧉ / ⤴ Pop back | pop a panel out / back in |
 | click a group heading in the Docker Host checklist | select/deselect every item in that group |
+| click the Gateway/Docker Host status pill (status bar) | switch between gateways / hosts |
+| right-click the Gateway/Docker Host status pill (status bar) | New/Edit/Uninstall/Remove, or Current Status |
 
 ## What is remembered between launches
 
 Chart style, strip height, host-panel visibility, container tracking states,
 log ordering, panel positions, the *others* list state, per-host SSH keys,
 your docker collections (restored automatically at startup; cleared by
-Remove Docker Host), the sidebar's dock position/collapsed state/size, and
-the "now" line's color and style.
+Remove Docker Host…, but kept — just not auto-reconnected — by Disconnect
+Docker Host, see
+[Removing or disconnecting the Docker Host](#removing-or-disconnecting-the-docker-host)),
+the sidebar's dock position/collapsed state/size, the "now" line's color and
+style, the highlight-window color, whether the status bar is shown, the
+toolbar Frequency (poll interval), the highlight window size, Live tracking's
+on/off state and offset, the double-click live-tracking resume delay, and
+how long status-bar notifications stay visible.
 
 ## Scripting the server
 
@@ -740,12 +846,20 @@ The app is backed by a local HTTP server (bound to `127.0.0.1` only; the
 port is printed on startup). All timestamps are epoch milliseconds.
 
 ```
-GET  /sources · /range · /series?from&to&px · /logs?source&start&count
-     /index_at?source&t · /ticks?source&from&to&px · /logs/find?source&q&start&dir
-     /point?t · /transforms · /ssh/keys · /cttc/keys · /events (SSE) · /logs/rate
-POST /open · /close · /docker/ps · /docker/collect · /sample/export
-     /cttc/keys/generate · /cttc/keys/import · /cttc/keys/delete · /shutdown
-     /logs/rate
+GET  /health · /sources · /transforms · /ssh/keys · /range
+     /series?from&to&px · /logs?source&start&count · /point?t
+     /stats_export · /index_at?source&t · /ticks?source&from&to&px
+     /logs/find?source&q&start&dir · /files/download · /events (SSE)
+     /logs/rate · /mlog · /events/list · /events/{id}
+     /scheduler/{id} · /session/{id}/status · /session/{id}/download
+POST /open · /close · /docker/ps · /docker/collect · /docker/forget
+     /sample/export · /sample/record · /files/upload · /logs/rate
+     /buffer/start · /buffer/{id}/pause · /buffer/{id}/stop
+     /session/start · /session/{id}/stop · /session/{id}/safe
+     /session/ttl · /scheduler/create · /scheduler/{id}/cancel
+     /events/create · /events/{id}/enable · /events/{id}/disable
+     /events/{id}/reset · /events/{id}/update · /events/{id}/cancel
+     /shutdown
 ```
 
 Highlights:
@@ -758,9 +872,17 @@ Highlights:
   `/events` so every connected client picks it up immediately.
 - `/docker/collect` accepts `host`, `stats`, `host_stats`,
   `logs: [{name, type}]`, `transforms`, `interval`, `ssh_key`.
-- `/sample/export` takes `{path, from, to, include_host, public_key}`;
-  `/open` accepts `private_key` per file and flags encrypted files with
-  `encrypted: true` in its error entries.
+- `/sample/export` takes `{path, from, to, include_host}` and produces a
+  `.cttc-metric` file — see
+  [Capturing and sharing metrics](#capturing-and-sharing-metrics-cttc-metric).
+- `/sample/record` is the byte-oriented endpoint behind
+  [Recording](#recording) — each segment flush POSTs the existing
+  `.cttc-record` bytes plus an `{from, to}` range and gets back the merged
+  archive.
+- `/events/create` and its siblings (`/events/list`, `/events/{id}`,
+  `/events/{id}/enable|disable|reset|update|cancel`) are what
+  [Automating with events](#automating-with-events) uses under the hood —
+  scriptable directly if you'd rather not use the dialog.
 - `/point?t` returns each service's sample nearest `t` — handy for
   comparing an arbitrary moment against another one regardless of zoom.
 
@@ -776,12 +898,16 @@ without an internet connection. Two ways to reach it from inside the app:
 ## Troubleshooting
 
 - **CTTC is stuck in a broken state and nothing else here helps** —
-  **Settings… → Danger → Hard Reset** closes every open source and erases
-  every saved CTTC preference on this machine (track states, panel
-  positions, sidebar layout, theme, docker/ssh-key associations,
+  **Preferences → Settings → Danger → Hard Reset** closes every open source
+  and erases every saved CTTC preference on this machine (track states,
+  panel positions, sidebar layout, theme, docker/ssh-key associations,
   everything), then reloads the app to boot exactly like a brand-new
-  install. This cannot be undone — it does not touch your `.cttc-metric`
-  files, gateways, or encryption keys, only CTTC's own cached UI state.
+  install. This cannot be undone — it does not touch your `.cttc-metric`/
+  `.cttc-record` files or gateways, only CTTC's own cached UI state.
+- **Reporting a problem and need diagnostic logs** — enable **Preferences
+  → Settings → Collect CTTC Own Logs**, pick a folder, and CTTC writes its
+  own timestamped `.cttc-log` files there; the same panel's **Ship logs**
+  button packages them up to attach to a report.
 - **"could not start server via uv"** — install
   [uv](https://docs.astral.sh/uv/); it provisions the server's Python
   environment on first run.
@@ -806,10 +932,6 @@ without an internet connection. Two ways to reach it from inside the app:
   turns Electron into plain Node. Unset it (`task start` already does).
 - **Timestamps look shifted** — files with naive local timestamps need the
   server started with `--naive-tz local`.
-- **An encrypted `.cttc-metric` won't open** — you need the *private* key of the
-  keypair it was encrypted for; a name from `~/.cttc/keys/` or a pasted PEM
-  both work at the prompt. If that private key was deleted, the file cannot
-  be recovered.
 - **Host telemetry for a remote host shows an error** — host sampling
   supports the local daemon and `ssh://` hosts (Linux `/proc` on the remote
   side); `tcp://` daemons are not supported for host vitals.

@@ -54,12 +54,13 @@ const APP_TAGLINE = "Correlate container telemetry with service logs on a shared
 // in-app "?" help buttons and About > User Manual open this -- a local,
 // self-contained copy bundled next to the app (see package.json's
 // extraResources and build/build-manual.js, which generates it from
-// MANUAL.md) so the manual works offline and doesn't depend on GitHub being
-// reachable. Falls back to the GitHub copy only if that file is somehow
-// missing (e.g. an unpackaged dev checkout that never ran build:manual).
-const HELP_URL = "https://github.com/oliben67/cut-to-the-chase/blob/main/MANUAL.md";
+// MANUAL.md; "prestart" also builds it for dev-mode runs) so opening the
+// manual is always a local file access, never a network request -- there is
+// deliberately no web fallback here. If the local file is somehow still
+// missing (a dev checkout that skipped `npm run build:manual`), openManual()
+// reports that clearly instead of reaching out to GitHub.
 const HELP_TOPICS = {
-  frequency: "#the-cursor-and-the-frequency-window",
+  frequency: "#the-cursor-and-the-highlight-window",
 };
 function localManualPath() {
   const p = app.isPackaged
@@ -67,9 +68,18 @@ function localManualPath() {
     : path.join(__dirname, "build", "CTTC-Manual.html");
   return fs.existsSync(p) ? p : null;
 }
-function helpUrl(anchor) {
+async function openManual(anchor) {
   const local = localManualPath();
-  return local ? `file://${local}${anchor}` : HELP_URL + anchor;
+  if (!local) {
+    await dialog.showMessageBox({
+      type: "error",
+      title: "User Manual unavailable",
+      message: "The local copy of the User Manual is missing.",
+      detail: "Run `npm run build:manual` (from app/) to generate build/CTTC-Manual.html, then try again.",
+    });
+    return;
+  }
+  await shell.openExternal(`file://${local}${anchor}`);
 }
 let serverProc = null;
 // serverHost/serverPort are the actual address the client (renderer + this
@@ -388,7 +398,7 @@ async function showAboutDialog() {
     defaultId: 0,
     noLink: true,
   });
-  if (response === 1) await shell.openExternal(helpUrl(""));
+  if (response === 1) await openManual("");
 }
 
 // menu items that just trigger something in the renderer (open a dialog,
@@ -658,7 +668,7 @@ ipcMain.handle("pick-files", async (_e, title, filters) => {
 
 ipcMain.handle("open-help", async (_e, topic) => {
   const anchor = HELP_TOPICS[topic] || "";
-  await shell.openExternal(helpUrl(anchor));
+  await openManual(anchor);
 });
 
 // phase 3 of docs/architecture/remote-server.md: the renderer fetches a
