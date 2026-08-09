@@ -2276,7 +2276,7 @@
   });
 
   await T("Recording capture-range band's sprocket holes and frame lines (isStrip), toggleable off", async () => {
-    // drawVerticals directly against a mock ctx, not drawAll() against the
+    // drawHighlightBands directly against a mock ctx, not drawAll() against the
     // real canvas prototype: the full render draws plenty of other shapes
     // too, and roundRect/line calls are otherwise only observable as pixels.
     const mockCtx = {
@@ -2320,7 +2320,7 @@
       // strip's full height (endpoint y === h).
       mockCtx.roundRectCalls.length = 0;
       mockCtx.lineToCalls.length = 0;
-      drawVerticals(mockCtx, 200, true, false, true);
+      drawHighlightBands(mockCtx, 200, true, false, true);
       ok(mockCtx.roundRectCalls.length > 0, "CPU strip (isFirst) draws holes");
       const topY = mockCtx.roundRectCalls[0][1];
       ok(mockCtx.roundRectCalls.every((args) => args[1] === topY), "CPU strip's holes all share one top-row y");
@@ -2332,7 +2332,7 @@
       // below the top row, plus its own frame lines.
       mockCtx.roundRectCalls.length = 0;
       mockCtx.lineToCalls.length = 0;
-      drawVerticals(mockCtx, 200, false, true, true);
+      drawHighlightBands(mockCtx, 200, false, true, true);
       ok(mockCtx.roundRectCalls.length > 0, "NET strip (isLast) draws holes");
       const bottomY = mockCtx.roundRectCalls[0][1];
       ok(mockCtx.roundRectCalls.every((args) => args[1] === bottomY), "NET strip's holes all share one bottom-row y");
@@ -2345,7 +2345,7 @@
       // continuous frame division once stacked, not just bookending ends.
       mockCtx.roundRectCalls.length = 0;
       mockCtx.lineToCalls.length = 0;
-      drawVerticals(mockCtx, 200, false, false, true);
+      drawHighlightBands(mockCtx, 200, false, false, true);
       eq(mockCtx.roundRectCalls.length, 0, "MEM strip (neither first nor last) draws no holes");
       ok(mockCtx.lineToCalls.length > 0, "MEM strip still draws frame-division lines, despite no holes");
 
@@ -2353,7 +2353,7 @@
       // neither holes nor frame lines -- this decoration is strip-only.
       mockCtx.roundRectCalls.length = 0;
       mockCtx.lineToCalls.length = 0;
-      drawVerticals(mockCtx, 8);
+      drawHighlightBands(mockCtx, 8);
       eq(mockCtx.roundRectCalls.length, 0, "a density lane (not a strip) draws no holes");
       eq(mockCtx.lineToCalls.length, 0, "a density lane (not a strip) draws no frame lines either");
 
@@ -2361,7 +2361,7 @@
       eq(recordingSprocketHoles, false);
       mockCtx.roundRectCalls.length = 0;
       mockCtx.lineToCalls.length = 0;
-      drawVerticals(mockCtx, 200, true, true, true);
+      drawHighlightBands(mockCtx, 200, true, true, true);
       eq(mockCtx.roundRectCalls.length, 0, "no sprocket holes drawn once the toggle is off, even for isFirst/isLast");
       eq(mockCtx.lineToCalls.length, 0, "no frame lines drawn once the toggle is off either");
     } finally {

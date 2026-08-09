@@ -506,6 +506,7 @@ function drawStrip(c, spec, group, isFirst, isLast) {
   const ctx = sizeCanvas(c, h);
   const w = c.clientWidth, pw = plotWidth();
   ctx.clearRect(0, 0, w, h);
+  drawHighlightBands(ctx, h, isFirst, isLast, true);
 
   const services = seriesOf(group);
   let max = spec.key === "net" ? 1 : 100;
@@ -622,7 +623,7 @@ function drawStrip(c, spec, group, isFirst, isLast) {
   }
 
   // crosshair (hover) + cursor (clicked)
-  drawVerticals(ctx, h, isFirst, isLast, true);
+  drawVerticals(ctx, h);
 }
 
 // A small filled circle marking a truly isolated data point (no neighbor
@@ -633,7 +634,13 @@ function dot(ctx, x, y) {
   ctx.arc(x, y, 1.5, 0, Math.PI * 2);
 }
 
-function drawVerticals(ctx, h, isFirst = false, isLast = false, isStrip = false) {
+// Highlight bands (drag selection + persistent recording capture-range) --
+// drawn first, before the grid/data/labels above them, so a highlight
+// always reads as "behind" the chart, never obscuring it. drawVerticals
+// (below) handles the cursor/crosshair/"now" line instead: those are
+// interactive overlay indicators, not highlights, and stay on top on
+// purpose so they're never hidden by the chart they're pointing at.
+function drawHighlightBands(ctx, h, isFirst = false, isLast = false, isStrip = false) {
   // active drag selection band (zoom = accent, sample = warning)
   if (dragStart != null && dragX != null && Math.abs(dragX - dragStart) > 2) {
     ctx.fillStyle = themeVar(dragIsSample ? "--warning" : "--accent");
@@ -683,7 +690,12 @@ function drawVerticals(ctx, h, isFirst = false, isLast = false, isStrip = false)
         // shows exactly one of each, not three. Never drawn for density
         // lanes (isStrip is false there).
         if (isFirst || isLast) {
-          ctx.globalAlpha = 0.236; // 30% lighter than 0.45, then another 25% lighter still
+          // True cutouts (erase, not another shade of the band color) --
+          // real film perforations let light straight through, so these
+          // punch back to the strip's own background rather than painting
+          // a darker patch of recordingBandColor on top of it.
+          ctx.globalCompositeOperation = "destination-out";
+          ctx.globalAlpha = 1;
           for (let x = xLo + inset; x <= xHi - inset - holeW; x += spacing) {
             if (isFirst) {
               ctx.beginPath();
@@ -696,6 +708,7 @@ function drawVerticals(ctx, h, isFirst = false, isLast = false, isStrip = false)
               ctx.fill();
             }
           }
+          ctx.globalCompositeOperation = "source-over";
         }
         // 2. Frame-division lines -- one faint vertical every third
         // perforation's gap (centered between two holes, never crossing
@@ -722,6 +735,9 @@ function drawVerticals(ctx, h, isFirst = false, isLast = false, isStrip = false)
     }
     ctx.globalAlpha = 1;
   }
+}
+
+function drawVerticals(ctx, h) {
   if (state.cursorT != null && state.view) {
     const x = tToX(state.cursorT);
     if (x >= MARGIN_L && x <= MARGIN_L + plotWidth()) {
@@ -807,6 +823,7 @@ function drawLane(c) {
   const w = c.clientWidth;
   const pw = plotWidth(); // identical geometry to the strips above
   ctx.clearRect(0, 0, w, LANE_H);
+  drawHighlightBands(ctx, LANE_H);
   const counts = state.ticks.get(sid);
   const live = !src || src.live !== false;
   const color = colorFor(src?.name || sid);
