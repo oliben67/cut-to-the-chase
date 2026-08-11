@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import importlib.metadata
 import importlib.util
 import io
 import logging
@@ -32,6 +33,7 @@ import os
 import re
 import shlex
 import sys
+import tempfile
 import time
 import uuid
 import zipfile
@@ -2302,6 +2304,19 @@ def bad_request(msg: str) -> ValueError:
 async def lifespan(app: FastAPI):
     state: State = app.state.cttc
     await state.redis_log.start()
+    # br-MESH-001/002: self-establish a gateway-list self-entry now if this
+    # gateway's address is already known (env override) -- there's no
+    # incoming request to read a Host header from at boot, so absent that
+    # override the self-entry is instead established lazily at the first
+    # POST /gateways/sync call, which always has a real Host to go by.
+    self_addr_at_boot = os.environ.get("PUBLIC_ADDRESS") or os.environ.get("ADVERTISED_HOST_PORT")
+    if self_addr_at_boot:
+        gateway_list = await state.redis_log.load_gateway_list()
+        self_host, self_port = _split_host_port(self_addr_at_boot)
+        gateway_list[_canonical_gateway_key(self_host, self_port)] = _self_gateway_entry(
+            self_addr_at_boot
+        )
+        await state.redis_log.save_gateway_list(gateway_list)
     # Retention reconciliation (sTTL) -- runs once, right here, strictly
     # *before* any Source starts writing (cli_files/auto-collect below), so
     # there are zero live writers for this run's sweep to race against.
@@ -2486,6 +2501,15 @@ async def _options_preflight(request: Request, call_next):
     return await call_next(request)
 
 
+# br-MESH-006 (REQ-0070): the one deliberate, narrow exemption from
+# br-NET-004's blanket token requirement -- a client that just learned
+# about a peer via mesh sync has no token for it yet, so GET /ping must
+# answer without one to tell "a gateway is actually here" apart from
+# "nothing's listening". Every other route, including /health, stays
+# exactly as gated as it already was.
+_UNAUTHENTICATED_PATHS = {"/ping"}
+
+
 @app.middleware("http")
 async def _require_api_token(request: Request, call_next):
     """Gates every route behind a shared-secret token when one is configured
@@ -2505,7 +2529,8 @@ async def _require_api_token(request: Request, call_next):
     OPTIONS is exempt: a CORS preflight can't carry the real header yet
     (that's exactly what it's asking permission for), so gating it here
     would break every actual request that needs one, not just
-    unauthenticated ones.
+    unauthenticated ones. _UNAUTHENTICATED_PATHS is the other, narrower
+    exemption -- see its own comment.
 
     A `?token=` query param is accepted as a fallback alongside the header
     for one reason: the browser's native EventSource (app.js's /events SSE
@@ -2514,7 +2539,7 @@ async def _require_api_token(request: Request, call_next):
     through get()/post()/authHeaders() and always uses the header.
     """
     expected = getattr(request.app.state, "api_token", None)
-    if expected and request.method != "OPTIONS":
+    if expected and request.method != "OPTIONS" and request.url.path not in _UNAUTHENTICATED_PATHS:
         got = request.headers.get("x-cttc-token") or request.query_params.get("token")
         if got != expected:
             logger.warning(
@@ -2543,11 +2568,260 @@ def get_log_source(request: Request, source: str) -> LogSource:
     return src
 
 
+# ── admin-action authorization (br-OWNER-002/003/005, REQ-0069) ────────────
+
+ADMIN_NONCE_TTL_SECONDS = 120
+# The `-n` namespace ssh-keygen -Y sign/verify both must agree on -- scopes
+# a signature to this specific purpose, so a signature produced for some
+# other ssh-keygen -Y consumer (e.g. git commit signing with the same key)
+# could never be replayed here, and vice versa.
+ADMIN_SIGNATURE_NAMESPACE = "cttc-admin-auth"
+
+
+async def _verify_owner_signature(nonce: str, signature: str, owner_public_key: str) -> bool:
+    """Verifies `signature` -- an ssh-keygen -Y sign SSHSIG armor blob --
+    over `nonce`, against `owner_public_key`, by shelling out to
+    `ssh-keygen -Y verify`. NOT paramiko, despite it already being a server
+    dependency for Docker-host SSH (_connect_ssh below): paramiko's own
+    verify_ssh_sig() speaks the raw SSH auth-protocol signature format
+    (RFC 4252/8332), a different wire format from the SSHSIG envelope
+    ssh-keygen -Y sign produces (the same format `git commit -S` uses) --
+    paramiko has no SSHSIG parser, and hand-rolling one would be exactly
+    the kind of crypto-adjacent risk this codebase avoids elsewhere in
+    favor of shelling to the real OS tool (see _connect_ssh's own docstring
+    on TOFU/paramiko for the one place this module *does* use paramiko).
+    `openssh-client` is already in the container image (Dockerfile)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        allowed_signers = tmp_path / "allowed_signers"
+        allowed_signers.write_text(f"owner {owner_public_key}\n")
+        sig_file = tmp_path / "nonce.sig"
+        sig_file.write_text(signature)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ssh-keygen",
+                "-Y",
+                "verify",
+                "-f",
+                str(allowed_signers),
+                "-I",
+                "owner",
+                "-n",
+                ADMIN_SIGNATURE_NAMESPACE,
+                "-s",
+                str(sig_file),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            logger.error("ssh-keygen not found on PATH -- cannot verify any admin signature")
+            return False
+        try:
+            await asyncio.wait_for(proc.communicate(nonce.encode()), timeout=5.0)
+        except TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return False
+        return proc.returncode == 0
+
+
+async def _require_owner_signature(request: Request, body: dict, action: str) -> dict:
+    """The gate for every admin-tier action (br-OWNER-003/005): raises
+    HTTPException(403) unless `body` carries a {nonce, signature} pair
+    that verifies against the current owner's public key. Returns the
+    ownership record on success, for the caller's own use (e.g. rotate
+    needs the prior owner's installedAt). A plain function called at the
+    top of each admin handler, not a FastAPI Depends() -- this codebase
+    has no Depends() usage anywhere (verified), and each admin route needs
+    a different `action` label for its own audit-log line anyway.
+
+    consume_nonce runs *before* signature verification, deliberately: a
+    wrong-signature attempt still burns that nonce, so retrying the same
+    nonce with a different signature can never turn into a brute-force
+    loop against one still-valid challenge (matches br-OWNER-003's
+    "single-use", not just "single-use on success"). Every rejection path
+    is logged individually with its specific reason -- the audit log
+    records *why* a request was refused, not just that it was."""
+    st = get_state(request)
+    client_host = request.client.host if request.client else "?"
+    ownership = await st.redis_log.read_ownership()
+    if ownership is None:
+        logger.warning(
+            "admin action %r rejected (no owner claimed yet) from %s", action, client_host
+        )
+        raise HTTPException(status_code=403, detail="no owner has claimed this gateway yet")
+    nonce = body.get("nonce")
+    signature = body.get("signature")
+    if not nonce or not signature:
+        logger.warning(
+            "admin action %r rejected (missing nonce/signature) from %s", action, client_host
+        )
+        raise HTTPException(status_code=403, detail="'nonce' and 'signature' are required")
+    if not await st.redis_log.consume_nonce(nonce):
+        logger.warning(
+            "admin action %r rejected (invalid/expired/reused nonce) from %s", action, client_host
+        )
+        raise HTTPException(status_code=403, detail="invalid, expired, or already-used nonce")
+    if not await _verify_owner_signature(nonce, signature, ownership["ownerPublicKey"]):
+        logger.warning(
+            "admin action %r rejected (signature did not verify against owner %s) from %s",
+            action,
+            ownership.get("ownerLabel"),
+            client_host,
+        )
+        raise HTTPException(
+            status_code=403, detail="signature did not verify against the owner's public key"
+        )
+    logger.info(
+        "admin action %r authorized for owner %s from %s",
+        action,
+        ownership.get("ownerLabel"),
+        client_host,
+    )
+    return ownership
+
+
 @app.get("/health")
 async def route_health():
     """Cheap liveness probe -- no state/docker/disk access, just confirms the
     process is up and answering HTTP, for the renderer's status indicator."""
     return {"ok": True}
+
+
+# ── gateway peer-discovery mesh (br-MESH-001..006, REQ-0070) ───────────────
+
+try:
+    GATEWAY_VERSION = importlib.metadata.version("cttc-timeline-server")
+except importlib.metadata.PackageNotFoundError:
+    # Not installed as a package in every deployment mode (e.g. a bare
+    # `uv run server.py` checkout) -- /ping still needs to answer with
+    # something rather than raise, so this falls back to a literal rather
+    # than mirroring pyproject.toml's version by hand in two places.
+    GATEWAY_VERSION = "0.0.0-dev"
+
+GATEWAY_LIST_MAX_ENTRIES = 500
+
+
+def _split_host_port(addr: str) -> tuple[str, int]:
+    host, _, port_str = (addr or "").rpartition(":")
+    if host and port_str.isdigit():
+        return host, int(port_str)
+    return addr or "", 0
+
+
+def _canonical_gateway_key(host: str, port: int) -> str:
+    """br-MESH-001: the one identity model every gateway-list entry is
+    keyed by -- lower(host):port. This is also, deliberately, the fix for
+    REQ-0012's flagged host-vs-host:port inconsistency (the provisioning
+    guard's own key granularity is unchanged by this requirement; only
+    this list adopts the canonical form)."""
+    return f"{(host or '').lower()}:{port}"
+
+
+def _self_address(request: Request) -> str:
+    """This gateway's own host:port, as it should appear in its peer list
+    (br-MESH-002). PUBLIC_ADDRESS/ADVERTISED_HOST_PORT env wins if set --
+    the operator knows this gateway's real externally-reachable address
+    better than anything inferred -- else the incoming request's own Host
+    header, which reflects whatever address the client actually dialed to
+    reach us (direct HTTP or through an ssh tunnel's local forward,
+    either way a real answer, unlike a bind address like 0.0.0.0 would
+    be)."""
+    override = os.environ.get("PUBLIC_ADDRESS") or os.environ.get("ADVERTISED_HOST_PORT")
+    return override or request.headers.get("host", "")
+
+
+def _self_gateway_entry(self_addr: str) -> dict:
+    host, port = _split_host_port(self_addr)
+    return {
+        "host": host,
+        "port": port,
+        "lastContactAt": now_iso(),
+        "lastContactResult": "ok",
+        "existence": "existing",
+    }
+
+
+@app.get("/ping")
+async def route_ping():
+    """br-MESH-006: unauthenticated (see _UNAUTHENTICATED_PATHS) L7
+    liveness that identifies this as specifically a gateway, unlike the
+    existing /health -- lets a client tell "a gateway answered" from
+    "some port is open" for a peer discovered via mesh sync it has no
+    token for yet."""
+    return {"service": "gateway", "version": GATEWAY_VERSION}
+
+
+def _merge_gateway_entry(current: dict | None, incoming: dict) -> dict:
+    """One incoming (relayed, untrusted) entry merged against this
+    gateway's own persisted record for the same canonical key.
+    br-MESH-003/004: a brand-new key is always added with `existence`
+    forced to `unknown`, regardless of what was reported; an existing
+    key keeps whichever side has the more recent `lastContactAt` (ties
+    prefer a verified `existence` over `unknown`); and a locally verified
+    `existing`/`absent` is never downgraded to a relayed `unknown`, no
+    matter how recent that relayed value claims to be -- checked first,
+    ahead of (and overriding) the recency comparison."""
+    if current is None:
+        merged = dict(incoming)
+        merged["existence"] = "unknown"
+        return merged
+    current_verified = current.get("existence") in ("existing", "absent")
+    incoming_verified = incoming.get("existence") in ("existing", "absent")
+    if current_verified and not incoming_verified:
+        return current
+    incoming_ts = str(incoming.get("lastContactAt") or "")
+    current_ts = str(current.get("lastContactAt") or "")
+    if incoming_ts > current_ts:
+        return dict(incoming)
+    if incoming_ts < current_ts:
+        return current
+    return dict(incoming) if (incoming_verified and not current_verified) else current
+
+
+@app.post("/gateways/sync")
+async def route_gateways_sync(request: Request):
+    """br-MESH-003/004/005: merges the client's posted gateway list into
+    this gateway's own persisted one under trust rules that stop relayed/
+    stale belief from overwriting something directly verified, then
+    returns the full merged list. The self-entry is (re)written last and
+    unconditionally, so it's always authoritative for itself regardless
+    of anything the client happened to relay about this same address
+    (br-MESH-002's "never flaps from relayed input")."""
+    body = await request.json()
+    incoming_entries = body.get("entries")
+    if not isinstance(incoming_entries, list):
+        raise bad_request("'entries' must be a list")
+    st = get_state(request)
+    current = await st.redis_log.load_gateway_list()
+    # br-MESH-005: bound accepted list size -- trim the posted payload
+    # itself rather than let a pathologically large one grow the merge
+    # (and the persisted list) without limit.
+    for incoming in incoming_entries[:GATEWAY_LIST_MAX_ENTRIES]:
+        host, port = incoming.get("host"), incoming.get("port")
+        if not host or not port:
+            continue
+        key = _canonical_gateway_key(host, port)
+        current[key] = _merge_gateway_entry(current.get(key), incoming)
+    self_addr = _self_address(request)
+    self_host, self_port = _split_host_port(self_addr)
+    self_key = _canonical_gateway_key(self_host, self_port)
+    current[self_key] = _self_gateway_entry(self_addr)
+    if len(current) > GATEWAY_LIST_MAX_ENTRIES:
+        # Trim oldest-by-lastContactAt, but the self-entry is never the
+        # one to go -- re-added unconditionally after the trim if the cut
+        # happened to exclude it.
+        kept = sorted(
+            current.items(), key=lambda kv: kv[1].get("lastContactAt") or "", reverse=True
+        )
+        current = dict(kept[:GATEWAY_LIST_MAX_ENTRIES])
+        current[self_key] = _self_gateway_entry(self_addr)
+    await st.redis_log.save_gateway_list(current)
+    logger.debug(
+        "gateways/sync: merged %d incoming entries, %d total", len(incoming_entries), len(current)
+    )
+    return {"entries": list(current.values())}
 
 
 @app.get("/mlog")
@@ -3211,6 +3485,92 @@ async def route_files_upload(request: Request):
         "needs_selection": needs_selection,
         "sources": await st.describe(),
     }
+
+
+@app.post("/gateway/ownership/claim")
+async def route_gateway_ownership_claim(request: Request):
+    """br-OWNER-001 (REQ-0069): the deploying client becomes owner. Called
+    once, right after provisioning's health check succeeds (see
+    lib/server-provision.js's ensureRemoteContainer/ensureLocalContainer).
+    Idempotent by design -- if an ownership record already exists, this is
+    a no-op that returns it unchanged: connecting to an already-owned
+    gateway must never rewrite who owns it. The read here is just a fast
+    path; write_ownership's SET NX is what actually makes the write
+    atomic, so two clients racing to claim the same fresh gateway can
+    never both "win" (the loser reads back the winner's record below)."""
+    body = await request.json()
+    owner_label = body.get("ownerLabel") or None
+    owner_public_key = body.get("ownerPublicKey") or None
+    if not owner_label or not owner_public_key:
+        raise bad_request("'ownerLabel' and 'ownerPublicKey' are required")
+    st = get_state(request)
+    existing = await st.redis_log.read_ownership()
+    if existing is not None:
+        return existing
+    now = now_iso()
+    record = {
+        "ownerLabel": owner_label,
+        "ownerPublicKey": owner_public_key,
+        "ownerKeyFingerprint": hashlib.sha256(owner_public_key.encode()).hexdigest(),
+        "installedAt": now,
+        "updatedAt": now,
+    }
+    if not await st.redis_log.write_ownership(record):
+        return await st.redis_log.read_ownership()
+    logger.info(
+        "gateway ownership claimed by %s (fingerprint %s)",
+        owner_label,
+        record["ownerKeyFingerprint"],
+    )
+    return record
+
+
+@app.get("/gateway/admin/challenge")
+async def route_gateway_admin_challenge(request: Request):
+    """br-OWNER-003 (REQ-0069): issues a short-lived, single-use nonce for
+    the caller to sign and present back to an admin-tier route (currently
+    just /gateway/ownership/rotate -- upgrade/delete aren't added yet, see
+    REQ-0069's Requirement 2 scope note). Unauthenticated beyond the
+    existing blanket X-CTTC-Token requirement (br-NET-004) -- a nonce on
+    its own authorizes nothing; only a *signature* over it, verified
+    against the current owner's public key, does."""
+    nonce = uuid.uuid4().hex
+    st = get_state(request)
+    await st.redis_log.remember_nonce(nonce, ADMIN_NONCE_TTL_SECONDS)
+    return {"nonce": nonce, "expiresInSeconds": ADMIN_NONCE_TTL_SECONDS}
+
+
+@app.post("/gateway/ownership/rotate")
+async def route_gateway_ownership_rotate(request: Request):
+    """br-OWNER-003 (REQ-0069): transfers ownership to a new owner --
+    the one ownership-record write path that's allowed to *replace* an
+    existing record (see overwrite_ownership's docstring), gated on proof
+    the *current* owner authorized it. Does not rotate X-CTTC-Token (see
+    REQ-0069's Open questions: the token is supplied by every client's own
+    docker-compose reconnect, so an in-memory-only rotation here would be
+    silently undone by any other client's next ordinary reconnect)."""
+    body = await request.json()
+    current = await _require_owner_signature(request, body, "ownership.rotate")
+    new_owner_label = body.get("newOwnerLabel") or None
+    new_owner_public_key = body.get("newOwnerPublicKey") or None
+    if not new_owner_label or not new_owner_public_key:
+        raise bad_request("'newOwnerLabel' and 'newOwnerPublicKey' are required")
+    st = get_state(request)
+    record = {
+        "ownerLabel": new_owner_label,
+        "ownerPublicKey": new_owner_public_key,
+        "ownerKeyFingerprint": hashlib.sha256(new_owner_public_key.encode()).hexdigest(),
+        "installedAt": current.get("installedAt", now_iso()),
+        "updatedAt": now_iso(),
+    }
+    await st.redis_log.overwrite_ownership(record)
+    logger.info(
+        "gateway ownership rotated from %s to %s (fingerprint %s)",
+        current.get("ownerLabel"),
+        new_owner_label,
+        record["ownerKeyFingerprint"],
+    )
+    return record
 
 
 @app.post("/shutdown")

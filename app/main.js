@@ -13,6 +13,7 @@ app.setName(`CTTC v${app.getVersion()}`);
 app.setPath("userData", defaultUserDataDir);
 const { spawn } = require("child_process");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const readline = require("readline");
 const {
@@ -24,7 +25,8 @@ const {
 } = require("./lib/connection-config");
 const { hasLocalDocker, canBeServerLocally } = require("./lib/docker-check");
 const { shouldShowSkipButton } = require("./lib/gateway-setup-visibility");
-const { writeKeyFile, copyKeyFile } = require("./lib/ssh-key-file");
+const { writeKeyFile, copyKeyFile, getPublicKey } = require("./lib/ssh-key-file");
+const { auditGatewayList } = require("./lib/gateway-audit");
 const {
   ensureLocalContainer,
   ensureRemoteContainer,
@@ -1021,6 +1023,90 @@ async function provisionRemoteGateway(payload, onLog) {
 // identity (gatewayHost/gatewayPort -- always its real address, tunneled or
 // not), plus imageRef for the registry and apiToken for every later request
 // (br-NET-004) -- callers must set currentApiToken from the result.
+// br-OWNER-001 (REQ-0069): claim ownership of a *remote* gateway once it's
+// confirmed reachable -- idempotent server-side (SET NX), so reconnecting
+// to an already-owned gateway is a harmless no-op there, never a rewrite.
+// Only called for remote gateways: the embedded/local ("This machine")
+// gateway is loopback-only (br-NET-001/003), already outside br-NET-004's
+// token requirement, and has no ssh keypair to claim with in the first
+// place. Best-effort -- a failure here (older gateway image with no
+// /gateway/ownership/claim route yet, network hiccup, etc.) must never
+// break an otherwise-successful connect.
+async function claimGatewayOwnership({ host, port, apiToken, sshKey }, onLog) {
+  if (!sshKey) return;
+  try {
+    const ownerPublicKey = getPublicKey(sshKey);
+    const r = await fetch(`http://${host}:${port}/gateway/ownership/claim`, {
+      method: "POST",
+      signal: AbortSignal.timeout(10000),
+      headers: {
+        "Content-Type": "application/json",
+        ...(apiToken ? { "X-CTTC-Token": apiToken } : {}),
+      },
+      body: JSON.stringify({ ownerLabel: os.hostname(), ownerPublicKey }),
+    });
+    if (!r.ok) {
+      onLog?.(`[ownership] claim request rejected (${r.status}) -- continuing unowned`);
+    }
+  } catch (err) {
+    onLog?.(`[ownership] could not claim ownership (${err.message || err}) -- continuing unowned`);
+  }
+}
+
+// br-MESH-003 / br-AUDIT-001/004 (REQ-0070/REQ-0071): posts this client's
+// known gateway list to the one just connected to, adopts the merged
+// list back, audits every entry (bounded concurrency, per-check
+// timeout), and persists the results locally to seed the next connect.
+// Entirely informational (REQ-0010's principle, reaffirmed by
+// br-AUDIT-004) -- never triggers a reconnect or switch, and never
+// speculatively adds a merely-*discovered* peer to the persistent
+// "recent gateways" history: recordGateway's own contract is "called
+// right after a connect actually succeeds -- never speculatively", so a
+// peer this client has never itself actually reached only ever gets
+// audited here, not written to disk, until/unless the user connects to
+// it for real. Best-effort, same as claimGatewayOwnership -- a failure
+// here must never break an otherwise-successful connect.
+async function syncAndAuditGateways({ host, port, apiToken }, onLog) {
+  try {
+    const registry = readGateways().filter((g) => g.mode !== "embedded");
+    const known = registry.map((g) => ({
+      host: g.host,
+      port: g.port,
+      lastContactAt: g.lastContactAt,
+      lastContactResult: g.lastContactResult,
+      existence: g.existence,
+    }));
+    const r = await fetch(`http://${host}:${port}/gateways/sync`, {
+      method: "POST",
+      signal: AbortSignal.timeout(10000),
+      headers: {
+        "Content-Type": "application/json",
+        ...(apiToken ? { "X-CTTC-Token": apiToken } : {}),
+      },
+      body: JSON.stringify({ entries: known }),
+    });
+    if (!r.ok) {
+      onLog?.(`[mesh] gateways/sync rejected (${r.status}) -- skipping this pass`);
+      return;
+    }
+    const { entries } = await r.json();
+    const audited = await auditGatewayList(entries || [], { onLog });
+    for (const entry of audited) {
+      const key = gatewayKey({ host: entry.host, port: entry.port });
+      const existingRecord = registry.find((g) => gatewayKey(g) === key);
+      if (!existingRecord) continue; // discovered, not (yet) connected to -- never recorded speculatively
+      recordGateway({
+        ...existingRecord,
+        lastContactAt: entry.lastContactAt,
+        lastContactResult: entry.lastContactResult,
+        existence: entry.existence,
+      });
+    }
+  } catch (err) {
+    onLog?.(`[mesh] sync/audit failed (${err.message || err}) -- continuing`);
+  }
+}
+
 async function connectRemoteGateway(cfg, { onLog, forceTunnel = false } = {}) {
   const sshBin = process.env.CTTC_SSH_BIN || "ssh";
   // Same key ensureRemoteContainer itself resolves `host` from below --
@@ -1045,6 +1131,8 @@ async function connectRemoteGateway(cfg, { onLog, forceTunnel = false } = {}) {
         headers: { "X-CTTC-Token": apiToken },
       });
       if (r.ok) {
+        await claimGatewayOwnership({ host: remote.host, port: remote.port, apiToken, sshKey: cfg.sshKey }, onLog);
+        await syncAndAuditGateways({ host: remote.host, port: remote.port, apiToken }, onLog);
         return {
           host: remote.host,
           port: remote.port,
@@ -1080,6 +1168,8 @@ async function connectRemoteGateway(cfg, { onLog, forceTunnel = false } = {}) {
     }
   );
   setCurrentTunnel(tunnel, remote.port, cfg.sshTarget);
+  await claimGatewayOwnership({ host: "127.0.0.1", port: remote.port, apiToken, sshKey: cfg.sshKey }, onLog);
+  await syncAndAuditGateways({ host: "127.0.0.1", port: remote.port, apiToken }, onLog);
   return {
     host: "127.0.0.1",
     port: remote.port,

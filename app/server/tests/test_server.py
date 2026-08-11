@@ -9,12 +9,15 @@ psutil and the HTTP stack are exercised for real. Run:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import hashlib
 import http.client
 import io
 import json
 import re
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -3536,6 +3539,549 @@ class TestApiTokenAuth:
         server.app.state.api_token = "s3cr3t"
         code, _ = get(base, "/sources?token=wrong")
         assert code == 401
+
+
+class TestGatewayOwnershipClaim:
+    """br-OWNER-001 (REQ-0069): the deploying client becomes owner, once,
+    at install -- POST /gateway/ownership/claim is idempotent (first claim
+    wins, SET NX under the hood) so a later reconnect can never rewrite an
+    already-established ownership record."""
+
+    def test_claim_writes_the_ownership_record(self, api):
+        base, _ = api
+        code, j = post(
+            base,
+            "/gateway/ownership/claim",
+            {"ownerLabel": "alice-laptop", "ownerPublicKey": "ssh-ed25519 AAAAC3abc"},
+        )
+        assert code == 200
+        assert j["ownerLabel"] == "alice-laptop"
+        assert j["ownerPublicKey"] == "ssh-ed25519 AAAAC3abc"
+        assert j["ownerKeyFingerprint"] == hashlib.sha256(b"ssh-ed25519 AAAAC3abc").hexdigest()
+        assert j["installedAt"] == j["updatedAt"]
+        assert j["installedAt"].endswith("Z")  # now_iso()'s UTC ISO-8601 shape
+
+    def test_reclaiming_an_already_owned_gateway_is_a_no_op(self, api):
+        # A second client (or the same one, reconnecting) must never
+        # rewrite who owns the gateway -- REQ-0069's Requirement 1
+        # acceptance criterion.
+        base, _ = api
+        _code, first = post(
+            base,
+            "/gateway/ownership/claim",
+            {"ownerLabel": "alice-laptop", "ownerPublicKey": "ssh-ed25519 AAAAC3abc"},
+        )
+        code, second = post(
+            base,
+            "/gateway/ownership/claim",
+            {"ownerLabel": "mallory-vps", "ownerPublicKey": "ssh-ed25519 AAAAC3evil"},
+        )
+        assert code == 200
+        assert second == first  # untouched -- still alice, not mallory
+
+    def test_missing_fields_are_rejected(self, api):
+        base, _ = api
+        code, j = post(base, "/gateway/ownership/claim", {"ownerLabel": "alice-laptop"})
+        assert code == 400
+        assert "ownerPublicKey" in j["error"]
+
+    def test_concurrent_claims_never_both_win(self, api):
+        # write_ownership's SET NX makes the write itself atomic -- two
+        # requests racing to claim the same fresh gateway must converge on
+        # exactly one owner, not whichever happened to be read last.
+        base, _ = api
+
+        def claim(label):
+            return post(
+                base,
+                "/gateway/ownership/claim",
+                {"ownerLabel": label, "ownerPublicKey": f"ssh-ed25519 {label}"},
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(claim, ["first-client", "second-client"]))
+        assert all(code == 200 for code, _ in results)
+        winners = {j["ownerLabel"] for _, j in results}
+        assert len(winners) == 1, f"both claims report a different winner: {results}"
+
+
+def _generate_admin_keypair(tmp_path, name):
+    """A real ed25519 keypair for admin-auth tests -- exercises the actual
+    `ssh-keygen -Y sign`/`-Y verify` contract _verify_owner_signature shells
+    out to, not a faked signature (openssh-client is a hard requirement
+    elsewhere in this project already -- see the Dockerfile)."""
+    key_path = tmp_path / name
+    subprocess.run(
+        ["ssh-keygen", "-t", "ed25519", "-N", "", "-f", str(key_path)],
+        check=True,
+        capture_output=True,
+    )
+    pub = (tmp_path / f"{name}.pub").read_text().strip()
+    return key_path, pub
+
+
+def _sign(nonce, key_path, namespace="cttc-admin-auth"):
+    """Mirrors ssh-key-file.js's signChallenge, in Python, for tests."""
+    nonce_file = key_path.parent / f"{key_path.name}.nonce"
+    nonce_file.write_text(nonce)
+    subprocess.run(
+        ["ssh-keygen", "-Y", "sign", "-f", str(key_path), "-n", namespace, str(nonce_file)],
+        check=True,
+        capture_output=True,
+    )
+    return Path(f"{nonce_file}.sig").read_text()
+
+
+class TestGatewayAdminAuth:
+    """br-OWNER-002/003/005 (REQ-0069): challenge-response gates
+    POST /gateway/ownership/rotate -- the only admin route added so far
+    (upgrade/delete aren't added yet, see REQ-0069's Requirement 2 scope
+    note)."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_token_after(self):
+        yield
+        server.app.state.api_token = None
+
+    def test_no_owner_claimed_yet_is_rejected(self, api):
+        base, _ = api
+        code, j = post(
+            base,
+            "/gateway/ownership/rotate",
+            {"newOwnerLabel": "bob", "newOwnerPublicKey": "ssh-ed25519 AAA"},
+        )
+        assert code == 403
+        assert "no owner" in j["detail"].lower()
+
+    def test_full_rotation_round_trip(self, api, tmp_path):
+        base, _ = api
+        owner_key, owner_pub = _generate_admin_keypair(tmp_path, "owner")
+        _new_key, new_pub = _generate_admin_keypair(tmp_path, "newowner")
+
+        _code, claimed = post(
+            base, "/gateway/ownership/claim", {"ownerLabel": "alice", "ownerPublicKey": owner_pub}
+        )
+
+        code, challenge = get(base, "/gateway/admin/challenge")
+        assert code == 200 and challenge["nonce"] and challenge["expiresInSeconds"] > 0
+
+        signature = _sign(challenge["nonce"], owner_key)
+        code, rotated = post(
+            base,
+            "/gateway/ownership/rotate",
+            {
+                "nonce": challenge["nonce"],
+                "signature": signature,
+                "newOwnerLabel": "bob",
+                "newOwnerPublicKey": new_pub,
+            },
+        )
+        assert code == 200
+        assert rotated["ownerLabel"] == "bob"
+        assert rotated["ownerPublicKey"] == new_pub
+        assert rotated["ownerKeyFingerprint"] == hashlib.sha256(new_pub.encode()).hexdigest()
+        assert rotated["installedAt"] == claimed["installedAt"]  # carried over, not reset
+        assert rotated["updatedAt"] != claimed["updatedAt"]
+
+        # And the record actually stuck -- a fresh read agrees.
+        _code, current = post(
+            base, "/gateway/ownership/claim", {"ownerLabel": "someone-else", "ownerPublicKey": "x"}
+        )
+        assert current == rotated  # claim on an owned gateway just echoes it back, unchanged
+
+    def test_missing_nonce_or_signature_is_rejected(self, api):
+        base, _ = api
+        post(
+            base,
+            "/gateway/ownership/claim",
+            {"ownerLabel": "alice", "ownerPublicKey": "ssh-ed25519 AAA"},
+        )
+        code, j = post(
+            base,
+            "/gateway/ownership/rotate",
+            {"newOwnerLabel": "bob", "newOwnerPublicKey": "ssh-ed25519 BBB"},
+        )
+        assert code == 403
+        assert "nonce" in j["detail"].lower()
+
+    def test_wrong_key_signature_is_rejected(self, api, tmp_path):
+        base, _ = api
+        _owner_key, owner_pub = _generate_admin_keypair(tmp_path, "owner")
+        attacker_key, _attacker_pub = _generate_admin_keypair(tmp_path, "attacker")
+        post(base, "/gateway/ownership/claim", {"ownerLabel": "alice", "ownerPublicKey": owner_pub})
+        _code, challenge = get(base, "/gateway/admin/challenge")
+        signature = _sign(challenge["nonce"], attacker_key)  # signed by the wrong key
+        code, j = post(
+            base,
+            "/gateway/ownership/rotate",
+            {
+                "nonce": challenge["nonce"],
+                "signature": signature,
+                "newOwnerLabel": "mallory",
+                "newOwnerPublicKey": "ssh-ed25519 CCC",
+            },
+        )
+        assert code == 403
+        assert "signature" in j["detail"].lower()
+
+    def test_reused_nonce_is_rejected(self, api, tmp_path):
+        base, _ = api
+        owner_key, owner_pub = _generate_admin_keypair(tmp_path, "owner")
+        post(base, "/gateway/ownership/claim", {"ownerLabel": "alice", "ownerPublicKey": owner_pub})
+        _code, challenge = get(base, "/gateway/admin/challenge")
+        signature = _sign(challenge["nonce"], owner_key)
+        body = {
+            "nonce": challenge["nonce"],
+            "signature": signature,
+            "newOwnerLabel": "bob",
+            "newOwnerPublicKey": "ssh-ed25519 DDD",
+        }
+        code1, _ = post(base, "/gateway/ownership/rotate", body)
+        assert code1 == 200
+        code2, j2 = post(base, "/gateway/ownership/rotate", body)  # same nonce again
+        assert code2 == 403
+        assert "nonce" in j2["detail"].lower()
+
+    def test_expired_nonce_is_rejected(self, api, tmp_path, monkeypatch):
+        base, _ = api
+        owner_key, owner_pub = _generate_admin_keypair(tmp_path, "owner")
+        post(base, "/gateway/ownership/claim", {"ownerLabel": "alice", "ownerPublicKey": owner_pub})
+        monkeypatch.setattr(server, "ADMIN_NONCE_TTL_SECONDS", 1)
+        _code, challenge = get(base, "/gateway/admin/challenge")
+        signature = _sign(challenge["nonce"], owner_key)
+        time.sleep(1.5)
+        code, j = post(
+            base,
+            "/gateway/ownership/rotate",
+            {
+                "nonce": challenge["nonce"],
+                "signature": signature,
+                "newOwnerLabel": "bob",
+                "newOwnerPublicKey": "ssh-ed25519 EEE",
+            },
+        )
+        assert code == 403
+        assert "nonce" in j["detail"].lower()
+
+    def test_correct_network_token_but_no_signature_is_still_rejected(self, api, tmp_path):
+        # STORY-0002: "the network token alone is never sufficient for
+        # admin actions" -- a valid X-CTTC-Token gets past br-NET-004's
+        # blanket gate but must not get anywhere near ownership/rotate.
+        base, _ = api
+        server.app.state.api_token = "s3cr3t"
+        headers = {"X-CTTC-Token": "s3cr3t"}
+        _owner_key, owner_pub = _generate_admin_keypair(tmp_path, "owner")
+        post(
+            base,
+            "/gateway/ownership/claim",
+            {"ownerLabel": "alice", "ownerPublicKey": owner_pub},
+            headers=headers,
+        )
+        code, j = post(
+            base,
+            "/gateway/ownership/rotate",
+            {"newOwnerLabel": "bob", "newOwnerPublicKey": "ssh-ed25519 FFF"},
+            headers=headers,
+        )
+        assert code == 403
+        assert "nonce" in j["detail"].lower()
+
+    def test_successful_rotation_is_audit_logged(self, api, tmp_path, caplog):
+        base, _ = api
+        owner_key, owner_pub = _generate_admin_keypair(tmp_path, "owner")
+        post(base, "/gateway/ownership/claim", {"ownerLabel": "alice", "ownerPublicKey": owner_pub})
+        _code, challenge = get(base, "/gateway/admin/challenge")
+        signature = _sign(challenge["nonce"], owner_key)
+        with caplog.at_level("INFO", logger="cttc"):
+            code, _ = post(
+                base,
+                "/gateway/ownership/rotate",
+                {
+                    "nonce": challenge["nonce"],
+                    "signature": signature,
+                    "newOwnerLabel": "bob",
+                    "newOwnerPublicKey": "ssh-ed25519 GGG",
+                },
+            )
+        assert code == 200
+        assert any(
+            "ownership.rotate" in r.message and "alice" in r.message
+            for r in caplog.records
+            if r.name == "cttc"
+        ), caplog.text
+
+    def test_rejected_admin_action_is_audit_logged(self, api, caplog):
+        base, _ = api
+        with caplog.at_level("WARNING", logger="cttc"):
+            code, _ = post(
+                base,
+                "/gateway/ownership/rotate",
+                {"newOwnerLabel": "bob", "newOwnerPublicKey": "ssh-ed25519 HHH"},
+            )
+        assert code == 403
+        assert any(
+            "ownership.rotate" in r.message and "rejected" in r.message
+            for r in caplog.records
+            if r.name == "cttc"
+        ), caplog.text
+
+
+class TestGatewayPing:
+    """br-MESH-006 (REQ-0070): GET /ping identifies this as a gateway and
+    is the one deliberate, narrow exemption from br-NET-004's blanket
+    token requirement -- /health stays exactly as gated as before."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_token_after(self):
+        yield
+        server.app.state.api_token = None
+
+    def test_ping_shape(self, api):
+        base, _ = api
+        code, j = get(base, "/ping")
+        assert code == 200
+        assert j == {"service": "gateway", "version": server.GATEWAY_VERSION}
+
+    def test_ping_is_unauthenticated_even_with_a_token_configured(self, api):
+        base, _ = api
+        server.app.state.api_token = "s3cr3t"
+        code, _ = get(base, "/ping")
+        assert code == 200
+
+    def test_health_still_requires_the_token_ping_is_not_a_blanket_exemption(self, api):
+        base, _ = api
+        server.app.state.api_token = "s3cr3t"
+        code, _ = get(base, "/health")
+        assert code == 401
+
+
+class TestGatewaysSync:
+    """br-MESH-001..005 (REQ-0070): the gateway list, its self-entry, and
+    the /gateways/sync merge rules."""
+
+    def test_new_key_is_added_with_existence_forced_to_unknown(self, api):
+        base, _ = api
+        code, j = post(
+            base,
+            "/gateways/sync",
+            {
+                "entries": [
+                    {
+                        "host": "10.0.0.5",
+                        "port": 8765,
+                        "lastContactAt": "2026-08-01T00:00:00.000Z",
+                        "lastContactResult": "ok",
+                        "existence": "existing",
+                    }
+                ]
+            },
+        )
+        assert code == 200
+        entry = next(e for e in j["entries"] if e["host"] == "10.0.0.5")
+        assert entry["existence"] == "unknown"  # relayed existence is never trusted for a new key
+
+    def test_self_entry_always_present_and_existing(self, api):
+        base, _ = api
+        code, j = post(base, "/gateways/sync", {"entries": []})
+        assert code == 200
+        host, _, port_str = base.partition("://")[2].partition("/")[0].rpartition(":")
+        self_entries = [e for e in j["entries"] if e["host"] == host and str(e["port"]) == port_str]
+        assert len(self_entries) == 1
+        self_entry = self_entries[0]
+        assert self_entry["existence"] == "existing"
+        assert self_entry["lastContactResult"] == "ok"
+        assert self_entry["lastContactAt"].endswith("Z")
+
+    def test_self_entry_never_flaps_from_a_relayed_entry_for_the_same_address(self, api):
+        base, _ = api
+        host, _, port_str = base.partition("://")[2].partition("/")[0].rpartition(":")
+        code, j = post(
+            base,
+            "/gateways/sync",
+            {
+                "entries": [
+                    {
+                        "host": host,
+                        "port": int(port_str),
+                        "lastContactAt": "2099-01-01T00:00:00.000Z",
+                        "lastContactResult": "failed",
+                        "existence": "absent",
+                    }
+                ]
+            },
+        )
+        assert code == 200
+        self_entry = next(
+            e for e in j["entries"] if e["host"] == host and str(e["port"]) == port_str
+        )
+        assert self_entry["existence"] == "existing"
+        assert self_entry["lastContactResult"] == "ok"
+
+    def test_most_recent_lastContactAt_wins(self, api):
+        base, _ = api
+        post(
+            base,
+            "/gateways/sync",
+            {
+                "entries": [
+                    {
+                        "host": "10.0.0.9",
+                        "port": 8765,
+                        "lastContactAt": "2026-08-01T00:00:00.000Z",
+                        "lastContactResult": "ok",
+                        "existence": "unknown",
+                    }
+                ]
+            },
+        )
+        code, j = post(
+            base,
+            "/gateways/sync",
+            {
+                "entries": [
+                    {
+                        "host": "10.0.0.9",
+                        "port": 8765,
+                        "lastContactAt": "2026-08-02T00:00:00.000Z",
+                        "lastContactResult": "failed",
+                        "existence": "absent",
+                    }
+                ]
+            },
+        )
+        assert code == 200
+        entry = next(e for e in j["entries"] if e["host"] == "10.0.0.9")
+        assert entry["lastContactAt"] == "2026-08-02T00:00:00.000Z"
+        assert entry["lastContactResult"] == "failed"
+        assert entry["existence"] == "absent"
+
+    # The next three exercise _merge_gateway_entry() directly rather than
+    # through the full /gateways/sync HTTP round trip: given the v1 design
+    # (client-mediated only, no gateway-to-gateway relay -- see REQ-0070's
+    # Open questions), there is currently no way for a *non-self* entry to
+    # legitimately become "existing"/"absent" via a sync payload at all
+    # (br-MESH-003/004 force every relayed claim to unknown on first
+    # insert, and the self-entry never goes through this function -- it's
+    # written directly by _self_gateway_entry, unconditionally, after the
+    # merge loop). Testing the merge function's own tie-break/never-
+    # downgrade rules in isolation is the accurate way to verify them
+    # without first having to fabricate a scenario the real system can't
+    # actually reach yet.
+
+    def test_merge_tie_prefers_verified_existence_over_unknown(self):
+        current = {
+            "host": "10.0.0.10",
+            "port": 8765,
+            "lastContactAt": "2026-08-01T00:00:00.000Z",
+            "lastContactResult": "ok",
+            "existence": "existing",
+        }
+        incoming = {
+            "host": "10.0.0.10",
+            "port": 8765,
+            "lastContactAt": "2026-08-01T00:00:00.000Z",
+            "lastContactResult": "ok",
+            "existence": "unknown",
+        }
+        merged = server._merge_gateway_entry(current, incoming)
+        assert merged["existence"] == "existing"
+
+    def test_merge_tie_the_other_direction_incoming_verified_beats_current_unknown(self):
+        current = {
+            "host": "10.0.0.10",
+            "port": 8765,
+            "lastContactAt": "2026-08-01T00:00:00.000Z",
+            "lastContactResult": "failed",
+            "existence": "unknown",
+        }
+        incoming = {
+            "host": "10.0.0.10",
+            "port": 8765,
+            "lastContactAt": "2026-08-01T00:00:00.000Z",
+            "lastContactResult": "ok",
+            "existence": "existing",
+        }
+        merged = server._merge_gateway_entry(current, incoming)
+        assert merged["existence"] == "existing"
+
+    def test_merge_never_downgrades_a_verified_entry_even_if_incoming_is_newer(self):
+        current = {
+            "host": "10.0.0.11",
+            "port": 8765,
+            "lastContactAt": "2026-08-01T00:00:00.000Z",
+            "lastContactResult": "ok",
+            "existence": "existing",
+        }
+        incoming = {
+            "host": "10.0.0.11",
+            "port": 8765,
+            "lastContactAt": "2026-08-02T00:00:00.000Z",
+            "lastContactResult": "failed",
+            "existence": "unknown",
+        }
+        merged = server._merge_gateway_entry(current, incoming)
+        assert merged["existence"] == "existing"
+
+    def test_oversized_payload_is_trimmed_not_persisted_whole(self, api, monkeypatch):
+        base, _ = api
+        monkeypatch.setattr(server, "GATEWAY_LIST_MAX_ENTRIES", 5)
+        entries = [
+            {
+                "host": f"10.0.1.{i}",
+                "port": 8765,
+                "lastContactAt": "2026-08-01T00:00:00.000Z",
+                "lastContactResult": "ok",
+                "existence": "unknown",
+            }
+            for i in range(20)
+        ]
+        code, j = post(base, "/gateways/sync", {"entries": entries})
+        assert code == 200
+        assert len(j["entries"]) <= 5
+
+    def test_entries_must_be_a_list(self, api):
+        base, _ = api
+        code, j = post(base, "/gateways/sync", {"entries": "not-a-list"})
+        assert code == 400
+        assert "list" in j["error"].lower()
+
+    def test_list_persists_across_multiple_sync_calls_within_the_same_process(self, api):
+        # The durable-store guarantee that's actually testable without a
+        # real redis-server process restart (this codebase's Redis is
+        # started fresh, non-persistent, per gateway process -- see
+        # redis_log.py's `--save ""`; the *same* limitation already
+        # applies to cttc:gateway:ownership). What's genuinely true and
+        # tested here: an entry written by one request is still present
+        # on a later, unrelated request -- it's in the durable store, not
+        # just that request's own response.
+        base, _ = api
+        post(
+            base,
+            "/gateways/sync",
+            {
+                "entries": [
+                    {
+                        "host": "10.0.0.20",
+                        "port": 8765,
+                        "lastContactAt": "2026-08-01T00:00:00.000Z",
+                        "lastContactResult": "ok",
+                        "existence": "existing",
+                    }
+                ]
+            },
+        )
+        code, j = post(base, "/gateways/sync", {"entries": []})
+        assert code == 200
+        assert any(e["host"] == "10.0.0.20" for e in j["entries"])
+
+    def test_sync_still_requires_the_network_token(self, api):
+        base, _ = api
+        server.app.state.api_token = "s3cr3t"
+        try:
+            code, _ = post(base, "/gateways/sync", {"entries": []})
+            assert code == 401
+        finally:
+            server.app.state.api_token = None
 
 
 class TestMlogEndpoint:

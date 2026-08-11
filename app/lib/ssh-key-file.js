@@ -132,4 +132,72 @@ function copyKeyFile(sourcePath, name = "cttc_ssh_key") {
   return writeKeyFile(decodeKeyFile(sourcePath), name);
 }
 
-module.exports = { keysDir, restrictKeyPermissions, writeKeyFile, copyKeyFile };
+/**
+ * Derives the public key from the private key file at `keyPath` via
+ * `ssh-keygen -y` -- the file on disk today has no `.pub` sibling
+ * (writeKeyFile/copyKeyFile only ever write the private half). Needed once,
+ * at ownership-claim time, to send `ownerPublicKey` to the gateway
+ * (REQ-0069/br-OWNER-001). Throws a clear Error rather than returning
+ * something a caller might not check, matching writeKeyFile's own
+ * error-on-bad-input style.
+ */
+function getPublicKey(keyPath) {
+  const r = spawnSync("ssh-keygen", ["-y", "-f", keyPath], { encoding: "utf8" });
+  if (r.error) {
+    throw new Error(
+      `could not run ssh-keygen to derive the public key (${r.error.message}) -- is OpenSSH installed and on PATH?`
+    );
+  }
+  if (r.status !== 0) {
+    throw new Error(`ssh-keygen -y failed for ${keyPath}: ${(r.stderr || "").trim() || "unknown error"}`);
+  }
+  return r.stdout.trim();
+}
+
+// Must match server.py's ADMIN_SIGNATURE_NAMESPACE exactly -- ssh-keygen -Y
+// sign/verify both require the same `-n` namespace, or verification fails
+// even with the right key. No shared-constants file between the Python
+// server and this client, same as e.g. the container's fixed port (8765)
+// already being a literal on both sides.
+const ADMIN_SIGNATURE_NAMESPACE = "cttc-admin-auth";
+
+/**
+ * Signs `nonce` (a challenge from GET /gateway/admin/challenge) with the
+ * private key at `keyPath`, via `ssh-keygen -Y sign` -- produces an SSHSIG
+ * armor blob the gateway verifies with the matching `ssh-keygen -Y verify`
+ * (REQ-0069/br-OWNER-003). Requires OpenSSH >= 8.2 for the `-Y` subcommand.
+ * `-Y sign` only operates on real files (no stdin/stdout mode), so this
+ * writes the nonce to a private throwaway directory, reads back the
+ * `.sig` sibling it produces, and always cleans up -- even on failure.
+ */
+function signChallenge(nonce, keyPath, { namespace = ADMIN_SIGNATURE_NAMESPACE } = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cttc-admin-sign-"));
+  const noncePath = path.join(dir, "nonce");
+  const sigPath = `${noncePath}.sig`;
+  try {
+    fs.writeFileSync(noncePath, nonce, { encoding: "utf8" });
+    const r = spawnSync("ssh-keygen", ["-Y", "sign", "-f", keyPath, "-n", namespace, noncePath], {
+      encoding: "utf8",
+    });
+    if (r.error) {
+      throw new Error(
+        `could not run ssh-keygen -Y sign (${r.error.message}) -- is OpenSSH >= 8.2 installed and on PATH?`
+      );
+    }
+    if (r.status !== 0) {
+      throw new Error(`ssh-keygen -Y sign failed for ${keyPath}: ${(r.stderr || "").trim() || "unknown error"}`);
+    }
+    return fs.readFileSync(sigPath, "utf8");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+module.exports = {
+  keysDir,
+  restrictKeyPermissions,
+  writeKeyFile,
+  copyKeyFile,
+  getPublicKey,
+  signChallenge,
+};

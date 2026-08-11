@@ -19,7 +19,14 @@ const path = require("path");
 // carries `dockerHosts`, each gateway's own catalog of the Docker hosts
 // (formerly called "daemons") actually created/used while connected to it
 // (see recordDockerHostForGateway below) -- distinct from and additional
-// to the renderer's own gateway-agnostic savedDockerDaemons list.
+// to the renderer's own gateway-agnostic savedDockerDaemons list. As of
+// REQ-0070/REQ-0071 (the peer-discovery mesh), an entry may also carry
+// `lastContactAt`/`lastContactResult`/`existence` -- the same fields
+// `POST /gateways/sync` returns and lib/gateway-audit.js's
+// auditGatewayList() updates locally; recordGateway's existing
+// merge-onto-existing behavior already preserves them across an
+// unrelated re-record (a reconnect, a connectionType refresh, etc.), no
+// special handling needed here.
 
 function defaultGatewaysPath(env) {
   const home = env.HOME || os.homedir();
@@ -62,7 +69,7 @@ function readGateways({ configPath } = {}) {
  * about (e.g. dockerHosts, recorded separately -- see
  * recordDockerHostForGateway) survive a routine re-record of the same
  * gateway (a reconnect, a connectionType refresh, etc).
- * @param {{mode: "embedded"|"remote", host: string, port: number, label: string, sshTarget?: string, sshKey?: string|null, sshPort?: number}} entry
+ * @param {{mode: "embedded"|"remote", host: string, port: number, label: string, sshTarget?: string, sshKey?: string|null, sshPort?: number, lastContactAt?: string, lastContactResult?: "ok"|"failed"|"unknown", existence?: "existing"|"absent"|"unknown"}} entry
  */
 function recordGateway(entry, { configPath } = {}) {
   const resolvedPath = configPath || defaultGatewaysPath(process.env);
