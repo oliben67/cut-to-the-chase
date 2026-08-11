@@ -1,6 +1,7 @@
 import "../../shared/legacy-globals";
 import { $ } from "../../shared/dollar";
 import { ctxMenu, closeCtxMenu } from "../../shared/ctx-menu";
+import { formatTransformName } from "../../shared/format";
 import { registerToolbarPill, syncPillPeerVisibility, CLIPBOARD_ICON_SVG } from "../../shared/toolbar-pills";
 import { dockerHostHistory } from "./state";
 import { openNewDockerHostDialog, openEditDockerHostDialog } from "./set-dialog";
@@ -113,7 +114,7 @@ export function mountDockerHostPill(): void {
       sep.className = "cip-sep";
       infoPopup.appendChild(sep);
       for (const name of TRANSFORM_NAMES) {
-        infoPopup.appendChild(renderInfoRow(name.replace(/_/g, " "), entry?.transforms?.includes(name) ? "True" : "False"));
+        infoPopup.appendChild(renderInfoRow(formatTransformName(name), entry?.transforms?.includes(name) ? "True" : "False"));
       }
     }
     infoPopup.hidden = false;

@@ -1,4 +1,4 @@
-export { fmtBytes, fmtClock } from "./formatters";
+export { fmtBytes, fmtClock, formatTransformName } from "./formatters";
 export {
   generatedSlotColor,
   colorFor,

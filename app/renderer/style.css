@@ -1353,23 +1353,30 @@ body.popout-host #btn-style-toggle-svc {
 }
 .panel-head {
   display: flex;
-  flex-direction: row;
-  align-items: center;
-  gap: 8px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
   padding: 6px 10px;
   border-bottom: 1px solid var(--border);
 }
 .panel-head-top {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 8px;
   min-width: 0; /* lets the name ellipsis/wrap instead of pushing controls off */
+}
+.panel-head-buttons {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  margin-left: auto; /* keeps the icon buttons flush right, lined up with the name row */
 }
 .panel-head-controls {
   display: flex;
   align-items: center;
+  justify-content: flex-end;
   gap: 8px;
-  margin-left: auto; /* keeps the icon buttons lined up with the title, flush right on the same row */
 }
 .panel-head .name {
   font-weight: 600;

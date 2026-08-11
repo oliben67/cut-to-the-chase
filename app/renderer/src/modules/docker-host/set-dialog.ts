@@ -1,6 +1,7 @@
 import "../../shared/legacy-globals";
 import { $ } from "../../shared/dollar";
 import { exposeMutable } from "../../shared/expose-mutable";
+import { formatTransformName } from "../../shared/format";
 import {
   dockerHostKeys,
   dockerFormFetched,
@@ -538,7 +539,7 @@ export let listContainers = async (): Promise<void> => {
       // common case, not an opt-in; anything else (e.g. drop_healthchecks)
       // stays opt-in as before.
       cb.checked = wasChecked.has(tr.name) ? wasChecked.get(tr.name)! : DEFAULT_ON_TRANSFORMS.has(tr.name);
-      label.append(cb, ` ${tr.name} `);
+      label.append(cb, ` ${formatTransformName(tr.name)} `);
       const doc = document.createElement("span");
       doc.className = "tdoc";
       doc.textContent = tr.doc || "";

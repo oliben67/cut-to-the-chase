@@ -38,15 +38,40 @@ window.cttc?.onMainLog?.(({ level, text }) => {
   (level === "error" ? console.error : console.log)(`[main] ${text}`);
 });
 
+// Default ceiling for get()/post() below -- generous enough for a large
+// export/date-range query on localhost or over an ssh tunnel, but finite:
+// without this, a stalled server (e.g. mid-recovery) leaves fetch() pending
+// forever and the caller's UI hangs with no error (see the "Export metrics
+// hangs" regression this default was added to fix).
+const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
+
 // GET path (relative to the CTTC server, never the docker/ssh target -- see
-// normalizeDockerHost below) -> parsed JSON body. Throws on any non-2xx.
-async function get(path) {
-  const r = await fetch(API + path, { headers: authHeaders() });
+// normalizeDockerHost below) -> parsed JSON body. Throws on any non-2xx or
+// if the server never responds within timeoutMs.
+async function get(path, { timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS } = {}) {
+  let r;
+  try {
+    r = await fetch(API + path, { headers: authHeaders(), signal: AbortSignal.timeout(timeoutMs) });
+  } catch (err) {
+    if (err.name === "TimeoutError") throw new Error(`${path}: no response within ${timeoutMs}ms`);
+    throw err;
+  }
   if (!r.ok) throw new Error(`${path}: ${r.status}`);
   return r.json();
 }
-async function post(path, body) {
-  const r = await fetch(API + path, { method: "POST", body: JSON.stringify(body || {}), headers: authHeaders() });
+async function post(path, body, { timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS } = {}) {
+  let r;
+  try {
+    r = await fetch(API + path, {
+      method: "POST",
+      body: JSON.stringify(body || {}),
+      headers: authHeaders(),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (err) {
+    if (err.name === "TimeoutError") throw new Error(`${path}: no response within ${timeoutMs}ms`);
+    throw err;
+  }
   const j = await r.json().catch(() => ({}));
   if (!r.ok) {
     const e = new Error(j.error || `${path}: ${r.status}`);
@@ -416,7 +441,7 @@ function buildStrips() {
       c.className = "strip";
       c.dataset.strip = i;
       c.dataset.group = group;
-      c.title = "Click: move cursor  ·  Drag: zoom to selection  ·  Right-click: zoom menu";
+      c.title = "Click: move cursor  ·  Drag: zoom to selection  ·  Right-click: capture/snapshot menu";
       parent.appendChild(c);
       arr.push(c);
     });
@@ -1681,19 +1706,22 @@ $("dlg-export-metrics-export").onclick = async () => {
   }
 };
 
-// Shared "time" context menu: capture metrics / take snapshot / zoom / reset,
-// anchored on time `t`. Used both by right-clicking a chart (t = the point
-// under the cursor) and by right-clicking selected log entries (t = the
-// center of their timestamps). `onDone`, if given, runs once whichever
-// action was picked (used to clear a log panel's selection afterwards).
+// Shared "time" context menu: capture metrics / take snapshot, anchored on
+// time `t`. Used both by right-clicking a chart (t = the point under the
+// cursor) and by right-clicking selected log entries (t = the center of
+// their timestamps). `onDone`, if given, runs once whichever action was
+// picked (used to clear a log panel's selection afterwards).
+//
+// Zoom in/out/reset used to be menu items here too -- removed from this
+// menu on request, but zoomAt()/resetZoom() themselves are untouched and
+// still very much live: plain drag-to-zoom (timelineUp) and the
+// View > Actual Size / Ctrl+0 menubar action (see menubarActions'
+// "zoom-reset") still work exactly as before.
 function timeContextMenu(e, t, onDone) {
   const wrap = (fn) => () => { onDone?.(); fn(); };
   ctxMenu(e, [
     ["✂ Capture metrics", wrap(armSampleCapture)],
     ["📸 Take snapshot at this time", wrap(() => takeSnapshot(t))],
-    ["🔍+ Zoom in here", wrap(() => zoomAt(t, 0.5))],
-    ["🔍− Zoom out here", wrap(() => zoomAt(t, 2))],
-    ["↺ Reset zoom", wrap(resetZoom)],
   ]);
 }
 
@@ -2234,7 +2262,15 @@ class Panel {
       right.append(popback);
     }
     headTop.append(name, this.sampleBadge);
-    headControls.append(this.countEl, orderToggle, searchToggle, right);
+    // Row 1: name + badge, flushed left, and the icon buttons, flushed
+    // right (headButtons). Row 2 (headControls) is the entries/transforms
+    // count, flushed right on its own -- this.countEl (set in update())
+    // is the only thing on the row below (headControls).
+    const headButtons = document.createElement("div");
+    headButtons.className = "panel-head-buttons";
+    headButtons.append(orderToggle, searchToggle, right);
+    headTop.appendChild(headButtons);
+    headControls.append(this.countEl);
     head.append(headTop, headControls);
     // Drag the header to reorder this panel (and its matching legend entry
     // moves to match), or drag it out past the window's edge to pop it out
@@ -2303,7 +2339,7 @@ class Panel {
       this.total = src.total;
     }
     this.countEl.textContent = `${this.total.toLocaleString()} entries` +
-      (src.transforms?.length ? ` · ${src.transforms.join("+")}` : "");
+      (src.transforms?.length ? ` · ${src.transforms.map(formatTransformName).join("+")}` : "");
     const broken = this.total === 0 && !!src.error;
     this.emptyState.hidden = !broken;
     this.emptyState.textContent = broken ? src.error : "";
@@ -2630,7 +2666,32 @@ async function refreshAll() {
       // rather than leaving every sample hidden with nothing selected.
       state.activeSamplePath = sampleGroups.length ? sampleGroups[0].path : null;
     }
-    if (hasSample !== state.liveHidden) setLiveHidden(hasSample);
+    // Regression fix: this self-heal used to fire unconditionally, which
+    // predates ui-LIVE-016 (Back to Live deliberately never closes loaded
+    // samples). Once that shipped, hasSample=true + liveHidden=false
+    // became a perfectly legitimate state -- exactly what clicking Back
+    // to Live with an old sample still parked open leaves you in -- but
+    // this line still treated it as "stale, force analysis mode back on",
+    // so the view rubber-banded: briefly live, then straight back to the
+    // sample. liveChosenWithSamplesStillOpen (set by setActiveView) is
+    // the fix: skip re-forcing analysis mode on only while that explicit
+    // choice still stands. The other direction (last sample just closed,
+    // nothing left to show) is unaffected and stays unconditional -- and
+    // any *explicit* switch into a file, including a no-op reupload's own
+    // setActiveView call (btn-load-sample/openRecording), already clears
+    // the flag itself, so a genuinely new/returning sample still correctly
+    // trips analysis mode exactly as this self-heal originally intended.
+    // Also self-clears here once every sample is actually gone (closed via
+    // Opened Metrics, a panel's own close button, etc. -- any route that
+    // doesn't go through setActiveView either): with nothing left open,
+    // "stay Live despite an old sample" is moot, and the *next* sample to
+    // appear is unambiguously new, so it must correctly trip analysis mode
+    // again rather than staying suppressed by a stale choice about a file
+    // that isn't even open anymore.
+    if (!hasSample) liveChosenWithSamplesStillOpen = false;
+    if (hasSample !== state.liveHidden && !(hasSample && liveChosenWithSamplesStillOpen)) {
+      setLiveHidden(hasSample);
+    }
     assignColorSlots(); // before anything draws, so slots don't depend on draw order
     const hadView = !!state.view;
     state.range = range;
@@ -3897,6 +3958,14 @@ function setLiveHidden(hidden) {
   syncPanels();
 }
 
+// Set by the user's own explicit "Back to Live" click, cleared by any
+// explicit switch back into a file (including a no-op reupload's own
+// setActiveView call) -- tells refreshAll()'s self-heal not to treat a
+// sample still sitting open in the background as a reason to force
+// analysis mode back on. See that self-heal's own comment for why this
+// exists (ui-LIVE-016 regression fix).
+let liveChosenWithSamplesStillOpen = false;
+
 // The one entry point for "show exactly this, and nothing else" -- either
 // "live" or one loaded file's path (sampleFileGroups()'s own g.path, the
 // same value state.activeSamplePath and isSampleHidden compare against).
@@ -3908,6 +3977,7 @@ function setLiveHidden(hidden) {
 // its own side effects when `hidden` doesn't actually change, but still
 // re-renders, so switching between two already-open files still works).
 function setActiveView(view) {
+  liveChosenWithSamplesStillOpen = view === "live";
   if (view === "live") {
     setLiveHidden(false);
     return;

@@ -438,7 +438,11 @@
     near((state.view.t0 + state.view.t1) / 2, t, 2000);
   });
 
-  await T("chart right-click offers snapshot/zoom entries", () => {
+  await T("chart right-click offers capture/snapshot entries, no zoom entries", () => {
+    // Zoom in/out/reset used to be menu items here too -- removed on
+    // request; zoomAt()/resetZoom() themselves are untouched (still
+    // reachable via plain drag-to-zoom and the View > Actual Size /
+    // Ctrl+0 menubar action), just no longer duplicated into this menu.
     setView(R.min_ts, R.max_ts);
     const c = stripCanvases[0];
     mouse(c, "contextmenu", tToX(MID));
@@ -446,7 +450,8 @@
     ok(menu, "menu open");
     const labels = [...menu.querySelectorAll("button")].map((b) => b.textContent).join("|");
     ok(labels.includes("snapshot"), labels);
-    ok(labels.includes("Reset zoom"), labels);
+    ok(labels.includes("Capture metrics"), labels);
+    ok(!labels.includes("zoom") && !labels.includes("Zoom"), labels);
     closeCtxMenu();
   });
 
@@ -2717,6 +2722,44 @@
       setActiveView(uploadPath);
       eq(state.liveHidden, true, "switched back into analysis mode");
       eq(state.activeSamplePath, uploadPath, "resumed the same file, no re-upload needed");
+    } finally {
+      for (const sid of r.opened) await post("/close", { id: sid });
+      await refreshAll();
+    }
+  });
+
+  await T("Back to live tracking doesn't rubber-band back to analysis mode when refreshAll() re-runs with the old sample still open (regression)", async () => {
+    // refreshAll()'s own self-heal used to force liveHidden back to true
+    // the moment *anything* re-ran refreshAll() (an SSE event, a periodic
+    // poll, ...) after Back to Live -- it predates ui-LIVE-016 (Back to
+    // Live never closes loaded samples) and couldn't tell "stale, force
+    // analysis mode back on" apart from "the user just explicitly chose
+    // Live with an old sample still parked open in the background": both
+    // look identical (hasSample=true, liveHidden=false) from refreshAll()'s
+    // own point of view. Symptom: click Back to Live, briefly see Live,
+    // then rubber-band straight back to the sample.
+    const res = await fetch(
+      `${API}/files/download?from=${R.min_ts}&to=${R.max_ts}&include_host=0`,
+      { headers: authHeaders() }
+    );
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const realPath = "/tmp/cttc-e2e-back-to-live-no-rubberband.cttc-metric";
+    await window.cttc.writeBinaryFile(realPath, bytes);
+    const r = await uploadAndResolveSegment(realPath);
+    try {
+      ok(r.opened.length >= 1, "sample opened");
+      await refreshAll();
+      eq(state.liveHidden, true, "sanity: in analysis mode");
+
+      $("btn-back-to-live").click();
+      eq(state.liveHidden, false, "switched to Live");
+
+      // Simulates whatever re-triggers a refresh after the click in real
+      // usage (an SSE /events push, a periodic poll, ...) -- the sample is
+      // still open (Back to Live never closes it), so hasSample is still
+      // true here, same as the moment the bug used to fire.
+      await refreshAll();
+      eq(state.liveHidden, false, "still Live -- refreshAll() must not rubber-band this back to analysis mode");
     } finally {
       for (const sid of r.opened) await post("/close", { id: sid });
       await refreshAll();
