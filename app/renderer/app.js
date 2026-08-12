@@ -1929,6 +1929,12 @@ function goLive() {
 setInterval(() => {
   liveTrackTick();
   if (!state.view) return;
+  // Analysis mode's view is static (see setLiveHidden's own centering) --
+  // nothing here may move it, resume live-follow out from under it, or
+  // even redraw on its behalf. Collection may still be running server-side
+  // for other open sources, but the displayed view must not react to real
+  // time at all while a sample/recording is what's shown.
+  if (state.liveHidden) return;
   if (state.live) followNow();
   else {
     if (state.liveResumeAt && Date.now() >= state.liveResumeAt) goLive();
@@ -2764,7 +2770,7 @@ async function refreshAll() {
 // (not "always"): a user who's panned away to look at history shouldn't
 // have their cursor yanked back to the live edge by a background refresh.
 function liveTrackTick() {
-  if (!state.live || !liveTrackEnabled) return;
+  if (!state.live || !liveTrackEnabled || state.liveHidden) return;
   setCursor(Date.now() + liveTrackSecs * 1000, { liveTrack: true });
 }
 
@@ -3969,6 +3975,13 @@ function setLiveHidden(hidden) {
     // restores exactly this, rather than whatever analysis mode leaves it
     // panned/zoomed to.
     savedLiveView = state.view ? { t0: state.view.t0, t1: state.view.t1, live: state.live } : null;
+    // Extremely hard rule: analysis mode is a static view centered on the
+    // active sample's own range, not wherever Live happened to be looking
+    // the instant it loaded (state.liveHidden is already true above, so
+    // resetZoom()'s own activeViewRange() picks up the active sample; the
+    // heartbeat's !state.liveHidden guard, above, is what then keeps it
+    // static going forward).
+    resetZoom();
   } else if (!hidden && wasHidden) {
     // Leaving analysis mode: restore the saved view (resuming live-follow
     // too, if it was on) rather than leaving the view stuck wherever

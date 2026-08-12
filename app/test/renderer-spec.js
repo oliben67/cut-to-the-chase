@@ -2824,6 +2824,40 @@
     }
   });
 
+  await T("analysis view is a static, centered view of the sample -- no time-driven movement (extremely hard rule)", async () => {
+    goLive();
+    eq(state.live, true, "sanity: live-following");
+    // A 5-minute slice (not the full demo range) -- these tests only need
+    // *a* sample with a real span, and a smaller download/upload/parse
+    // keeps this test's own added runtime down.
+    const res = await fetch(
+      `${API}/files/download?from=${R.min_ts}&to=${R.min_ts + 5 * 60000}&include_host=0`,
+      { headers: authHeaders() }
+    );
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const realPath = "/tmp/cttc-e2e-analysis-static-center.cttc-metric";
+    await window.cttc.writeBinaryFile(realPath, bytes);
+    const r = await uploadAndResolveSegment(realPath);
+    try {
+      ok(r.opened.length >= 1, "sample opened");
+      await refreshAll();
+      eq(state.liveHidden, true, "sanity: entered analysis mode");
+      eq(state.live, false, "live-follow stopped on entering analysis mode");
+      const range = activeViewRange();
+      ok(range && range.min_ts != null, "sanity: sample has a real range");
+      const mid = (range.min_ts + range.max_ts) / 2;
+      const viewMid = (state.view.t0 + state.view.t1) / 2;
+      near(viewMid, mid, 5, "view is centered on the sample's own midpoint, not wherever Live was");
+      const before = { t0: state.view.t0, t1: state.view.t1 };
+      await sleep(1150); // let the 1s heartbeat tick at least once
+      eq(state.view.t0, before.t0, "view must not move while in analysis mode");
+      eq(state.view.t1, before.t1, "view must not move while in analysis mode");
+    } finally {
+      for (const sid of r.opened) await post("/close", { id: sid });
+      await refreshAll();
+    }
+  });
+
   /* ── export metrics: the active file's stats/logs as text or JSON ───────── */
 
   // Shared by every export-metrics test below: uploads the demo range as a
