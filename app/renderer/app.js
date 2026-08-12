@@ -4406,18 +4406,36 @@ function shouldPromptSetSourcesOnBoot() {
   return state.sources.length === 0 && !dlgResumeChoice.open;
 }
 
+// Named (not inlined) so it's independently testable. Reopens whatever
+// containers/services were being collected last time (nothing else has
+// opened anything yet -- see the only caller, below), and sets
+// state.activeDockerHost to match -- the same funnel point as Set/Edit
+// Docker Host's dlg-ok (br-DHOST-030). Without this, activeDockerHost
+// stays whatever it last was (often "local" from a much earlier session),
+// and if that stale local session also gets replayed here alongside a
+// newer remote one (lastDockerSessions is undeduped and append-only, so
+// both can coexist), refreshAll()'s self-heal treats "local" as a
+// perfectly valid match and never corrects it -- silently hiding the
+// remote host's containers/telemetry even though it's the one just
+// (re)connected (regression found 2026-08-12).
+async function autoReconnectLastDockerSessions() {
+  const sessions = prefs.get("lastDockerSessions", []);
+  if (!sessions.length) return;
+  try {
+    await Promise.all(sessions.map((req) => post("/docker/collect", req)));
+    const lastHost = sessions[sessions.length - 1]?.host;
+    state.activeDockerHost = lastHost || "local";
+    prefs.set("activeDockerHost", state.activeDockerHost);
+    await refreshAll();
+  } catch { /* remembered host(s) unreachable; fall through */ }
+}
+
 refreshAll().then(async () => {
   if (POPOUT_KIND) return; // popout windows never restore/set sources on their own
   if (state.sources.length === 0) {
     // nothing open yet (fresh install, or the last session's sources are all
     // closed): try to reopen the containers/services collected last time.
-    const sessions = prefs.get("lastDockerSessions", []);
-    if (sessions.length) {
-      try {
-        await Promise.all(sessions.map((req) => post("/docker/collect", req)));
-        await refreshAll();
-      } catch { /* remembered host(s) unreachable; fall through below */ }
-    }
+    await autoReconnectLastDockerSessions();
   }
   if (shouldPromptSetSourcesOnBoot()) $("btn-set").click();
 });

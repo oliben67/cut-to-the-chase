@@ -2310,6 +2310,34 @@
     }
   });
 
+  await T("autoReconnectLastDockerSessions sets activeDockerHost to the most recently configured session (regression, br-DHOST-030)", async () => {
+    // A stale local session replayed alongside a newer remote one (both
+    // legitimately present in the undeduped lastDockerSessions list) used
+    // to leave activeDockerHost stuck on whatever it defaulted to --
+    // refreshAll()'s self-heal treats *any* still-open host as a valid
+    // match, local included, so it never corrected this -- silently
+    // hiding the remote host's containers/telemetry even though it's the
+    // one actually just (re)connected. Reported 2026-08-12, right after
+    // this exact host-scoping change shipped.
+    const realSessions = prefs.get("lastDockerSessions", []);
+    const realActiveHost = state.activeDockerHost;
+    const realPost = post;
+    post = async (path, body) => (path === "/docker/collect" ? { opened: [], sources: [] } : realPost(path, body));
+    try {
+      prefs.set("lastDockerSessions", [
+        { host: null, stats: true, logs: [], transforms: [], interval: 5 },
+        { host: "ssh://u@h", stats: true, logs: [], transforms: [], interval: 5 },
+      ]);
+      state.activeDockerHost = "local";
+      await autoReconnectLastDockerSessions();
+      eq(state.activeDockerHost, "ssh://u@h", "the last (most recently configured) session's host becomes active, not the stale local one");
+    } finally {
+      post = realPost;
+      prefs.set("lastDockerSessions", realSessions);
+      state.activeDockerHost = realActiveHost;
+    }
+  });
+
   await T("Recording capture-range band uses the configurable recordingBandColor (Preferences > Appearance)", async () => {
     // Spy on fillRect the same way the "now" line test spies on stroke --
     // the band is otherwise only observable as pixels, not DOM state.
