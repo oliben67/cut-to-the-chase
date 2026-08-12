@@ -807,6 +807,7 @@ class StatsSource:
                 "mem_bytes": payload.get("mem_bytes"),
                 "net": payload.get("net"),
                 "host": self.is_host,
+                "sid": self.id,
             }
         return out
 
@@ -2202,6 +2203,11 @@ class State:
                 "max_ts": rng[1] if rng else None,
                 "error": getattr(s, "error", None),
                 "total": total,
+                # real Docker host identity (None for the local daemon and for
+                # any non-docker source, e.g. a loaded/uploaded file) -- not to
+                # be confused with bucketed()/point_at()/export_stats()'s own
+                # "host" field below, which is the unrelated is_host boolean.
+                "host": getattr(s, "host", None),
             }
             if s.kind == "log":
                 d["transforms"] = [n for n, _ in s.transforms]
@@ -2953,14 +2959,31 @@ async def route_logs_find(
 
 @app.get("/files/download")
 async def route_files_download(
-    request: Request, from_: str = Query("", alias="from"), to: str = "", include_host: str = "1"
+    request: Request,
+    from_: str = Query("", alias="from"),
+    to: str = "",
+    include_host: str = "1",
+    host: str = "",
 ):
     if not from_ or not to:
         raise bad_request("'from' and 'to' are required")
     st = get_state(request)
     t0, t1 = float(from_), float(to)
     inc = include_host.lower() not in ("0", "false")
-    data, filename, count = await files.download_sample(st, t0, t1, inc)
+    source_ids = None
+    if host:
+        # br-DHOST-030 (host/telemetry scoping): restrict the export to the
+        # requested Docker host's own sources -- any source with no `host`
+        # attribute at all (a loaded/uploaded file, never docker-collected)
+        # is untouched by this filter, since host-scoping and sample-scoping
+        # are orthogonal axes (see isOtherDockerHostHidden in app.js).
+        normalized_host = None if host == "local" else normalize_docker_host(host)
+        source_ids = {
+            s.id
+            for s in st.sources.values()
+            if not hasattr(s, "host") or s.host == normalized_host
+        }
+    data, filename, count = await files.download_sample(st, t0, t1, inc, source_ids)
     return Response(
         content=data,
         media_type="application/octet-stream",

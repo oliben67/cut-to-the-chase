@@ -168,6 +168,15 @@ const state = {
   // survives the source itself being closed and reopened, same as
   // state.track/state.visible above.
   panelOrder: prefs.get("panelOrder", {}),
+  // Which connected Docker host's telemetry/containers are actually shown
+  // -- multiple hosts can be collected concurrently server-side (New Docker
+  // Host never disconnects a previous one, and lastDockerSessions replays
+  // every remembered host on launch), but the graph/snapshot/exports only
+  // ever show one at a time (see isOtherDockerHostHidden). "local" or a
+  // full "ssh://user@host[:port]" string -- set whenever a host is
+  // connected/edited (Set/Edit Docker Host's dlg-ok), self-healed in
+  // refreshAll() if it stops matching anything currently open.
+  activeDockerHost: prefs.get("activeDockerHost", "local"),
 };
 // Migrates a pre-per-graph "chartStyle" pref (a bare "lines"/"bars" string,
 // applied to every graph at once) to the {svc, host} shape -- carries the
@@ -316,6 +325,18 @@ function isSampleHidden(sid) {
 // depending on which one the toolbar is currently focused on.
 function isLiveDataHidden(sid) {
   return state.liveHidden && isLiveSid(sid);
+}
+// true if this source is live docker telemetry/logs from a Docker host
+// other than the currently active one (state.activeDockerHost) -- multiple
+// hosts can be collected concurrently in the background (see New Docker
+// Host's own docstring), but only the active host's data is ever shown.
+// Orthogonal to isSampleHidden/isLiveDataHidden: a loaded/uploaded sample
+// (live === false) is never host-scoped, so this only ever applies to a
+// live docker:// source.
+function isOtherDockerHostHidden(sid) {
+  const src = state.sources.find((s) => s.id === sid);
+  if (!src || src.live !== true || !/^docker:\/\//.test(src.path || "")) return false;
+  return (src.host || "local") !== (state.activeDockerHost || "local");
 }
 /* ── layout references ──────────────────────────────────────────────────── */
 
@@ -472,10 +493,10 @@ function seriesOf(group, respectVisibility = true) {
     if (!!s.host !== (group === "host")) return false;
     if (group === "svc" && POPOUT_KIND === "series") {
       // a series popout shows exactly its one series, whatever its track state
-      return s.name === POPOUT_ID && !isSampleHidden(s.sid) && !isLiveDataHidden(s.sid);
+      return s.name === POPOUT_ID && !isSampleHidden(s.sid) && !isLiveDataHidden(s.sid) && !isOtherDockerHostHidden(s.sid);
     }
     if (group === "svc" && trackStateOf(s) !== "sel") return false;
-    if (isSampleHidden(s.sid) || isLiveDataHidden(s.sid)) return false;
+    if (isSampleHidden(s.sid) || isLiveDataHidden(s.sid) || isOtherDockerHostHidden(s.sid)) return false;
     return !respectVisibility || state.visible.get(s.name) !== false;
   });
 }
@@ -488,7 +509,7 @@ function allSvcSeries() {
 // the host-stats source "host@<hostname>" (bare hostname, no user@, see
 // HostStatsSource) specifically so the client can pull it back out here.
 function hostTelemetryLabel() {
-  const src = state.sources.find((s) => s.kind === "stats" && s.is_host);
+  const src = state.sources.find((s) => s.kind === "stats" && s.is_host && !isOtherDockerHostHidden(s.id));
   const name = String(src?.name || "");
   const host = name.startsWith("host@") ? name.slice("host@".length) : "";
   if (!host || host === "local") return "Host telemetry — localhost";
@@ -819,7 +840,7 @@ function drawVerticals(ctx, h) {
 /* ── density lanes (one per log source) ─────────────────────────────────── */
 
 function drawLanes() {
-  let logs = state.sources.filter((s) => s.kind === "log" && !isSampleHidden(s.id) && !isLiveDataHidden(s.id));
+  let logs = state.sources.filter((s) => s.kind === "log" && !isSampleHidden(s.id) && !isLiveDataHidden(s.id) && !isOtherDockerHostHidden(s.id));
   // a series popout keeps only the lanes of the same-named log source(s)
   if (POPOUT_KIND === "series") logs = logs.filter((s) => s.name === POPOUT_ID);
   // rebuild DOM if the set changed
@@ -1019,7 +1040,7 @@ function renderLegend() {
   // loaded file's own series, must never appear alongside the active
   // one's (BUG-0082 -- this filter was missing here, so every container
   // ever tracked across every load kept piling up in the legend forever).
-  let all = allSvcSeries().filter((s) => !isSampleHidden(s.sid) && !isLiveDataHidden(s.sid));
+  let all = allSvcSeries().filter((s) => !isSampleHidden(s.sid) && !isLiveDataHidden(s.sid) && !isOtherDockerHostHidden(s.sid));
   // a series popout's legend shows just its one series, always as selected
   if (POPOUT_KIND === "series") all = all.filter((s) => s.name === POPOUT_ID);
   const sel = all.filter((s) => POPOUT_KIND === "series" || trackStateOf(s) === "sel")
@@ -1156,20 +1177,19 @@ function timelineUp(c, e) {
 // opposed to any individual container) is currently being collected --
 // drives the export dialog's default "include host telemetry" checkbox.
 function hasHostSeries() {
-  return (state.series?.services || []).some((s) => s.host);
+  return (state.series?.services || []).some((s) => s.host && !isOtherDockerHostHidden(s.sid));
 }
 
-// any currently open docker:// source tells us which host (and ssh key) to
-// use if we need to start host-telemetry collection from the export dialog
+// The active Docker host (see state.activeDockerHost), in the "null means
+// local" shape every existing caller already expects (form pre-fill, Edit
+// Docker Host's target, the export dialog's host-telemetry POST). Multiple
+// hosts can be connected at once, so this deliberately does NOT scan
+// state.sources for "the first docker:// source found" anymore (ambiguous,
+// and arbitrary once a second host is open) -- state.activeDockerHost is
+// the single source of truth, set on connect/edit and self-healed in
+// refreshAll().
 function currentDockerHost() {
-  for (const s of state.sources) {
-    // hostkey itself is "local" or a full "ssh://user@host[:port]" (which
-    // has its own slashes) -- a plain "up to the first slash" match would
-    // truncate that down to just "ssh:".
-    const m = /^docker:\/\/(local|ssh:\/\/[^/]+)\//.exec(s.path || "");
-    if (m) return m[1] === "local" ? null : m[1];
-  }
-  return null;
+  return state.activeDockerHost === "local" ? null : state.activeDockerHost;
 }
 
 // Whether *any* docker:// source (stats/host/container/service, local or
@@ -1276,7 +1296,14 @@ async function exportSample(t0, t1) {
     // remote one reached directly over HTTP -- see docs/architecture/
     // remote-server.md phase 3) rather than asking it to write to a path
     // that might not exist on whichever machine actually ran it
-    const params = new URLSearchParams({ from: t0, to: t1, include_host: opts.includeHost ? "1" : "0" });
+    // Scoped to the active Docker host server-side too (not just this
+    // client's own display filtering) -- see isOtherDockerHostHidden and
+    // /files/download's `host` param. state.activeDockerHost itself (not
+    // currentDockerHost(), which maps local to null for form pre-fill).
+    const params = new URLSearchParams({
+      from: t0, to: t1, include_host: opts.includeHost ? "1" : "0",
+      host: state.activeDockerHost || "local",
+    });
     const res = await fetch(`${API}/files/download?${params}`, { headers: authHeaders() });
     if (!res.ok) throw new Error((await res.json().catch(() => null))?.error || `download failed: ${res.status}`);
     const sourceCount = Number(res.headers.get("X-CTTC-Source-Count") || 0);
@@ -1331,12 +1358,12 @@ async function computeSlice(t, { includeLogs, ctxLines }) {
   const r = await get(`/point?t=${t}`);
   let services = Object.entries(r.services || {}).map(([name, v]) => ({ name, ...v }));
   const selected = new Set(allSvcSeries().filter((s) => trackStateOf(s) === "sel").map((s) => s.name));
-  services = services.filter((s) => s.host || selected.has(s.name));
+  services = services.filter((s) => (s.host || selected.has(s.name)) && !isOtherDockerHostHidden(s.sid));
   services.sort((a, b) => (b.host - a.host) || a.name.localeCompare(b.name));
 
   let logs = [];
   if (includeLogs) {
-    const logSources = state.sources.filter((s) => s.kind === "log" && !isSampleHidden(s.id) && !isLiveDataHidden(s.id));
+    const logSources = state.sources.filter((s) => s.kind === "log" && !isSampleHidden(s.id) && !isLiveDataHidden(s.id) && !isOtherDockerHostHidden(s.id));
     logs = await Promise.all(logSources.map(async (s) => {
       try {
         const idx = await get(`/index_at?source=${s.id}&t=${t}`);
@@ -1631,11 +1658,11 @@ async function gatherExportMetricsData(includeStats, includeLogs) {
     const r = await get(`/stats_export?from=${range.min_ts}&to=${range.max_ts}&granularity=${exportMetricsGranularity}`);
     data.stats = {
       granularity: exportMetricsGranularity,
-      services: r.services.filter((s) => !isSampleHidden(s.sid) && !isLiveDataHidden(s.sid)),
+      services: r.services.filter((s) => !isSampleHidden(s.sid) && !isLiveDataHidden(s.sid) && !isOtherDockerHostHidden(s.sid)),
     };
   }
   if (includeLogs) {
-    const logSources = state.sources.filter((s) => s.kind === "log" && !isSampleHidden(s.id) && !isLiveDataHidden(s.id));
+    const logSources = state.sources.filter((s) => s.kind === "log" && !isSampleHidden(s.id) && !isLiveDataHidden(s.id) && !isOtherDockerHostHidden(s.id));
     data.logs = await Promise.all(logSources.map(async (s) => ({
       source: s.name,
       path: s.path,
@@ -2591,7 +2618,7 @@ function syncPanels() {
     // via the legend or the panel's own close button (see Panel's close
     // handler) -- collection keeps running server-side either way, so it's
     // still right here, at the exact same spot, whenever it's switched back on.
-    p.el.hidden = isSampleHidden(s.id) || isLiveDataHidden(s.id) || state.visible.get(s.name) === false;
+    p.el.hidden = isSampleHidden(s.id) || isLiveDataHidden(s.id) || isOtherDockerHostHidden(s.id) || state.visible.get(s.name) === false;
   }
   // Reorders the DOM to match panelOrder every sync -- appendChild on an
   // already-attached node just moves it, so this is cheap and keeps a
@@ -2665,6 +2692,20 @@ async function refreshAll() {
       // direct /open) -- either way, default to the first still-open file
       // rather than leaving every sample hidden with nothing selected.
       state.activeSamplePath = sampleGroups.length ? sampleGroups[0].path : null;
+    }
+    // Self-heals state.activeDockerHost the same way: if it no longer
+    // matches any currently-open live docker source (that host was
+    // disconnected/removed some other way), fall back to whichever live
+    // docker source is still open rather than leaving the graph/exports
+    // scoped to a host with nothing left collecting. Left as-is (not
+    // reset to "local") when nothing docker-related is open at all, so
+    // reconnecting the same remote host later restores it.
+    const liveDockerHosts = state.sources
+      .filter((s) => s.live === true && /^docker:\/\//.test(s.path || ""))
+      .map((s) => s.host || "local");
+    if (liveDockerHosts.length && !liveDockerHosts.includes(state.activeDockerHost)) {
+      state.activeDockerHost = liveDockerHosts[0];
+      prefs.set("activeDockerHost", state.activeDockerHost);
     }
     // Regression fix: this self-heal used to fire unconditionally, which
     // predates ui-LIVE-016 (Back to Live deliberately never closes loaded

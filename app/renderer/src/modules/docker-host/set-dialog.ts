@@ -615,6 +615,12 @@ $("dlg-ok").onclick = async () => {
     const sshKey = $("docker-ssh-key").value.trim() || null;
     dockerHostKeys.set(host || "local", sshKey!);
     const hostKey = host || "local";
+    // Connecting/editing a host is the one funnel point for "this is what
+    // the graph/snapshot/exports should show now" -- see
+    // isOtherDockerHostHidden in app.js. Multiple hosts can stay collected
+    // concurrently in the background; only the active one is displayed.
+    state.activeDockerHost = hostKey;
+    prefs.set("activeDockerHost", hostKey);
     // :not(:disabled) excludes the "no longer available" entries
     // (renderDockerTargetGroup's `missing`) -- checked=true there only to
     // show "this was selected", never meant to actually be (re-)submitted

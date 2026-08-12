@@ -364,6 +364,38 @@
     }
   });
 
+  await T("isOtherDockerHostHidden scopes svc/host series to the active Docker host", () => {
+    // br-DHOST-030: multiple Docker hosts can be collected concurrently
+    // (New Docker Host never disconnects a previous one), but the
+    // graph/snapshot/exports must only ever show the active one.
+    const savedSeries = state.series;
+    const savedActiveHost = state.activeDockerHost;
+    const localSid = "__dhost_local", remoteSid = "__dhost_remote";
+    state.sources.push(
+      { id: localSid, path: "docker://local/host", kind: "stats", live: true, host: null },
+      { id: remoteSid, path: "docker://ssh://u@remotehost/host", kind: "stats", live: true, host: "ssh://u@remotehost" }
+    );
+    state.series = { px: 100, services: [
+      { name: "__dhost_l", sid: localSid, host: true, cpu: [], mem: [], net: [] },
+      { name: "__dhost_r", sid: remoteSid, host: true, cpu: [], mem: [], net: [] },
+    ]};
+    try {
+      state.activeDockerHost = "local";
+      ok(!isOtherDockerHostHidden(localSid), "local source visible while local is active");
+      ok(isOtherDockerHostHidden(remoteSid), "remote source hidden while local is active");
+      eq(seriesOf("host").map((s) => s.sid).join(","), localSid);
+
+      state.activeDockerHost = "ssh://u@remotehost";
+      ok(isOtherDockerHostHidden(localSid), "local source hidden once remote is active");
+      ok(!isOtherDockerHostHidden(remoteSid), "remote source visible once it's active");
+      eq(seriesOf("host").map((s) => s.sid).join(","), remoteSid);
+    } finally {
+      state.series = savedSeries;
+      state.activeDockerHost = savedActiveHost;
+      state.sources = state.sources.filter((s) => s.id !== localSid && s.id !== remoteSid);
+    }
+  });
+
   await T("host block stays hidden without host series", () => {
     drawAll();
     eq(hostBlockEl.hidden, true);
@@ -769,6 +801,12 @@
     const fakeSrc = { id: "__edit_test", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
     state.sources.push(fakeSrc);
     syncDockerDaemonButtons(); // a real app calls this via refreshAll() whenever state.sources changes
+    // currentDockerHost() now reflects state.activeDockerHost (br-DHOST-030
+    // -- set on connect/edit, not derived from state.sources, since
+    // multiple hosts can be open at once) -- a real connect/edit flow sets
+    // this itself; simulated directly here since dlg-ok isn't exercised.
+    const savedActiveHost = state.activeDockerHost;
+    state.activeDockerHost = "ssh://u@h";
     dockerHostKeys.set("ssh://u@h", "/path/to/key");
     // Edit Docker Host runs an immediate live Refresh on open (see
     // enterDockerHostEditMode) -- mocked here since this test isn't about
@@ -799,6 +837,7 @@
       post = realPost;
       get = realGet;
       state.sources = state.sources.filter((s) => s.id !== "__edit_test");
+      state.activeDockerHost = savedActiveHost;
       syncDockerDaemonButtons();
       dockerHostKeys.delete("ssh://u@h");
       dlg.close();
@@ -890,11 +929,16 @@
     const activeKey = "ssh://u@abandon-active";
     const saved = prefs.get("savedDockerDaemons", {});
     saved[activeKey] = { host: activeKey, stats: true, logs: [], transforms: [], interval: 5, lastUsed: Date.now() };
-    saved["ssh://u@abandon-inactive"] = { host: "ssh://u@abandon-inactive", stats: true, logs: [], transforms: [], interval: 5, lastUsed: Date.now() };
+    saved["ssh://u@other-daemon"] = { host: "ssh://u@other-daemon", stats: true, logs: [], transforms: [], interval: 5, lastUsed: Date.now() };
     prefs.set("savedDockerDaemons", saved);
     const fakeSrc = { id: "__abandon_active", path: `docker://${activeKey}/stats`, kind: "stats", live: true };
     state.sources.push(fakeSrc);
     dockerHostKeys.set(activeKey, "/path/to/key");
+    // currentDockerHost() (which remove-dialog.ts's own activeHostKey is
+    // built from) now reflects state.activeDockerHost, not state.sources
+    // (br-DHOST-030) -- simulated directly here since dlg-ok isn't exercised.
+    const savedActiveHost = state.activeDockerHost;
+    state.activeDockerHost = activeKey;
 
     const realConfirm = window.confirm, realPost = post;
     const realScratch = recordingScratchPath, realWrite = writeRecordingBytes, realRead = readRecordingBytes;
@@ -912,7 +956,7 @@
       await startRecording();
       calls = [];
       populateRemoveDaemonSelect();
-      $("remove-daemon-select").value = "ssh://u@abandon-inactive";
+      $("remove-daemon-select").value = "ssh://u@other-daemon";
       $("remove-daemon-select").onchange();
       await $("dlg-remove-daemon-delete").onclick();
       ok(!calls.some((m) => m.includes("abandon")), `expected no abandon warning for an inactive daemon: ${JSON.stringify(calls)}`);
@@ -935,10 +979,11 @@
       readRecordingBytes = realRead;
       if (recording.status !== "idle") await discardRecording();
       state.sources = state.sources.filter((s) => s.id !== "__abandon_active");
+      state.activeDockerHost = savedActiveHost;
       dockerHostKeys.delete(activeKey);
       const cleanup = prefs.get("savedDockerDaemons", {});
       delete cleanup[activeKey];
-      delete cleanup["ssh://u@abandon-inactive"];
+      delete cleanup["ssh://u@other-daemon"];
       prefs.set("savedDockerDaemons", cleanup);
       await refreshAll();
       if (dlgRemoveDaemon.open) dlgRemoveDaemon.close();
@@ -983,6 +1028,7 @@
     state.sources.push(fakeStats, fakeContainer, fakeService);
     syncDockerDaemonButtons();
     dockerHostKeys.set("ssh://u@h", "/path/to/key");
+    state.activeDockerHost = "ssh://u@h"; // br-DHOST-030: currentDockerHost() now reflects this, not state.sources
     // demo-c is in the persisted [user]@[gateway]-containers.json (actually
     // selected); demo-svc is merely followed (e.g. previously unselected
     // from the legend) -- the checklist must reflect that distinction, not
@@ -1022,6 +1068,7 @@
       state.sources = state.sources.filter((s) => !s.id.startsWith("__prefill_"));
       syncDockerDaemonButtons();
       dockerHostKeys.delete("ssh://u@h");
+      state.activeDockerHost = "local";
       dlg.close();
       $("btn-set").click();
       dlg.close();
@@ -1033,6 +1080,7 @@
     state.sources.push(fakeSrc);
     syncDockerDaemonButtons();
     dockerHostKeys.set("ssh://u@h", "/path/to/key");
+    state.activeDockerHost = "ssh://u@h"; // br-DHOST-030: currentDockerHost() now reflects this, not state.sources
     const realPost = post;
     const realGet = get;
     post = async (path, body) => {
@@ -1059,6 +1107,7 @@
       state.sources = state.sources.filter((s) => s.id !== "__edit_test2");
       syncDockerDaemonButtons();
       dockerHostKeys.delete("ssh://u@h");
+      state.activeDockerHost = "local";
       dlg.close();
       $("btn-set").click();
       dlg.close();
@@ -1071,6 +1120,7 @@
     state.sources.push(fakeContainerA, fakeContainerB);
     syncDockerDaemonButtons();
     dockerHostKeys.set("ssh://u@h", "/path/to/key");
+    state.activeDockerHost = "ssh://u@h"; // br-DHOST-030: currentDockerHost() now reflects this, not state.sources
     // demo-a is persisted-selected; demo-b was merely followed, never
     // persisted-selected -- per spec, if it's gone and NOT in the file, it
     // must be omitted entirely, not shown disabled.
@@ -1105,6 +1155,7 @@
       state.sources = state.sources.filter((s) => !s.id.startsWith("__diff_"));
       syncDockerDaemonButtons();
       dockerHostKeys.delete("ssh://u@h");
+      state.activeDockerHost = "local";
       dlg.close();
       $("btn-set").click();
       dlg.close();
@@ -1116,6 +1167,7 @@
     state.sources.push(fakeContainerA);
     syncDockerDaemonButtons();
     dockerHostKeys.set("ssh://u@h", "/path/to/key");
+    state.activeDockerHost = "ssh://u@h"; // br-DHOST-030: currentDockerHost() now reflects this, not state.sources
     const realLoadSelectedTargets = loadSelectedTargets;
     loadSelectedTargets = async () => ({ containers: new Set(["demo-a"]), services: new Set() });
     const realPost = post;
@@ -1145,6 +1197,7 @@
       state.sources = state.sources.filter((s) => !s.id.startsWith("__gone_"));
       syncDockerDaemonButtons();
       dockerHostKeys.delete("ssh://u@h");
+      state.activeDockerHost = "local";
       dlg.close();
       $("btn-set").click();
       dlg.close();
@@ -1158,6 +1211,7 @@
     state.sources.push(stillSelected, wasUnselected, nowGone);
     syncDockerDaemonButtons();
     dockerHostKeys.set("ssh://u@h", "/path/to/key");
+    state.activeDockerHost = "ssh://u@h"; // br-DHOST-030: currentDockerHost() now reflects this, not state.sources
     // Mirrors the real flow: still-selected and now-gone were persisted
     // (ticked and Set/Updated); was-unselected was followed but never
     // actually ticked/persisted.
@@ -1194,6 +1248,7 @@
       state.sources = state.sources.filter((s) => !s.id.startsWith("__combo_"));
       syncDockerDaemonButtons();
       dockerHostKeys.delete("ssh://u@h");
+      state.activeDockerHost = "local";
       dlg.close();
       $("btn-set").click();
       dlg.close();
@@ -1318,6 +1373,7 @@
       window.confirm = realConfirm;
       prefs.set("savedDockerDaemons", savedBefore);
       dockerHostKeys.delete("ssh://u@h");
+      state.activeDockerHost = "local";
       state.sources = state.sources.filter((s) => s.id !== "__reconnect_test");
       syncDockerDaemonButtons();
     }
@@ -1383,6 +1439,7 @@
       state.sources = state.sources.filter((s) => s.id !== "__cancel_test");
       syncDockerDaemonButtons();
       dockerHostKeys.delete("ssh://u@h");
+      state.activeDockerHost = "local";
       if (dlg.open) dlg.close();
     }
   });
@@ -1419,6 +1476,7 @@
       eq($("activity-toggle").disabled, false, "unlocked once the attempt completes, success or not");
     } finally {
       dockerHostKeys.delete("ssh://u@h");
+      state.activeDockerHost = "local";
       dlg.close();
     }
   });
@@ -4160,6 +4218,7 @@
     state.sources.push(fakeSrc);
     syncDockerDaemonButtons();
     dockerHostKeys.set("ssh://u@h", "/path/to/key");
+    state.activeDockerHost = "ssh://u@h"; // br-DHOST-030: currentDockerHost() now reflects this, not state.sources
     const realPost = post;
     const realGet = get;
     post = async (path, body) => (path === "/docker/ps" ? { containers: [], services: [], log: [] } : realPost(path, body));
@@ -4179,6 +4238,7 @@
       post = realPost;
       get = realGet;
       dockerHostKeys.delete("ssh://u@h");
+      state.activeDockerHost = "local";
       state.sources = state.sources.filter((s) => s.id !== "__editpick_test");
       syncDockerDaemonButtons();
       prefs.set("savedDockerDaemons", saved);

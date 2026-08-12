@@ -32,12 +32,16 @@ declare global {
       live?: boolean;
       kind?: string;
       is_host?: boolean;
+      // real Docker host identity (null for local/non-docker sources) --
+      // not the is_host boolean above. See isOtherDockerHostHidden.
+      host?: string | null;
       [k: string]: unknown;
     }>;
     series?: {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       services?: Array<{ sid: string; name: string; host?: boolean; [k: string]: any }>;
     };
+    activeDockerHost?: string;
     [k: string]: unknown;
   };
   const prefs: { get(key: string, dflt: unknown): unknown; set(key: string, val: unknown): void };

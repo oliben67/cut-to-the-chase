@@ -631,6 +631,7 @@ class TestStatsSource:
         assert before["cpu"] == 10.0
         at_t0 = await src.point_at(t0)
         assert at_t0["api"]["host"] is False
+        assert at_t0["api"]["sid"] == src.id  # so callers can host-scope /point the same way as /series
         assert "empty" not in at_t0
 
 
@@ -1857,6 +1858,32 @@ class TestState:
         assert d["stats"]["min_ts"] is not None
         assert d["stats"]["is_host"] is False
         assert "is_host" not in d["svc"]  # log sources don't carry the flag
+        # br-DHOST-030: a loaded file is never docker-collected, so it has no
+        # real host identity -- distinct from a *local* docker source, which
+        # also reports None here (see test_collect_docker_describe_host below).
+        assert d["svc"]["host"] is None
+        assert d["stats"]["host"] is None
+
+    async def test_collect_docker_describe_host(self, state, docker_cli, monkeypatch):
+        """describe()'s "host" field (br-DHOST-030) is the real Docker host
+        identity -- None for the local daemon, the ssh:// string for a
+        remote one -- not to be confused with bucketed()'s own "host" field
+        (is_host boolean), which describe() doesn't touch."""
+        _no_op_docker(monkeypatch)
+        local_ids = state.collect_docker(
+            None, stats=True, logs=[], transforms=[], interval=0.05, host_stats=True
+        )
+        remote_ids = state.collect_docker(
+            "ssh://u@remotehost", stats=True, logs=[], transforms=[], interval=0.05, host_stats=True
+        )
+        await _flush()
+        d = {s["id"]: s for s in await state.describe()}
+        for sid in local_ids:
+            assert d[sid]["host"] is None
+        for sid in remote_ids:
+            assert d[sid]["host"] == "ssh://u@remotehost"
+        for sid in local_ids + remote_ids:
+            state.close_source(sid)
 
     async def test_collect_docker_all_sources(self, state, docker_cli, monkeypatch):
         _no_op_docker(monkeypatch)
@@ -4139,6 +4166,65 @@ class TestFilesEndpoints:
             s["type"] != "stats" for s in sources
         )  # the host-marked stats source is excluded
         assert any(s["type"] == "log" for s in sources)  # the unrelated log source is unaffected
+
+    def test_download_host_param_scopes_by_docker_host(self, api, monkeypatch):
+        """br-DHOST-030: /files/download's `host` param resolves to the
+        right source_ids subset (State.build_sample_bytes' pre-existing
+        source_ids param, used today by the rolling-buffer feature) --
+        sources tagged for a different host are excluded, sources with no
+        `host` attribute at all (never docker-collected -- api's own
+        log/stats file sources) are untouched either way. Spies on
+        build_sample_bytes rather than inspecting a real exported archive:
+        _entity_for host-qualifies its Redis key once a source has a real
+        `host` (br-DEDUP-006), so retrofitting `.host` onto an
+        already-ingested test source would silently orphan its data from
+        a different key -- irrelevant to what's under test here, which is
+        purely the route's host-param-to-source_ids resolution."""
+        base, st = api
+        real_ids = set(st.sources.keys())  # the fixture's own sources, no .host attr at all
+
+        class _FakeHostSource:
+            def __init__(self, sid, host):
+                self.id = sid
+                self.host = host
+
+        fake_local = _FakeHostSource("fake-local", None)
+        fake_remote = _FakeHostSource("fake-remote", "ssh://u@remotehost")
+        st.sources[fake_local.id] = fake_local
+        st.sources[fake_remote.id] = fake_remote
+        captured = {}
+
+        async def spy(t0, t1, include_host=True, source_ids=None):
+            captured["source_ids"] = source_ids
+            return b"", []
+
+        monkeypatch.setattr(st, "build_sample_bytes", spy)
+        t0 = ms(2026, 1, 2, 3, 0, 0)
+        try:
+            get_raw(base, f"/files/download?from={t0}&to={t0 + 60000}&host=local")
+            ids = captured["source_ids"]
+            assert real_ids <= ids
+            assert fake_local.id in ids and fake_remote.id not in ids
+
+            get_raw(base, f"/files/download?from={t0}&to={t0 + 60000}&host=ssh://u@remotehost")
+            ids = captured["source_ids"]
+            assert real_ids <= ids
+            assert fake_remote.id in ids and fake_local.id not in ids
+
+            get_raw(base, f"/files/download?from={t0}&to={t0 + 60000}")
+            assert captured["source_ids"] is None  # no host param -> unfiltered, as before
+        finally:
+            del st.sources[fake_local.id]
+            del st.sources[fake_remote.id]
+
+    def test_download_without_host_param_is_unfiltered(self, api):
+        """Backward compatible: omitting `host` (every pre-existing caller)
+        keeps the old "every open source" behavior -- source_ids stays
+        None, not an empty/host-derived set."""
+        base, _ = api
+        t0 = ms(2026, 1, 2, 3, 0, 0)
+        _code, headers, _data = get_raw(base, f"/files/download?from={t0}&to={t0 + 60000}")
+        assert headers["X-CTTC-Source-Count"] == "2"
 
     def test_upload_plain_log(self, api):
         # Checks total() over HTTP (/logs), not by awaiting src.total()
