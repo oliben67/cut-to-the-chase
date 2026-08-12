@@ -396,6 +396,119 @@
     }
   });
 
+  await T("log panel Export .log button sits right after the search icon, and only fetches/writes once Save is confirmed", async () => {
+    const p = [...panels.values()][0];
+    const buttons = [...p.el.querySelectorAll(".panel-head-buttons button")];
+    const searchIdx = buttons.findIndex((b) => b.title === "Search this log");
+    const exportIdx = buttons.findIndex((b) => b.title === "Export this log's current entries as a .log file");
+    ok(searchIdx >= 0, "search icon present");
+    eq(exportIdx, searchIdx + 1, "export button immediately follows the search icon");
+
+    const realPick = pickLogExportPath;
+    const realWrite = writeLogExportFile;
+    const realFetchAll = fetchAllLogRows;
+    const writes = [];
+    let pickCalls = 0, fetchCalls = 0;
+    try {
+      // Cancelled dialog: the whole point of asking first -- nothing
+      // fetched, nothing written.
+      pickLogExportPath = async (defaultName) => {
+        pickCalls++;
+        ok(defaultName.startsWith(`${p.src.name}-`) && defaultName.endsWith(".log"), defaultName);
+        return null;
+      };
+      fetchAllLogRows = async (...args) => { fetchCalls++; return realFetchAll(...args); };
+      writeLogExportFile = async (path, bytes) => { writes.push({ path, bytes }); };
+      await p.exportLog();
+      eq(pickCalls, 1, "dialog shown");
+      eq(fetchCalls, 0, "no data fetched on cancel");
+      eq(writes.length, 0, "nothing written on cancel");
+
+      // Confirmed: only now does it fetch and write, with every current row.
+      pickLogExportPath = async () => "/tmp/e2e-log-export-test.log";
+      await p.exportLog();
+      eq(fetchCalls, 1, "data fetched exactly once confirmed");
+      eq(writes.length, 1, "written exactly once confirmed");
+      eq(writes[0].path, "/tmp/e2e-log-export-test.log");
+      const rows = await realFetchAll(p.src.id);
+      const expected = rows.map((r) => r.text).join("\n") + (rows.length ? "\n" : "");
+      eq(new TextDecoder().decode(writes[0].bytes), expected, "exported text is every current row, in order, one per line");
+    } finally {
+      pickLogExportPath = realPick;
+      writeLogExportFile = realWrite;
+      fetchAllLogRows = realFetchAll;
+    }
+  });
+
+  await T("log search keeps focus in the box while typing, and Up/Down drive find() the same way Enter/Shift+Enter do", async () => {
+    // Spies on find() itself rather than asserting a specific match count
+    // for a specific search term -- which panel is panels.values()[0], and
+    // how many times any given term appears in its real demo content, both
+    // vary run to run. What's actually under test is the keydown wiring
+    // (ArrowDown/ArrowUp call the same find(forward) Enter/Shift+Enter do)
+    // and that focus never leaves the input -- find() still runs for real
+    // underneath the spy, so its own finally-block refocus is exercised too.
+    const p = [...panels.values()][0];
+    const searchToggle = [...p.el.querySelectorAll(".panel-head-buttons button")].find((b) => b.title === "Search this log");
+    searchToggle.click();
+    const realFind = p.find.bind(p);
+    const calls = [];
+    p.find = async (forward) => { calls.push(forward); return realFind(forward); };
+    try {
+      eq(p.searchBar.hidden, false, "search bar opened");
+      eq(document.activeElement, p.searchInput, "focus lands in the search box on open");
+      p.searchInput.value = "e"; // find() is spied, not asserted on match content -- any non-empty query does
+      p.searchInput.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true }));
+      await until(() => calls.length === 1, "ArrowDown called find()");
+      eq(calls[0], true, "ArrowDown searches forward, same as Enter");
+      eq(document.activeElement, p.searchInput, "focus still in the box after ArrowDown");
+      p.searchInput.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowUp", bubbles: true, cancelable: true }));
+      await until(() => calls.length === 2, "ArrowUp called find()");
+      eq(calls[1], false, "ArrowUp searches backward, same as Shift+Enter");
+      eq(document.activeElement, p.searchInput, "focus still in the box after ArrowUp");
+    } finally {
+      p.find = realFind;
+      p.searchInput.value = "";
+      p.searchQuery = "";
+      p.searchBar.hidden = true;
+    }
+  });
+
+  await T("turning Live tracking off interrupts its own highlight instead of leaving it frozen", async () => {
+    const realEnabled = liveTrackEnabled;
+    const realCursorT = state.cursorT;
+    const realLiveTrackCursor = state.liveTrackCursor;
+    try {
+      setLiveTrackEnabled(true);
+      await setCursor(Date.now(), { liveTrack: true });
+      eq(state.liveTrackCursor, true, "sanity: cursor is currently the live-tracking kind");
+      ok(state.cursorT != null, "sanity: a cursor time is set");
+      setLiveTrackEnabled(false);
+      eq(state.liveTrackCursor, false, "live-track flag cleared once tracking turns off");
+      eq(state.cursorT, null, "cursor itself cleared, not just left frozen in place");
+    } finally {
+      setLiveTrackEnabled(realEnabled);
+      state.cursorT = realCursorT;
+      state.liveTrackCursor = realLiveTrackCursor;
+    }
+  });
+
+  await T("turning Live tracking off leaves a manually-placed cursor alone", async () => {
+    const realEnabled = liveTrackEnabled;
+    const realCursorT = state.cursorT;
+    const realLiveTrackCursor = state.liveTrackCursor;
+    try {
+      setLiveTrackEnabled(true);
+      await setCursor(MID, { liveTrack: false }); // a manual click, not live-tracking's own
+      eq(state.liveTrackCursor, false, "sanity: manual cursor, not live-tracking's");
+      setLiveTrackEnabled(false);
+      eq(state.cursorT, MID, "manual cursor position untouched by turning tracking off");
+    } finally {
+      setLiveTrackEnabled(realEnabled);
+      state.cursorT = realCursorT;
+      state.liveTrackCursor = realLiveTrackCursor;
+    }
+  });
   await T("host block stays hidden without host series", () => {
     drawAll();
     eq(hostBlockEl.hidden, true);
@@ -4575,6 +4688,7 @@
     toggle.click();
     eq(p.reversed, startReversed, "restored");
   });
+
 
   await T("log panels default to newest-first and land pinned to the very top on the boot-time cursor sync (goLive -> setCursor(now))", async () => {
     // fresh panels (see Panel's constructor) always default to reversed --

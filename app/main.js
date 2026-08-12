@@ -722,6 +722,22 @@ ipcMain.handle("write-binary-file", async (_e, filePath, bytes) => {
   await require("fs").promises.writeFile(filePath, Buffer.from(bytes));
 });
 
+/* ── log panel export (per-panel "Export .log" button, app.js) ────────────
+   Same dialog-first, write-later split as pick-recording-path/
+   write-binary-file above -- and for the same reason: exporting means
+   paginating through potentially every row a source has, which the
+   renderer must only do once the user has actually confirmed Save, not
+   before (the whole point of asking for the path here without touching
+   the log data at all). */
+ipcMain.handle("pick-log-export-path", async (_e, defaultName) => {
+  const r = await dialog.showSaveDialog({
+    title: "Export log",
+    defaultPath: defaultName,
+    filters: [{ name: "Log file", extensions: ["log"] }],
+  });
+  return r.canceled || !r.filePath ? null : r.filePath;
+});
+
 /* ── Events (renderer/app.js's UI-hosted event engine) ────────────────────
    A UI-hosted event's triggered snapshot/recording is saved silently (no
    save dialog -- nobody's necessarily watching when a background event

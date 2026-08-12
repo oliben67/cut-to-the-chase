@@ -1653,6 +1653,36 @@ async function fetchLogRowsInRange(sourceId, t0, t1) {
   }
 }
 
+// Every row a source has, start to end -- the counterpart to
+// fetchLogRowsInRange above but with no time bound at all (used by the log
+// panel's own "Export .log" button, which always exports everything
+// currently in that viewer, not just what's in the chart's current time
+// window).
+async function fetchAllLogRows(sourceId) {
+  const rows = [];
+  let start = 0;
+  for (;;) {
+    const page = await get(`/logs?source=${sourceId}&start=${start}&count=2000`);
+    rows.push(...page.rows);
+    start += page.rows.length;
+    if (page.rows.length < 2000 || start >= page.total) return rows;
+  }
+}
+
+// Thin, individually reassignable wrappers -- same pattern as
+// pickRecordingSavePath/writeRecordingBytes, so tests can substitute an
+// in-memory store instead of driving a real native save dialog (which
+// can't run headlessly). Dialog and write are deliberately two separate
+// calls (see main.js's pick-log-export-path docstring): the log panel's
+// export button asks where to save *before* fetching a single row, so
+// cancelling out of the dialog costs nothing.
+async function pickLogExportPath(defaultName) {
+  return window.cttc?.pickLogExportPath ? window.cttc.pickLogExportPath(defaultName) : null;
+}
+async function writeLogExportFile(path, bytes) {
+  return window.cttc.writeBinaryFile(path, bytes);
+}
+
 // stats_export's response, like /series's own, spans every open stats
 // source -- filtered down to just the active sample's own (isSampleHidden/
 // isLiveDataHidden, via each service's "sid") so an export doesn't pile up
@@ -2268,6 +2298,14 @@ class Panel {
       this.searchBar.hidden = !this.searchBar.hidden;
       if (!this.searchBar.hidden) this.searchInput.focus();
     };
+    const exportLogBtn = document.createElement("button");
+    exportLogBtn.className = "icon-btn";
+    // Same export glyph as #btn-export-metrics, next to the metric(s)
+    // dropdown in analysis mode -- this is that same action's log-viewer
+    // counterpart, one panel at a time.
+    exportLogBtn.innerHTML = '<svg viewBox="0 0 512 512" fill="currentColor" aria-hidden="true"><path d="m256.008 383.451c-26.012 0-47.149-21.137-47.149-47.117v-181.017c-16.889 6.563-36.829 3.037-50.442-10.576-.117-.117-.232-.236-.345-.356-18.066-18.418-18.005-47.98.341-66.313l64.263-64.263c8.889-8.902 20.726-13.809 33.324-13.809s24.435 4.907 33.332 13.816l64.259 64.259c18.286 18.273 18.46 47.834.337 66.309-.113.121-.228.24-.345.356-13.617 13.618-33.563 17.142-50.458 10.571v181.022c0 25.981-21.136 47.118-47.117 47.118zm-26.409-272.59c5.605 2.321 9.26 7.791 9.26 13.858v211.614c0 9.438 7.679 17.117 17.117 17.117 9.47 0 17.149-7.679 17.149-17.117v-211.63c0-6.067 3.655-11.537 9.26-13.858s12.057-1.038 16.347 3.252l9.431 9.431c6.604 6.604 17.306 6.674 23.995.208.074-.076.148-.152.224-.228 6.696-6.692 6.701-17.52 0-24.216l-64.27-64.271c-3.237-3.24-7.535-5.021-12.112-5.021s-8.875 1.781-12.104 5.014l-64.274 64.274c-6.698 6.694-6.707 17.52-.003 24.22.075.075.15.151.223.228 6.689 6.465 17.391 6.396 23.996-.208l9.415-9.415c4.605-4.607 11.159-5.401 16.346-3.252z"/><path d="m432.733 512h-353.466c-43.781 0-79.267-35.415-79.267-79.267v-160.666c0-43.78 35.415-79.267 79.267-79.267h48.2c25.808 0 47.133 20.856 47.133 47.133 0 25.744-20.796 47.134-47.133 47.134h-33.2v130.667h323.467v-130.667h-33.2c-25.743 0-47.133-20.797-47.133-47.134 0-25.743 20.796-47.133 47.133-47.133h48.2c43.78 0 79.267 35.415 79.267 79.267v160.667c-.001 43.781-35.417 79.266-79.268 79.266zm-353.466-289.2c-27.216 0-49.267 22.015-49.267 49.267v160.667c0 27.211 22.011 49.266 49.267 49.266h353.467c27.214 0 49.266-22.012 49.266-49.267v-160.666c0-27.216-22.015-49.267-49.267-49.267h-48.2c-9.596 0-17.133 7.808-17.133 17.133 0 9.578 7.788 17.134 17.133 17.134h48.2c8.284 0 15 6.716 15 15v160.667c0 8.284-6.716 15-15 15h-353.466c-8.284 0-15-6.716-15-15v-160.667c0-8.284 6.716-15 15-15h48.2c9.595 0 17.133-7.807 17.133-17.134 0-9.576-7.786-17.133-17.133-17.133z"/></svg>';
+    exportLogBtn.title = "Export this log's current entries as a .log file";
+    exportLogBtn.onclick = () => this.exportLog();
     const popout = document.createElement("button");
     popout.className = "icon-btn";
     popout.textContent = "⧉";
@@ -2308,7 +2346,7 @@ class Panel {
     // is the only thing on the row below (headControls).
     const headButtons = document.createElement("div");
     headButtons.className = "panel-head-buttons";
-    headButtons.append(orderToggle, searchToggle, right);
+    headButtons.append(orderToggle, searchToggle, exportLogBtn, right);
     headTop.appendChild(headButtons);
     headControls.append(this.countEl);
     head.append(headTop, headControls);
@@ -2326,7 +2364,14 @@ class Panel {
     this.searchInput.type = "text";
     this.searchInput.placeholder = "search…";
     this.searchInput.onkeydown = (e) => {
+      // Enter/Shift+Enter and Up/Down all drive the same find() -- focus
+      // stays on the input the whole time (find() itself re-focuses after
+      // jumping to a match), so once a search is underway the user can
+      // keep stepping through matches with the keyboard alone, without
+      // ever needing to click ▲/▼.
       if (e.key === "Enter") { e.preventDefault(); this.find(!e.shiftKey); }
+      else if (e.key === "ArrowDown") { e.preventDefault(); this.find(true); }
+      else if (e.key === "ArrowUp") { e.preventDefault(); this.find(false); }
       else if (e.key === "Escape") { this.searchBar.hidden = true; }
     };
     const prevBtn = document.createElement("button");
@@ -2535,6 +2580,32 @@ class Panel {
       await this.jumpToIndex(r.index);
     } catch (err) {
       this.searchStatus.textContent = String(err.message || err);
+    } finally {
+      // Whether this find succeeded, found nothing, or errored, focus
+      // stays on the input -- jumpToIndex()'s own render()/setCursor()
+      // touch every panel's DOM but never this one's search box, so this
+      // is only ever needed after a click on ▲/▼ (which, unlike Enter/
+      // Up/Down on the input itself, steals focus to the button).
+      this.searchInput.focus();
+    }
+  }
+
+  // "Export .log": writes every entry this log viewer currently has to a
+  // plain .log file, one line per entry. Asks where to save *first* (see
+  // main.js's pick-log-export-path docstring) -- fetchAllLogRows only
+  // runs, and nothing gets written, once the user actually confirms Save
+  // in the native dialog; cancelling costs nothing.
+  async exportLog() {
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, "-");
+    const path = await pickLogExportPath(`${this.src.name}-${stamp}.log`);
+    if (!path) return;
+    try {
+      const rows = await fetchAllLogRows(this.src.id);
+      const text = rows.map((r) => r.text).join("\n") + (rows.length ? "\n" : "");
+      await writeLogExportFile(path, new TextEncoder().encode(text));
+      notifyEvent(`Log exported: ${path}`);
+    } catch (err) {
+      notifyEvent(`Could not export log: ${err.message || err}`);
     }
   }
 
@@ -3735,6 +3806,20 @@ function setLiveTrackEnabled(enabled) {
   $("live-track-toggle-sidebar").checked = enabled;
   $("live-track-secs").disabled = !enabled;
   $("live-track-secs-sidebar").disabled = !enabled;
+  // Turning tracking off must interrupt its own highlight, not just stop
+  // moving it -- liveTrackTick() becoming a no-op above only freezes
+  // state.cursorT/liveTrackCursor wherever they last were, so the "live"
+  // highlight (log rows in hl-live, the chart's own live-track bar --
+  // both driven off this same shared cursor) would otherwise linger
+  // indefinitely. Only clears it when the highlight actually is the
+  // live-tracking one (liveTrackCursor true) -- a manually-placed cursor
+  // is left alone.
+  if (!enabled && state.liveTrackCursor) {
+    state.liveTrackCursor = false;
+    state.cursorT = null;
+    drawAll();
+    for (const p of panels.values()) p.render();
+  }
 }
 setLiveTrackEnabled(liveTrackEnabled); // apply the persisted value to both fields on load
 
