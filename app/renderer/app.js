@@ -2918,7 +2918,7 @@ $("record-sections").onchange = async () => {
   // segment recorded at a different point in time left its data outside
   // the visible window entirely: it looked empty even though it loaded
   // correctly (BUG-0077).
-  centerViewOnLoadedStart(res.opened || []);
+  centerViewOnLoadedRange(res.opened || []);
   // Flip activeIndex (and the dropdown) only now that the view is actually
   // centered on the new segment -- this is the signal anything watching
   // activeRecordSections uses to know the switch is done, so it must not
@@ -2941,22 +2941,34 @@ async function pickAnalysisFiles() {
   ]);
 }
 
-// Centers the view on the earliest min_ts among just-opened sources,
-// instead of resetZoom()'s "fit the combined range" -- recording keeps
-// ingesting live data in the background regardless of what's shown (see
-// ui-REC-013), so the combined /range can span from the loaded file's own
-// history all the way to "now", making the file itself look like a sliver
-// (or vice versa) rather than showing what was actually just loaded.
-// Reads from state.sources (already refreshed by the caller's own
-// refreshAll(), which is /sources-backed and so already carries min_ts).
-function centerViewOnLoadedStart(openedIds) {
+// Centers the view on the midpoint of just-opened sources' own combined
+// span, zoomed so that span occupies 75% of the visible width (explicit
+// user direction, 2026-08-12) -- instead of resetZoom()'s "fit the
+// combined /range". Recording keeps ingesting live data in the background
+// regardless of what's shown (see ui-REC-013), so the combined /range can
+// span from the loaded file's own history all the way to "now", making
+// the file itself look like a sliver (or vice versa) rather than showing
+// what was actually just loaded. Reads from state.sources (already
+// refreshed by the caller's own refreshAll(), which is /sources-backed
+// and so already carries min_ts/max_ts).
+function centerViewOnLoadedRange(openedIds) {
   const opened = new Set(openedIds);
-  const starts = state.sources
-    .filter((s) => opened.has(s.id) && s.min_ts != null)
-    .map((s) => s.min_ts);
+  const starts = [], ends = [];
+  for (const s of state.sources) {
+    if (opened.has(s.id) && s.min_ts != null) {
+      starts.push(s.min_ts);
+      ends.push(s.max_ts);
+    }
+  }
   if (!starts.length) return;
   const start = Math.min(...starts);
-  setView(start - DEFAULT_SPAN / 2, start + DEFAULT_SPAN / 2);
+  const end = Math.max(...ends);
+  // pad chosen so (span + 2*pad) * 0.75 === span, i.e. the loaded data
+  // occupies exactly 75% of the resulting view; floored so a near-
+  // instantaneous recording still gets a sensible, non-degenerate zoom.
+  const span = Math.max(end - start, 1500);
+  const pad = span / 6;
+  setView(start - pad, end + pad);
 }
 
 $("btn-load-sample").onclick = async () => {
@@ -2997,7 +3009,7 @@ $("btn-load-sample").onclick = async () => {
     }
     await refreshAll(); // also switches into analysis mode -- see setLiveHidden
     setActiveView(`upload://${basename(files[files.length - 1])}`);
-    centerViewOnLoadedStart(openedIds);
+    centerViewOnLoadedRange(openedIds);
   } catch (err) {
     alert(String(err.message || err));
   }
@@ -3410,7 +3422,7 @@ async function openRecording() {
     }
     await refreshAll(); // also switches into analysis mode -- see setLiveHidden
     setActiveView(`upload://${basename(files[files.length - 1])}`);
-    centerViewOnLoadedStart(openedIds);
+    centerViewOnLoadedRange(openedIds);
   } catch (err) {
     alert(String(err.message || err));
   }

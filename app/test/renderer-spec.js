@@ -2669,27 +2669,29 @@
     }
   });
 
-  await T("centerViewOnLoadedStart centers on the earliest min_ts among just-opened sources", () => {
+  await T("centerViewOnLoadedRange centers on the midpoint of just-opened sources, data occupying 75% of the view", () => {
     // A direct unit check against a fabricated state.sources entry, rather
     // than a real upload: entity names are shared/reused across this whole
     // long-running suite's many recordings, so a real source's reported
-    // min_ts reflects the earliest sample *ever* stored under that name
-    // this run, not just what this one test loaded -- exactly the kind of
-    // cross-source bleed this function must center past when it's the
-    // *live* feed doing the accumulating, but not what this unit itself
-    // should be judged against.
+    // min_ts/max_ts reflects the earliest/latest sample *ever* stored
+    // under that name this run, not just what this one test loaded --
+    // exactly the kind of cross-source bleed this function must center
+    // past when it's the *live* feed doing the accumulating, but not what
+    // this unit itself should be judged against.
     const realSources = state.sources;
     const realView = state.view;
     const fileStart = 1_700_000_000_000; // arbitrary, fixed, unrelated to any real fixture data
+    const fileEnd = fileStart + 30000;
     state.sources = [
       ...state.sources,
-      { id: "e2e-fake-source", path: "upload://fake.cttc-metric", live: false, min_ts: fileStart, max_ts: fileStart + 30000 },
+      { id: "e2e-fake-source", path: "upload://fake.cttc-metric", live: false, min_ts: fileStart, max_ts: fileEnd },
     ];
     try {
-      centerViewOnLoadedStart(["e2e-fake-source"]);
+      centerViewOnLoadedRange(["e2e-fake-source"]);
       const center = (state.view.t0 + state.view.t1) / 2;
-      eq(center, fileStart, "view centered exactly on the fabricated source's min_ts");
-      eq(state.view.t1 - state.view.t0, DEFAULT_SPAN, "uses the default span width");
+      eq(center, (fileStart + fileEnd) / 2, "view centered exactly on the fabricated source's own midpoint");
+      const totalSpan = state.view.t1 - state.view.t0;
+      near((fileEnd - fileStart) / totalSpan, 0.75, 0.001, "loaded data occupies 75% of the view");
     } finally {
       state.sources = realSources;
       state.view = realView;
@@ -2713,7 +2715,7 @@
     try {
       ok(r.opened.length >= 1, "sample opened");
       await refreshAll();
-      centerViewOnLoadedStart(r.opened); // matches what the real Load Analysis/Open Recording button flow does
+      centerViewOnLoadedRange(r.opened); // matches what the real Load Analysis/Open Recording button flow does
       eq(state.liveHidden, true, "now in analysis mode");
       ok(
         state.view.t0 !== t0 || state.view.t1 !== t1,
