@@ -4,6 +4,16 @@
 // to {passed, failed, failures: [...]}.
 (async () => {
   "use strict";
+  // A real, unstubbed window.alert() is genuinely OS-blocking in a real
+  // Electron window -- if any test's real code path happens to hit one
+  // unexpectedly (e.g. a narrow query landing on a zero-row slice of demo
+  // data, tripping app.js's own "No data found..." alert), it freezes the
+  // whole suite behind a visible, disruptive native dialog instead of
+  // just failing that one test. Stubbed globally so that's a normal,
+  // catchable failure instead; tests that need to inspect what alert()
+  // was actually called with still save/restore this (now-stubbed) value
+  // locally, exactly as before -- nothing here changes for them.
+  window.alert = () => {};
   const results = { passed: 0, failed: 0, failures: [] };
   const T = async (name, fn) => {
     try {
