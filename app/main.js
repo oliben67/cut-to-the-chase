@@ -476,8 +476,8 @@ let splashWindow = null;
 function showSplash() {
   if (splashWindow && !splashWindow.isDestroyed()) return splashWindow;
   splashWindow = new BrowserWindow({
-    width: 280,
-    height: 220,
+    width: 300,
+    height: 320,
     frame: false,
     resizable: false,
     alwaysOnTop: true,
