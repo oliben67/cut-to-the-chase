@@ -3374,6 +3374,22 @@
     }
   });
 
+  await T("Preferences toolbar button defaults to the Settings pane, not Appearance (regression)", () => {
+    // The toolbar's single flat "Preferences" entry used to default to
+    // pane-preferences (Appearance) -- a deliberate-at-the-time collapse
+    // of the old separate Settings…/Appearance… buttons into one, but
+    // reversed per explicit user direction: opening Preferences must land
+    // on Settings.
+    openSettingsDialog();
+    try {
+      eq($("pane-settings").hidden, false, "Settings pane visible");
+      eq($("pane-preferences").hidden, true, "Appearance pane hidden");
+      eq($("dlg-preferences").querySelector('.mac-settings-item[data-pane="pane-settings"]').dataset.active, "true", "Settings marked active in the sidebar");
+    } finally {
+      dlgPreferences.close();
+    }
+  });
+
   /* ── status bar (event notifications) ─────────────────────────────────── */
 
   await T("status bar is shown by default and toggled from Appearance", () => {
