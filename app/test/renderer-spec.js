@@ -406,13 +406,16 @@
     }
   });
 
-  await T("log panel Export .log button sits right after the search icon, and only fetches/writes once Save is confirmed", async () => {
+  await T("log panel hamburger menu lists Search, Sort up, Sort down, Export in order (each with an icon), and Export only fetches/writes once Save is confirmed", async () => {
     const p = [...panels.values()][0];
-    const buttons = [...p.el.querySelectorAll(".panel-head-buttons button")];
-    const searchIdx = buttons.findIndex((b) => b.title === "Search this log");
-    const exportIdx = buttons.findIndex((b) => b.title === "Export this log's current entries as a .log file");
-    ok(searchIdx >= 0, "search icon present");
-    eq(exportIdx, searchIdx + 1, "export button immediately follows the search icon");
+    const menuBtn = p.el.querySelector(".panel-menu-btn");
+    const openMenu = () => { menuBtn.focus(); menuBtn.click(); return document.getElementById("ctxmenu"); };
+
+    let menu = openMenu();
+    ok(menu, "menu open");
+    let buttons = [...menu.querySelectorAll("button")];
+    eq(buttons.map((b) => b.textContent).join(","), "Search,Sort up,Sort down,Export", "menu items appear in the spec's order");
+    ok(buttons.every((b) => b.querySelector(".ctxmenu-icon svg")), "every entry has an icon");
 
     const realPick = pickLogExportPath;
     const realWrite = writeLogExportFile;
@@ -429,16 +432,18 @@
       };
       fetchAllLogRows = async (...args) => { fetchCalls++; return realFetchAll(...args); };
       writeLogExportFile = async (path, bytes) => { writes.push({ path, bytes }); };
-      await p.exportLog();
-      eq(pickCalls, 1, "dialog shown");
+      buttons.find((b) => b.textContent === "Export").click();
+      await until(() => pickCalls === 1, "dialog shown");
+      ok(!document.getElementById("ctxmenu"), "selecting an item closes the menu");
       eq(fetchCalls, 0, "no data fetched on cancel");
       eq(writes.length, 0, "nothing written on cancel");
 
       // Confirmed: only now does it fetch and write, with every current row.
       pickLogExportPath = async () => "/tmp/e2e-log-export-test.log";
-      await p.exportLog();
+      menu = openMenu();
+      [...menu.querySelectorAll("button")].find((b) => b.textContent === "Export").click();
+      await until(() => writes.length === 1, "written exactly once confirmed");
       eq(fetchCalls, 1, "data fetched exactly once confirmed");
-      eq(writes.length, 1, "written exactly once confirmed");
       eq(writes[0].path, "/tmp/e2e-log-export-test.log");
       const rows = await realFetchAll(p.src.id);
       const expected = rows.map((r) => r.text).join("\n") + (rows.length ? "\n" : "");
@@ -459,8 +464,11 @@
     // and that focus never leaves the input -- find() still runs for real
     // underneath the spy, so its own finally-block refocus is exercised too.
     const p = [...panels.values()][0];
-    const searchToggle = [...p.el.querySelectorAll(".panel-head-buttons button")].find((b) => b.title === "Search this log");
-    searchToggle.click();
+    const menuBtn = p.el.querySelector(".panel-menu-btn");
+    menuBtn.focus();
+    menuBtn.click();
+    const searchEntry = [...document.getElementById("ctxmenu").querySelectorAll("button")].find((b) => b.textContent === "Search");
+    searchEntry.click();
     const realFind = p.find.bind(p);
     const calls = [];
     p.find = async (forward) => { calls.push(forward); return realFind(forward); };
@@ -483,6 +491,80 @@
       p.searchBar.hidden = true;
     }
   });
+
+  await T("log panel Sort up/down are mutually exclusive, reorder the list, mark themselves active, and persist", async () => {
+    const p = [...panels.values()][0];
+    const startReversed = p.reversed;
+    ok(p.total >= 2, "panel has rows");
+    eq(p.dataIndexAt(0), startReversed ? p.total - 1 : 0, "visual->data mapping");
+    eq(p.visualIndexOf(p.dataIndexAt(5)), 5, "mapping is its own inverse");
+    const menuBtn = p.el.querySelector(".panel-menu-btn");
+    const openMenu = () => { menuBtn.focus(); menuBtn.click(); return document.getElementById("ctxmenu"); };
+    const sortEntries = (menu) => {
+      const buttons = [...menu.querySelectorAll("button")];
+      return { up: buttons.find((b) => b.textContent === "Sort up"), down: buttons.find((b) => b.textContent === "Sort down") };
+    };
+
+    let { up, down } = sortEntries(openMenu());
+    eq(up.dataset.active, startReversed ? undefined : "true", "Sort up marked active iff the panel isn't currently reversed");
+    eq(down.dataset.active, startReversed ? "true" : undefined, "Sort down marked active iff the panel is currently reversed");
+    (startReversed ? up : down).click();
+    eq(p.reversed, !startReversed, "flipped");
+    eq(prefs.get("logNewestFirst", null), p.reversed, "persisted");
+    eq(p.dataIndexAt(0), p.reversed ? p.total - 1 : 0, "mapping follows the flip");
+
+    ({ up, down } = sortEntries(openMenu()));
+    eq(up.dataset.active, p.reversed ? undefined : "true", "active marking flipped along with the sort direction");
+    eq(down.dataset.active, p.reversed ? "true" : undefined, "active marking flipped along with the sort direction");
+    (p.reversed ? up : down).click();
+    eq(p.reversed, startReversed, "restored");
+  });
+
+  await T("log panel header is a 3-zone layout: hamburger, centered name, right-side icons -- and the name still truncates with a full-name tooltip", async () => {
+    const p = [...panels.values()][0];
+    const top = p.el.querySelector(".panel-head-top");
+    const kids = [...top.children];
+    eq(kids.length, 3, "exactly 3 zones");
+    ok(kids[0].classList.contains("panel-menu-btn"), "left zone is the hamburger");
+    ok(kids[1].classList.contains("panel-head-center"), "center zone holds the name");
+    ok(kids[2].classList.contains("panel-head-right"), "right zone is unchanged");
+    const name = kids[1].querySelector(".name");
+    ok(name, "name lives in the center zone");
+    eq(name.title, p.src.path, "full name/path still exposed via a tooltip");
+    ok(kids[2].contains(p.el.querySelector('[title="Open this log in its own window"]')), "popout stayed in the right zone");
+    ok(kids[2].contains(p.el.querySelector(".close")), "close stayed in the right zone");
+  });
+
+  await T("log panel hamburger menu is keyboard accessible: opens focused, Up/Down cycle through all 4 items and wrap, Esc closes and returns focus", async () => {
+    const p = [...panels.values()][0];
+    const menuBtn = p.el.querySelector(".panel-menu-btn");
+    eq(menuBtn.getAttribute("aria-label"), "Menu");
+    eq(menuBtn.getAttribute("aria-expanded"), "false");
+
+    menuBtn.focus();
+    menuBtn.click();
+    const menu = document.getElementById("ctxmenu");
+    ok(menu, "menu open");
+    eq(menuBtn.getAttribute("aria-expanded"), "true", "aria-expanded set while open");
+    const items = [...menu.querySelectorAll("button")];
+    eq(document.activeElement, items[0], "focus enters the menu on open, on the first item");
+
+    const down = (ke) => menu.dispatchEvent(new KeyboardEvent("keydown", { key: ke, bubbles: true, cancelable: true }));
+    down("ArrowDown");
+    eq(document.activeElement, items[1], "ArrowDown moves to the next item");
+    down("ArrowDown"); down("ArrowDown");
+    eq(document.activeElement, items[3], "ArrowDown x2 more reaches the last item");
+    down("ArrowDown");
+    eq(document.activeElement, items[0], "ArrowDown wraps from the last item back to the first");
+    down("ArrowUp");
+    eq(document.activeElement, items[3], "ArrowUp wraps from the first item to the last");
+
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    ok(!document.getElementById("ctxmenu"), "Esc closes the menu");
+    eq(document.activeElement, menuBtn, "focus returns to the hamburger on close");
+    eq(menuBtn.getAttribute("aria-expanded"), "false", "aria-expanded reset on close");
+  });
+
 
   await T("turning Live tracking off interrupts its own highlight instead of leaving it frozen", async () => {
     const realEnabled = liveTrackEnabled;
@@ -4680,23 +4762,6 @@
       state.sources = state.sources.filter((s) => s.id !== "__hremote");
       drawAll();
     }
-  });
-
-  await T("log panel order toggle flips newest/oldest-first and persists", async () => {
-    const p = [...panels.values()][0];
-    const startReversed = p.reversed;
-    ok(p.total >= 2, "panel has rows");
-    eq(p.dataIndexAt(0), startReversed ? p.total - 1 : 0, "visual->data mapping");
-    eq(p.visualIndexOf(p.dataIndexAt(5)), 5, "mapping is its own inverse");
-    const toggle = [...p.el.querySelectorAll("button")].find(
-      (b) => b.textContent === "⬆" || b.textContent === "⬇");
-    ok(toggle, "order toggle present");
-    toggle.click();
-    eq(p.reversed, !startReversed, "flipped");
-    eq(prefs.get("logNewestFirst", null), p.reversed, "persisted");
-    eq(p.dataIndexAt(0), p.reversed ? p.total - 1 : 0, "mapping follows the flip");
-    toggle.click();
-    eq(p.reversed, startReversed, "restored");
   });
 
 

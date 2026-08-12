@@ -1140,6 +1140,12 @@ body.sample-armed .strip {
 }
 #ctxmenu button:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
 #ctxmenu button:disabled:hover { background: none; }
+#ctxmenu button:focus-visible { background: color-mix(in srgb, var(--accent) 12%, transparent); outline: none; }
+/* Mutually-exclusive choices (e.g. a sort direction) mark their active
+   entry via ctxMenu's optional 4th tuple element -- same "selected" look
+   as .seg-control button[data-active="true"]. */
+#ctxmenu button[data-active="true"] { background: var(--accent); color: #fff; }
+#ctxmenu button[data-active="true"] .ctxmenu-icon { color: #fff; }
 /* Divider between groups of entries (see ctxMenu's "separator" sentinel) --
    same look as .gateway-dropdown's own .gateway-item-sep. */
 .ctxmenu-sep { border-top: 1px solid var(--border); margin: 2px 4px; }
@@ -1359,18 +1365,22 @@ body.popout-host #btn-style-toggle-svc {
   padding: 6px 10px;
   border-bottom: 1px solid var(--border);
 }
+/* 3 columns, the outer two equal (1fr) -- keeps the center column (the
+   name) truly centered no matter how wide the hamburger vs. the right
+   icon cluster is, instead of drifting toward whichever side is lighter. */
 .panel-head-top {
-  display: flex;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
   align-items: center;
   gap: 8px;
-  min-width: 0; /* lets the name ellipsis/wrap instead of pushing controls off */
+  min-width: 0;
 }
-.panel-head-buttons {
+.panel-head-center {
   display: flex;
   align-items: center;
   gap: 8px;
-  flex: 0 0 auto;
-  margin-left: auto; /* keeps the icon buttons flush right, lined up with the name row */
+  min-width: 0; /* lets the name ellipsis instead of forcing the center column wide */
+  max-width: 100%;
 }
 .panel-head-controls {
   display: flex;

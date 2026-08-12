@@ -2246,6 +2246,18 @@ const panels = new Map(); // source id -> Panel
 // oldest-first; `reversed` only affects display order (see dataIndexAt/
 // visualIndexOf) so index-based operations (cursor sync, search) never need
 // to care which way the panel is currently sorted.
+// Log panel header menu icons -- inlined the same way the Export entry's
+// own SVG is (see below, in the constructor), sourced from
+// ~/sources/icons/{search,sort-up,sort-down,hamburger}.svg, stripped down
+// to just viewBox plus fill="currentColor" so they inherit .icon-btn's
+// color like every other
+// header icon. Search's markup is identical (same path data) to the
+// magnifier already inlined at index.html's .mac-settings-search button.
+const LOG_MENU_SEARCH_SVG = '<svg viewBox="0 0 512 512" fill="currentColor" aria-hidden="true"><path d="m292 80c-77.196 0-140 62.804-140 140s62.804 140 140 140 140-62.804 140-140-62.804-140-140-140zm97.989 120h-38.507c-1.262-24.255-4.859-47.745-10.975-67.42 25.09 13.978 43.576 38.437 49.482 67.42zm-117.414 40h38.849c-2.545 43.399-12.971 69.987-19.425 78.185-6.453-8.198-16.879-34.786-19.424-78.185zm0-40c2.545-43.399 12.971-69.987 19.425-78.185 6.454 8.198 16.88 34.786 19.425 78.185zm-29.082-67.42c-6.116 19.675-9.714 43.165-10.975 67.42h-38.507c5.906-28.983 24.392-53.442 49.482-67.42zm-49.482 107.42h38.507c1.262 24.255 4.859 47.745 10.975 67.42-25.09-13.978-43.576-38.437-49.482-67.42zm146.496 67.42c6.116-19.675 9.714-43.165 10.975-67.42h38.507c-5.906 28.983-24.392 53.442-49.482 67.42z"/><path d="m292 0c-121.588 0-220 98.396-220 220 0 52.045 17.963 101.324 50.935 140.781l-117.077 117.077c-7.811 7.811-7.811 20.474 0 28.284 7.81 7.81 20.473 7.811 28.284 0l117.077-117.077c39.457 32.972 88.736 50.935 140.781 50.935 121.588 0 220-98.396 220-220 0-121.588-98.396-220-220-220zm0 400c-99.252 0-180-80.748-180-180s80.748-180 180-180 180 80.748 180 180-80.748 180-180 180z"/></svg>';
+const LOG_MENU_SORT_UP_SVG = '<svg viewBox="0 0 32 32" fill="currentColor" aria-hidden="true"><path d="M9.707,7.293A1,1,0,1,1,8.293,8.707L7,7.414V27a1,1,0,0,1-2,0V7.414L3.707,8.707A1,1,0,0,1,2.293,7.293l3-3a1,1,0,0,1,1.414,0ZM29,5H13a1,1,0,0,0,0,2H29a1,1,0,0,0,0-2Zm-4,7H13a1,1,0,0,0,0,2H25a1,1,0,0,0,0-2Zm-4,7H13a1,1,0,0,0,0,2h8a1,1,0,0,0,0-2Zm-4,7H13a1,1,0,0,0,0,2h4a1,1,0,0,0,0-2Z"/></svg>';
+const LOG_MENU_SORT_DOWN_SVG = '<svg viewBox="0 0 32 32" fill="currentColor" aria-hidden="true"><path d="m9.707 23.293a1 1 0 0 1 0 1.414l-3 3a1 1 0 0 1 -1.414 0l-3-3a1 1 0 0 1 1.414-1.414l1.293 1.293v-19.586a1 1 0 0 1 2 0v19.586l1.293-1.293a1 1 0 0 1 1.414 0zm19.293-18.293h-16a1 1 0 0 0 0 2h16a1 1 0 0 0 0-2zm-4 7h-12a1 1 0 0 0 0 2h12a1 1 0 0 0 0-2zm-4 7h-8a1 1 0 0 0 0 2h8a1 1 0 0 0 0-2zm-4 7h-4a1 1 0 0 0 0 2h4a1 1 0 0 0 0-2z"/></svg>';
+const LOG_MENU_HAMBURGER_SVG = '<svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path d="m19 11h-18c-.265216 0-.51957-.1054-.707107-.2929-.187536-.1875-.292893-.4419-.292893-.7071 0-.26522.105357-.51957.292893-.70711.187537-.18753.441891-.29289.707107-.29289h18c.2652 0 .5196.10536.7071.29289.1875.18754.2929.44189.2929.70711 0 .2652-.1054.5196-.2929.7071s-.4419.2929-.7071.2929zm0-7h-18c-.265216 0-.51957-.10536-.707107-.29289-.187536-.18754-.292893-.44189-.292893-.70711s.105357-.51957.292893-.70711c.187537-.18753.441891-.29289.707107-.29289h18c.2652 0 .5196.10536.7071.29289.1875.18754.2929.44189.2929.70711s-.1054.51957-.2929.70711c-.1875.18753-.4419.29289-.7071.29289zm0 14h-18c-.265216 0-.51957-.1054-.707107-.2929-.187536-.1875-.292893-.4419-.292893-.7071s.105357-.5196.292893-.7071c.187537-.1875.441891-.2929.707107-.2929h18c.2652 0 .5196.1054.7071.2929s.2929.4419.2929.7071-.1054.5196-.2929.7071-.4419.2929-.7071.2929z"/></svg>';
+
 class Panel {
   constructor(src) {
     this.src = src;
@@ -2274,38 +2286,37 @@ class Panel {
     this.sampleBadge.hidden = true;
     this.countEl = document.createElement("span");
     this.countEl.className = "muted";
-    const orderToggle = document.createElement("button");
-    orderToggle.className = "icon-btn";
-    const syncOrderToggle = () => {
-      orderToggle.textContent = this.reversed ? "⬆" : "⬇";
-      orderToggle.title = this.reversed
-        ? "Showing newest entries first — click to show oldest first"
-        : "Showing oldest entries first — click to show newest first";
-    };
-    syncOrderToggle();
-    orderToggle.onclick = () => {
-      this.reversed = !this.reversed;
+    // Search/Sort up/Sort down/Export all live in the hamburger menu below
+    // instead of as standalone buttons -- setSortDir is shared by the Sort
+    // up/down entries (mutually exclusive; the active one is marked fresh
+    // on every menu open, since entries are rebuilt per click).
+    const setSortDir = (reversed) => {
+      this.reversed = reversed;
       prefs.set("logNewestFirst", this.reversed);
-      syncOrderToggle();
       this.body.scrollTop = 0;
       this.render();
     };
-    const searchToggle = document.createElement("button");
-    searchToggle.className = "icon-btn";
-    searchToggle.textContent = "🔍";
-    searchToggle.title = "Search this log";
-    searchToggle.onclick = () => {
-      this.searchBar.hidden = !this.searchBar.hidden;
-      if (!this.searchBar.hidden) this.searchInput.focus();
+    const menuBtn = document.createElement("button");
+    menuBtn.className = "icon-btn panel-menu-btn";
+    menuBtn.innerHTML = LOG_MENU_HAMBURGER_SVG;
+    menuBtn.title = "Menu";
+    menuBtn.setAttribute("aria-label", "Menu");
+    menuBtn.setAttribute("aria-haspopup", "true");
+    menuBtn.setAttribute("aria-expanded", "false");
+    menuBtn.onclick = (e) => {
+      ctxMenu(e, [
+        ["Search", () => {
+          this.searchBar.hidden = !this.searchBar.hidden;
+          if (!this.searchBar.hidden) this.searchInput.focus();
+        }, LOG_MENU_SEARCH_SVG],
+        ["Sort up", () => setSortDir(false), LOG_MENU_SORT_UP_SVG, !this.reversed],
+        ["Sort down", () => setSortDir(true), LOG_MENU_SORT_DOWN_SVG, this.reversed],
+        // Same export glyph as #btn-export-metrics, next to the metric(s)
+        // dropdown in analysis mode -- this is that same action's
+        // log-viewer counterpart, one panel at a time.
+        ["Export", () => this.exportLog(), '<svg viewBox="0 0 512 512" fill="currentColor" aria-hidden="true"><path d="m256.008 383.451c-26.012 0-47.149-21.137-47.149-47.117v-181.017c-16.889 6.563-36.829 3.037-50.442-10.576-.117-.117-.232-.236-.345-.356-18.066-18.418-18.005-47.98.341-66.313l64.263-64.263c8.889-8.902 20.726-13.809 33.324-13.809s24.435 4.907 33.332 13.816l64.259 64.259c18.286 18.273 18.46 47.834.337 66.309-.113.121-.228.24-.345.356-13.617 13.618-33.563 17.142-50.458 10.571v181.022c0 25.981-21.136 47.118-47.117 47.118zm-26.409-272.59c5.605 2.321 9.26 7.791 9.26 13.858v211.614c0 9.438 7.679 17.117 17.117 17.117 9.47 0 17.149-7.679 17.149-17.117v-211.63c0-6.067 3.655-11.537 9.26-13.858s12.057-1.038 16.347 3.252l9.431 9.431c6.604 6.604 17.306 6.674 23.995.208.074-.076.148-.152.224-.228 6.696-6.692 6.701-17.52 0-24.216l-64.27-64.271c-3.237-3.24-7.535-5.021-12.112-5.021s-8.875 1.781-12.104 5.014l-64.274 64.274c-6.698 6.694-6.707 17.52-.003 24.22.075.075.15.151.223.228 6.689 6.465 17.391 6.396 23.996-.208l9.415-9.415c4.605-4.607 11.159-5.401 16.346-3.252z"/><path d="m432.733 512h-353.466c-43.781 0-79.267-35.415-79.267-79.267v-160.666c0-43.78 35.415-79.267 79.267-79.267h48.2c25.808 0 47.133 20.856 47.133 47.133 0 25.744-20.796 47.134-47.133 47.134h-33.2v130.667h323.467v-130.667h-33.2c-25.743 0-47.133-20.797-47.133-47.134 0-25.743 20.796-47.133 47.133-47.133h48.2c43.78 0 79.267 35.415 79.267 79.267v160.667c-.001 43.781-35.417 79.266-79.268 79.266zm-353.466-289.2c-27.216 0-49.267 22.015-49.267 49.267v160.667c0 27.211 22.011 49.266 49.267 49.266h353.467c27.214 0 49.266-22.012 49.266-49.267v-160.666c0-27.216-22.015-49.267-49.267-49.267h-48.2c-9.596 0-17.133 7.808-17.133 17.133 0 9.578 7.788 17.134 17.133 17.134h48.2c8.284 0 15 6.716 15 15v160.667c0 8.284-6.716 15-15 15h-353.466c-8.284 0-15-6.716-15-15v-160.667c0-8.284 6.716-15 15-15h48.2c9.595 0 17.133-7.807 17.133-17.134 0-9.576-7.786-17.133-17.133-17.133z"/></svg>'],
+      ]);
     };
-    const exportLogBtn = document.createElement("button");
-    exportLogBtn.className = "icon-btn";
-    // Same export glyph as #btn-export-metrics, next to the metric(s)
-    // dropdown in analysis mode -- this is that same action's log-viewer
-    // counterpart, one panel at a time.
-    exportLogBtn.innerHTML = '<svg viewBox="0 0 512 512" fill="currentColor" aria-hidden="true"><path d="m256.008 383.451c-26.012 0-47.149-21.137-47.149-47.117v-181.017c-16.889 6.563-36.829 3.037-50.442-10.576-.117-.117-.232-.236-.345-.356-18.066-18.418-18.005-47.98.341-66.313l64.263-64.263c8.889-8.902 20.726-13.809 33.324-13.809s24.435 4.907 33.332 13.816l64.259 64.259c18.286 18.273 18.46 47.834.337 66.309-.113.121-.228.24-.345.356-13.617 13.618-33.563 17.142-50.458 10.571v181.022c0 25.981-21.136 47.118-47.117 47.118zm-26.409-272.59c5.605 2.321 9.26 7.791 9.26 13.858v211.614c0 9.438 7.679 17.117 17.117 17.117 9.47 0 17.149-7.679 17.149-17.117v-211.63c0-6.067 3.655-11.537 9.26-13.858s12.057-1.038 16.347 3.252l9.431 9.431c6.604 6.604 17.306 6.674 23.995.208.074-.076.148-.152.224-.228 6.696-6.692 6.701-17.52 0-24.216l-64.27-64.271c-3.237-3.24-7.535-5.021-12.112-5.021s-8.875 1.781-12.104 5.014l-64.274 64.274c-6.698 6.694-6.707 17.52-.003 24.22.075.075.15.151.223.228 6.689 6.465 17.391 6.396 23.996-.208l9.415-9.415c4.605-4.607 11.159-5.401 16.346-3.252z"/><path d="m432.733 512h-353.466c-43.781 0-79.267-35.415-79.267-79.267v-160.666c0-43.78 35.415-79.267 79.267-79.267h48.2c25.808 0 47.133 20.856 47.133 47.133 0 25.744-20.796 47.134-47.133 47.134h-33.2v130.667h323.467v-130.667h-33.2c-25.743 0-47.133-20.797-47.133-47.134 0-25.743 20.796-47.133 47.133-47.133h48.2c43.78 0 79.267 35.415 79.267 79.267v160.667c-.001 43.781-35.417 79.266-79.268 79.266zm-353.466-289.2c-27.216 0-49.267 22.015-49.267 49.267v160.667c0 27.211 22.011 49.266 49.267 49.266h353.467c27.214 0 49.266-22.012 49.266-49.267v-160.666c0-27.216-22.015-49.267-49.267-49.267h-48.2c-9.596 0-17.133 7.808-17.133 17.133 0 9.578 7.788 17.134 17.133 17.134h48.2c8.284 0 15 6.716 15 15v160.667c0 8.284-6.716 15-15 15h-353.466c-8.284 0-15-6.716-15-15v-160.667c0-8.284 6.716-15 15-15h48.2c9.595 0 17.133-7.807 17.133-17.134 0-9.576-7.786-17.133-17.133-17.133z"/></svg>';
-    exportLogBtn.title = "Export this log's current entries as a .log file";
-    exportLogBtn.onclick = () => this.exportLog();
     const popout = document.createElement("button");
     popout.className = "icon-btn";
     popout.textContent = "⧉";
@@ -2339,15 +2350,15 @@ class Panel {
       popback.onclick = () => window.close();
       right.append(popback);
     }
-    headTop.append(name, this.sampleBadge);
-    // Row 1: name + badge, flushed left, and the icon buttons, flushed
-    // right (headButtons). Row 2 (headControls) is the entries/transforms
-    // count, flushed right on its own -- this.countEl (set in update())
-    // is the only thing on the row below (headControls).
-    const headButtons = document.createElement("div");
-    headButtons.className = "panel-head-buttons";
-    headButtons.append(orderToggle, searchToggle, exportLogBtn, right);
-    headTop.appendChild(headButtons);
+    const center = document.createElement("div");
+    center.className = "panel-head-center";
+    center.append(name, this.sampleBadge);
+    // Row 1: hamburger menu, centered name+badge, and the right-side icons
+    // -- a 3-column grid (see .panel-head-top) so the center stays
+    // centered regardless of how wide either side is. Row 2 (headControls)
+    // is the entries/transforms count, flushed right on its own --
+    // this.countEl (set in update()) is the only thing on the row below.
+    headTop.append(menuBtn, center, right);
     headControls.append(this.countEl);
     head.append(headTop, headControls);
     // Drag the header to reorder this panel (and its matching legend entry
