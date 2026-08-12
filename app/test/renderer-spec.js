@@ -2824,6 +2824,44 @@
     }
   });
 
+  await T("strict live/analysis separation: a sample's data hides again once back in live view (extremely hard rule)", async () => {
+    // isLiveDataHidden already correctly hid live data during analysis
+    // mode; isSampleHidden never symmetrically hid a sample's data once
+    // back in live view, since state.activeSamplePath isn't cleared by
+    // Back to Live (ui-LIVE-016 -- loaded samples aren't closed). Fixed by
+    // also checking !state.liveHidden in isSampleHidden; this guards the
+    // regression.
+    // A 5-minute slice (not the full demo range) -- these tests only need
+    // *a* sample with a real span, and a smaller download/upload/parse
+    // keeps this test's own added runtime down.
+    const res = await fetch(
+      `${API}/files/download?from=${R.min_ts}&to=${R.min_ts + 5 * 60000}&include_host=0`,
+      { headers: authHeaders() }
+    );
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const realPath = "/tmp/cttc-e2e-live-analysis-separation.cttc-metric";
+    await window.cttc.writeBinaryFile(realPath, bytes);
+    const r = await uploadAndResolveSegment(realPath);
+    try {
+      ok(r.opened.length >= 1, "sample opened");
+      await refreshAll();
+      eq(state.liveHidden, true, "sanity: in analysis mode");
+      const sampleSid = r.opened[0];
+      const liveSid = state.sources.find((s) => s.live !== false && !r.opened.includes(s.id))?.id;
+      ok(liveSid, "sanity: a live source is open alongside the sample");
+      ok(!isSampleHidden(sampleSid), "sample visible in analysis mode");
+      ok(isLiveDataHidden(liveSid), "live data hidden in analysis mode");
+
+      $("btn-back-to-live").click();
+      eq(state.liveHidden, false, "switched to Live");
+      ok(isSampleHidden(sampleSid), "sample must hide once back in live view");
+      ok(!isLiveDataHidden(liveSid), "live data visible again");
+    } finally {
+      for (const sid of r.opened) await post("/close", { id: sid });
+      await refreshAll();
+    }
+  });
+
   await T("analysis view is a static, centered view of the sample -- no time-driven movement (extremely hard rule)", async () => {
     goLive();
     eq(state.live, true, "sanity: live-following");
@@ -2856,6 +2894,25 @@
       for (const sid of r.opened) await post("/close", { id: sid });
       await refreshAll();
     }
+  });
+
+  await T("removing the only open metric reverts to Live view immediately (regression guard)", async () => {
+    // A 5-minute slice (not the full demo range) -- these tests only need
+    // *a* sample with a real span, and a smaller download/upload/parse
+    // keeps this test's own added runtime down.
+    const res = await fetch(
+      `${API}/files/download?from=${R.min_ts}&to=${R.min_ts + 5 * 60000}&include_host=0`,
+      { headers: authHeaders() }
+    );
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const realPath = "/tmp/cttc-e2e-remove-reverts-live.cttc-metric";
+    await window.cttc.writeBinaryFile(realPath, bytes);
+    const r = await uploadAndResolveSegment(realPath);
+    await refreshAll();
+    eq(state.liveHidden, true, "sanity: in analysis mode");
+    await removeOpenedDataRow(`upload://${basename(realPath)}`);
+    eq(state.liveHidden, false, "reverted to Live immediately on remove, no extra refresh needed");
+    eq(state.activeSamplePath, null, "no sample left active");
   });
 
   /* ── export metrics: the active file's stats/logs as text or JSON ───────── */

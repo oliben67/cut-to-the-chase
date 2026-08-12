@@ -312,12 +312,19 @@ function sampleFileGroups() {
   return [...byPath.values()];
 }
 // true if this source belongs to a loaded .cttc-metric/.cttc-record file
-// that *isn't* the current active view (see setActiveView) -- exactly one
-// loaded file's sources are ever shown at a time now, checked everywhere a
-// sample-sourced series/lane/panel might need hiding.
+// that shouldn't be shown right now: either it isn't the active view's own
+// file (see setActiveView), or we're not even in analysis mode at all.
+// Extremely hard rule: live view and analysis view never share data in
+// either direction -- Back to Live (setLiveHidden(false)) deliberately
+// never clears state.activeSamplePath (loaded samples aren't closed, so
+// Opened Data can still list them), so the `!state.liveHidden` check here
+// is what actually hides a just-left sample's data once back in live view;
+// without it this only ever compared *which* sample, never *whether* one
+// should be showing at all. Checked everywhere a sample-sourced
+// series/lane/panel might need hiding.
 function isSampleHidden(sid) {
   const src = state.sources.find((s) => s.id === sid);
-  return !!(src && src.live === false && src.path !== state.activeSamplePath);
+  return !!(src && src.live === false && (!state.liveHidden || src.path !== state.activeSamplePath));
 }
 // The inverse of isSampleHidden: true for a *live* source while the app is
 // in analysis mode (state.liveHidden) -- checked
