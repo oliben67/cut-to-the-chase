@@ -540,20 +540,6 @@ function narrate(text) {
   splashStatus(text);
 }
 
-// Electron's titleBarOverlay reports the real OS/DE window-controls
-// position via navigator.windowControlsOverlay in the renderer -- needed
-// because Linux DEs (and some Windows themes) can move those controls to
-// either side, unlike macOS where traffic lights are always left. macOS
-// is deliberately left on its native frame: titleBarOverlay isn't
-// meaningfully supported there and traffic-light position is an OS
-// constant anyway, so there's nothing to detect and no reason to take on
-// frameless-window risk on that platform. Applies only to windows that
-// load index.html (the main window and log/telemetry popouts), which are
-// the only ones that render a log panel header needing this.
-function overlayFrameOptions() {
-  return process.platform === "darwin" ? {} : { frame: false, titleBarOverlay: true };
-}
-
 let mainWindow = null;
 async function createWindow() {
   const win = new BrowserWindow({
@@ -566,7 +552,6 @@ async function createWindow() {
     // well before index.html/app.js have anything to show -- exactly the
     // "long time before any UI" gap the splash screen exists to cover.
     show: false,
-    ...overlayFrameOptions(),
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
@@ -839,7 +824,6 @@ ipcMain.handle("popout", async (e, kind, id, view) => {
     width: big ? 1000 : 640,
     height: big ? 620 : 520,
     icon: APP_ICON,
-    ...overlayFrameOptions(),
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,

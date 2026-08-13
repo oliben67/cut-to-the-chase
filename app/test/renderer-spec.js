@@ -537,7 +537,7 @@
     ok(iconsZone.contains(p.el.querySelector(".close")), "close stayed in the icon zone");
   });
 
-  await T("log panel hamburger/icon-cluster zones swap live when controlsSide changes (Window Controls Overlay geometrychange)", async () => {
+  await T("log panel hamburger/icon-cluster zones swap live when controlsSide changes", async () => {
     const p = [...panels.values()][0];
     const original = controlsSide;
     try {

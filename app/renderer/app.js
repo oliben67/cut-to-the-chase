@@ -2256,16 +2256,20 @@ function formatLogEntryText(text) {
 
 const panels = new Map(); // source id -> Panel
 
-// Which side the OS's own window-control buttons are on. macOS is a hard
-// OS constant (traffic lights are always left, never relocatable), so
-// it's hardcoded -- no overlay is enabled there (see main.js's
-// overlayFrameOptions). Windows/Linux genuinely vary by theme/DE, so
-// those ask Chromium directly via navigator.windowControlsOverlay, which
-// main.js's titleBarOverlay makes available here. Log panel headers
-// mirror this: the hamburger sits opposite the OS's own controls, the
-// two right-side icons sit alongside them (see Panel's syncControlsSide
-// and the body.controls-left CSS overrides).
-let controlsSide = IS_MAC ? "left" : "right"; // synchronous default
+// Which side the OS's own window-control buttons are on. Ideally this
+// would ask the OS directly (Windows/Linux themes and DEs can move
+// those buttons, unlike macOS's fixed-left traffic lights) -- an earlier
+// version of this did exactly that via Electron's titleBarOverlay +
+// navigator.windowControlsOverlay, but that requires frame:false, and
+// frame:false silently dropped the window's control buttons entirely on
+// Windows (never actually verified there before landing) -- a broken
+// window is worse than an imperfect guess, so that's reverted and this
+// is back to a platform-only default until a way to detect the real
+// side is found that doesn't risk the window chrome itself. Log panel
+// headers mirror this: the hamburger sits opposite the OS's own
+// controls, the two right-side icons sit alongside them (see Panel's
+// syncControlsSide and the body.controls-left CSS overrides).
+let controlsSide = IS_MAC ? "left" : "right";
 
 // A button cluster's outside-in reading order (the order you'd encounter
 // its buttons moving from the window's edge toward the center) has to
@@ -2292,21 +2296,6 @@ function applyControlsSide(side) {
   for (const p of panels.values()) p.syncControlsSide();
 }
 applyControlsSide(controlsSide);
-const wco = navigator.windowControlsOverlay;
-if (wco) {
-  document.body.classList.add("wco-overlay");
-  const titleEl = document.getElementById("titlebar-drag-text");
-  if (titleEl) titleEl.textContent = document.title;
-  const syncFromWco = () => {
-    if (!wco.visible) return;
-    const rect = wco.getTitlebarAreaRect();
-    // rect is the area safe for content -- if it starts at the left
-    // edge, the controls occupy the right side instead, and vice versa.
-    applyControlsSide(rect.x > 0 ? "left" : "right");
-  };
-  syncFromWco();
-  wco.addEventListener("geometrychange", syncFromWco);
-}
 
 // One log source's virtual-scrolled panel: renders only the rows currently
 // in (or just outside) the visible scroll viewport, fetching them from the

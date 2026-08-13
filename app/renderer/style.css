@@ -90,25 +90,6 @@ body {
   flex-direction: column;
 }
 
-/* Reserved strip for the OS's own overlay window-control buttons (see
-   app.js's controlsSide/wco-overlay wiring) -- display:none (zero
-   layout impact) unless main.js actually enabled titleBarOverlay for
-   this window, which never happens on macOS. env(titlebar-area-height)
-   is the real control height Chromium reports once the overlay is
-   active, so this self-sizes instead of guessing a constant. */
-#titlebar-drag { display: none; }
-body.wco-overlay #titlebar-drag {
-  display: flex;
-  align-items: center;
-  height: env(titlebar-area-height, 33px);
-  padding: 0 8px;
-  -webkit-app-region: drag;
-  font-size: 12px;
-  color: var(--muted);
-  flex: 0 0 auto;
-}
-body.wco-overlay.controls-left #titlebar-drag-text { margin-left: auto; }
-
 /* custom menu bar — replaces the native OS menu so the vertical spacing
    between items can actually be tuned (impossible for the native menu on
    either macOS or Windows) */
