@@ -1084,7 +1084,8 @@ body.sample-armed .strip {
 #empty-state { padding: 28px 16px; text-align: center; }
 
 #chart-head {
-  display: flex;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
   align-items: center;
   gap: 8px;
   height: 32px; /* matches the sidebar's .ab-group-header */
@@ -1247,7 +1248,8 @@ body.sample-armed .strip {
 #lanes-head, #lanes { display: none !important; }
 
 #host-head {
-  display: flex;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
   align-items: center;
   gap: 8px;
   height: 32px; /* matches the sidebar's .ab-group-header */
@@ -1276,6 +1278,30 @@ body.sample-armed .strip {
   align-items: center;
   gap: 4px;
   margin-left: auto;
+}
+
+/* Telemetry/host-telemetry headers (#chart-head, #host-head): title
+   centered regardless of button-cluster width, button cluster on
+   whichever side sits opposite the OS's own window-control buttons (see
+   app.js's controlsSide) -- same rule as the log panel header's icon
+   cluster, just with no hamburger to occupy the other column. */
+.panel-head-title { grid-column: 2; justify-self: center; }
+#chart-head .panel-head-right,
+#host-head .panel-head-right {
+  /* the grid's justify-self (below) positions the cluster instead of
+     the auto-margin trick .panel-head-right's base rule above relies on
+     for the flex-based log panel header. */
+  margin-left: 0;
+}
+body.controls-left #chart-head .panel-head-right,
+body.controls-left #host-head .panel-head-right {
+  grid-column: 3;
+  justify-self: end;
+}
+body.controls-right #chart-head .panel-head-right,
+body.controls-right #host-head .panel-head-right {
+  grid-column: 1;
+  justify-self: start;
 }
 
 #splitter {

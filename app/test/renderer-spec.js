@@ -552,6 +552,27 @@
     }
   });
 
+  await T("telemetry headers (#chart-head, #host-head): title stays centered, button cluster sits opposite the OS's own window-control side, and follows controlsSide live", async () => {
+    const original = controlsSide;
+    try {
+      for (const headId of ["chart-head", "host-head"]) {
+        const head = $(headId);
+        const title = head.querySelector(".panel-head-title");
+        ok(title, `${headId}: title has the centering class`);
+        const buttons = head.querySelector(".panel-head-right");
+        ok(buttons, `${headId}: button cluster present`);
+        eq(getComputedStyle(title).gridColumnStart, "2", `${headId}: title is always the center column`);
+
+        applyControlsSide("left");
+        eq(getComputedStyle(buttons).gridColumnStart, "3", `${headId}: controls-left -> buttons on the opposite (right) side`);
+        applyControlsSide("right");
+        eq(getComputedStyle(buttons).gridColumnStart, "1", `${headId}: controls-right -> buttons on the opposite (left) side`);
+      }
+    } finally {
+      applyControlsSide(original);
+    }
+  });
+
   await T("log panel hamburger menu is keyboard accessible: opens focused, Up/Down cycle through all 4 items and wrap, Esc closes and returns focus", async () => {
     const p = [...panels.values()][0];
     const menuBtn = p.el.querySelector(".panel-menu-btn");
