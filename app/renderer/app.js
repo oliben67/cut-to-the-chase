@@ -2257,10 +2257,29 @@ const panels = new Map(); // source id -> Panel
 // two right-side icons sit alongside them (see Panel's syncControlsSide
 // and the body.controls-left CSS overrides).
 let controlsSide = IS_MAC ? "left" : "right"; // synchronous default
+
+// A button cluster's outside-in reading order (the order you'd encounter
+// its buttons moving from the window's edge toward the center) has to
+// stay the same regardless of which side it's actually pinned to -- e.g.
+// the detach/popout button always closest to the edge, a "hide"-style
+// toggle always closest to center. canonicalOutsideIn is that fixed
+// reading order; reversing it is only ever needed once the cluster
+// itself is on the right (so left-to-right DOM order still reads as
+// outside-in from that side).
+function orderForSide(canonicalOutsideIn, side) {
+  return side === "left" ? canonicalOutsideIn : [...canonicalOutsideIn].reverse();
+}
+
 function applyControlsSide(side) {
   controlsSide = side;
   document.body.classList.toggle("controls-left", side === "left");
   document.body.classList.toggle("controls-right", side === "right");
+  $("chart-head").querySelector(".panel-head-right").append(
+    ...orderForSide([$("btn-popout-telemetry"), $("btn-popback-telemetry"), $("btn-style-toggle-svc")], side)
+  );
+  $("host-head").querySelector(".panel-head-right").append(
+    ...orderForSide([$("btn-popout-host"), $("btn-popback-host"), $("btn-style-toggle-host"), $("btn-host-toggle")], side)
+  );
   for (const p of panels.values()) p.syncControlsSide();
 }
 applyControlsSide(controlsSide);
@@ -2379,7 +2398,9 @@ class Panel {
     };
     const right = document.createElement("div");
     right.className = "panel-head-right";
-    right.append(popout, close);
+    this.popout = popout;
+    this.close = close;
+    this.popback = null;
     if (POPOUT_KIND === "log") {
       const popback = document.createElement("button");
       popback.className = "popback btn-flat";
@@ -2389,7 +2410,7 @@ class Panel {
         "Bring Back";
       popback.title = "Bring back into the main window";
       popback.onclick = () => window.close();
-      right.append(popback);
+      this.popback = popback;
     }
     const center = document.createElement("div");
     center.className = "panel-head-center";
@@ -2468,15 +2489,18 @@ class Panel {
     this.update(src);
   }
 
-  // Places the hamburger and icon-cluster zones into headTop according to
-  // the current controlsSide -- called once from the constructor, and
-  // again for every existing panel if controlsSide ever changes live (a
+  // Places the hamburger and icon-cluster zones into headTop, and orders
+  // the icon cluster's own buttons (detach closest to the window edge,
+  // close closest to center -- see orderForSide), according to the
+  // current controlsSide. Called once from the constructor, and again
+  // for every existing panel if controlsSide ever changes live (a
   // geometrychange from the Window Controls Overlay API, see the
   // controlsSide/applyControlsSide definitions above).
   syncControlsSide() {
     const start = controlsSide === "left" ? this.headRight : this.menuBtn;
     const end = controlsSide === "left" ? this.menuBtn : this.headRight;
     this.headTop.append(start, this.headCenter, end);
+    this.headRight.append(...orderForSide([this.popout, this.popback, this.close].filter(Boolean), controlsSide));
   }
 
   // Called on every refreshAll() with this source's latest /sources entry

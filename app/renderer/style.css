@@ -1282,12 +1282,18 @@ body.sample-armed .strip {
 
 /* Telemetry/host-telemetry headers (#chart-head, #host-head): title
    centered regardless of button-cluster width, button cluster on
-   whichever side sits opposite the OS's own window-control buttons (see
-   app.js's controlsSide) -- same rule as the log panel header's icon
-   cluster, just with no hamburger to occupy the other column. */
-.panel-head-title { grid-column: 2; justify-self: center; }
+   whichever side the OS's own window-control buttons are actually on
+   (see app.js's controlsSide) -- same rule as the log panel header's
+   icon cluster, just with no hamburger to occupy the other column.
+   Both get an explicit grid-row: 1 -- items placed with an explicit
+   column but no explicit row don't reliably auto-place into the same
+   row (the sparse-packing cursor can advance past row 1 for the second
+   one), so without this they silently land in two separate implicit
+   rows instead of sharing the header's one row. */
+.panel-head-title { grid-column: 2; grid-row: 1; justify-self: center; }
 #chart-head .panel-head-right,
 #host-head .panel-head-right {
+  grid-row: 1;
   /* the grid's justify-self (below) positions the cluster instead of
      the auto-margin trick .panel-head-right's base rule above relies on
      for the flex-based log panel header. */
@@ -1295,13 +1301,13 @@ body.sample-armed .strip {
 }
 body.controls-left #chart-head .panel-head-right,
 body.controls-left #host-head .panel-head-right {
-  grid-column: 3;
-  justify-self: end;
+  grid-column: 1;
+  justify-self: start;
 }
 body.controls-right #chart-head .panel-head-right,
 body.controls-right #host-head .panel-head-right {
-  grid-column: 1;
-  justify-self: start;
+  grid-column: 3;
+  justify-self: end;
 }
 
 #splitter {

@@ -544,16 +544,31 @@
       applyControlsSide("right");
       eq([...p.headTop.children][0], p.menuBtn, "hamburger moves to the start zone when controls are on the right");
       eq([...p.headTop.children][2], p.headRight, "icon cluster moves to the end zone when controls are on the right");
+      // Reading order within the cluster itself must stay "detach, then
+      // close" from the outside in -- on the right, that means detach
+      // (popout) is the rightmost/outermost button, so DOM order (left to
+      // right) is the reverse: close first, popout last.
+      eq([...p.headRight.children][0], p.close, "controls-right: close sits closest to center");
+      eq([...p.headRight.children][1], p.popout, "controls-right: detach (popout) sits closest to the window edge");
       applyControlsSide("left");
       eq([...p.headTop.children][0], p.headRight, "icon cluster moves to the start zone when controls are on the left");
       eq([...p.headTop.children][2], p.menuBtn, "hamburger moves to the end zone when controls are on the left");
+      eq([...p.headRight.children][0], p.popout, "controls-left: detach (popout) sits closest to the window edge");
+      eq([...p.headRight.children][1], p.close, "controls-left: close sits closest to center");
     } finally {
       applyControlsSide(original);
     }
   });
 
-  await T("telemetry headers (#chart-head, #host-head): title stays centered, button cluster sits opposite the OS's own window-control side, and follows controlsSide live", async () => {
+  await T("telemetry headers (#chart-head, #host-head): title stays centered, button cluster sits on the same side as the OS's own window controls, keeps its outside-in reading order, and follows controlsSide live", async () => {
     const original = controlsSide;
+    // Canonical outside-in order (the order you'd encounter buttons moving
+    // from the window's edge toward the center): detach, then histogram
+    // toggle, then (for host telemetry only) the hide toggle.
+    const CANONICAL = {
+      "chart-head": [$("btn-popout-telemetry"), $("btn-popback-telemetry"), $("btn-style-toggle-svc")],
+      "host-head": [$("btn-popout-host"), $("btn-popback-host"), $("btn-style-toggle-host"), $("btn-host-toggle")],
+    };
     try {
       for (const headId of ["chart-head", "host-head"]) {
         const head = $(headId);
@@ -562,11 +577,22 @@
         const buttons = head.querySelector(".panel-head-right");
         ok(buttons, `${headId}: button cluster present`);
         eq(getComputedStyle(title).gridColumnStart, "2", `${headId}: title is always the center column`);
+        // Regression guard: grid items placed with an explicit column but
+        // no explicit row don't reliably auto-place into the same row --
+        // without grid-row:1 on both, they silently land in two separate
+        // implicit rows and the button cluster visually spills down into
+        // the legend below instead of sitting level with the title.
+        const titleMid = (title.getBoundingClientRect().top + title.getBoundingClientRect().bottom) / 2;
+        const buttonsMid = (buttons.getBoundingClientRect().top + buttons.getBoundingClientRect().bottom) / 2;
+        near(titleMid, buttonsMid, 2, `${headId}: title and button cluster sit on the same row`);
 
+        const domOrder = () => [...buttons.children].map((el) => el.id).join(",");
         applyControlsSide("left");
-        eq(getComputedStyle(buttons).gridColumnStart, "3", `${headId}: controls-left -> buttons on the opposite (right) side`);
+        eq(getComputedStyle(buttons).gridColumnStart, "1", `${headId}: controls-left -> buttons on the same (left) side`);
+        eq(domOrder(), CANONICAL[headId].map((el) => el.id).join(","), `${headId}: controls-left -> left-to-right DOM order reads as the outside-in canonical order`);
         applyControlsSide("right");
-        eq(getComputedStyle(buttons).gridColumnStart, "1", `${headId}: controls-right -> buttons on the opposite (left) side`);
+        eq(getComputedStyle(buttons).gridColumnStart, "3", `${headId}: controls-right -> buttons on the same (right) side`);
+        eq(domOrder(), [...CANONICAL[headId]].reverse().map((el) => el.id).join(","), `${headId}: controls-right -> DOM order reverses so right-to-left still reads as the outside-in canonical order`);
       }
     } finally {
       applyControlsSide(original);
