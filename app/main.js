@@ -34,7 +34,14 @@ const {
   uninstallRemoteContainer,
   checkStillInstalled,
 } = require("./lib/server-provision");
-const { readGateways, recordGateway, removeGateway, gatewayKey, recordDockerHostForGateway } = require("./lib/gateway-registry");
+const {
+  readGateways,
+  recordGateway,
+  retireGateway,
+  gatewayKey,
+  recordDockerHostForGateway,
+  retireDockerHost,
+} = require("./lib/gateway-registry");
 const { readSelectedContainers, writeSelectedContainers, deleteSelectedContainers } = require("./lib/container-selection");
 const { openSshTunnel, closeSshTunnel } = require("./lib/ssh-tunnel");
 const { recordTunnel, removeTunnel, killOrphanedTunnels } = require("./lib/tunnel-registry");
@@ -1815,7 +1822,7 @@ ipcMain.handle("gateway-manage-save", async (_e, payload) => {
       connectionType: result.connectionType || existing.connectionType || "remote",
       imageRef: result.imageRef,
     });
-    if (gatewayKey({ host: gatewayHost, port: gatewayPort }) !== payload.key) removeGateway(payload.key);
+    if (gatewayKey({ host: gatewayHost, port: gatewayPort }) !== payload.key) retireGateway(payload.key);
     if (wasActive) {
       saveConnectionConfig(cfg);
       serverHost = result.host;
@@ -1857,7 +1864,7 @@ ipcMain.handle("gateway-manage-uninstall", async (_e, entry) => {
         { sshBin: process.env.CTTC_SSH_BIN || "ssh", onLog }
       );
     }
-    removeGateway(gatewayKey(entry));
+    retireGateway(entry.id || gatewayKey(entry));
     // So a stale token isn't silently reused if this same host is ever
     // re-provisioned as a fresh gateway later (br-NET-004).
     forgetApiToken(entry.mode === "embedded" ? "embedded" : hostFromTarget(entry.sshTarget));

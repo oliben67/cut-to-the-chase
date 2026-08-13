@@ -4174,6 +4174,42 @@ class TestRedisCli:
             server.app.state.api_token = None
 
 
+class TestDockerForget:
+    """br-REDIS-017: /docker/forget must actually clear the Redis-side
+    cttc:daemons registry entry /docker/collect's remember_daemon wrote --
+    reported bug: 'Remove Docker Host' sometimes can't find the just-
+    disconnected host. Seeds cttc:daemons directly (via /admin/redis-cli,
+    same as remember_daemon's own HSET would) rather than exercising the
+    full /docker/collect pipeline, which would need a real reachable SSH
+    target just to construct its sources -- this isolates exactly the
+    thing in question: does /docker/forget's own host-string handling
+    match whatever key the entry was actually stored under."""
+
+    def test_forget_removes_the_exact_host_it_was_remembered_under(self, api):
+        base, _ = api
+        host = "ssh://user@otherhost"
+        post(base, "/admin/redis-cli", {"argv": ["HSET", "cttc:daemons", host, '{"host":"ssh://user@otherhost"}']})
+        code, j = post(base, "/admin/redis-cli", {"argv": ["HGET", "cttc:daemons", host]})
+        assert code == 200 and j["type"] == "bulk", "sanity: seeded"
+        code, j = post(base, "/docker/forget", {"host": host})
+        assert code == 200 and j == {"ok": True}
+        code, j = post(base, "/admin/redis-cli", {"argv": ["HGET", "cttc:daemons", host]})
+        assert code == 200 and j == {"type": "nil", "value": None}, "forget must actually clear the registry entry"
+
+    def test_forget_normalizes_a_bare_user_host_shorthand_to_match_what_was_remembered(self, api):
+        base, _ = api
+        # collect_docker() always normalizes before remember_daemon() ever
+        # sees the host (server.py:1803-1854) -- so the registry is always
+        # keyed by the ssh:// form. A caller sending the bare shorthand
+        # (no scheme) must still resolve to the same key.
+        normalized = "ssh://user@otherhost"
+        post(base, "/admin/redis-cli", {"argv": ["HSET", "cttc:daemons", normalized, '{"host":"ssh://user@otherhost"}']})
+        code, j = post(base, "/docker/forget", {"host": "user@otherhost"})
+        assert code == 200 and j == {"ok": True}
+        code, j = post(base, "/admin/redis-cli", {"argv": ["HGET", "cttc:daemons", normalized]})
+        assert code == 200 and j == {"type": "nil", "value": None}
+
+
 class TestMlogEndpoint:
     async def test_returns_logs_with_name_header(self, api, monkeypatch):
         base, _ = api

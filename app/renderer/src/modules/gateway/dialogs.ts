@@ -122,7 +122,9 @@ function gwFillFormForEdit(g: Gateway | undefined): void {
 // window.cttc.getGateways() itself, since the toolbar's gateway-switcher
 // dropdown still needs to offer switching *to* it.
 export function editableGateways(gateways: Gateway[]): Gateway[] {
-  return gateways.filter((g) => g.mode !== "embedded");
+  // retired entries (soft-deleted, see lib/gateway-registry.js) stay in
+  // gateways.json for history/audit but are never selectable here.
+  return gateways.filter((g) => g.mode !== "embedded" && !g.retired);
 }
 
 async function gwLoadGatewaysForEdit(): Promise<void> {
