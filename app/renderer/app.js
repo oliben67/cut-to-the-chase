@@ -4375,6 +4375,7 @@ if (!POPOUT_KIND) {
     "event-edit": () => $("btn-event-edit").click(),
     "open-theme": () => openThemeDialog(),
     "open-settings": () => openSettingsDialog(),
+    "redis-cli": () => openRedisCliDialog(),
     // View > Actual Size (Ctrl/Cmd+0) otherwise only resets the browser
     // page's own zoom level (window.cttc.menubarAction, handled in main.js)
     // -- which does nothing to the timeline's pan/zoom. "Reset zoom"

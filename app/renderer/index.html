@@ -64,7 +64,10 @@
       <button class="menu-label" type="button">Help</button>
       <div class="menu-list" role="menu">
         <button data-action="about">About CTTC</button>
-        <button data-action="toggle-devtools">Toggle Developer Tools <span class="acc">F12</span></button>
+        <div class="menu-sep"></div>
+        <div class="menu-sub-label">Developers</div>
+        <button class="menu-indent" data-action="redis-cli">Redis CLI…</button>
+        <button class="menu-indent" data-action="toggle-devtools">Toggle Developer Tools <span class="acc">F12</span></button>
       </div>
     </div>
   </nav>
@@ -274,7 +277,7 @@
     <span class="status-bar-divider"></span>
 
     <div id="server-status" class="server-status" title="">
-      <button id="server-status-btn" type="button" class="server-status-btn" title="Switch gateway…">
+      <button id="server-status-btn" type="button" class="server-status-btn">
         <span class="server-status-dot"></span>
         <svg class="server-status-icon" viewBox="0 0 512 512" fill="currentColor" aria-hidden="true"><g><circle cx="356" cy="412" r="20"/><path d="m436 0h-160c-33.084 0-60 26.916-60 60v71.716l-40-40v-71.716c0-11.046-8.954-20-20-20h-80c-11.046 0-20 8.954-20 20v80c0 11.046 8.954 20 20 20h71.716l68.284 68.284v47.716h-80v-20c0-11.046-8.954-20-20-20h-80c-11.046 0-20 8.954-20 20v80c0 11.046 8.954 20 20 20h80c11.046 0 20-8.954 20-20v-20h80v47.716l-68.284 68.284h-71.716c-11.046 0-20 8.954-20 20v80c0 11.046 8.954 20 20 20h80c11.046 0 20-8.954 20-20v-71.716l40-40v71.716c0 33.084 26.916 60 60 60h160c33.084 0 60-26.916 60-60v-392c0-33.084-26.916-60-60-60zm-340 40h40v40h-40zm0 236h-40v-40h40zm40 196h-40v-40h40zm140-432h160c11.028 0 20 8.972 20 20v20h-200v-20c0-11.028 8.972-20 20-20zm160 432h-160c-11.028 0-20-8.972-20-20v-332h200v332c0 11.028-8.972 20-20 20z"/><path d="m396 160h-80c-11.046 0-20 8.954-20 20s8.954 20 20 20h80c11.046 0 20-8.954 20-20s-8.954-20-20-20z"/></g></svg>
       </button>
@@ -283,7 +286,7 @@
     </div>
 
     <div id="docker-host-status" class="server-status">
-      <button id="docker-host-status-btn" type="button" class="server-status-btn" title="Manage Docker hosts…">
+      <button id="docker-host-status-btn" type="button" class="server-status-btn">
         <span class="server-status-dot"></span>
         <svg class="server-status-icon" fill="currentColor" viewBox="0 0 512 512" aria-hidden="true"><g><path d="m260 0h-240c-11.046 0-20 8.954-20 20v472c0 11.046 8.954 20 20 20h240c11.046 0 20-8.954 20-20v-472c0-11.046-8.954-20-20-20zm-20 40v40h-200v-40zm-200 432v-352h200v352z"/><path d="m140 316c-33.084 0-60 26.916-60 60s26.916 60 60 60 60-26.916 60-60-26.916-60-60-60zm0 80c-11.028 0-20-8.972-20-20s8.972-20 20-20 20 8.972 20 20-8.972 20-20 20z"/><path d="m180 156h-80c-11.046 0-20 8.954-20 20s8.954 20 20 20h80c11.046 0 20-8.954 20-20s-8.954-20-20-20z"/><path d="m180 236h-80c-11.046 0-20 8.954-20 20s8.954 20 20 20h80c11.046 0 20-8.954 20-20s-8.954-20-20-20z"/><path d="m492 160h-100v-20c0-11.046-8.954-20-20-20s-20 8.954-20 20v20h-20c-11.046 0-20 8.954-20 20s8.954 20 20 20h20v20c0 11.046 8.954 20 20 20s20-8.954 20-20v-20h100c11.046 0 20-8.954 20-20s-8.954-20-20-20z"/><path d="m332 80h100v20c0 11.046 8.954 20 20 20s20-8.954 20-20v-20h20c11.046 0 20-8.954 20-20s-8.954-20-20-20h-20v-20c0-11.046-8.954-20-20-20s-20 8.954-20 20v20h-100c-11.046 0-20 8.954-20 20s8.954 20 20 20z"/></g></svg>
       </button>
@@ -727,6 +730,22 @@
     <div id="opened-data-list" class="opened-data-list" role="listbox"></div>
     <div class="dlg-actions">
       <button id="dlg-opened-data-cancel" title="Close without switching">Cancel</button>
+    </div>
+  </dialog>
+
+  <!-- Developer-only: send raw commands to the internal Redis of whichever
+       target (local or the active gateway) is currently connected -- see
+       Help > Developers > Redis CLI…. -->
+  <dialog id="dlg-redis-cli">
+    <h2>Redis CLI <span id="redis-cli-target" class="muted"></span></h2>
+    <div id="redis-cli-output" class="redis-cli-output" role="log"></div>
+    <div class="redis-cli-input-row">
+      <input id="redis-cli-input" type="text" placeholder="Enter a Redis command…" autocomplete="off" spellcheck="false" />
+      <button id="redis-cli-run">Run</button>
+    </div>
+    <div class="dlg-actions">
+      <button id="redis-cli-clear" title="Clear the output pane">Clear</button>
+      <button id="dlg-redis-cli-close">Close</button>
     </div>
   </dialog>
 

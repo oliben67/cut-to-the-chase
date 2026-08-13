@@ -14,6 +14,7 @@ import * as dockerHost from "./modules/docker-host";
 import * as preferences from "./modules/preferences";
 import * as events from "./modules/events";
 import * as pollRate from "./shared/poll-rate";
+import * as redisCli from "./modules/redis-cli";
 
 (window as unknown as { __cttcModules: { ready: boolean } }).__cttcModules = {
   ready: true,
@@ -70,3 +71,8 @@ Object.assign(window, events);
 // sRate) -- mountPollRate() is called back in from app.js's own boot
 // sequence, same reasoning as gateway/docker-host/events' mount functions.
 Object.assign(window, pollRate);
+
+// Developer-only Redis CLI (Help > Developers > Redis CLI…) -- no mount()
+// needed: nothing here reads an app.js global at this module's own top
+// level, same reasoning as the PREF domain above.
+Object.assign(window, redisCli);

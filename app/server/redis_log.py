@@ -361,6 +361,17 @@ class RedisLog:
             ) from e
 
         self._client = client
+        # A second client view over the *same* connection pool (no new
+        # connections), purely for execute_raw() below -- execute_command()
+        # on a normal client still runs the response through redis-py's own
+        # per-command callback table (e.g. SET's callback turns "OK" into a
+        # bool, not the raw status string), so it's not actually "raw" the
+        # way a real redis-cli's wire read is. Clearing response_callbacks
+        # on this instance is what makes it genuinely raw -- confirmed via
+        # this file's execute_raw tests (a plain SET must read back as a
+        # status reply "OK", not an integer/bool).
+        self._raw_client = aioredis.Redis(connection_pool=client.connection_pool)
+        self._raw_client.response_callbacks = {}
         self._buffer = []
         self._loop = asyncio.get_running_loop()
         self._interval_changed = asyncio.Event()
@@ -934,3 +945,19 @@ class RedisLog:
         if not self.enabled:
             return
         await self._client.set("cttc:gateway:list", orjson.dumps(entries))
+
+    # ── developer Redis CLI (POST /admin/redis-cli) ──────────────────────
+    #
+    # Unlike every method above, this is a raw, schema-agnostic passthrough
+    # -- intentionally unrestricted (no blocked commands), since it's a
+    # dev-only tool per its own feature spec. server.py's own
+    # _redis_type_reply() maps whatever comes back into the {type, value}
+    # shape the renderer formats in real-redis-cli style.
+
+    async def execute_raw(self, *args: str):
+        """Runs a single raw Redis command (already split into argv by the
+        renderer, matching redis-cli's own quoting rules) and returns the
+        wire-level RESP value with no per-command reshaping -- see
+        self._raw_client's own construction comment in start() for why the
+        normal self._client can't be used for this."""
+        return await self._raw_client.execute_command(*args)

@@ -1826,6 +1826,37 @@ pre.snapshot-body {
   margin: 6px 0;
 }
 
+/* #dlg-redis-cli -- output pane matches .panel-body's monospace log
+   styling, just not virtualized (a transcript, not a large scrollable
+   log). Input row matches .panel-search's flex-grow-input pattern. */
+#dlg-redis-cli { min-width: 560px; max-width: 720px; }
+.redis-cli-output {
+  min-height: 260px;
+  max-height: 50vh;
+  overflow-y: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  margin-top: 6px;
+}
+.redis-cli-input-row { display: flex; gap: 8px; margin-top: 8px; }
+.redis-cli-input-row input {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 8px;
+  background: var(--surface-1);
+  color: inherit;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
 /* gateway-setup.html (New Gateway / Edit Gateways -- a standalone page, not
    a <dialog>, so it needs its own top-level layout) -- everything else
    (labels/inputs via .ctl/.ctl.block, .keys-box fieldsets, .radio-row,

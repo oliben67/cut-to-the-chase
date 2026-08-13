@@ -384,6 +384,7 @@ async function showAboutDialog() {
     "Python >=3.11 (via uv)",
     "orjson >=3.10",
     "psutil >=5.9",
+    "Redis >=5.0.0",
   ];
   const { response } = await dialog.showMessageBox({
     type: "info",
@@ -1377,6 +1378,26 @@ ipcMain.handle("get-connection-info", () => ({
   sshTarget: activeSshTarget,
   sshPort: activeSshPort,
 }));
+
+// Developer-only Redis CLI (Help > Developers > Redis CLI…) -- runs a raw
+// command against whichever target's internal Redis is currently active.
+// Deliberately just a plain fetch to the already-resolved serverHost/
+// serverPort, same as claimGatewayOwnership/syncAndAuditGateways below --
+// "the currently active target" is already fully described by those two
+// variables (embedded or remote gateway alike), so no new connection
+// (SSH tunnel, direct Redis TCP) is ever opened for this.
+ipcMain.handle("redis-cli-run", async (_e, argv) => {
+  try {
+    const res = await fetch(`http://${serverHost}:${serverPort}/admin/redis-cli`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(currentApiToken ? { "X-CTTC-Token": currentApiToken } : {}) },
+      body: JSON.stringify({ argv }),
+    });
+    return await res.json();
+  } catch (err) {
+    return { type: "error", value: String(err.message || err) };
+  }
+});
 
 // Records a Docker host under the currently-active gateway's own catalog in
 // gateways.json (see recordDockerHostForGateway) -- called from the

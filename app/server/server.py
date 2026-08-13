@@ -2830,6 +2830,52 @@ async def route_gateways_sync(request: Request):
     return {"entries": list(current.values())}
 
 
+# Simple-status replies are a small, explicit allow-list -- redis-py's
+# execute_command() decodes RESP simple-strings and RESP bulk-strings to
+# the exact same Python str, so there's no way to tell a status reply
+# ("OK") apart from a same-valued bulk string reply from the value alone.
+_REDIS_STATUS_REPLIES = {"OK", "PONG", "QUEUED"}
+
+
+def _redis_type_reply(raw):
+    """Maps a redis-py execute_command() return value to the {type, value}
+    shape app.js's formatRedisReply() renders in real-redis-cli style."""
+    if raw is None:
+        return {"type": "nil", "value": None}
+    if isinstance(raw, bool):
+        return {"type": "integer", "value": int(raw)}
+    if isinstance(raw, int):
+        return {"type": "integer", "value": raw}
+    if isinstance(raw, (list, tuple)):
+        return {"type": "array", "value": [_redis_type_reply(item) for item in raw]}
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+    if isinstance(raw, str):
+        if raw in _REDIS_STATUS_REPLIES:
+            return {"type": "status", "value": raw}
+        return {"type": "bulk", "value": raw}
+    return {"type": "bulk", "value": str(raw)}
+
+
+@app.post("/admin/redis-cli")
+async def route_admin_redis_cli(request: Request):
+    """Developer-only Redis CLI (see app.js's Help > Developers menu) --
+    runs a raw command against this gateway's own internal Redis and
+    returns a type-tagged reply the renderer formats in real-redis-cli
+    style. Intentionally unrestricted (no blocked commands) -- dev-only
+    tool, per the feature's own spec."""
+    body = await request.json()
+    argv = body.get("argv")
+    if not isinstance(argv, list) or not argv:
+        raise bad_request("'argv' must be a non-empty list")
+    st = get_state(request)
+    try:
+        raw = await st.redis_log.execute_raw(*argv)
+    except Exception as e:
+        return {"type": "error", "value": str(e)}
+    return _redis_type_reply(raw)
+
+
 @app.get("/mlog")
 async def route_mlog():
     """Ship Logs (Settings > Collect CTTC Own Logs, main.js's "ship-logs"):

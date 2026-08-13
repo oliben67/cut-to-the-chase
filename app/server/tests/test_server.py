@@ -4111,6 +4111,69 @@ class TestGatewaysSync:
             server.app.state.api_token = None
 
 
+class TestRedisCli:
+    """Developer-only Redis CLI (Help > Developers > Redis CLI…, app.js) --
+    POST /admin/redis-cli runs a raw command against this gateway's own
+    internal Redis and returns a type-tagged reply."""
+
+    def test_set_get_round_trip(self, api):
+        base, _ = api
+        code, j = post(base, "/admin/redis-cli", {"argv": ["SET", "cli:test:key", "hello"]})
+        assert code == 200
+        assert j == {"type": "status", "value": "OK"}
+        code, j = post(base, "/admin/redis-cli", {"argv": ["GET", "cli:test:key"]})
+        assert code == 200
+        assert j == {"type": "bulk", "value": "hello"}
+
+    def test_missing_key_returns_nil(self, api):
+        base, _ = api
+        code, j = post(base, "/admin/redis-cli", {"argv": ["GET", "cli:test:does-not-exist"]})
+        assert code == 200
+        assert j == {"type": "nil", "value": None}
+
+    def test_integer_reply(self, api):
+        base, _ = api
+        code, j = post(base, "/admin/redis-cli", {"argv": ["DEL", "cli:test:int-key"]})
+        assert code == 200
+        assert j["type"] == "integer"
+        code, j = post(base, "/admin/redis-cli", {"argv": ["INCR", "cli:test:int-key"]})
+        assert code == 200
+        assert j == {"type": "integer", "value": 1}
+
+    def test_array_reply(self, api):
+        base, _ = api
+        post(base, "/admin/redis-cli", {"argv": ["RPUSH", "cli:test:list", "a", "b"]})
+        code, j = post(base, "/admin/redis-cli", {"argv": ["LRANGE", "cli:test:list", "0", "-1"]})
+        assert code == 200
+        assert j == {
+            "type": "array",
+            "value": [{"type": "bulk", "value": "a"}, {"type": "bulk", "value": "b"}],
+        }
+
+    def test_unknown_command_returns_a_typed_error_reply_not_a_500(self, api):
+        base, _ = api
+        code, j = post(base, "/admin/redis-cli", {"argv": ["NOTACOMMAND", "foo"]})
+        assert code == 200  # the failure is Redis's, not this endpoint's -- 200 with an error reply
+        assert j["type"] == "error"
+        assert j["value"]
+
+    def test_empty_argv_is_a_bad_request(self, api):
+        base, _ = api
+        code, j = post(base, "/admin/redis-cli", {"argv": []})
+        assert code == 400
+        code, j = post(base, "/admin/redis-cli", {})
+        assert code == 400
+
+    def test_still_requires_the_network_token(self, api):
+        base, _ = api
+        server.app.state.api_token = "s3cr3t"
+        try:
+            code, _ = post(base, "/admin/redis-cli", {"argv": ["PING"]})
+            assert code == 401
+        finally:
+            server.app.state.api_token = None
+
+
 class TestMlogEndpoint:
     async def test_returns_logs_with_name_header(self, api, monkeypatch):
         base, _ = api

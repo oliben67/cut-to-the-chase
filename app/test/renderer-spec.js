@@ -82,6 +82,101 @@
     ok(fmtIso(0).endsWith(" UTC"));
   });
 
+  await T("parseRedisArgv splits like redis-cli: bare tokens, quoted strings, escapes", () => {
+    eq(JSON.stringify(parseRedisArgv("GET foo")), '["GET","foo"]');
+    eq(JSON.stringify(parseRedisArgv("  SET  foo   bar  ")), '["SET","foo","bar"]');
+    eq(JSON.stringify(parseRedisArgv('SET foo "a b c"')), '["SET","foo","a b c"]');
+    eq(JSON.stringify(parseRedisArgv("SET foo 'a b c'")), '["SET","foo","a b c"]');
+    eq(JSON.stringify(parseRedisArgv('SET foo "a \\"quoted\\" b"')), '["SET","foo","a \\"quoted\\" b"]');
+    eq(JSON.stringify(parseRedisArgv("SET foo a\\ b")), '["SET","foo","a b"]');
+    eq(JSON.stringify(parseRedisArgv("   ")), "[]");
+    eq(JSON.stringify(parseRedisArgv("")), "[]");
+  });
+
+  await T("formatRedisReply mirrors real redis-cli conventions for every reply type", () => {
+    eq(formatRedisReply({ type: "nil" }), "(nil)");
+    eq(formatRedisReply({ type: "integer", value: 42 }), "(integer) 42");
+    eq(formatRedisReply({ type: "status", value: "OK" }), "OK");
+    eq(formatRedisReply({ type: "bulk", value: "1000" }), '"1000"');
+    eq(formatRedisReply({ type: "error", value: "ERR unknown command" }), "(error) ERR unknown command");
+    eq(formatRedisReply({ type: "array", value: [] }), "(empty array)");
+    eq(
+      formatRedisReply({ type: "array", value: [{ type: "bulk", value: "a" }, { type: "bulk", value: "b" }] }),
+      '1) "a"\n2) "b"'
+    );
+    // nested arrays indent
+    eq(
+      formatRedisReply({
+        type: "array",
+        value: [{ type: "array", value: [{ type: "integer", value: 1 }, { type: "integer", value: 2 }] }],
+      }),
+      "1) 1) (integer) 1\n   2) (integer) 2"
+    );
+  });
+
+  await T("Redis CLI dialog: target label, Run/Enter submit and clear the input while keeping focus, clear empties output without a round trip, history cycles with Up/Down", async () => {
+    const realGetConnectionInfo = window.cttc.getConnectionInfo;
+    const realRedisCliRun = window.cttc.redisCliRun;
+    const output = $("redis-cli-output");
+    const input = $("redis-cli-input");
+    const runCalls = [];
+    try {
+      window.cttc.getConnectionInfo = async () => ({ connectionType: "remote", gatewayHost: "example.com" });
+      window.cttc.redisCliRun = async (argv) => { runCalls.push(argv); return { type: "status", value: "OK" }; };
+      await openRedisCliDialog();
+      eq($("dlg-redis-cli").open, true, "dialog opened");
+      eq($("redis-cli-target").textContent, "— gateway: example.com", "target label reflects getConnectionInfo");
+      eq(document.activeElement, input, "focus lands in the command input on open");
+
+      input.value = "SET foo bar";
+      $("redis-cli-run").click();
+      eq(input.value, "", "Run clears the input");
+      eq(document.activeElement, input, "focus stays in the input after Run");
+      await until(() => runCalls.length === 1, "Run round-trips through redisCliRun");
+      eq(JSON.stringify(runCalls[0]), '["SET","foo","bar"]', "argv sent matches the typed command");
+      ok(output.textContent.includes("> SET foo bar"), "echoed command appears in the transcript");
+      ok(output.textContent.includes("OK"), "reply appears in the transcript");
+
+      input.value = "GET foo";
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+      eq(input.value, "", "Enter also clears the input");
+      await until(() => runCalls.length === 2, "Enter round-trips through redisCliRun");
+
+      const outputLenBeforeClear = output.children.length;
+      ok(outputLenBeforeClear > 0, "sanity: transcript has content before clear");
+      input.value = "clear";
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+      eq(output.textContent, "", "'clear' empties the output pane");
+      eq(runCalls.length, 2, "'clear' never calls redisCliRun -- client-side only, like real redis-cli");
+
+      // History: three lines were entered above, in order -- "SET foo bar",
+      // "GET foo", "clear". "clear" is itself a real history entry (same
+      // convention as a real shell/redis-cli: every entered line is
+      // recorded, whether or not it was actually sent anywhere) -- Up
+      // recalls it first, being the most recent.
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowUp", bubbles: true, cancelable: true }));
+      eq(input.value, "clear", "ArrowUp recalls the most recent entry, including 'clear'");
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowUp", bubbles: true, cancelable: true }));
+      eq(input.value, "GET foo", "ArrowUp again recalls the one before it");
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowUp", bubbles: true, cancelable: true }));
+      eq(input.value, "SET foo bar", "ArrowUp again recalls the oldest entry");
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowUp", bubbles: true, cancelable: true }));
+      eq(input.value, "SET foo bar", "ArrowUp stops at the oldest entry");
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true }));
+      eq(input.value, "GET foo", "ArrowDown moves forward through history");
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true }));
+      eq(input.value, "clear", "ArrowDown continues forward");
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true }));
+      eq(input.value, "", "ArrowDown past the newest entry lands on an empty line");
+    } finally {
+      window.cttc.getConnectionInfo = realGetConnectionInfo;
+      window.cttc.redisCliRun = realRedisCliRun;
+      output.textContent = "";
+      input.value = "";
+      $("dlg-redis-cli-close").click();
+    }
+  });
+
   await T("authHeaders adds X-CTTC-Token only when API_TOKEN is set (br-NET-004)", () => {
     const realToken = API_TOKEN;
     try {
