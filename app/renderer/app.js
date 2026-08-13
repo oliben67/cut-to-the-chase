@@ -209,7 +209,16 @@ const STRIPS = [
   { key: "mem", title: "MEM %", fmt: (v) => v.toFixed(1) + "%" },
   { key: "net", title: "NET", fmt: fmtBytes },
 ];
-const MARGIN_L = 46, MARGIN_R = 8, AXIS_H = 20;
+// NET's byte-rate axis labels ("999.9 GB/s") are the widest text any
+// strip ever draws (percentages top out at "100.0%") -- measured here
+// once, rather than guessed, so a wide value can never silently clip off
+// the left edge of the chart the way a too-small fixed constant did.
+const MARGIN_L = (() => {
+  const ctx = document.createElement("canvas").getContext("2d");
+  ctx.font = "10px system-ui, sans-serif";
+  return Math.ceil(ctx.measureText("999.9 GB/s").width) + 8;
+})();
+const MARGIN_R = 8, AXIS_H = 20;
 const STRIP_MIN_H = 44;
 // Per-strip height -- no longer a fixed/dragged value: each group (svc,
 // host) auto-fits its own strips to whatever vertical room its container

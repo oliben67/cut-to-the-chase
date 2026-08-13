@@ -1072,7 +1072,8 @@ body.sample-armed .strip {
 .graph-block #host-nav,
 .graph-block #chart-head,
 .graph-block #host-head,
-.graph-block #host-loading {
+.graph-block #host-loading,
+.graph-block .panel-head-divider {
   flex: 0 0 auto;
 }
 .graph-block #charts,
@@ -1082,6 +1083,15 @@ body.sample-armed .strip {
   overflow-y: auto;
 }
 #empty-state { padding: 28px 16px; text-align: center; }
+
+/* Experimental: a light divider between the telemetry header (title +
+   buttons) and the list of containers below it. */
+.panel-head-divider {
+  width: 100%;
+  height: 1px;
+  margin-bottom: 6px;
+  background: var(--border);
+}
 
 #chart-head {
   display: grid;
@@ -1254,7 +1264,7 @@ body.sample-armed .strip {
   gap: 8px;
   height: 32px; /* matches the sidebar's .ab-group-header */
   padding: 0 12px;
-  border-top: 1px solid var(--border);
+  border-top: 2px solid var(--border); /* doubled -- the separator between the svc and host telemetry panels */
   margin-top: 4px;
   font-size: 11px;
   font-weight: 600;
