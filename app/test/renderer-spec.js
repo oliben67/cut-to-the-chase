@@ -520,19 +520,36 @@
     eq(p.reversed, startReversed, "restored");
   });
 
-  await T("log panel header is a 3-zone layout: hamburger, centered name, right-side icons -- and the name still truncates with a full-name tooltip", async () => {
+  await T("log panel header is a 3-zone layout: hamburger and icon cluster on either side of a centered name (swapped to mirror the OS's own window-control side), and the name still truncates with a full-name tooltip", async () => {
     const p = [...panels.values()][0];
     const top = p.el.querySelector(".panel-head-top");
     const kids = [...top.children];
     eq(kids.length, 3, "exactly 3 zones");
-    ok(kids[0].classList.contains("panel-menu-btn"), "left zone is the hamburger");
-    ok(kids[1].classList.contains("panel-head-center"), "center zone holds the name");
-    ok(kids[2].classList.contains("panel-head-right"), "right zone is unchanged");
-    const name = kids[1].querySelector(".name");
+    const [startZone, centerZone, endZone] = kids;
+    const [hamburgerZone, iconsZone] = controlsSide === "left" ? [endZone, startZone] : [startZone, endZone];
+    ok(hamburgerZone.classList.contains("panel-menu-btn"), "hamburger sits opposite the OS's own window controls");
+    ok(centerZone.classList.contains("panel-head-center"), "center zone holds the name");
+    ok(iconsZone.classList.contains("panel-head-right"), "icon cluster sits on the same side as the OS's own window controls");
+    const name = centerZone.querySelector(".name");
     ok(name, "name lives in the center zone");
     eq(name.title, p.src.path, "full name/path still exposed via a tooltip");
-    ok(kids[2].contains(p.el.querySelector('[title="Open this log in its own window"]')), "popout stayed in the right zone");
-    ok(kids[2].contains(p.el.querySelector(".close")), "close stayed in the right zone");
+    ok(iconsZone.contains(p.el.querySelector('[title="Open this log in its own window"]')), "popout stayed in the icon zone");
+    ok(iconsZone.contains(p.el.querySelector(".close")), "close stayed in the icon zone");
+  });
+
+  await T("log panel hamburger/icon-cluster zones swap live when controlsSide changes (Window Controls Overlay geometrychange)", async () => {
+    const p = [...panels.values()][0];
+    const original = controlsSide;
+    try {
+      applyControlsSide("right");
+      eq([...p.headTop.children][0], p.menuBtn, "hamburger moves to the start zone when controls are on the right");
+      eq([...p.headTop.children][2], p.headRight, "icon cluster moves to the end zone when controls are on the right");
+      applyControlsSide("left");
+      eq([...p.headTop.children][0], p.headRight, "icon cluster moves to the start zone when controls are on the left");
+      eq([...p.headTop.children][2], p.menuBtn, "hamburger moves to the end zone when controls are on the left");
+    } finally {
+      applyControlsSide(original);
+    }
   });
 
   await T("log panel hamburger menu is keyboard accessible: opens focused, Up/Down cycle through all 4 items and wrap, Esc closes and returns focus", async () => {

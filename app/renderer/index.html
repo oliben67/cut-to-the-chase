@@ -12,6 +12,11 @@
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
+  <!-- Reserved space for the OS's own window-control buttons on
+       platforms where main.js enables titleBarOverlay (see app.js's
+       controlsSide detection) -- stays display:none (zero layout impact)
+       everywhere else, including macOS's native frame. -->
+  <div id="titlebar-drag"><span id="titlebar-drag-text"></span></div>
   <nav id="menubar">
     <div class="menu" data-menu="file">
       <button class="menu-label" type="button">File</button>

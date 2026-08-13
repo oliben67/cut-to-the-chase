@@ -412,6 +412,14 @@ if (POPOUT_KIND === "series") {
   document.querySelector("#chart-head span").textContent = POPOUT_ID;
 }
 
+// True platform distinction (Cmd vs Ctrl, menu label glyphs) -- NOT the
+// same question as which side the OS's window-control buttons are on
+// (see controlsSide, defined below panels/Panel since it needs to walk
+// existing panels): macOS traffic lights are always left, an OS
+// constant, but Windows/Linux control-button position genuinely varies
+// by theme/DE and can't be inferred from the platform alone.
+const IS_MAC = navigator.platform.toUpperCase().includes("MAC");
+
 // in the main window, hide whichever panels have been popped out elsewhere.
 function applyPopoutLayout() {
   if (POPOUT_KIND) return; // popout windows have a fixed single-panel layout
@@ -2239,6 +2247,39 @@ function formatLogEntryText(text) {
 
 const panels = new Map(); // source id -> Panel
 
+// Which side the OS's own window-control buttons are on. macOS is a hard
+// OS constant (traffic lights are always left, never relocatable), so
+// it's hardcoded -- no overlay is enabled there (see main.js's
+// overlayFrameOptions). Windows/Linux genuinely vary by theme/DE, so
+// those ask Chromium directly via navigator.windowControlsOverlay, which
+// main.js's titleBarOverlay makes available here. Log panel headers
+// mirror this: the hamburger sits opposite the OS's own controls, the
+// two right-side icons sit alongside them (see Panel's syncControlsSide
+// and the body.controls-left CSS overrides).
+let controlsSide = IS_MAC ? "left" : "right"; // synchronous default
+function applyControlsSide(side) {
+  controlsSide = side;
+  document.body.classList.toggle("controls-left", side === "left");
+  document.body.classList.toggle("controls-right", side === "right");
+  for (const p of panels.values()) p.syncControlsSide();
+}
+applyControlsSide(controlsSide);
+const wco = navigator.windowControlsOverlay;
+if (wco) {
+  document.body.classList.add("wco-overlay");
+  const titleEl = document.getElementById("titlebar-drag-text");
+  if (titleEl) titleEl.textContent = document.title;
+  const syncFromWco = () => {
+    if (!wco.visible) return;
+    const rect = wco.getTitlebarAreaRect();
+    // rect is the area safe for content -- if it starts at the left
+    // edge, the controls occupy the right side instead, and vice versa.
+    applyControlsSide(rect.x > 0 ? "left" : "right");
+  };
+  syncFromWco();
+  wco.addEventListener("geometrychange", syncFromWco);
+}
+
 // One log source's virtual-scrolled panel: renders only the rows currently
 // in (or just outside) the visible scroll viewport, fetching them from the
 // server a PAGE (200 rows) at a time and caching pages by index for as long
@@ -2355,10 +2396,17 @@ class Panel {
     center.append(name, this.sampleBadge);
     // Row 1: hamburger menu, centered name+badge, and the right-side icons
     // -- a 3-column grid (see .panel-head-top) so the center stays
-    // centered regardless of how wide either side is. Row 2 (headControls)
-    // is the entries/transforms count, flushed right on its own --
-    // this.countEl (set in update()) is the only thing on the row below.
-    headTop.append(menuBtn, center, right);
+    // centered regardless of how wide either side is, with the hamburger
+    // and icon cluster swapping which column they occupy to mirror the
+    // OS's own window-control side (see syncControlsSide). Row 2
+    // (headControls) is the entries/transforms count, flushed right on
+    // its own -- this.countEl (set in update()) is the only thing on the
+    // row below.
+    this.headTop = headTop;
+    this.menuBtn = menuBtn;
+    this.headCenter = center;
+    this.headRight = right;
+    this.syncControlsSide();
     headControls.append(this.countEl);
     head.append(headTop, headControls);
     // Drag the header to reorder this panel (and its matching legend entry
@@ -2418,6 +2466,17 @@ class Panel {
 
     this.el.append(head, this.searchBar, this.body);
     this.update(src);
+  }
+
+  // Places the hamburger and icon-cluster zones into headTop according to
+  // the current controlsSide -- called once from the constructor, and
+  // again for every existing panel if controlsSide ever changes live (a
+  // geometrychange from the Window Controls Overlay API, see the
+  // controlsSide/applyControlsSide definitions above).
+  syncControlsSide() {
+    const start = controlsSide === "left" ? this.headRight : this.menuBtn;
+    const end = controlsSide === "left" ? this.menuBtn : this.headRight;
+    this.headTop.append(start, this.headCenter, end);
   }
 
   // Called on every refreshAll() with this source's latest /sources entry
@@ -4224,8 +4283,7 @@ if (!POPOUT_KIND) {
    be styled via CSS on either macOS or Windows) ─────────────────────────── */
 {
   const menubar = $("menubar");
-  const isMac = navigator.platform.toUpperCase().includes("MAC");
-  if (isMac) {
+  if (IS_MAC) {
     for (const acc of menubar.querySelectorAll(".acc")) {
       acc.textContent = acc.textContent
         .replace(/Ctrl\+Shift\+/, "⇧⌘")
@@ -4487,7 +4545,7 @@ if (!POPOUT_KIND) {
     "mod+q": "quit",
   };
   window.addEventListener("keydown", (e) => {
-    const mod = isMac ? e.metaKey : e.ctrlKey;
+    const mod = IS_MAC ? e.metaKey : e.ctrlKey;
     const key = e.key.toLowerCase();
     if (["control", "meta", "shift", "alt"].includes(key)) return;
     const combo = mod ? `mod+${key}` : key;
