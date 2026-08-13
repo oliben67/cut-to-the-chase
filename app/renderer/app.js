@@ -1960,9 +1960,16 @@ function followNow() {
 
 // The nav's "now" label: explicitly resumes live-following (unlike a plain
 // click elsewhere, which only recenters once and leaves live off).
-function goLive() {
+// opts.resetSpan (only ever passed by the "now" label's own click handler
+// below) additionally drops whatever span the user had zoomed/panned to,
+// restoring the graphs to their original DEFAULT_SPAN window -- every
+// other caller (auto-resume after a double-click pause, the Live-track
+// toggle, boot, leaving analysis mode) deliberately keeps the current
+// span, since those aren't the user explicitly asking to start over.
+function goLive(opts = {}) {
   state.live = true;
   state.liveResumeAt = null;
+  if (opts.resetSpan) state.view = null;
   followNow();
   setCursor(Date.now());
 }
@@ -2118,7 +2125,7 @@ function attachTimelineNav(navEl) {
 
   nowLabel.addEventListener("click", (e) => {
     e.stopPropagation();
-    goLive();
+    goLive({ resetSpan: true });
   });
 
   thumb.addEventListener("mousedown", (e) => {

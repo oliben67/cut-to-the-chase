@@ -231,11 +231,18 @@
     drawAll();
   });
 
-  await T("timeline-nav 'now' label jumps live, centered 5s behind the present", () => {
-    setView(MID, MID + 60000);
+  await T("timeline-nav 'now' label jumps live, centered 5s behind the present, and resets the zoom back to the graphs' original span", () => {
+    setView(MID, MID + 60000); // a deliberately narrow, zoomed-in span
     document.querySelector("#chart-nav .tl-now-label").click();
     near((state.view.t0 + state.view.t1) / 2, Date.now() - 5000, 2000, "centered ~5s behind now");
     if (!state.live) throw new Error("expected state.live to be true after clicking 'now'");
+    near(state.view.t1 - state.view.t0, DEFAULT_SPAN, 1, "clicking 'now' restores the original (default) zoom span, not whatever was zoomed in");
+  });
+
+  await T("timeline-nav 'now' label resets zoom for the host graph's nav too, sharing the same view", () => {
+    setView(MID, MID + 60000);
+    document.querySelector("#host-nav .tl-now-label").click();
+    near(state.view.t1 - state.view.t0, DEFAULT_SPAN, 1, "host nav's 'now' label also restores the original span");
   });
 
   await T("timeline-nav track click re-centers, keeping the span", () => {
