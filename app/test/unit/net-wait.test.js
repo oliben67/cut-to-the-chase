@@ -76,3 +76,31 @@ test("waitForHttpOk rejects on timeout when the server never responds ok", async
     /timed out waiting/
   );
 });
+
+test("waitForHttpOk passes headers through to fetchFn when given (br-NET-004)", async () => {
+  // ensureRemoteContainer's own health check must be able to send
+  // X-CTTC-Token once the gateway requires one, or a token-gated /health
+  // would 401 forever and this would just spin until timeoutMs.
+  let seenHeaders = null;
+  const fetchFn = async (_url, opts) => {
+    seenHeaders = opts.headers;
+    return { ok: true, status: 200 };
+  };
+  await waitForHttpOk("http://127.0.0.1:9/health", {
+    timeoutMs: 2000,
+    intervalMs: 10,
+    fetchFn,
+    headers: { "X-CTTC-Token": "s3cr3t" },
+  });
+  assert.deepEqual(seenHeaders, { "X-CTTC-Token": "s3cr3t" });
+});
+
+test("waitForHttpOk omits the headers option entirely for fetchFn when none is given", async () => {
+  let sawHeadersKey = true;
+  const fetchFn = async (_url, opts) => {
+    sawHeadersKey = "headers" in opts;
+    return { ok: true, status: 200 };
+  };
+  await waitForHttpOk("http://127.0.0.1:9/health", { timeoutMs: 2000, intervalMs: 10, fetchFn });
+  assert.equal(sawHeadersKey, false);
+});

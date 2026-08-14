@@ -1,11 +1,16 @@
 {
   "name": "cttc-timeline",
-  "version": "0.0.3",
+  "version": "0.2.0",
   "description": "Correlate container telemetry with service logs on a shared clickable timeline",
   "main": "main.js",
   "scripts": {
+    "prestart": "npm run build:renderer && npm run build:manual",
     "start": "electron .",
+    "build:renderer": "node build/build-renderer.js",
+    "watch:renderer": "node build/build-renderer.js --watch",
+    "typecheck": "tsc --noEmit -p renderer/src",
     "test:unit": "node --test test/unit/*.test.js",
+    "pretest:e2e": "npm run build:renderer",
     "test:e2e": "./test/run-e2e.sh",
     "build:manual": "node build/build-manual.js",
     "predist:win": "npm run build:manual",
@@ -23,8 +28,13 @@
     "release:linux": "../releases/linux/build-bundle.sh"
   },
   "devDependencies": {
+    "@floating-ui/dom": "^1.8.0",
     "electron": "^43.1.1",
-    "electron-builder": "^26.15.3"
+    "electron-builder": "^26.15.3",
+    "esbuild": "^0.28.1",
+    "jotai": "^2.20.2",
+    "preact": "^10.29.8",
+    "typescript": "^7.0.2"
   },
   "build": {
     "appId": "com.olivierbien67.cttc",
@@ -45,16 +55,33 @@
       "output": "dist"
     },
     "extraResources": [
-      { "from": "../releases/_repo/image.json", "to": "image.json" },
-      { "from": "../releases/_repo/docker-compose.yml", "to": "docker-compose.registry.yml" },
-      { "from": "build/CTTC-Manual.html", "to": "CTTC-Manual.html" }
+      {
+        "from": "../releases/_repo/image.json",
+        "to": "image.json"
+      },
+      {
+        "from": "../releases/_repo/docker-compose.yml",
+        "to": "docker-compose.registry.yml"
+      },
+      {
+        "from": "build/CTTC-Manual.html",
+        "to": "CTTC-Manual.html"
+      }
     ],
     "win": {
-      "target": ["nsis"],
+      "target": [
+        "nsis"
+      ],
       "icon": "assets/icon.png",
       "extraResources": [
-        { "from": "../releases/_shared/cttc-gateway.tar.gz", "to": "cttc-gateway.tar.gz" },
-        { "from": "../releases/_shared/docker-compose.yml", "to": "docker-compose.offline.yml" }
+        {
+          "from": "../releases/_shared/cttc-gateway.tar.gz",
+          "to": "cttc-gateway.tar.gz"
+        },
+        {
+          "from": "../releases/_shared/docker-compose.yml",
+          "to": "docker-compose.offline.yml"
+        }
       ]
     },
     "nsis": {
@@ -65,12 +92,16 @@
       "include": "build/installer.nsh"
     },
     "mac": {
-      "target": ["dmg"],
+      "target": [
+        "dmg"
+      ],
       "icon": "assets/icon.png",
       "category": "public.app-category.developer-tools"
     },
     "linux": {
-      "target": ["AppImage"],
+      "target": [
+        "AppImage"
+      ],
       "icon": "assets/icon.png",
       "category": "Development"
     }

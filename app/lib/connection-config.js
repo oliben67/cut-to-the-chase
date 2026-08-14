@@ -50,14 +50,20 @@ function readConfigFile(configPath) {
 /**
  * @param {{env?: object, configPath?: string}} opts
  *   configPath overrides the default ~/.cttc/connection.json (mainly for tests).
- * @returns {{mode: "embedded"} | {mode: "remote", host: string, sshTarget: string, sshKey: string|null, remotePort: number}}
+ * @returns {{mode: "embedded", runMode?: "native"|"container"} | {mode: "remote", host: string, sshTarget: string, sshKey: string|null, remotePort: number, gatewayId?: string}}
  */
 function loadConnectionConfig({ env = process.env, configPath } = {}) {
   const resolvedPath = configPath || defaultConfigPath(env);
   const fileCfg = readConfigFile(resolvedPath);
 
   const mode = env.CTTC_MODE || fileCfg.mode || "embedded";
-  if (mode === "embedded") return { mode: "embedded" };
+  if (mode === "embedded") {
+    // runMode: the user's one-time choice (see main.js's first-run dialog)
+    // between running the gateway as a local Docker container or as a bare
+    // native process -- omitted (not just `undefined`) when never chosen,
+    // so callers can tell "never asked" apart from an explicit pick.
+    return fileCfg.run_mode ? { mode: "embedded", runMode: fileCfg.run_mode } : { mode: "embedded" };
+  }
   if (mode !== "remote") {
     throw new Error(`unknown CTTC connection mode: ${JSON.stringify(mode)} (expected "embedded" or "remote")`);
   }
@@ -67,6 +73,14 @@ function loadConnectionConfig({ env = process.env, configPath } = {}) {
     throw new Error("remote mode requires ssh_target (CTTC_SSH_TARGET env var, or ssh_target in connection.json)");
   }
   const sshKey = env.CTTC_SSH_KEY || fileCfg.ssh_key || null;
+  // Set for a GUI-managed gateway (its key lives encrypted in the vault,
+  // keyed on this id -- see lib/key-vault.js/lib/ssh-key-file.js) instead of
+  // sshKey above, which stays a literal path for the scripted/env-var deploy
+  // case. The two are mutually exclusive in practice (see main.js's
+  // recordGateway call sites) but both are read here unconditionally --
+  // it's loadConnectionConfig's job to report what's in the file, not to
+  // enforce that invariant.
+  const gatewayId = fileCfg.gateway_id || null;
 
   const remotePortRaw = env.CTTC_REMOTE_PORT || fileCfg.remote_port;
   const remotePort = Number(remotePortRaw);
@@ -89,14 +103,18 @@ function loadConnectionConfig({ env = process.env, configPath } = {}) {
     sshKey,
     remotePort,
     ...(sshPort ? { sshPort } : {}),
+    ...(gatewayId ? { gatewayId } : {}),
   };
 }
 
 /**
  * Writes a "remote" connection.json (mirrors deploy.ps1's step 4) so the
  * gateway setup (see main.js's runSetupWizard) and the PowerShell deploy path
- * produce byte-identical config files.
- * @param {{sshTarget: string, sshKey: string, remotePort: number, sshPort?: number}} cfg
+ * produce byte-identical config files. `cfg.gatewayId` and `cfg.sshKey` are
+ * mutually exclusive (see loadConnectionConfig): a GUI-managed gateway's key
+ * lives encrypted in the vault, keyed by gateway_id; a scripted/env-var
+ * deploy keeps a literal ssh_key path.
+ * @param {{sshTarget: string, sshKey?: string|null, gatewayId?: string, remotePort: number, sshPort?: number}} cfg
  * @param {{configPath?: string}} [opts]
  */
 function saveConnectionConfig(cfg, { configPath } = {}) {
@@ -106,7 +124,11 @@ function saveConnectionConfig(cfg, { configPath } = {}) {
     {
       mode: "remote",
       ssh_target: cfg.sshTarget,
-      ssh_key: cfg.sshKey,
+      // Explicit `undefined` (JSON.stringify drops it) rather than simply
+      // omitted, so a stale ssh_key can never leak through if this is ever
+      // called with a merged/previous object instead of a freshly built one.
+      ssh_key: cfg.gatewayId ? undefined : cfg.sshKey,
+      ...(cfg.gatewayId ? { gateway_id: cfg.gatewayId } : {}),
       remote_port: cfg.remotePort,
       ...(cfg.sshPort ? { ssh_port: cfg.sshPort } : {}),
     },
@@ -127,9 +149,28 @@ function clearConnectionConfig({ configPath } = {}) {
   if (fs.existsSync(resolvedPath)) fs.unlinkSync(resolvedPath);
 }
 
+/**
+ * Persists the user's one-time choice (see main.js's first-run dialog)
+ * between running the embedded gateway as a local Docker container or as a
+ * bare native process. Preserves any other keys already in the file (there
+ * shouldn't be any for embedded mode today, but this keeps it forward
+ * compatible rather than clobbering the file).
+ * @param {"native"|"container"} runMode
+ * @param {{configPath?: string}} [opts]
+ */
+function saveRunMode(runMode, { configPath } = {}) {
+  const resolvedPath = configPath || defaultConfigPath(process.env);
+  const existing = readConfigFile(resolvedPath);
+  fs.mkdirSync(path.dirname(resolvedPath), { recursive: true });
+  const json = JSON.stringify({ ...existing, mode: "embedded", run_mode: runMode }, null, 2);
+  fs.writeFileSync(resolvedPath, json, { encoding: "utf8" });
+  return resolvedPath;
+}
+
 module.exports = {
   loadConnectionConfig,
   saveConnectionConfig,
+  saveRunMode,
   clearConnectionConfig,
   defaultConfigPath,
   hostFromTarget,

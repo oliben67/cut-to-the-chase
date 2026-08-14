@@ -1,0 +1,44 @@
+# Dependencies
+node_modules/
+venv/
+env/
+.venv/
+__pycache__/
+*.pyc
+# Build / Output
+dist/
+build/
+.next/
+out/
+*.log
+*.lock
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+# Git & Version Control
+.git/
+.gitignore
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+# Large data / media
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.mp4
+*.zip
+*.tar.gz
+# Environment & secrets
+.env
+.env.*
+*.pem
+secrets/
+# Test coverage
+coverage/
+.nyc_output/
+# Misc
+.DS_Store
+Thumbs.db

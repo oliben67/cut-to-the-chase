@@ -40,6 +40,15 @@ RUN uv sync --no-dev
 # COPY list here. .dockerignore already keeps tests/, caches, and .venv/ out
 # of the build context, so this can't accidentally sweep those in.
 COPY *.py ./
+# redis_log.py's own Redis Function (LUA_PATH) -- *.py's wildcard above
+# doesn't catch this non-Python sibling, and it was missed when the
+# Redis-backed store was introduced (see redis_log.py's module docstring):
+# the container built fine, then crash-looped forever on its very first
+# request needing Redis, since redis_log.start() raises RedisUnavailable
+# the instant FileNotFoundError'ing on logs.lua turns into a failed
+# function_load -- never caught locally/in tests, which run server.py
+# straight from this same source directory, logs.lua sitting right there.
+COPY logs.lua ./
 COPY transforms ./transforms
 
 FROM python:3.14-alpine
@@ -54,6 +63,15 @@ FROM python:3.14-alpine
 # independent of what this container itself runs on).
 RUN apk add --no-cache ca-certificates openssh-client
 COPY --from=builder /usr/local/bin/docker /usr/local/bin/docker
+
+# Bundled Redis (see redis_log.py) -- the durable, TTL-bounded side store
+# for logs/telemetry, running as a plain subprocess of server.py inside this
+# same container (no separate container/volume, for now). Needs 7.4+ for
+# per-hash-field TTL (HEXPIRE/HTTL), which is why the binary is copied
+# straight from the official image instead of relying on whatever version
+# Alpine's own `apk add redis` happens to carry -- both images are Alpine
+# (musl), so the binary runs here unmodified.
+COPY --from=redis:7.4-alpine /usr/local/bin/redis-server /usr/local/bin/redis-server
 
 # `docker -H ssh://...` (Set Sources with an ssh:// host, e.g. to reach a
 # *third* machine from this container) execs plain ssh with no flags of its
@@ -77,10 +95,21 @@ COPY --from=builder /srv/cttc-gateway ./
 ENV PATH="/srv/cttc-gateway/.venv/bin:${PATH}"
 
 EXPOSE 8765
+# Redis's own TCP monitor port (see redis_log.py's DEFAULT_TCP_PORT) --
+# bound to 127.0.0.1 only regardless of this EXPOSE, unlike 8765 above
+# (documentation-only under --network=host, same as 8765's own EXPOSE;
+# listed here so the two stay consistent/greppable).
+EXPOSE 56379
 # 0.0.0.0: the client talks to this container directly over plain HTTP (no
 # ssh tunnel -- see docs/architecture/remote-server.md), so it must be
 # reachable on the host's real network interfaces, not just loopback.
 # --network=host (see docker-compose.yml) means this *is* the host's own
 # network stack, so binding 0.0.0.0 here exposes it exactly as if the port
 # were opened directly on the host.
-ENTRYPOINT ["python", "server.py", "--host", "0.0.0.0", "--port", "8765"]
+# --auto-collect: this is the one place the gateway runs as a standing
+# service rather than something main.js launches bare/embedded alongside a
+# single client -- so it's the one place always-on collection (see
+# lifespan() in server.py) should default on.
+# --redis-port: explicit rather than relying on server.py's own default,
+# matching --auto-collect's own spelled-out-here style.
+ENTRYPOINT ["python", "server.py", "--host", "0.0.0.0", "--port", "8765", "--auto-collect", "--redis-port", "56379"]

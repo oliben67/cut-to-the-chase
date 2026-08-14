@@ -99,6 +99,61 @@ test("openSshTunnel calls onUnexpectedExit (and logs) when the tunnel dies after
   assert.ok(lines.some((l) => l.includes("exited unexpectedly") && l.includes(String(port))));
 });
 
+test("openSshTunnel kills the still-running process when the readiness timeout wins the race (br-TUNL-007)", async () => {
+  const port = await freePort();
+  const lines = [];
+  const p = new EventEmitter();
+  p.pid = 5150;
+  p.stdout = new EventEmitter();
+  p.stderr = new EventEmitter();
+  p.killed = false;
+  let killed = false;
+  p.kill = () => {
+    killed = true;
+    p.killed = true;
+    // Deliberately does NOT emit "exit" -- a real ssh process being sent
+    // SIGTERM doesn't die synchronously either; the point being tested is
+    // that openSshTunnel calls kill() at all; a delayed/absent exit event
+    // must not be mistaken for "already exited" and skip the kill.
+  };
+  await assert.rejects(
+    openSshTunnel(
+      { sshTarget: "u@h", sshKey: null, containerPort: port },
+      { spawnFn: () => p, onLog: (l) => lines.push(l), readyTimeoutMs: 30 }
+    ),
+    /timed out/
+  );
+  assert.equal(killed, true, "the never-established process must be killed, not orphaned");
+  assert.ok(lines.some((l) => l.includes(`ssh tunnel (pid ${p.pid}) failed to establish -- killing it`)));
+});
+
+test("openSshTunnel does not try to kill a process that already exited before the race settled", async () => {
+  const port = await freePort();
+  const lines = [];
+  const p = new EventEmitter();
+  p.pid = 5151;
+  p.stdout = new EventEmitter();
+  p.stderr = new EventEmitter();
+  p.killed = false;
+  let killCalls = 0;
+  p.kill = () => {
+    killCalls++;
+    p.killed = true;
+  };
+  const spawnFn = () => {
+    setTimeout(() => p.emit("exit", 1, null), 5); // dies before ever forwarding
+    return p;
+  };
+  await assert.rejects(
+    openSshTunnel(
+      { sshTarget: "u@h", sshKey: null, containerPort: port },
+      { spawnFn, onLog: (l) => lines.push(l), readyTimeoutMs: 5000 }
+    ),
+    /ssh tunnel exited/
+  );
+  assert.equal(killCalls, 0, "a process that already exited on its own must not be killed again");
+});
+
 test("closeSshTunnel logs when it actually kills a running tunnel", () => {
   const p = new EventEmitter();
   p.pid = 99;

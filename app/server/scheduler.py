@@ -19,6 +19,7 @@ RecordingSessionManager.tick().
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -27,6 +28,8 @@ from croniter import croniter
 
 if TYPE_CHECKING:
     from recording_session import RecordingSessionManager
+
+logger = logging.getLogger("cttc")
 
 
 class UnknownSchedule(KeyError):
@@ -107,14 +110,33 @@ class Scheduler:
         now = now if now is not None else time.time() * 1000.0
         for sch in list(self._schedules.values()):
             if sch.cron is not None:
-                while sch.next_fire is not None and now >= sch.next_fire:
-                    self._fire(sch)
-                    sch.next_fire = (
-                        croniter(sch.cron, sch.next_fire / 1000.0).get_next(float) * 1000.0
-                    )
+                if sch.next_fire is not None and now >= sch.next_fire:
+                    # br-SCHED-004: fire at most once per tick regardless of
+                    # how many occurrences were actually missed -- a gateway
+                    # suspended/stalled for an hour on "* * * * *" used to
+                    # loop here ~60 times, firing ~60 back-dated sessions in
+                    # one synchronous burst, all recording the same "now"
+                    # window (start() has no notion of a historical start
+                    # time, so replaying every missed occurrence bought
+                    # nothing but duplicate, overlapping recordings). Fire
+                    # once, then fast-forward next_fire past every other
+                    # already-past occurrence without firing again for them,
+                    # so the backlog is caught up to the present in one tick
+                    # instead of bursting through it.
+                    self._fire_safe(sch)
+                    next_fire = sch.next_fire
+                    while next_fire is not None and now >= next_fire:
+                        next_fire = croniter(sch.cron, next_fire / 1000.0).get_next(float) * 1000.0
+                    sch.next_fire = next_fire
             elif not sch.done and sch.start_at is not None and now >= sch.start_at:
-                self._fire(sch)
+                self._fire_safe(sch)
                 sch.done = True
+
+    def _fire_safe(self, sch: Schedule) -> None:
+        try:
+            self._fire(sch)
+        except Exception:
+            logger.exception("scheduler: schedule %s failed to fire", sch.id)
 
     def _fire(self, sch: Schedule) -> None:
         sid = self._sessions.start(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import zipfile
 from datetime import UTC, datetime, timezone
@@ -19,13 +20,25 @@ def ms(y, mo, d, h=0, mi=0, s=0):
 
 
 @pytest.fixture
-def state(tmp_path):
+async def state(tmp_path):
     tdir = tmp_path / "transforms"
     tdir.mkdir()
     (tdir / "upper.py").write_text(
         'def transform(r):\n    r["text"] = r["text"].upper()\n    return r\n'
     )
-    return server.State(tdir)
+    # redis_flush_interval_seconds=0.05 (sRate), not the 1.0s default -- see
+    # _flush() below.
+    st = server.State(tdir, redis_flush_interval_seconds=0.05, redis_data_dir=str(tdir / "redis-data"))
+    await st.redis_log.start()
+    yield st
+    await st.redis_log.stop()
+
+
+async def _flush():
+    # record() buffers in memory and is flushed to Redis every
+    # flush_interval_seconds (sRate, 0.05s for this fixture's State); give
+    # it a beat past that before reads that expect it.
+    await asyncio.sleep(0.15)
 
 
 @pytest.fixture
@@ -36,10 +49,11 @@ def log_file(tmp_path):
 
 
 class TestDownloadSample:
-    def test_download_matches_export_sample_bytes(self, state, log_file):
+    async def test_download_matches_export_sample_bytes(self, state, log_file):
         state.open_file(str(log_file), "auto", None, live=False, transforms=[])
+        await _flush()
         t0, t1 = ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 20)
-        data, filename, count = files.download_sample(state, t0, t1, True)
+        data, filename, count = await files.download_sample(state, t0, t1, True)
         assert count == 1
         assert filename == "sample-2026-01-02-03-00-00.cttc-metric"
         assert filename.endswith(".cttc-metric")
@@ -47,31 +61,34 @@ class TestDownloadSample:
         manifest = json.loads(z.read("manifest.json"))
         assert len(manifest["segments"][0]["sources"]) == 1
 
-    def test_download_empty_range_yields_zero_sources(self, state, log_file):
+    async def test_download_empty_range_yields_zero_sources(self, state, log_file):
         state.open_file(str(log_file), "auto", None, live=False, transforms=[])
-        data, filename, count = files.download_sample(state, 0.0, 1.0, True)
+        await _flush()
+        data, _filename, count = await files.download_sample(state, 0.0, 1.0, True)
         assert count == 0
         z = zipfile.ZipFile(BytesIO(data))
         assert json.loads(z.read("manifest.json"))["segments"][0]["sources"] == []
 
 
 class TestUploadAndOpen:
-    def test_upload_plain_log(self, state):
+    async def test_upload_plain_log(self, state):
         data = b"2026-01-02T03:00:00Z hello\n2026-01-02T03:00:01Z world\n"
-        opened = files.upload_and_open(state, "mylog.log", data, [])
+        opened = await files.upload_and_open(state, "mylog.log", data, [])
+        await _flush()
         assert len(opened) == 1
         src = state.sources[opened[0]]
-        assert src.kind == "log" and src.total() == 2
+        assert src.kind == "log" and await src.total() == 2
         assert src.path == "upload://mylog.log"
         assert src.live is False
 
-    def test_upload_applies_transforms(self, state):
+    async def test_upload_applies_transforms(self, state):
         data = b"2026-01-02T03:00:00Z hello\n"
-        opened = files.upload_and_open(state, "mylog.log", data, ["upper"])
+        opened = await files.upload_and_open(state, "mylog.log", data, ["upper"])
+        await _flush()
         src = state.sources[opened[0]]
-        assert src.slice(0, 1)[0]["text"] == "HELLO"
+        assert (await src.slice(0, 1))[0]["text"] == "HELLO"
 
-    def test_upload_scratch_file_removed_after(self, state, monkeypatch):
+    async def test_upload_scratch_file_removed_after(self, state, monkeypatch):
         captured = {}
         real_mkstemp = files.tempfile.mkstemp
 
@@ -81,33 +98,41 @@ class TestUploadAndOpen:
             return fd, path
 
         monkeypatch.setattr(files.tempfile, "mkstemp", spy_mkstemp)
-        files.upload_and_open(state, "x.log", b"2026-01-02T03:00:00Z a\n", [])
+        await files.upload_and_open(state, "x.log", b"2026-01-02T03:00:00Z a\n", [])
         assert not Path(captured["path"]).exists()
 
-    def test_upload_cttc_sample(self, state, log_file):
+    async def test_upload_cttc_sample(self, state, log_file):
         state.open_file(str(log_file), "auto", None, live=False, transforms=[])
+        await _flush()
         t0, t1 = ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 20)
-        data, _filename, _count = files.download_sample(state, t0, t1, True)
+        data, _filename, _count = await files.download_sample(state, t0, t1, True)
 
+        # Reuses `state`'s already-running RedisLog rather than starting a
+        # second redis-server subprocess bound to the same fixed unix
+        # socket (see redis_log.SOCKET_PATH) -- both States sharing one
+        # physical Redis is exactly what "Redis is the sole source of
+        # truth" means in practice, and is simpler than juggling a second
+        # subprocess's lifecycle just for this test.
         state2 = server.State(Path("/tmp"))
-        opened = files.upload_and_open(state2, "reload.cttc-metric", data, [])
-        assert len(opened) == 1
+        state2.redis_log = state.redis_log
+        opened = await files.upload_and_open(state2, "reload.cttc-metric", data, [])
         src = state2.sources[opened[0]]
+        assert len(opened) == 1
         assert src.path == "upload://reload.cttc-metric"
-        assert src.slice(0, 1)[0]["text"] == "alpha"
+        assert (await src.slice(0, 1))[0]["text"] == "alpha"
 
-    def test_upload_bad_data_propagates_error(self, state):
+    async def test_upload_bad_data_propagates_error(self, state):
         with pytest.raises(Exception):
-            files.upload_and_open(state, "broken.cttc-metric", b"not a zip file", [])
+            await files.upload_and_open(state, "broken.cttc-metric", b"not a zip file", [])
 
-    def test_upload_no_extension_defaults_to_log_suffix(self, state):
+    async def test_upload_no_extension_defaults_to_log_suffix(self, state):
         # mainly asserts this doesn't blow up picking a temp-file suffix
-        opened = files.upload_and_open(state, "noext", b"2026-01-02T03:00:00Z a\n", [])
+        opened = await files.upload_and_open(state, "noext", b"2026-01-02T03:00:00Z a\n", [])
         assert len(opened) == 1
 
-    def test_upload_survives_scratch_cleanup_failure(self, state, monkeypatch):
+    async def test_upload_survives_scratch_cleanup_failure(self, state, monkeypatch):
         # a failed unlink (already gone, permissions, ...) must not surface
         # as an error on top of an otherwise-successful upload
         monkeypatch.setattr(files.os, "unlink", lambda *_: (_ for _ in ()).throw(OSError("nope")))
-        opened = files.upload_and_open(state, "x.log", b"2026-01-02T03:00:00Z a\n", [])
+        opened = await files.upload_and_open(state, "x.log", b"2026-01-02T03:00:00Z a\n", [])
         assert len(opened) == 1

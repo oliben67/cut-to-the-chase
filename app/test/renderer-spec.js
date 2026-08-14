@@ -4,6 +4,16 @@
 // to {passed, failed, failures: [...]}.
 (async () => {
   "use strict";
+  // A real, unstubbed window.alert() is genuinely OS-blocking in a real
+  // Electron window -- if any test's real code path happens to hit one
+  // unexpectedly (e.g. a narrow query landing on a zero-row slice of demo
+  // data, tripping app.js's own "No data found..." alert), it freezes the
+  // whole suite behind a visible, disruptive native dialog instead of
+  // just failing that one test. Stubbed globally so that's a normal,
+  // catchable failure instead; tests that need to inspect what alert()
+  // was actually called with still save/restore this (now-stubbed) value
+  // locally, exactly as before -- nothing here changes for them.
+  window.alert = () => {};
   const results = { passed: 0, failed: 0, failures: [] };
   const T = async (name, fn) => {
     try {
@@ -72,6 +82,138 @@
     ok(fmtIso(0).endsWith(" UTC"));
   });
 
+  await T("parseRedisArgv splits like redis-cli: bare tokens, quoted strings, escapes", () => {
+    eq(JSON.stringify(parseRedisArgv("GET foo")), '["GET","foo"]');
+    eq(JSON.stringify(parseRedisArgv("  SET  foo   bar  ")), '["SET","foo","bar"]');
+    eq(JSON.stringify(parseRedisArgv('SET foo "a b c"')), '["SET","foo","a b c"]');
+    eq(JSON.stringify(parseRedisArgv("SET foo 'a b c'")), '["SET","foo","a b c"]');
+    eq(JSON.stringify(parseRedisArgv('SET foo "a \\"quoted\\" b"')), '["SET","foo","a \\"quoted\\" b"]');
+    eq(JSON.stringify(parseRedisArgv("SET foo a\\ b")), '["SET","foo","a b"]');
+    eq(JSON.stringify(parseRedisArgv("   ")), "[]");
+    eq(JSON.stringify(parseRedisArgv("")), "[]");
+  });
+
+  await T("formatRedisReply mirrors real redis-cli conventions for every reply type", () => {
+    eq(formatRedisReply({ type: "nil" }), "(nil)");
+    eq(formatRedisReply({ type: "integer", value: 42 }), "(integer) 42");
+    eq(formatRedisReply({ type: "status", value: "OK" }), "OK");
+    eq(formatRedisReply({ type: "bulk", value: "1000" }), '"1000"');
+    eq(formatRedisReply({ type: "error", value: "ERR unknown command" }), "(error) ERR unknown command");
+    eq(formatRedisReply({ type: "array", value: [] }), "(empty array)");
+    eq(
+      formatRedisReply({ type: "array", value: [{ type: "bulk", value: "a" }, { type: "bulk", value: "b" }] }),
+      '1) "a"\n2) "b"'
+    );
+    // nested arrays indent
+    eq(
+      formatRedisReply({
+        type: "array",
+        value: [{ type: "array", value: [{ type: "integer", value: 1 }, { type: "integer", value: 2 }] }],
+      }),
+      "1) 1) (integer) 1\n   2) (integer) 2"
+    );
+  });
+
+  await T("Redis CLI dialog: target label, Run/Enter submit and clear the input while keeping focus, clear empties output without a round trip, history cycles with Up/Down", async () => {
+    const realGetConnectionInfo = window.cttc.getConnectionInfo;
+    const realRedisCliRun = window.cttc.redisCliRun;
+    const output = $("redis-cli-output");
+    const input = $("redis-cli-input");
+    const runCalls = [];
+    try {
+      window.cttc.getConnectionInfo = async () => ({ connectionType: "remote", gatewayHost: "example.com" });
+      window.cttc.redisCliRun = async (argv) => { runCalls.push(argv); return { type: "status", value: "OK" }; };
+      await openRedisCliDialog();
+      eq($("dlg-redis-cli").open, true, "dialog opened");
+      eq($("redis-cli-target").textContent, "— gateway: example.com", "target label reflects getConnectionInfo");
+      eq(document.activeElement, input, "focus lands in the command input on open");
+
+      input.value = "SET foo bar";
+      $("redis-cli-run").click();
+      eq(input.value, "", "Run clears the input");
+      eq(document.activeElement, input, "focus stays in the input after Run");
+      await until(() => runCalls.length === 1, "Run round-trips through redisCliRun");
+      eq(JSON.stringify(runCalls[0]), '["SET","foo","bar"]', "argv sent matches the typed command");
+      ok(output.textContent.includes("> SET foo bar"), "echoed command appears in the transcript");
+      ok(output.textContent.includes("OK"), "reply appears in the transcript");
+
+      input.value = "GET foo";
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+      eq(input.value, "", "Enter also clears the input");
+      await until(() => runCalls.length === 2, "Enter round-trips through redisCliRun");
+
+      const outputLenBeforeClear = output.children.length;
+      ok(outputLenBeforeClear > 0, "sanity: transcript has content before clear");
+      input.value = "clear";
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+      eq(output.textContent, "", "'clear' empties the output pane");
+      eq(runCalls.length, 2, "'clear' never calls redisCliRun -- client-side only, like real redis-cli");
+
+      // History: three lines were entered above, in order -- "SET foo bar",
+      // "GET foo", "clear". "clear" is itself a real history entry (same
+      // convention as a real shell/redis-cli: every entered line is
+      // recorded, whether or not it was actually sent anywhere) -- Up
+      // recalls it first, being the most recent.
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowUp", bubbles: true, cancelable: true }));
+      eq(input.value, "clear", "ArrowUp recalls the most recent entry, including 'clear'");
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowUp", bubbles: true, cancelable: true }));
+      eq(input.value, "GET foo", "ArrowUp again recalls the one before it");
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowUp", bubbles: true, cancelable: true }));
+      eq(input.value, "SET foo bar", "ArrowUp again recalls the oldest entry");
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowUp", bubbles: true, cancelable: true }));
+      eq(input.value, "SET foo bar", "ArrowUp stops at the oldest entry");
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true }));
+      eq(input.value, "GET foo", "ArrowDown moves forward through history");
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true }));
+      eq(input.value, "clear", "ArrowDown continues forward");
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true }));
+      eq(input.value, "", "ArrowDown past the newest entry lands on an empty line");
+    } finally {
+      window.cttc.getConnectionInfo = realGetConnectionInfo;
+      window.cttc.redisCliRun = realRedisCliRun;
+      output.textContent = "";
+      input.value = "";
+      $("dlg-redis-cli-close").click();
+    }
+  });
+
+  await T("authHeaders adds X-CTTC-Token only when API_TOKEN is set (br-NET-004)", () => {
+    const realToken = API_TOKEN;
+    try {
+      API_TOKEN = null;
+      eq(JSON.stringify(authHeaders()), "{}", "no token in this suite's own connection -- nothing added");
+      eq(JSON.stringify(authHeaders({ Foo: "bar" })), JSON.stringify({ Foo: "bar" }), "extras still pass through");
+
+      API_TOKEN = "test-token-abc";
+      eq(authHeaders()["X-CTTC-Token"], "test-token-abc");
+      const merged = authHeaders({ "X-CTTC-Filename": "x.log" });
+      eq(merged["X-CTTC-Token"], "test-token-abc");
+      eq(merged["X-CTTC-Filename"], "x.log");
+    } finally {
+      API_TOKEN = realToken;
+    }
+  });
+
+  await T("get()/post() actually send X-CTTC-Token on the wire once API_TOKEN is set", async () => {
+    const realToken = API_TOKEN;
+    const realFetch = window.fetch;
+    const calls = [];
+    window.fetch = (url, opts) => {
+      calls.push({ url, headers: opts?.headers });
+      return realFetch(url, opts);
+    };
+    try {
+      API_TOKEN = "test-token-abc";
+      await get("/sources");
+      await post("/close", { id: "nonexistent" });
+      eq(calls.length, 2);
+      for (const c of calls) eq(c.headers["X-CTTC-Token"], "test-token-abc", c.url);
+    } finally {
+      window.fetch = realFetch;
+      API_TOKEN = realToken;
+    }
+  });
+
   await T("colorFor assigns stable slots and never folds to gray past 8", () => {
     const c1 = colorFor("__test_series_1");
     eq(colorFor("__test_series_1"), c1, "stable on repeat");
@@ -108,45 +250,6 @@
     zoomAt(MID, 0.5);
     near(state.view.t1 - state.view.t0, 30000, 1, "halved");
     near((state.view.t0 + state.view.t1) / 2, MID, 1, "still centered");
-  });
-
-  await T("zoomAtAnchored keeps the anchor point fixed, unlike zoomAt", () => {
-    setView(MID - 30000, MID + 30000);
-    const anchor = MID + 10000; // off-center, so recentering would move it
-    zoomAtAnchored(anchor, 0.5);
-    near(state.view.t1 - state.view.t0, 30000, 1, "halved");
-    near(anchor, state.view.t0 + (anchor - (MID - 30000)) * 0.5, 1, "anchor stayed put");
-    // the anchor's position within the view (as a fraction of the span) is unchanged
-    const before = { t0: MID - 30000, t1: MID + 30000 };
-    const fracBefore = (anchor - before.t0) / (before.t1 - before.t0);
-    const fracAfter = (anchor - state.view.t0) / (state.view.t1 - state.view.t0);
-    near(fracBefore, fracAfter, 0.001, "anchor's relative position preserved");
-  });
-
-  await T("wheel over a chart zooms anchored on the cursor, not the view center", () => {
-    setView(MID - 30000, MID + 30000);
-    const canvas = document.querySelector("canvas[data-strip]");
-    ok(canvas, "a strip canvas exists");
-    const rect = canvas.getBoundingClientRect();
-    const x = rect.left + rect.width * 0.75; // off-center, right side
-    const before = { ...state.view };
-    canvas.dispatchEvent(new WheelEvent("wheel", { deltaY: -100, clientX: x, clientY: rect.top + 5, bubbles: true, cancelable: true }));
-    ok(state.view.t1 - state.view.t0 < before.t1 - before.t0, "scrolling up (deltaY<0) zoomed in");
-
-    setView(MID - 30000, MID + 30000);
-    const before2 = { ...state.view };
-    canvas.dispatchEvent(new WheelEvent("wheel", { deltaY: 100, clientX: x, clientY: rect.top + 5, bubbles: true, cancelable: true }));
-    ok(state.view.t1 - state.view.t0 > before2.t1 - before2.t0, "scrolling down (deltaY>0) zoomed out");
-  });
-
-  await T("ctrl/meta+wheel over a chart is left alone (reserved for page zoom)", () => {
-    setView(MID - 30000, MID + 30000);
-    const canvas = document.querySelector("canvas[data-strip]");
-    const rect = canvas.getBoundingClientRect();
-    const before = { ...state.view };
-    canvas.dispatchEvent(new WheelEvent("wheel", { deltaY: -100, clientX: rect.left + 10, clientY: rect.top + 5, ctrlKey: true, bubbles: true, cancelable: true }));
-    eq(state.view.t0, before.t0);
-    eq(state.view.t1, before.t1);
   });
 
   await T("recenterOn keeps span, moves center", () => {
@@ -196,15 +299,19 @@
 
   /* ── toolbar controls ─────────────────────────────────────────────────── */
 
-  await T("chart style segmented control toggles lines/bars and persists", () => {
-    const before = state.chartStyle;
-    const other = before === "bars" ? "btn-style-lines" : "btn-style-histogram";
-    $(other).click();
-    ok(state.chartStyle !== before, "flipped");
-    eq(prefs.get("chartStyle", null), state.chartStyle, "persisted");
-    const back = before === "bars" ? "btn-style-histogram" : "btn-style-lines";
-    $(back).click();
-    eq(state.chartStyle, before, "flipped back");
+  await T("per-graph chart style toggle flips lines/bars independently and persists", () => {
+    const beforeSvc = state.chartStyle.svc;
+    const beforeHost = state.chartStyle.host;
+    $("btn-style-toggle-svc").click();
+    ok(state.chartStyle.svc !== beforeSvc, "svc graph flipped");
+    eq(state.chartStyle.host, beforeHost, "host graph untouched by the svc toggle");
+    eq(prefs.get("chartStyle", null).svc, state.chartStyle.svc, "persisted");
+    $("btn-style-toggle-host").click();
+    ok(state.chartStyle.host !== beforeHost, "host graph flipped");
+    $("btn-style-toggle-svc").click();
+    $("btn-style-toggle-host").click();
+    eq(state.chartStyle.svc, beforeSvc, "svc flipped back");
+    eq(state.chartStyle.host, beforeHost, "host flipped back");
   });
 
   await T("splitter drag changes strip height within clamps", () => {
@@ -219,11 +326,18 @@
     drawAll();
   });
 
-  await T("timeline-nav 'now' label jumps live, centered 5s behind the present", () => {
-    setView(MID, MID + 60000);
+  await T("timeline-nav 'now' label jumps live, centered 5s behind the present, and resets the zoom back to the graphs' original span", () => {
+    setView(MID, MID + 60000); // a deliberately narrow, zoomed-in span
     document.querySelector("#chart-nav .tl-now-label").click();
     near((state.view.t0 + state.view.t1) / 2, Date.now() - 5000, 2000, "centered ~5s behind now");
     if (!state.live) throw new Error("expected state.live to be true after clicking 'now'");
+    near(state.view.t1 - state.view.t0, DEFAULT_SPAN, 1, "clicking 'now' restores the original (default) zoom span, not whatever was zoomed in");
+  });
+
+  await T("timeline-nav 'now' label resets zoom for the host graph's nav too, sharing the same view", () => {
+    setView(MID, MID + 60000);
+    document.querySelector("#host-nav .tl-now-label").click();
+    near(state.view.t1 - state.view.t0, DEFAULT_SPAN, 1, "host nav's 'now' label also restores the original span");
   });
 
   await T("timeline-nav track click re-centers, keeping the span", () => {
@@ -362,6 +476,297 @@
     }
   });
 
+  await T("isOtherDockerHostHidden scopes svc/host series to the active Docker host", () => {
+    // br-DHOST-030: multiple Docker hosts can be collected concurrently
+    // (New Docker Host never disconnects a previous one), but the
+    // graph/snapshot/exports must only ever show the active one.
+    const savedSeries = state.series;
+    const savedActiveHost = state.activeDockerHost;
+    const localSid = "__dhost_local", remoteSid = "__dhost_remote";
+    state.sources.push(
+      { id: localSid, path: "docker://local/host", kind: "stats", live: true, host: null },
+      { id: remoteSid, path: "docker://ssh://u@remotehost/host", kind: "stats", live: true, host: "ssh://u@remotehost" }
+    );
+    state.series = { px: 100, services: [
+      { name: "__dhost_l", sid: localSid, host: true, cpu: [], mem: [], net: [] },
+      { name: "__dhost_r", sid: remoteSid, host: true, cpu: [], mem: [], net: [] },
+    ]};
+    try {
+      state.activeDockerHost = "local";
+      ok(!isOtherDockerHostHidden(localSid), "local source visible while local is active");
+      ok(isOtherDockerHostHidden(remoteSid), "remote source hidden while local is active");
+      eq(seriesOf("host").map((s) => s.sid).join(","), localSid);
+
+      state.activeDockerHost = "ssh://u@remotehost";
+      ok(isOtherDockerHostHidden(localSid), "local source hidden once remote is active");
+      ok(!isOtherDockerHostHidden(remoteSid), "remote source visible once it's active");
+      eq(seriesOf("host").map((s) => s.sid).join(","), remoteSid);
+    } finally {
+      state.series = savedSeries;
+      state.activeDockerHost = savedActiveHost;
+      state.sources = state.sources.filter((s) => s.id !== localSid && s.id !== remoteSid);
+    }
+  });
+
+  await T("log panel hamburger menu lists Search, Sort up, Sort down, Export in order (each with an icon), and Export only fetches/writes once Save is confirmed", async () => {
+    const p = [...panels.values()][0];
+    const menuBtn = p.el.querySelector(".panel-menu-btn");
+    const openMenu = () => { menuBtn.focus(); menuBtn.click(); return document.getElementById("ctxmenu"); };
+
+    let menu = openMenu();
+    ok(menu, "menu open");
+    let buttons = [...menu.querySelectorAll("button")];
+    eq(buttons.map((b) => b.textContent).join(","), "Search,Sort up,Sort down,Export", "menu items appear in the spec's order");
+    ok(buttons.every((b) => b.querySelector(".ctxmenu-icon svg")), "every entry has an icon");
+
+    const realPick = pickLogExportPath;
+    const realWrite = writeLogExportFile;
+    const realFetchAll = fetchAllLogRows;
+    const writes = [];
+    let pickCalls = 0, fetchCalls = 0;
+    try {
+      // Cancelled dialog: the whole point of asking first -- nothing
+      // fetched, nothing written.
+      pickLogExportPath = async (defaultName) => {
+        pickCalls++;
+        ok(defaultName.startsWith(`${p.src.name}-`) && defaultName.endsWith(".log"), defaultName);
+        return null;
+      };
+      fetchAllLogRows = async (...args) => { fetchCalls++; return realFetchAll(...args); };
+      writeLogExportFile = async (path, bytes) => { writes.push({ path, bytes }); };
+      buttons.find((b) => b.textContent === "Export").click();
+      await until(() => pickCalls === 1, "dialog shown");
+      ok(!document.getElementById("ctxmenu"), "selecting an item closes the menu");
+      eq(fetchCalls, 0, "no data fetched on cancel");
+      eq(writes.length, 0, "nothing written on cancel");
+
+      // Confirmed: only now does it fetch and write, with every current row.
+      pickLogExportPath = async () => "/tmp/e2e-log-export-test.log";
+      menu = openMenu();
+      [...menu.querySelectorAll("button")].find((b) => b.textContent === "Export").click();
+      await until(() => writes.length === 1, "written exactly once confirmed");
+      eq(fetchCalls, 1, "data fetched exactly once confirmed");
+      eq(writes[0].path, "/tmp/e2e-log-export-test.log");
+      const rows = await realFetchAll(p.src.id);
+      const expected = rows.map((r) => r.text).join("\n") + (rows.length ? "\n" : "");
+      eq(new TextDecoder().decode(writes[0].bytes), expected, "exported text is every current row, in order, one per line");
+    } finally {
+      pickLogExportPath = realPick;
+      writeLogExportFile = realWrite;
+      fetchAllLogRows = realFetchAll;
+    }
+  });
+
+  await T("log search keeps focus in the box while typing, and Up/Down drive find() the same way Enter/Shift+Enter do", async () => {
+    // Spies on find() itself rather than asserting a specific match count
+    // for a specific search term -- which panel is panels.values()[0], and
+    // how many times any given term appears in its real demo content, both
+    // vary run to run. What's actually under test is the keydown wiring
+    // (ArrowDown/ArrowUp call the same find(forward) Enter/Shift+Enter do)
+    // and that focus never leaves the input -- find() still runs for real
+    // underneath the spy, so its own finally-block refocus is exercised too.
+    const p = [...panels.values()][0];
+    const menuBtn = p.el.querySelector(".panel-menu-btn");
+    menuBtn.focus();
+    menuBtn.click();
+    const searchEntry = [...document.getElementById("ctxmenu").querySelectorAll("button")].find((b) => b.textContent === "Search");
+    searchEntry.click();
+    const realFind = p.find.bind(p);
+    const calls = [];
+    p.find = async (forward) => { calls.push(forward); return realFind(forward); };
+    try {
+      eq(p.searchBar.hidden, false, "search bar opened");
+      eq(document.activeElement, p.searchInput, "focus lands in the search box on open");
+      p.searchInput.value = "e"; // find() is spied, not asserted on match content -- any non-empty query does
+      p.searchInput.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true }));
+      await until(() => calls.length === 1, "ArrowDown called find()");
+      eq(calls[0], true, "ArrowDown searches forward, same as Enter");
+      eq(document.activeElement, p.searchInput, "focus still in the box after ArrowDown");
+      p.searchInput.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowUp", bubbles: true, cancelable: true }));
+      await until(() => calls.length === 2, "ArrowUp called find()");
+      eq(calls[1], false, "ArrowUp searches backward, same as Shift+Enter");
+      eq(document.activeElement, p.searchInput, "focus still in the box after ArrowUp");
+    } finally {
+      p.find = realFind;
+      p.searchInput.value = "";
+      p.searchQuery = "";
+      p.searchBar.hidden = true;
+    }
+  });
+
+  await T("log panel Sort up/down are mutually exclusive, reorder the list, mark themselves active, and persist", async () => {
+    const p = [...panels.values()][0];
+    const startReversed = p.reversed;
+    ok(p.total >= 2, "panel has rows");
+    eq(p.dataIndexAt(0), startReversed ? p.total - 1 : 0, "visual->data mapping");
+    eq(p.visualIndexOf(p.dataIndexAt(5)), 5, "mapping is its own inverse");
+    const menuBtn = p.el.querySelector(".panel-menu-btn");
+    const openMenu = () => { menuBtn.focus(); menuBtn.click(); return document.getElementById("ctxmenu"); };
+    const sortEntries = (menu) => {
+      const buttons = [...menu.querySelectorAll("button")];
+      return { up: buttons.find((b) => b.textContent === "Sort up"), down: buttons.find((b) => b.textContent === "Sort down") };
+    };
+
+    let { up, down } = sortEntries(openMenu());
+    eq(up.dataset.active, startReversed ? undefined : "true", "Sort up marked active iff the panel isn't currently reversed");
+    eq(down.dataset.active, startReversed ? "true" : undefined, "Sort down marked active iff the panel is currently reversed");
+    (startReversed ? up : down).click();
+    eq(p.reversed, !startReversed, "flipped");
+    eq(prefs.get("logNewestFirst", null), p.reversed, "persisted");
+    eq(p.dataIndexAt(0), p.reversed ? p.total - 1 : 0, "mapping follows the flip");
+
+    ({ up, down } = sortEntries(openMenu()));
+    eq(up.dataset.active, p.reversed ? undefined : "true", "active marking flipped along with the sort direction");
+    eq(down.dataset.active, p.reversed ? "true" : undefined, "active marking flipped along with the sort direction");
+    (p.reversed ? up : down).click();
+    eq(p.reversed, startReversed, "restored");
+  });
+
+  await T("log panel header is a 3-zone layout: hamburger and icon cluster on either side of a centered name (swapped to mirror the OS's own window-control side), and the name still truncates with a full-name tooltip", async () => {
+    const p = [...panels.values()][0];
+    const top = p.el.querySelector(".panel-head-top");
+    const kids = [...top.children];
+    eq(kids.length, 3, "exactly 3 zones");
+    const [startZone, centerZone, endZone] = kids;
+    const [hamburgerZone, iconsZone] = controlsSide === "left" ? [endZone, startZone] : [startZone, endZone];
+    ok(hamburgerZone.classList.contains("panel-menu-btn"), "hamburger sits opposite the OS's own window controls");
+    ok(centerZone.classList.contains("panel-head-center"), "center zone holds the name");
+    ok(iconsZone.classList.contains("panel-head-right"), "icon cluster sits on the same side as the OS's own window controls");
+    const name = centerZone.querySelector(".name");
+    ok(name, "name lives in the center zone");
+    eq(name.title, p.src.path, "full name/path still exposed via a tooltip");
+    ok(iconsZone.contains(p.el.querySelector('[title="Open this log in its own window"]')), "popout stayed in the icon zone");
+    ok(iconsZone.contains(p.el.querySelector(".close")), "close stayed in the icon zone");
+  });
+
+  await T("log panel hamburger/icon-cluster zones swap live when controlsSide changes", async () => {
+    const p = [...panels.values()][0];
+    const original = controlsSide;
+    try {
+      applyControlsSide("right");
+      eq([...p.headTop.children][0], p.menuBtn, "hamburger moves to the start zone when controls are on the right");
+      eq([...p.headTop.children][2], p.headRight, "icon cluster moves to the end zone when controls are on the right");
+      // Reading order within the cluster itself must stay "detach, then
+      // close" from the outside in -- on the right, that means detach
+      // (popout) is the rightmost/outermost button, so DOM order (left to
+      // right) is the reverse: close first, popout last.
+      eq([...p.headRight.children][0], p.close, "controls-right: close sits closest to center");
+      eq([...p.headRight.children][1], p.popout, "controls-right: detach (popout) sits closest to the window edge");
+      applyControlsSide("left");
+      eq([...p.headTop.children][0], p.headRight, "icon cluster moves to the start zone when controls are on the left");
+      eq([...p.headTop.children][2], p.menuBtn, "hamburger moves to the end zone when controls are on the left");
+      eq([...p.headRight.children][0], p.popout, "controls-left: detach (popout) sits closest to the window edge");
+      eq([...p.headRight.children][1], p.close, "controls-left: close sits closest to center");
+    } finally {
+      applyControlsSide(original);
+    }
+  });
+
+  await T("telemetry headers (#chart-head, #host-head): title stays centered, button cluster sits on the same side as the OS's own window controls, keeps its outside-in reading order, and follows controlsSide live", async () => {
+    const original = controlsSide;
+    // Canonical outside-in order (the order you'd encounter buttons moving
+    // from the window's edge toward the center): detach, then histogram
+    // toggle, then (for host telemetry only) the hide toggle.
+    const CANONICAL = {
+      "chart-head": [$("btn-popout-telemetry"), $("btn-popback-telemetry"), $("btn-style-toggle-svc")],
+      "host-head": [$("btn-popout-host"), $("btn-popback-host"), $("btn-style-toggle-host"), $("btn-host-toggle")],
+    };
+    try {
+      for (const headId of ["chart-head", "host-head"]) {
+        const head = $(headId);
+        const title = head.querySelector(".panel-head-title");
+        ok(title, `${headId}: title has the centering class`);
+        const buttons = head.querySelector(".panel-head-right");
+        ok(buttons, `${headId}: button cluster present`);
+        eq(getComputedStyle(title).gridColumnStart, "2", `${headId}: title is always the center column`);
+        // Regression guard: grid items placed with an explicit column but
+        // no explicit row don't reliably auto-place into the same row --
+        // without grid-row:1 on both, they silently land in two separate
+        // implicit rows and the button cluster visually spills down into
+        // the legend below instead of sitting level with the title.
+        const titleMid = (title.getBoundingClientRect().top + title.getBoundingClientRect().bottom) / 2;
+        const buttonsMid = (buttons.getBoundingClientRect().top + buttons.getBoundingClientRect().bottom) / 2;
+        near(titleMid, buttonsMid, 2, `${headId}: title and button cluster sit on the same row`);
+
+        const domOrder = () => [...buttons.children].map((el) => el.id).join(",");
+        applyControlsSide("left");
+        eq(getComputedStyle(buttons).gridColumnStart, "1", `${headId}: controls-left -> buttons on the same (left) side`);
+        eq(domOrder(), CANONICAL[headId].map((el) => el.id).join(","), `${headId}: controls-left -> left-to-right DOM order reads as the outside-in canonical order`);
+        applyControlsSide("right");
+        eq(getComputedStyle(buttons).gridColumnStart, "3", `${headId}: controls-right -> buttons on the same (right) side`);
+        eq(domOrder(), [...CANONICAL[headId]].reverse().map((el) => el.id).join(","), `${headId}: controls-right -> DOM order reverses so right-to-left still reads as the outside-in canonical order`);
+      }
+    } finally {
+      applyControlsSide(original);
+    }
+  });
+
+  await T("log panel hamburger menu is keyboard accessible: opens focused, Up/Down cycle through all 4 items and wrap, Esc closes and returns focus", async () => {
+    const p = [...panels.values()][0];
+    const menuBtn = p.el.querySelector(".panel-menu-btn");
+    eq(menuBtn.getAttribute("aria-label"), "Menu");
+    eq(menuBtn.getAttribute("aria-expanded"), "false");
+
+    menuBtn.focus();
+    menuBtn.click();
+    const menu = document.getElementById("ctxmenu");
+    ok(menu, "menu open");
+    eq(menuBtn.getAttribute("aria-expanded"), "true", "aria-expanded set while open");
+    const items = [...menu.querySelectorAll("button")];
+    eq(document.activeElement, items[0], "focus enters the menu on open, on the first item");
+
+    const down = (ke) => menu.dispatchEvent(new KeyboardEvent("keydown", { key: ke, bubbles: true, cancelable: true }));
+    down("ArrowDown");
+    eq(document.activeElement, items[1], "ArrowDown moves to the next item");
+    down("ArrowDown"); down("ArrowDown");
+    eq(document.activeElement, items[3], "ArrowDown x2 more reaches the last item");
+    down("ArrowDown");
+    eq(document.activeElement, items[0], "ArrowDown wraps from the last item back to the first");
+    down("ArrowUp");
+    eq(document.activeElement, items[3], "ArrowUp wraps from the first item to the last");
+
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    ok(!document.getElementById("ctxmenu"), "Esc closes the menu");
+    eq(document.activeElement, menuBtn, "focus returns to the hamburger on close");
+    eq(menuBtn.getAttribute("aria-expanded"), "false", "aria-expanded reset on close");
+  });
+
+
+  await T("turning Live tracking off interrupts its own highlight instead of leaving it frozen", async () => {
+    const realEnabled = liveTrackEnabled;
+    const realCursorT = state.cursorT;
+    const realLiveTrackCursor = state.liveTrackCursor;
+    try {
+      setLiveTrackEnabled(true);
+      await setCursor(Date.now(), { liveTrack: true });
+      eq(state.liveTrackCursor, true, "sanity: cursor is currently the live-tracking kind");
+      ok(state.cursorT != null, "sanity: a cursor time is set");
+      setLiveTrackEnabled(false);
+      eq(state.liveTrackCursor, false, "live-track flag cleared once tracking turns off");
+      eq(state.cursorT, null, "cursor itself cleared, not just left frozen in place");
+    } finally {
+      setLiveTrackEnabled(realEnabled);
+      state.cursorT = realCursorT;
+      state.liveTrackCursor = realLiveTrackCursor;
+    }
+  });
+
+  await T("turning Live tracking off leaves a manually-placed cursor alone", async () => {
+    const realEnabled = liveTrackEnabled;
+    const realCursorT = state.cursorT;
+    const realLiveTrackCursor = state.liveTrackCursor;
+    try {
+      setLiveTrackEnabled(true);
+      await setCursor(MID, { liveTrack: false }); // a manual click, not live-tracking's own
+      eq(state.liveTrackCursor, false, "sanity: manual cursor, not live-tracking's");
+      setLiveTrackEnabled(false);
+      eq(state.cursorT, MID, "manual cursor position untouched by turning tracking off");
+    } finally {
+      setLiveTrackEnabled(realEnabled);
+      state.cursorT = realCursorT;
+      state.liveTrackCursor = realLiveTrackCursor;
+    }
+  });
   await T("host block stays hidden without host series", () => {
     drawAll();
     eq(hostBlockEl.hidden, true);
@@ -376,7 +781,6 @@
     mouse(c, "mousedown", x);
     mouse(c, "mouseup", x);
     near(state.cursorT, MID, 60000, "cursor near clicked time");
-    ok($("cursor-label").textContent.includes("UTC"), "cursor label set");
   });
 
   await T("drag on a strip zooms to the selection", () => {
@@ -437,7 +841,11 @@
     near((state.view.t0 + state.view.t1) / 2, t, 2000);
   });
 
-  await T("chart right-click offers snapshot/zoom entries", () => {
+  await T("chart right-click offers capture/snapshot entries, no zoom entries", () => {
+    // Zoom in/out/reset used to be menu items here too -- removed on
+    // request; zoomAt()/resetZoom() themselves are untouched (still
+    // reachable via plain drag-to-zoom and the View > Actual Size /
+    // Ctrl+0 menubar action), just no longer duplicated into this menu.
     setView(R.min_ts, R.max_ts);
     const c = stripCanvases[0];
     mouse(c, "contextmenu", tToX(MID));
@@ -445,7 +853,8 @@
     ok(menu, "menu open");
     const labels = [...menu.querySelectorAll("button")].map((b) => b.textContent).join("|");
     ok(labels.includes("snapshot"), labels);
-    ok(labels.includes("Reset zoom"), labels);
+    ok(labels.includes("Capture metrics"), labels);
+    ok(!labels.includes("zoom") && !labels.includes("Zoom"), labels);
     closeCtxMenu();
   });
 
@@ -477,6 +886,61 @@
     ok(r.index != null && r.index >= 0, "found an INFO row");
     const none = await get(`/logs/find?source=${sid}&q=__no_such_text__`);
     eq(none.index, null);
+  });
+
+  /* ── formatLogEntryText: JSON log lines pretty-printed in the row tooltip
+     (the compact virtualized row itself stays raw, unaffected) ──────────── */
+
+  await T("formatLogEntryText leaves plain, non-JSON text alone", () => {
+    eq(formatLogEntryText("plain text, not JSON at all"), "plain text, not JSON at all");
+    eq(formatLogEntryText('{"unterminated": '), '{"unterminated": ');
+    eq(formatLogEntryText("[1, 2, 3]"), "[1, 2, 3]", "a JSON array isn't a set of fields to pretty-print");
+    eq(formatLogEntryText("{}"), "{}", "an empty object has no fields to show, left as-is");
+  });
+
+  await T("formatLogEntryText pretty-prints a plain JSON object, one 'key: value' line per field, defaulting to INFO", () => {
+    const text = JSON.stringify({ a: "1", b: "2", c: "3" });
+    eq(formatLogEntryText(text), "INFO:  a: 1\n        b: 2\n        c: 3");
+  });
+
+  await T("formatLogEntryText unwraps a log line that's been JSON-encoded an extra time by an upstream shipper", () => {
+    const doubleEncoded = JSON.stringify(JSON.stringify({ a: "1", b: "2" }));
+    eq(formatLogEntryText(doubleEncoded), "INFO:  a: 1\n        b: 2");
+  });
+
+  await T("formatLogEntryText prefers a well-known level-shaped key over a value that merely looks like a level token", () => {
+    eq(formatLogEntryText(JSON.stringify({ level: "warning", status: "OK" })), "WARNING:  level: warning\n        status: OK");
+    eq(formatLogEntryText(JSON.stringify({ lvl: "error", a: "1" })), "ERROR:  lvl: error\n        a: 1");
+  });
+
+  await T("formatLogEntryText falls back to scanning values for a recognized level token when no level-shaped key exists", () => {
+    eq(formatLogEntryText(JSON.stringify({ uwsgi_status: "200", note: "ERROR" })), 'ERROR:  uwsgi_status: 200\n        note: ERROR');
+  });
+
+  await T("formatLogEntryText never mangles URLs/paths in a field's value -- only JSON's own escaping is undone", () => {
+    const text = JSON.stringify({ uwsgi_uri: "/api/v2/pipeline/341074", uwsgi_referer: "https://cembalo.dev.finmod.eu.scor.local/r/" });
+    const out = formatLogEntryText(text);
+    ok(out.includes("uwsgi_uri: /api/v2/pipeline/341074"), out);
+    ok(out.includes("uwsgi_referer: https://cembalo.dev.finmod.eu.scor.local/r/"), out);
+  });
+
+  await T("formatLogEntryText stringifies a nested object/array value inline rather than recursing into it", () => {
+    eq(formatLogEntryText(JSON.stringify({ a: "1", tags: ["x", "y"] })), 'INFO:  a: 1\n        tags: ["x","y"]');
+  });
+
+  await T("a log row's tooltip uses formatLogEntryText's output, not the raw row text, alongside the ISO timestamp", async () => {
+    const p = [...panels.values()][0];
+    await p.render();
+    const firstRow = p.body.querySelector(".log-row");
+    ok(firstRow, "at least one row rendered");
+    // dataIndexAt(0), not page(0)[0] -- logs display newest-first by
+    // default (this.reversed), so the first *rendered* row is the highest
+    // data index, not the lowest.
+    const dataIdx = p.dataIndexAt(0);
+    const page = await p.page(Math.floor(dataIdx / PAGE));
+    const row = page[dataIdx % PAGE];
+    eq(firstRow.title, new Date(row.ts).toISOString() + "\n" + formatLogEntryText(row.text)
+      + "\n(ctrl/cmd-click to select, shift-click to select a range, right-click for actions)");
   });
 
   await T("selecting log entries opens a time-anchored context menu, centered on their timestamps", async () => {
@@ -558,11 +1022,11 @@
 
   /* ── set-sources dialog logic ─────────────────────────────────────────── */
 
-  await T("Set Docker Daemon dialog opens with the form empty and disabled", () => {
+  await T("Set Docker Host dialog opens with the form empty and disabled", () => {
     $("btn-set").click();
     try {
       eq($("docker-targets").innerHTML, "", "targets empty");
-      eq($("dlg-ok").disabled, true, "Set Docker Daemon disabled");
+      eq($("dlg-ok").disabled, true, "Set Docker Host disabled");
       // only Docker host / SSH key / Fetch stay usable up front
       eq($("docker-host").disabled, false, "host stays enabled");
       eq($("docker-ssh-key").disabled, false, "ssh key stays enabled");
@@ -586,11 +1050,11 @@
       $("btn-set").click();
       $("docker-host").value = ""; // empty -- the gateway/local daemon is used
       await listContainers();
-      eq($("dlg-ok").disabled, true, "Set Docker Daemon stays disabled -- nothing checked yet, nothing to collect");
+      eq($("dlg-ok").disabled, true, "Set Docker Host stays disabled -- nothing checked yet, nothing to collect");
       ok($("docker-targets").textContent.includes("demo"), "fetched container listed");
       $("docker-targets").querySelector('input[value="demo"]').checked = true;
       $("docker-targets").querySelector('input[value="demo"]').dispatchEvent(new Event("change"));
-      eq($("dlg-ok").disabled, false, "Set Docker Daemon enabled once at least one container is checked");
+      eq($("dlg-ok").disabled, false, "Set Docker Host enabled once at least one container is checked");
     } finally {
       post = realPost;
       get = realGet;
@@ -638,7 +1102,7 @@
     }
   });
 
-  await T("clicking a group title in the Docker Daemon checklist toggles every checkbox in that group", async () => {
+  await T("clicking a group title in the Docker Host checklist toggles every checkbox in that group", async () => {
     const realPost = post;
     const realGet = get;
     post = async (path, body) => {
@@ -674,7 +1138,7 @@
     }
   });
 
-  await T("Set/Update Docker Daemon stays disabled with nothing checked, including via the group-select-all header", async () => {
+  await T("Set/Update Docker Host stays disabled with nothing checked, including via the group-select-all header", async () => {
     const realPost = post;
     const realGet = get;
     post = async (path, body) => {
@@ -704,35 +1168,47 @@
     }
   });
 
-  await T("Edit Docker Daemon pre-fills and locks host/ssh-key, relabels buttons", async () => {
+  await T("Edit Docker Host pre-fills and locks host/ssh-key, relabels buttons", async () => {
     const fakeSrc = { id: "__edit_test", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
     state.sources.push(fakeSrc);
     syncDockerDaemonButtons(); // a real app calls this via refreshAll() whenever state.sources changes
+    // currentDockerHost() now reflects state.activeDockerHost (br-DHOST-030
+    // -- set on connect/edit, not derived from state.sources, since
+    // multiple hosts can be open at once) -- a real connect/edit flow sets
+    // this itself; simulated directly here since dlg-ok isn't exercised.
+    const savedActiveHost = state.activeDockerHost;
+    state.activeDockerHost = "ssh://u@h";
     dockerHostKeys.set("ssh://u@h", "/path/to/key");
-    // Opening Edit Docker Daemon now always runs an immediate live Refresh
-    // (see btn-edit-docker-daemon's onclick) -- mocked here since this test
-    // isn't about that probe itself, just the form's fields/labels.
+    // Edit Docker Host runs an immediate live Refresh on open (see
+    // enterDockerHostEditMode) -- mocked here since this test isn't about
+    // that probe itself, just the form's fields/labels.
     const realPost = post;
     const realGet = get;
     post = async (path, body) => (path === "/docker/ps" ? { containers: [], services: [], log: [] } : realPost(path, body));
     get = async (path) => (path === "/transforms" ? { transforms: [] } : realGet(path));
     try {
       eq(currentDockerHost(), "ssh://u@h", "host resolved correctly (not truncated to 'ssh:')");
-      eq($("btn-edit-docker-daemon").disabled, false, "Edit enabled once a daemon is being watched");
+      eq($("btn-set").disabled, false, "New Docker Host always stays enabled");
+      eq($("btn-edit-docker-host").disabled, false, "Edit Docker Host enabled once a daemon is being watched");
       eq($("btn-clear-sources").disabled, false, "Remove enabled once a daemon is being watched");
-      await $("btn-edit-docker-daemon").onclick();
+      // Goes through the sidebar button's own wired handler, not
+      // enterDockerHostEditMode directly -- catches wiring regressions
+      // (BUG-0087: btn-edit-docker-host had no onclick at all, only the
+      // status-bar pill's context-menu entry called openEditDockerHostDialog).
+      await $("btn-edit-docker-host").onclick();
       eq($("docker-host").value, "u@h", "host prefilled (scheme stripped for editing)");
       eq($("docker-host").disabled, true, "host locked");
       eq($("docker-ssh-key").value, "/path/to/key", "ssh key prefilled");
       eq($("docker-ssh-key").disabled, true, "ssh key locked");
       eq($("docker-ssh-key-browse").disabled, true, "browse locked");
-      eq($("btn-ps-refresh").textContent, "Refresh", "Fetch relabeled Refresh");
-      eq($("dlg-ok").textContent, "Update Docker Daemon", "confirm relabeled");
-      eq($("dlg-set-title").textContent, "Edit Docker Daemon", "dialog titled for editing, not creating");
+      eq($("btn-ps-refresh").textContent, "Refresh Sources", "Fetch relabeled Refresh Sources");
+      eq($("dlg-ok").textContent, "Update Docker Host", "confirm relabeled");
+      eq($("dlg-set-title").textContent, "Edit Docker Host", "dialog titled for editing, not creating");
     } finally {
       post = realPost;
       get = realGet;
       state.sources = state.sources.filter((s) => s.id !== "__edit_test");
+      state.activeDockerHost = savedActiveHost;
       syncDockerDaemonButtons();
       dockerHostKeys.delete("ssh://u@h");
       dlg.close();
@@ -741,19 +1217,183 @@
     }
   });
 
-  await T("Edit/Remove Docker Daemon are disabled when no daemon is being watched", () => {
+  await T("Edit/Disconnect Docker Host are disabled when no daemon is being watched, New Docker Host stays enabled", () => {
     ok(!hasDockerDaemon(), "no docker:// source open in this suite's baseline state");
-    eq($("btn-edit-docker-daemon").disabled, true, "Edit disabled");
-    eq($("btn-clear-sources").disabled, true, "Remove disabled");
+    eq($("btn-set").disabled, false, "New Docker Host stays enabled -- always opens a blank create form");
+    eq($("btn-edit-docker-host").disabled, true, "nothing to edit yet");
+    eq($("btn-clear-sources").disabled, true, "nothing to disconnect yet");
   });
 
-  await T("Edit Docker Daemon pre-fills immediately, then its automatic Refresh confirms both containers still exist, marking only the persisted-selected one with a checkmark", async () => {
+  await T("Remove Docker Host also forgets the daemon server-side, not just the local catalog (br-REDIS-017)", async () => {
+    const hostKey = "ssh://e2e@removeme";
+    await window.cttc.recordDockerHost({ hostKey, host: hostKey, sshKey: null, transforms: [] });
+
+    const realConfirm = window.confirm;
+    const realPost = post;
+    const calls = [];
+    window.confirm = () => true;
+    // Stubbed rather than forwarded to the real server: this hostKey never
+    // matches the suite's actual active daemon (there is none, in this
+    // suite's baseline), so the handler's own "close every current source"
+    // branch never fires for it regardless -- stubbing just keeps this test
+    // from depending on that, and from ever touching the real demo sources
+    // every other test in this file relies on staying open.
+    post = async (path, body) => {
+      calls.push({ path, body });
+      return {};
+    };
+    try {
+      await populateRemoveDaemonSelect();
+      $("remove-daemon-select").value = hostKey;
+      $("remove-daemon-select").onchange();
+      await $("dlg-remove-daemon-delete").onclick();
+      ok(
+        calls.some((c) => c.path === "/docker/forget" && c.body.host === hostKey),
+        `expected a POST /docker/forget for ${hostKey}: ${JSON.stringify(calls)}`
+      );
+      ok(!(await dockerHostHistory()).some((e) => e.hostKey === hostKey), "removed from the local catalog too");
+    } finally {
+      window.confirm = realConfirm;
+      post = realPost;
+      if (dlgRemoveDaemon.open) dlgRemoveDaemon.close();
+    }
+  });
+
+  await T("confirmAbandonRecordingIfAny is a no-op while idle, and gates on accept/decline while recording (ui-REC-018)", async () => {
+    const realConfirm = window.confirm;
+    const realScratch = recordingScratchPath, realWrite = writeRecordingBytes, realRead = readRecordingBytes;
+    const store = {};
+    recordingScratchPath = async () => "/fake/abandon-scratch.cttc-record";
+    readRecordingBytes = async (p) => { if (!(p in store)) throw new Error("no such file"); return store[p]; };
+    writeRecordingBytes = async (p, bytes) => { store[p] = bytes; };
+    let calls = [];
+    try {
+      eq(recording.status, "idle", "sanity");
+      window.confirm = (m) => { calls.push(m); return true; };
+      eq(await confirmAbandonRecordingIfAny("Test action"), true, "no-op while idle");
+      eq(calls.length, 0, "no confirm dialog while idle");
+
+      await startRecording();
+      calls = [];
+      window.confirm = (m) => { calls.push(m); return false; };
+      eq(await confirmAbandonRecordingIfAny("Test action"), false, "declining aborts");
+      eq(recording.status, "recording", "declined -- recording untouched");
+      ok(calls[0].includes("Test action"), `warning cites the caller's action label: ${calls[0]}`);
+
+      calls = [];
+      window.confirm = (m) => { calls.push(m); return true; };
+      eq(await confirmAbandonRecordingIfAny("Test action"), true, "accepting proceeds");
+      eq(recording.status, "idle", "accepted -- recording discarded");
+      eq(recording.path, null);
+    } finally {
+      window.confirm = realConfirm;
+      recordingScratchPath = realScratch;
+      writeRecordingBytes = realWrite;
+      readRecordingBytes = realRead;
+      if (recording.status !== "idle") await discardRecording();
+    }
+  });
+
+  await T("Removing the active Docker host warns that it abandons the running recording; an inactive one doesn't (ui-REC-018)", async () => {
+    const activeKey = "ssh://u@abandon-active";
+    await window.cttc.recordDockerHost({ hostKey: activeKey, host: activeKey, sshKey: null, transforms: [] });
+    await window.cttc.recordDockerHost({ hostKey: "ssh://u@other-daemon", host: "ssh://u@other-daemon", sshKey: null, transforms: [] });
+    const fakeSrc = { id: "__abandon_active", path: `docker://${activeKey}/stats`, kind: "stats", live: true };
+    state.sources.push(fakeSrc);
+    dockerHostKeys.set(activeKey, "/path/to/key");
+    // currentDockerHost() (which remove-dialog.ts's own activeHostKey is
+    // built from) now reflects state.activeDockerHost, not state.sources
+    // (br-DHOST-030) -- simulated directly here since dlg-ok isn't exercised.
+    const savedActiveHost = state.activeDockerHost;
+    state.activeDockerHost = activeKey;
+
+    const realConfirm = window.confirm, realPost = post;
+    const realScratch = recordingScratchPath, realWrite = writeRecordingBytes, realRead = readRecordingBytes;
+    const store = {};
+    recordingScratchPath = async () => "/fake/abandon-scratch-2.cttc-record";
+    readRecordingBytes = async (p) => { if (!(p in store)) throw new Error("no such file"); return store[p]; };
+    writeRecordingBytes = async (p, bytes) => { store[p] = bytes; };
+    post = async (path, body) => (path === "/docker/forget" ? {} : realPost(path, body));
+    let calls = [];
+    window.confirm = (m) => { calls.push(m); return true; };
+    try {
+      eq(currentDockerHost(), activeKey, "sanity: our fake source is the active host");
+
+      // Inactive entry: no recording-abandon warning at all.
+      await startRecording();
+      calls = [];
+      await populateRemoveDaemonSelect();
+      $("remove-daemon-select").value = "ssh://u@other-daemon";
+      $("remove-daemon-select").onchange();
+      await $("dlg-remove-daemon-delete").onclick();
+      ok(!calls.some((m) => m.includes("abandon")), `expected no abandon warning for an inactive daemon: ${JSON.stringify(calls)}`);
+      eq(recording.status, "recording", "removing an inactive daemon left the recording running");
+
+      // Active entry: warns, then (on accept) discards before the normal confirm.
+      calls = [];
+      await populateRemoveDaemonSelect();
+      $("remove-daemon-select").value = activeKey;
+      $("remove-daemon-select").onchange();
+      await $("dlg-remove-daemon-delete").onclick();
+      eq(calls.length, 2, `expected the abandon warning + the normal "forget this daemon" confirm: ${JSON.stringify(calls)}`);
+      ok(calls[0].includes("abandon"), `first confirm is the recording warning: ${calls[0]}`);
+      eq(recording.status, "idle", "accepted -- recording discarded");
+    } finally {
+      window.confirm = realConfirm;
+      post = realPost;
+      recordingScratchPath = realScratch;
+      writeRecordingBytes = realWrite;
+      readRecordingBytes = realRead;
+      if (recording.status !== "idle") await discardRecording();
+      state.sources = state.sources.filter((s) => s.id !== "__abandon_active");
+      state.activeDockerHost = savedActiveHost;
+      dockerHostKeys.delete(activeKey);
+      // Both were already retired above via the dialog's own delete handler --
+      // this is belt-and-braces in case an assertion threw before either ran.
+      await window.cttc.retireDockerHost(activeKey);
+      await window.cttc.retireDockerHost("ssh://u@other-daemon");
+      await refreshAll();
+      if (dlgRemoveDaemon.open) dlgRemoveDaemon.close();
+    }
+  });
+
+  await T("Remove Docker Host never calls /docker/forget for 'This machine' (never remembered server-side)", async () => {
+    await window.cttc.recordDockerHost({ hostKey: "local", host: null, sshKey: null, transforms: [] });
+
+    const realConfirm = window.confirm;
+    const realPost = post;
+    const calls = [];
+    window.confirm = () => true;
+    // Stubbed, not forwarded: with no active docker daemon in this suite's
+    // baseline, currentDockerHost() falls back to "local" too, so picking
+    // "local" here would otherwise trip the handler's "close every current
+    // source" branch and tear down the demo sources every other test in
+    // this file depends on -- this test only cares what path gets posted.
+    post = async (path, body) => {
+      calls.push({ path, body });
+      return {};
+    };
+    try {
+      await populateRemoveDaemonSelect();
+      $("remove-daemon-select").value = "local";
+      $("remove-daemon-select").onchange();
+      await $("dlg-remove-daemon-delete").onclick();
+      ok(!calls.some((c) => c.path === "/docker/forget"), JSON.stringify(calls));
+    } finally {
+      window.confirm = realConfirm;
+      post = realPost;
+      if (dlgRemoveDaemon.open) dlgRemoveDaemon.close();
+    }
+  });
+
+  await T("Edit Docker Host pre-fills immediately, then its automatic Refresh confirms both containers still exist, marking only the persisted-selected one with a checkmark", async () => {
     const fakeStats = { id: "__prefill_stats", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
     const fakeContainer = { id: "__prefill_c", path: "docker://ssh://u@h/container/demo-c", name: "demo-c", kind: "log", live: true };
     const fakeService = { id: "__prefill_s", path: "docker://ssh://u@h/service/demo-svc", name: "demo-svc", kind: "log", live: true };
     state.sources.push(fakeStats, fakeContainer, fakeService);
     syncDockerDaemonButtons();
     dockerHostKeys.set("ssh://u@h", "/path/to/key");
+    state.activeDockerHost = "ssh://u@h"; // br-DHOST-030: currentDockerHost() now reflects this, not state.sources
     // demo-c is in the persisted [user]@[gateway]-containers.json (actually
     // selected); demo-svc is merely followed (e.g. previously unselected
     // from the legend) -- the checklist must reflect that distinction, not
@@ -762,9 +1402,9 @@
     loadSelectedTargets = async () => ({ containers: new Set(["demo-c"]), services: new Set() });
     const realPost = post;
     const realGet = get;
-    // The live daemon still has both -- opening Edit Docker Daemon runs
-    // this automatically (see btn-edit-docker-daemon), so the pre-fill and
-    // the confirmed post-Refresh state should agree.
+    // The live daemon still has both -- Edit Docker Host runs an immediate
+    // live Refresh on open (see enterDockerHostEditMode), so the pre-fill
+    // and the confirmed post-Refresh state should agree.
     post = async (path, body) => {
       if (path === "/docker/ps") {
         return { containers: [{ id: "c", name: "demo-c" }], services: [{ id: "s", name: "demo-svc" }], log: [] };
@@ -773,7 +1413,7 @@
     };
     get = async (path) => (path === "/transforms" ? { transforms: [] } : realGet(path));
     try {
-      await $("btn-edit-docker-daemon").onclick();
+      await enterDockerHostEditMode(currentDockerHost() || "local");
       const text = $("docker-targets").textContent;
       ok(text.includes("demo-c"), `container pre-filled: ${text}`);
       ok(text.includes("demo-svc"), `service pre-filled: ${text}`);
@@ -793,17 +1433,19 @@
       state.sources = state.sources.filter((s) => !s.id.startsWith("__prefill_"));
       syncDockerDaemonButtons();
       dockerHostKeys.delete("ssh://u@h");
+      state.activeDockerHost = "local";
       dlg.close();
       $("btn-set").click();
       dlg.close();
     }
   });
 
-  await T("Refresh in Edit Docker Daemon re-fetches, leaves checkboxes selectable, and keeps host/ssh-key locked", async () => {
+  await T("Refresh in Edit Docker Host re-fetches, leaves checkboxes selectable, and keeps host/ssh-key locked", async () => {
     const fakeSrc = { id: "__edit_test2", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
     state.sources.push(fakeSrc);
     syncDockerDaemonButtons();
     dockerHostKeys.set("ssh://u@h", "/path/to/key");
+    state.activeDockerHost = "ssh://u@h"; // br-DHOST-030: currentDockerHost() now reflects this, not state.sources
     const realPost = post;
     const realGet = get;
     post = async (path, body) => {
@@ -812,8 +1454,8 @@
     };
     get = async (path) => (path === "/transforms" ? { transforms: [] } : realGet(path));
     try {
-      // opening Edit Docker Daemon already runs this live probe automatically
-      await $("btn-edit-docker-daemon").onclick();
+      // opening the locked edit view already runs this live probe automatically
+      await enterDockerHostEditMode(currentDockerHost() || "local");
       let cb = $("docker-targets").querySelector("input[type=checkbox]");
       ok(cb, "checkbox rendered from the automatic Refresh on open");
       eq(cb.disabled, false, "checkbox is selectable, not locked, in edit mode");
@@ -830,6 +1472,7 @@
       state.sources = state.sources.filter((s) => s.id !== "__edit_test2");
       syncDockerDaemonButtons();
       dockerHostKeys.delete("ssh://u@h");
+      state.activeDockerHost = "local";
       dlg.close();
       $("btn-set").click();
       dlg.close();
@@ -842,6 +1485,7 @@
     state.sources.push(fakeContainerA, fakeContainerB);
     syncDockerDaemonButtons();
     dockerHostKeys.set("ssh://u@h", "/path/to/key");
+    state.activeDockerHost = "ssh://u@h"; // br-DHOST-030: currentDockerHost() now reflects this, not state.sources
     // demo-a is persisted-selected; demo-b was merely followed, never
     // persisted-selected -- per spec, if it's gone and NOT in the file, it
     // must be omitted entirely, not shown disabled.
@@ -859,9 +1503,9 @@
     };
     get = async (path) => (path === "/transforms" ? { transforms: [] } : realGet(path));
     try {
-      // Edit Docker Daemon's automatic Refresh on open already runs the
+      // enterDockerHostEditMode's automatic Refresh on open already runs the
       // live probe above.
-      await $("btn-edit-docker-daemon").onclick();
+      await enterDockerHostEditMode(currentDockerHost() || "local");
       await until(() => $("docker-targets").textContent.includes("demo-c"), "checklist reflects the live daemon after opening");
       const boxes = [...$("docker-targets").querySelectorAll("input[type=checkbox]")];
       const names = boxes.map((cb) => cb.value);
@@ -876,6 +1520,7 @@
       state.sources = state.sources.filter((s) => !s.id.startsWith("__diff_"));
       syncDockerDaemonButtons();
       dockerHostKeys.delete("ssh://u@h");
+      state.activeDockerHost = "local";
       dlg.close();
       $("btn-set").click();
       dlg.close();
@@ -887,6 +1532,7 @@
     state.sources.push(fakeContainerA);
     syncDockerDaemonButtons();
     dockerHostKeys.set("ssh://u@h", "/path/to/key");
+    state.activeDockerHost = "ssh://u@h"; // br-DHOST-030: currentDockerHost() now reflects this, not state.sources
     const realLoadSelectedTargets = loadSelectedTargets;
     loadSelectedTargets = async () => ({ containers: new Set(["demo-a"]), services: new Set() });
     const realPost = post;
@@ -898,7 +1544,7 @@
     };
     get = async (path) => (path === "/transforms" ? { transforms: [] } : realGet(path));
     try {
-      await $("btn-edit-docker-daemon").onclick(); // runs the live probe above immediately
+      await enterDockerHostEditMode(currentDockerHost() || "local"); // runs the live probe above immediately
       const cb = $("docker-targets").querySelector('input[value="demo-a"]');
       ok(cb, "demo-a still shown, not silently dropped, since it was persisted-selected");
       eq(cb.disabled, true, "shown disabled -- it can't actually be followed anymore");
@@ -916,19 +1562,21 @@
       state.sources = state.sources.filter((s) => !s.id.startsWith("__gone_"));
       syncDockerDaemonButtons();
       dockerHostKeys.delete("ssh://u@h");
+      state.activeDockerHost = "local";
       dlg.close();
       $("btn-set").click();
       dlg.close();
     }
   });
 
-  await T("opening Edit Docker Daemon: persisted-selected stays checked, a followed-but-never-persisted-selected container comes back unchecked, and one no longer returned is removed from the graph but shown disabled only if it was persisted-selected", async () => {
+  await T("opening Edit Docker Host: persisted-selected stays checked, a followed-but-never-persisted-selected container comes back unchecked, and one no longer returned is removed from the graph but shown disabled only if it was persisted-selected", async () => {
     const stillSelected = { id: "__combo_sel", path: "docker://ssh://u@h/container/still-selected", name: "still-selected", kind: "log", live: true };
     const wasUnselected = { id: "__combo_unsel", path: "docker://ssh://u@h/container/was-unselected", name: "was-unselected", kind: "log", live: true };
     const nowGone = { id: "__combo_gone", path: "docker://ssh://u@h/container/now-gone", name: "now-gone", kind: "log", live: true };
     state.sources.push(stillSelected, wasUnselected, nowGone);
     syncDockerDaemonButtons();
     dockerHostKeys.set("ssh://u@h", "/path/to/key");
+    state.activeDockerHost = "ssh://u@h"; // br-DHOST-030: currentDockerHost() now reflects this, not state.sources
     // Mirrors the real flow: still-selected and now-gone were persisted
     // (ticked and Set/Updated); was-unselected was followed but never
     // actually ticked/persisted.
@@ -945,7 +1593,7 @@
     };
     get = async (path) => (path === "/transforms" ? { transforms: [] } : realGet(path));
     try {
-      await $("btn-edit-docker-daemon").onclick(); // auto-refreshes immediately, no manual Refresh click needed
+      await enterDockerHostEditMode(currentDockerHost() || "local"); // auto-refreshes immediately, no manual Refresh click needed
       const byName = (n) => $("docker-targets").querySelector(`input[value="${n}"]`);
       eq(byName("still-selected").checked, true, "persisted-selected -> stays checked");
       eq(byName("still-selected").disabled, false, "still there server-side -> interactive");
@@ -965,6 +1613,7 @@
       state.sources = state.sources.filter((s) => !s.id.startsWith("__combo_"));
       syncDockerDaemonButtons();
       dockerHostKeys.delete("ssh://u@h");
+      state.activeDockerHost = "local";
       dlg.close();
       $("btn-set").click();
       dlg.close();
@@ -980,36 +1629,246 @@
     }
   });
 
-  await T("Set Docker Daemon (create mode) is never left showing edit-mode labels/locks", () => {
+  await T("New Docker Host (create mode) is never left showing edit-mode labels/locks", async () => {
     $("btn-set").click();
+    // openNewDockerHostDialog doesn't await populating/hiding the Load
+    // Docker Host row (an IPC round-trip) before returning -- give it a
+    // moment before checking it below.
+    await sleep(20);
     try {
       eq($("docker-host").disabled, false, "host unlocked");
       eq($("docker-ssh-key").disabled, false, "ssh key unlocked");
       eq($("docker-ssh-key-browse").disabled, false, "browse unlocked");
-      eq($("btn-ps-refresh").textContent, "Fetch", "Fetch label restored");
-      eq($("dlg-ok").textContent, "Set Docker Daemon", "confirm label restored");
-      eq($("dlg-set-title").textContent, "Set Docker Daemon", "dialog re-titled for creating, not editing");
+      eq($("btn-ps-refresh").textContent, "Fetch Sources", "Fetch Sources label restored");
+      eq($("dlg-ok").textContent, "Connect Docker Host", "confirm label restored");
+      eq($("dlg-set-title").textContent, "New Docker Host", "dialog re-titled for creating, not editing");
+      eq($("docker-host-history-row").hidden, true, "Load Docker Host never shown in New Docker Host");
     } finally {
       dlg.close();
     }
   });
 
-  await T("Set Docker Daemon is enabled only when no daemon is currently being watched", () => {
+  await T("New Docker Host always opens in create mode, never edit mode, regardless of whether a daemon is connected (br-DHOST-001/BUG-0067)", () => {
+    ok(!hasDockerDaemon(), "sanity: baseline has no docker daemon connected");
+    eq(dockerDaemonEditMode, false, "sanity: not already in edit mode from a prior test");
+    $("btn-set").click();
+    try {
+      eq(dockerDaemonEditMode, false, "edit mode never entered -- nothing to edit");
+      eq($("dlg-set-title").textContent, "New Docker Host", "dialog opened in create mode");
+    } finally {
+      dlg.close();
+    }
+  });
+
+  await T("Disconnect always clears a stale edit-mode lock, regardless of whether the dialog happens to be open (br-DHOST-001/BUG-0067)", async () => {
+    // #dlg-set is a showModal() dialog -- the toolbar's Disconnect button is
+    // structurally unreachable while it's open, so the realistic trigger is
+    // always "closed, but still carrying edit mode's lock state from before
+    // it was closed" (Cancel/OK don't reset it either -- only opening does).
+    // This mirrors that: an earlier Edit Docker Host session, closed, then
+    // the daemon it was editing gets disconnected.
+    ok(!dlg.open, "sanity: dialog is not open, matching showModal()'s modal-blocks-toolbar reality");
+    dockerDaemonEditMode = true;
+    $("docker-host").disabled = true;
+    $("docker-ssh-key").disabled = true;
+    $("docker-ssh-key-browse").disabled = true;
+    const fakeSrc = { id: "__disc_test", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
+    state.sources.push(fakeSrc);
+    const realConfirm = window.confirm;
+    const realPost = post;
+    window.confirm = () => true;
+    post = async (path, body) => (path === "/close" ? {} : realPost(path, body));
+    try {
+      await $("btn-clear-sources").onclick();
+      eq(dockerDaemonEditMode, false, "edit-mode flag cleared even though the dialog was never open to trigger the old dlg.open-gated reset");
+      eq($("docker-host").disabled, false, "host unlocked");
+      eq($("docker-ssh-key").disabled, false, "ssh key unlocked");
+      eq($("docker-ssh-key-browse").disabled, false, "browse unlocked");
+    } finally {
+      window.confirm = realConfirm;
+      post = realPost;
+      state.sources = state.sources.filter((s) => s.id !== "__disc_test");
+      syncDockerDaemonButtons();
+    }
+  });
+
+  await T("New Docker Host after a real Disconnect opens unlocked, with Load Docker Host never shown (reported regression)", async () => {
+    // Unlike the synthetic test above (which pre-sets dockerDaemonEditMode
+    // and the .disabled flags directly), this drives the actual sequence a
+    // user hits: really connected to a remote host (enterDockerHostEditMode
+    // locks the fields for real) -> real Disconnect -> reopen via the real
+    // btn-set click. Originally reported as: after Disconnect, both Docker
+    // host and SSH key stayed disabled on reopen whenever Load Docker Host
+    // had a previously-used entry to show and the user didn't pick one --
+    // New Docker Host now never shows that picker at all (Edit Docker Host's
+    // job instead), but must still always unlock the fields regardless.
+    await window.cttc.recordDockerHost({ hostKey: "ssh://u@h", host: "ssh://u@h", sshKey: "/path/to/key" });
+    const fakeSrc = { id: "__reconnect_test", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
+    state.sources.push(fakeSrc);
+    syncDockerDaemonButtons();
+    const realPost = post;
+    const realGet = get;
+    const realConfirm = window.confirm;
+    post = async (path, body) =>
+      path === "/docker/ps" ? { containers: [], services: [], log: [] } : path === "/close" ? {} : realPost(path, body);
+    get = async (path) => (path === "/transforms" ? { transforms: [] } : realGet(path));
+    window.confirm = () => true;
+    try {
+      // Really connect/lock the fields first, same as opening Edit Docker
+      // Host on the currently-active host would.
+      await enterDockerHostEditMode(currentDockerHost() || "local");
+      eq($("docker-host").disabled, true, "sanity: locked while editing the live daemon");
+      dlg.close();
+
+      // Real Disconnect, through the actual button handler.
+      await $("btn-clear-sources").onclick();
+
+      // Reopen via the real New Docker Host button -- no daemon left, so
+      // this must take the create-mode branch, not edit mode.
+      $("btn-set").click();
+      // openNewDockerHostDialog doesn't await populating/hiding the Load
+      // Docker Host row (an IPC round-trip) before returning -- give it a
+      // moment before checking it below.
+      await sleep(20);
+      try {
+        eq(dockerDaemonEditMode, false, "create mode, not edit mode -- nothing left to edit");
+        eq($("docker-host-history-row").hidden, true, "New Docker Host never shows Load Docker Host, history or not");
+        eq($("docker-host").disabled, false, "host stays editable");
+        eq($("docker-ssh-key").disabled, false, "ssh key stays editable");
+        eq($("docker-ssh-key-browse").disabled, false, "browse stays enabled");
+      } finally {
+        dlg.close();
+      }
+    } finally {
+      post = realPost;
+      get = realGet;
+      window.confirm = realConfirm;
+      await window.cttc.retireDockerHost("ssh://u@h");
+      dockerHostKeys.delete("ssh://u@h");
+      state.activeDockerHost = "local";
+      state.sources = state.sources.filter((s) => s.id !== "__reconnect_test");
+      syncDockerDaemonButtons();
+    }
+  });
+
+  await T("Disconnect still unlocks the dialog for next open even if closing one of several sources fails (reported regression)", async () => {
+    // Disconnect closes every open source with Promise.all(...post("/close"...))
+    // -- a remote host is disconnected precisely because it's flaky, so a
+    // single failing/timing-out close among several is a realistic real-
+    // world trigger, not a contrived one. The reset (dockerDaemonEditMode
+    // + unlocking host/ssh-key/browse) lived *after* that await, inside the
+    // same try -- one rejected close skipped straight to the catch's alert()
+    // and left the dialog locked for whatever opened next, contradicting
+    // ui-DHOST-026's "unconditionally clears" claim.
+    dockerDaemonEditMode = true;
+    $("docker-host").disabled = true;
+    $("docker-ssh-key").disabled = true;
+    $("docker-ssh-key-browse").disabled = true;
+    const srcA = { id: "__partial_a", path: "docker://ssh://u@h/container/a", kind: "log", live: true };
+    const srcB = { id: "__partial_b", path: "docker://ssh://u@h/container/b", kind: "log", live: true };
+    state.sources.push(srcA, srcB);
+    syncDockerDaemonButtons();
+    const realPost = post;
+    const realConfirm = window.confirm;
+    const realAlert = window.alert;
+    window.confirm = () => true;
+    window.alert = () => {};
+    post = async (path, body) => {
+      if (path === "/close" && body.id === "__partial_b") return Promise.reject(new Error("connection reset"));
+      return path === "/close" ? {} : realPost(path, body);
+    };
+    try {
+      await $("btn-clear-sources").onclick();
+      eq(dockerDaemonEditMode, false, "cleared even though one close call rejected");
+      eq($("docker-host").disabled, false, "host unlocked even though one close call rejected");
+      eq($("docker-ssh-key").disabled, false, "ssh key unlocked even though one close call rejected");
+      eq($("docker-ssh-key-browse").disabled, false, "browse unlocked even though one close call rejected");
+    } finally {
+      post = realPost;
+      window.confirm = realConfirm;
+      window.alert = realAlert;
+      state.sources = state.sources.filter((s) => s.id !== "__partial_a" && s.id !== "__partial_b");
+      syncDockerDaemonButtons();
+    }
+  });
+
+  await T("Cancelling out of Edit Docker Host clears dockerDaemonEditMode, so it can't leak into a later stale-lock scenario", async () => {
+    const fakeSrc = { id: "__cancel_test", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
+    state.sources.push(fakeSrc);
+    syncDockerDaemonButtons();
+    const realPost = post;
+    const realGet = get;
+    post = async (path, body) => (path === "/docker/ps" ? { containers: [], services: [], log: [] } : realPost(path, body));
+    get = async (path) => (path === "/transforms" ? { transforms: [] } : realGet(path));
+    try {
+      await enterDockerHostEditMode(currentDockerHost() || "local");
+      eq(dockerDaemonEditMode, true, "sanity: now in edit mode");
+      $("dlg-cancel").onclick();
+      eq(dockerDaemonEditMode, false, "cleared on cancel, not left stuck for whatever opens the dialog next");
+    } finally {
+      post = realPost;
+      get = realGet;
+      state.sources = state.sources.filter((s) => s.id !== "__cancel_test");
+      syncDockerDaemonButtons();
+      dockerHostKeys.delete("ssh://u@h");
+      state.activeDockerHost = "local";
+      if (dlg.open) dlg.close();
+    }
+  });
+
+  await T("Show activity stays enabled for the local daemon (empty host) without needing a fetch first", () => {
+    $("btn-set").click();
+    try {
+      eq($("docker-host").value, "", "sanity: fresh create-mode dialog starts with an empty (local) host");
+      eq($("activity-toggle").disabled, false, "empty host is a complete, valid target on its own -- no fetch needed to unlock");
+    } finally {
+      dlg.close();
+    }
+  });
+
+  await T("Show activity is disabled for a remote host until a Fetch attempt actually completes (br-DHOST-001/BUG-0067)", async () => {
+    $("btn-set").click();
+    try {
+      $("docker-host").value = "u@h";
+      $("docker-host").dispatchEvent(new Event("input"));
+      eq($("activity-toggle").disabled, true, "nothing to show for an untested remote target yet");
+      eq($("activity-toggle").checked, false, "force-unchecked when locked out");
+
+      const realPost = post;
+      post = async (path, body) =>
+        path === "/docker/ps" ? Promise.reject(Object.assign(new Error("boom"), { serverResponded: false })) : realPost(path, body);
+      try {
+        await listContainers();
+      } finally {
+        post = realPost;
+      }
+      // Unlocked even though the attempt failed -- the activity log of a
+      // failed attempt is exactly what Show activity is for, arguably more
+      // than a successful one.
+      eq($("activity-toggle").disabled, false, "unlocked once the attempt completes, success or not");
+    } finally {
+      dockerHostKeys.delete("ssh://u@h");
+      state.activeDockerHost = "local";
+      dlg.close();
+    }
+  });
+
+  await T("New Docker Host stays enabled regardless of whether a daemon is currently being watched -- always opens a blank create form, never edit mode", () => {
     ok(!hasDockerDaemon(), "no docker:// source open in this suite's baseline state");
     eq($("btn-set").disabled, false, "enabled -- nothing set yet");
     const fakeSrc = { id: "__setbtn_test", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
     state.sources.push(fakeSrc);
     syncDockerDaemonButtons(); // a real app calls this via refreshAll() whenever state.sources changes
     try {
-      eq($("btn-set").disabled, true, "disabled once a daemon is already being watched -- use Edit/Remove instead");
+      eq($("btn-set").disabled, false, "still enabled once a daemon is already being watched -- New Docker Host never depends on it");
     } finally {
       state.sources = state.sources.filter((s) => s.id !== "__setbtn_test");
       syncDockerDaemonButtons();
-      eq($("btn-set").disabled, false, "re-enabled once that daemon is gone");
+      eq($("btn-set").disabled, false, "stays enabled once that daemon is gone too");
     }
   });
 
-  await T("Set/Update Docker Daemon syncs the legend's track state to exactly what's checked -- a newly checked entry becomes selected (plotted), a just-unchecked one is demoted, not left stuck selected", async () => {
+  await T("Set/Update Docker Host syncs the legend's track state to exactly what's checked -- a newly checked entry becomes selected (plotted), a just-unchecked one is demoted, not left stuck selected", async () => {
     setTrack("was-selected", "sel"); // simulates a prior Set/Update that had this one checked
     const realPost = post;
     const realGet = get;
@@ -1046,19 +1905,29 @@
     }
   });
 
-  await T("activity log toggle reflects the last docker/ps call", async () => {
-    renderActivityLog(null);
-    eq($("btn-activity-toggle").hidden, true, "hidden with no activity");
-    eq($("docker-activity").hidden, true, "panel hidden with no activity");
+  await T("activity log toggle is always visible and drives the panel directly", async () => {
+    const toggle = $("activity-toggle");
+    const before = toggle.checked;
+    try {
+      toggle.checked = false;
+      renderActivityLog(null);
+      eq(toggle.hidden, false, "switch always visible, even with no activity");
+      eq($("docker-activity").hidden, true, "panel hidden while switch is off");
 
-    renderActivityLog([{ cmd: "docker ps --format json", returncode: 0, ms: 12, stderr: "" }]);
-    eq($("btn-activity-toggle").hidden, false, "toggle shown once there's activity");
-    ok($("docker-activity").textContent.includes("docker ps"), "logged command shown");
+      renderActivityLog([{ cmd: "docker ps --format json", returncode: 0, ms: 12, stderr: "" }]);
+      eq($("docker-activity").hidden, true, "still hidden -- rendering entries doesn't itself flip the switch");
+      ok($("docker-activity").textContent.includes("docker ps"), "logged command shown once revealed");
 
-    $("btn-activity-toggle").click();
-    eq($("docker-activity").hidden, false, "shown after toggle click");
-    $("btn-activity-toggle").click();
-    eq($("docker-activity").hidden, true, "hidden again after second click");
+      toggle.checked = true;
+      toggle.dispatchEvent(new Event("change"));
+      eq($("docker-activity").hidden, false, "shown once the switch is turned on");
+      toggle.checked = false;
+      toggle.dispatchEvent(new Event("change"));
+      eq($("docker-activity").hidden, true, "hidden again once turned off");
+    } finally {
+      toggle.checked = before;
+      toggle.dispatchEvent(new Event("change"));
+    }
   });
 
   await T("normalizeDockerHost defaults a schemeless host to ssh://", () => {
@@ -1159,7 +2028,7 @@
 
   /* ── sample round trip through the UI data model ──────────────────────── */
 
-  await T("sample export + load shows grayed sample sources", async () => {
+  await T("sample export + load tracks sample sources in the data model", async () => {
     const out = "/tmp/cttc-e2e-sample.cttc-metric";
     const r = await post("/sample/export", { path: out, from: R.min_ts, to: R.min_ts + 5 * 60000 });
     ok(r.sources >= 2, "exported sources");
@@ -1170,15 +2039,15 @@
       const sample = state.sources.find((s) => s.live === false);
       ok(sample, "sample source present and static");
       eq(isLiveSid(sample.id), false);
-      ok(sampleFileLabel(sample.id).includes("cttc-e2e-sample.cttc-metric"), "labeled with file");
+      ok(basename(sample.path).includes("cttc-e2e-sample.cttc-metric"), "source path reflects the loaded file");
       const groups = sampleFileGroups();
       eq(groups.length, 1, "one sample file group");
       ok(groups[0].ids.size >= 2, "group covers its sources");
-      eq(isSampleHidden(sample.id), false);
-      state.hiddenSamples.add(sample.path);
-      eq(isSampleHidden(sample.id), true, "hide toggle honors path");
-      state.hiddenSamples.delete(sample.path);
-      ok(Array.isArray(dashFor(sample.id)), "dash pattern assigned");
+      eq(isSampleHidden(sample.id), false, "the only loaded file becomes the active view (refreshAll's self-heal)");
+      eq(state.activeSamplePath, sample.path, "sanity: refreshAll picked this file as the active view");
+      state.activeSamplePath = "/some/other/path";
+      eq(isSampleHidden(sample.id), true, "hidden once a *different* path is the active view");
+      state.activeSamplePath = sample.path;
       renderLegend();
       ok(document.getElementById("sample-files"), "sample chip row rendered");
     } finally {
@@ -1202,7 +2071,7 @@
       ok(saved.bytes instanceof Uint8Array && saved.bytes.length > 0, "got real bytes");
       eq(saved.bytes[0], 0x50, "PK zip magic byte 1"); // 'P'
       eq(saved.bytes[1], 0x4b, "PK zip magic byte 2"); // 'K'
-      ok($("status").textContent.includes("metrics saved"), $("status").textContent);
+      ok($("app-status-bar-text").textContent.includes("metrics saved"), $("app-status-bar-text").textContent);
     } finally {
       saveBinaryFile = realSave;
       askExportOptions = realAsk;
@@ -1216,7 +2085,7 @@
     askExportOptions = async () => ({ includeHost: false, hadHost: false });
     try {
       await exportSample(R.min_ts, R.min_ts + 5 * 60000);
-      ok($("status").textContent.includes("canceled"), $("status").textContent);
+      ok($("app-status-bar-text").textContent.includes("canceled"), $("app-status-bar-text").textContent);
     } finally {
       saveBinaryFile = realSave;
       askExportOptions = realAsk;
@@ -1245,11 +2114,123 @@
     ok(!open.has("/some/local/never-opened.cttc-metric"), "sanity: local path form never matches");
   });
 
+  await T("Load Analysis accepts a .cttc-record file, not just .cttc-metric (ui-EXPORT-011)", async () => {
+    // Previously this button's client-side filter only kept ".cttc-metric"
+    // paths, silently dropping ".cttc-record" even though the button's own
+    // label ("Load Data...") advertises
+    // accepting both -- see ui-EXPORT-011's stale "silently dropped" bullet.
+    const t0 = R.min_ts;
+    const res = await fetch(`${API}/sample/record`, {
+      method: "POST", body: new Uint8Array(0),
+      headers: { "X-CTTC-From": String(t0), "X-CTTC-To": String(t0 + 60000) },
+    });
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const realPath = "/tmp/cttc-e2e-load-analysis.cttc-record";
+    await window.cttc.writeBinaryFile(realPath, bytes);
+
+    const realPick = pickAnalysisFiles;
+    pickAnalysisFiles = async () => [realPath];
+    try {
+      // Awaits the actual onclick handler directly (it's a plain async
+      // function reference, not a DOM-dispatched event) rather than
+      // .click()-and-poll -- .click() doesn't return its promise, so
+      // polling for a side effect risked this test's own cleanup below
+      // racing the handler's still-in-flight refreshAll()/centering.
+      await $("btn-load-sample").onclick();
+      ok(
+        state.sources.some((s) => s.path === `upload://${realPath.split("/").pop()}`),
+        "the .cttc-record file's source(s) actually opened, not silently dropped"
+      );
+    } finally {
+      pickAnalysisFiles = realPick;
+      const opened = state.sources.filter((s) => s.path === `upload://${realPath.split("/").pop()}`);
+      for (const s of opened) await post("/close", { id: s.id });
+      await refreshAll();
+    }
+  });
+
+  await T("Open Recording is deduped like Load Data -- re-opening an already-open file is a no-op, not a pile of duplicate sources", async () => {
+    // openRecording() used to call window.cttc.pickFiles directly with no
+    // dedup at all -- every click re-uploaded and opened a brand-new,
+    // independent set of sources for the same file, regardless of whether
+    // it was already open (reported: "keeps piling up every time I open
+    // it (containers repeat on the top above graph)").
+    const t0 = R.min_ts;
+    const res = await fetch(`${API}/sample/record`, {
+      method: "POST", body: new Uint8Array(0),
+      headers: { "X-CTTC-From": String(t0), "X-CTTC-To": String(t0 + 60000) },
+    });
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const realPath = "/tmp/cttc-e2e-open-recording-dedup.cttc-record";
+    await window.cttc.writeBinaryFile(realPath, bytes);
+
+    const realPick = pickRecordingFiles;
+    pickRecordingFiles = async () => [realPath];
+    try {
+      await openRecording();
+      const opened = state.sources.filter((s) => s.path === `upload://${realPath.split("/").pop()}`);
+      ok(opened.length > 0, "first open actually opened something");
+      await openRecording(); // re-open the exact same file
+      const stillOpen = state.sources.filter((s) => s.path === `upload://${realPath.split("/").pop()}`);
+      eq(stillOpen.length, opened.length, "re-opening the same file changed nothing -- no duplicate sources");
+    } finally {
+      pickRecordingFiles = realPick;
+      const opened = state.sources.filter((s) => s.path === `upload://${realPath.split("/").pop()}`);
+      for (const s of opened) await post("/close", { id: s.id });
+      await refreshAll();
+    }
+  });
+
+  await T("Opening a recording with no data for its time range says so, instead of silently vanishing (BUG-0089)", async () => {
+    // A segment whose window covers zero rows for every source (e.g. Stop
+    // hit before anything was actually captured) used to upload "fine"
+    // (opened:[], errors:[], needs_selection:[]) and openRecording() still
+    // unconditionally called setActiveView/refreshAll, switching into a
+    // blank analysis view with the file added nowhere -- reported as "I
+    // opened a recording and the system did not remember it at all: it is
+    // gone from Opened Metrics."
+    const emptyFrom = R.min_ts - 10_000_000;
+    const res = await fetch(`${API}/sample/record`, {
+      method: "POST", body: new Uint8Array(0),
+      headers: { "X-CTTC-From": String(emptyFrom), "X-CTTC-To": String(emptyFrom + 1000) },
+    });
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const realPath = "/tmp/cttc-e2e-empty-recording.cttc-record";
+    await window.cttc.writeBinaryFile(realPath, bytes);
+
+    const realPick = pickRecordingFiles;
+    const realAlert = window.alert;
+    const alerts = [];
+    pickRecordingFiles = async () => [realPath];
+    window.alert = (m) => alerts.push(m);
+    const beforeHidden = state.liveHidden;
+    const beforeCount = state.sources.length;
+    try {
+      await openRecording();
+      eq(state.sources.length, beforeCount, "no sources added for an empty recording");
+      ok(alerts.some((m) => m.includes("No data found")), `expected a "no data" alert, got: ${JSON.stringify(alerts)}`);
+      eq(state.liveHidden, beforeHidden, "view mode unchanged -- no forced switch into a blank analysis view");
+      ok(!sampleFileGroups().some((g) => g.path === `upload://${realPath.split("/").pop()}`), "never appears in Opened Metrics");
+    } finally {
+      pickRecordingFiles = realPick;
+      window.alert = realAlert;
+    }
+  });
+
   /* ── Recording (Start/Pause/Stop/Open Recording) ──────────────────────── */
 
-  await T("Record -> Pause -> Resume -> Stop writes a real 2-segment .cttc-record, menu state tracks it", async () => {
-    const realPick = pickRecordingSavePath, realRead = readRecordingBytes, realWrite = writeRecordingBytes;
+  await T("Record -> Pause -> Resume -> Stop writes a real 2-segment .cttc-record, filename is only asked at Stop", async () => {
+    // br-REC-UI-002: Start used to prompt for a save path immediately;
+    // every segment now flushes to a fixed scratch path instead (see
+    // main.js's RECORDING_SCRATCH_PATH), and the *real* destination is
+    // only asked for once, when Stop actually finalizes the recording.
+    const realScratch = recordingScratchPath,
+      realPick = pickRecordingSavePath,
+      realRead = readRecordingBytes,
+      realWrite = writeRecordingBytes;
     const store = {};
+    const scratchPath = "/fake/scratch.cttc-record";
+    recordingScratchPath = async () => scratchPath;
     pickRecordingSavePath = async () => "/fake/e2e-recording.cttc-record";
     readRecordingBytes = async (p) => {
       if (!(p in store)) throw new Error("no such file");
@@ -1258,28 +2239,72 @@
     writeRecordingBytes = async (p, bytes) => { store[p] = bytes; };
     try {
       eq(recording.status, "idle");
+      eq($("btn-start-recording").title, "Start Recording");
+      eq($("status-bar-recording-dot").hidden, true, "no dot while idle");
       await startRecording();
       eq(recording.status, "recording");
-      eq(recording.path, "/fake/e2e-recording.cttc-record");
+      eq(recording.path, scratchPath, "writes to the fixed scratch path, not a user-chosen one");
       eq($("btn-start-recording").disabled, true);
+      eq($("btn-start-recording").title, "Recording");
       eq($("btn-pause-recording").disabled, false);
+      eq($("btn-pause-recording").title, "Pause Recording");
       eq($("btn-stop-recording").disabled, false);
+      eq(recording.segments.length, 0, "no completed segment yet -- still recording the first one");
+      const firstSegmentStart = recording.segmentStart;
+      eq($("status-bar-recording-dot").hidden, false, "dot visible while recording");
+      eq($("status-bar-recording-dot").dataset.state, "recording");
+      eq($("status-bar-recording-text").hidden, false);
+      eq($("status-bar-recording-text").textContent, "recording", "no filename shown yet -- nothing's been chosen");
 
       await pauseRecording();
       eq(recording.status, "paused");
       eq($("btn-start-recording").disabled, false);
+      eq($("btn-start-recording").title, "Resume Recording");
       eq($("btn-pause-recording").disabled, true);
-      ok(store["/fake/e2e-recording.cttc-record"], "first segment flushed to the in-memory store");
-      const afterFirst = store["/fake/e2e-recording.cttc-record"];
+      eq($("btn-pause-recording").title, "Recording Paused");
+      eq($("btn-pause-recording").dataset.state, "paused");
+      // br-REC-UI-004: paused reads via the glyphs themselves (record
+      // button's ⏺ solid orange, pause button's/status bar's ⏸ blinking
+      // orange), not the small recording-dot -- the dot is hidden outright
+      // on both the toolbar button and the status bar while paused.
+      eq($("status-bar-recording-dot").hidden, true, "dot hidden while paused -- the pause glyph is the indicator instead");
+      eq($("status-bar-recording-glyph").hidden, false, "pause glyph shown while paused");
+      eq(getComputedStyle($("recording-glyph")).display, "inline", "record button's own glyph shown (not hidden) while paused");
+      eq(getComputedStyle($("recording-glyph")).color, getComputedStyle($("status-bar-recording-glyph")).color, "record button glyph is the same orange as the pause glyphs");
+      eq(getComputedStyle($("pause-glyph")).color, getComputedStyle($("status-bar-recording-glyph")).color, "pause button glyph matches too");
+      eq(getComputedStyle($("recording-glyph")).animationName, "none", "record button glyph is solid orange, not blinking");
+      eq(getComputedStyle($("pause-glyph")).animationName, "recording-pulse", "pause button glyph blinks");
+      eq(getComputedStyle($("status-bar-recording-glyph")).animationName, "recording-pulse", "status bar pause glyph blinks");
+      eq(getComputedStyle($("btn-pause-recording")).opacity, "1", "pause button reads at full vibrancy despite being disabled");
+      eq($("status-bar-recording-text").textContent, "recording paused");
+      ok(store[scratchPath], "first segment flushed to the scratch path");
+      const afterFirst = store[scratchPath];
       eq(afterFirst[0], 0x50, "PK zip magic byte 1");
+      // the completed segment is recorded for the highlight; segmentStart
+      // (the *next* segment's start, not yet known) is cleared meanwhile,
+      // leaving a genuine gap rather than painting through the pause
+      eq(recording.segments.length, 1, "first segment finalized for the highlight");
+      eq(recording.segments[0].from, firstSegmentStart);
+      ok(recording.segments[0].to > firstSegmentStart, "finalized with a real end time");
+      eq(recording.segmentStart, null, "no in-progress segment while paused -- pause gap stays unhighlighted");
 
       await startRecording(); // resume
       eq(recording.status, "recording");
+      eq($("btn-start-recording").title, "Recording");
+      eq(recording.segments.length, 1, "still just the one completed segment");
+      ok(recording.segmentStart >= recording.segments[0].to, "new segment starts at/after the pause gap");
+      eq($("status-bar-recording-dot").dataset.state, "recording", "dot back to recording on resume");
+      eq($("status-bar-recording-text").textContent, "recording");
+
       await stopRecording();
-      eq(recording.status, "idle");
+      eq(recording.status, "idle", "a save path was provided -- fully finalized");
       eq(recording.path, null);
+      eq(recording.segments.length, 0, "highlight cleared once actually stopped");
       eq($("btn-stop-recording").disabled, true);
+      eq($("status-bar-recording-dot").hidden, true, "dot hidden again once stopped");
+      eq($("status-bar-recording-text").hidden, true, "text hidden again once stopped");
       const afterSecond = store["/fake/e2e-recording.cttc-record"];
+      ok(afterSecond, "the chosen destination (not the scratch path) received the final bytes");
       ok(afterSecond.length >= afterFirst.length, "second segment appended, archive grew (or stayed same size)");
 
       // write the final in-memory bytes to a real path and confirm /open
@@ -1291,22 +2316,186 @@
       eq(openRes.needs_selection.length, 1);
       eq(openRes.needs_selection[0].segments.length, 2, "both flushed segments present");
     } finally {
+      recordingScratchPath = realScratch;
       pickRecordingSavePath = realPick;
       readRecordingBytes = realRead;
       writeRecordingBytes = realWrite;
     }
   });
 
-  await T("Start Recording without a chosen path stays idle (dialog cancelled)", async () => {
-    const realPick = pickRecordingSavePath;
-    pickRecordingSavePath = async () => null; // user closed the native dialog
+  await T("Recording N sections then Stop while paused writes exactly N segments, not N+1", async () => {
+    const realScratch = recordingScratchPath,
+      realPick = pickRecordingSavePath,
+      realRead = readRecordingBytes,
+      realWrite = writeRecordingBytes;
+    const store = {};
+    const scratchPath = "/fake/scratch-n-sections.cttc-record";
+    recordingScratchPath = async () => scratchPath;
+    pickRecordingSavePath = async () => "/fake/e2e-n-sections.cttc-record";
+    readRecordingBytes = async (p) => {
+      if (!(p in store)) throw new Error("no such file");
+      return store[p];
+    };
+    writeRecordingBytes = async (p, bytes) => { store[p] = bytes; };
     try {
-      await startRecording();
+      if (recording.status !== "idle") await stopRecording(); // clean baseline
+      const N = 3;
+      for (let i = 0; i < N; i++) {
+        await startRecording(); // first iteration starts, rest resume
+        await pauseRecording();
+      }
+      eq(recording.status, "paused", "ends paused -- Stop must not add a further segment");
+      await stopRecording(); // pressed once, while already paused
       eq(recording.status, "idle");
+
+      const finalBytes = store["/fake/e2e-n-sections.cttc-record"];
+      const realPath = "/tmp/cttc-e2e-n-sections.cttc-record";
+      await window.cttc.writeBinaryFile(realPath, finalBytes);
+      const openRes = await post("/open", { files: [{ path: realPath }] });
+      eq(openRes.needs_selection[0].segments.length, N, `expected exactly ${N} segments, one per Start/Pause cycle`);
     } finally {
+      recordingScratchPath = realScratch;
       pickRecordingSavePath = realPick;
+      readRecordingBytes = realRead;
+      writeRecordingBytes = realWrite;
     }
   });
+
+  await T("A brand-new recording does not inherit a previous recording's leftover segments from the shared scratch path (BUG-0076)", async () => {
+    const realScratch = recordingScratchPath,
+      realPick = pickRecordingSavePath,
+      realRead = readRecordingBytes,
+      realWrite = writeRecordingBytes;
+    const store = {};
+    // Both recordings reuse the *same* scratch path, matching real
+    // production behavior (main.js's RECORDING_SCRATCH_PATH is one fixed
+    // path for every recording, never re-chosen per session).
+    const scratchPath = "/fake/shared-scratch.cttc-record";
+    recordingScratchPath = async () => scratchPath;
+    readRecordingBytes = async (p) => {
+      if (!(p in store)) throw new Error("no such file");
+      return store[p];
+    };
+    writeRecordingBytes = async (p, bytes) => { store[p] = bytes; };
+    try {
+      if (recording.status !== "idle") await stopRecording(); // clean baseline
+
+      // First, complete and save a whole recording.
+      pickRecordingSavePath = async () => "/fake/e2e-first-recording.cttc-record";
+      await startRecording();
+      await pauseRecording();
+      await stopRecording();
+      eq(recording.status, "idle");
+      ok(store["/fake/e2e-first-recording.cttc-record"], "first recording saved");
+
+      // Second, completely independent recording -- the scratch path on
+      // disk still holds the first recording's finished bytes at this
+      // point (stopRecording never clears it).
+      pickRecordingSavePath = async () => "/fake/e2e-second-recording.cttc-record";
+      await startRecording();
+      await pauseRecording();
+      await stopRecording();
+      eq(recording.status, "idle");
+      const secondBytes = store["/fake/e2e-second-recording.cttc-record"];
+      ok(secondBytes, "second recording saved");
+
+      const realPath = "/tmp/cttc-e2e-second-recording.cttc-record";
+      await window.cttc.writeBinaryFile(realPath, secondBytes);
+      const openRes = await post("/open", { files: [{ path: realPath }] });
+      const segCount = openRes.needs_selection?.[0]?.segments?.length ?? 1;
+      ok(segCount === 1, `expected exactly 1 segment in the second recording, got ${segCount}: ${JSON.stringify(openRes.needs_selection)}`);
+      for (const id of openRes.opened) await post("/close", { id });
+    } finally {
+      recordingScratchPath = realScratch;
+      pickRecordingSavePath = realPick;
+      readRecordingBytes = realRead;
+      writeRecordingBytes = realWrite;
+    }
+  });
+
+  await T("Stop without choosing a save path stays 'stopped' -- the recording itself isn't lost, Stop can be retried", async () => {
+    const realScratch = recordingScratchPath,
+      realPick = pickRecordingSavePath,
+      realRead = readRecordingBytes,
+      realWrite = writeRecordingBytes;
+    const store = {};
+    const scratchPath = "/fake/scratch2.cttc-record";
+    recordingScratchPath = async () => scratchPath;
+    readRecordingBytes = async (p) => {
+      if (!(p in store)) throw new Error("no such file");
+      return store[p];
+    };
+    writeRecordingBytes = async (p, bytes) => { store[p] = bytes; };
+    try {
+      if (recording.status !== "idle") await stopRecording(); // clean baseline
+      pickRecordingSavePath = async () => null; // user closes the native dialog
+      await startRecording();
+      await stopRecording();
+      eq(recording.status, "stopped", "finalized, but no destination chosen yet");
+      eq($("btn-start-recording").disabled, true, "can't start a new one until this is saved");
+      eq($("btn-pause-recording").disabled, true);
+      eq($("btn-stop-recording").disabled, false, "Stop can be clicked again to retry the save prompt");
+      eq($("status-bar-recording-dot").hidden, false);
+      eq($("status-bar-recording-dot").dataset.state, "stopped");
+      eq($("status-bar-recording-text").textContent, "recording stopped, not yet saved");
+      ok(store[scratchPath], "the recording itself was NOT lost -- it's safely on the scratch file");
+      const scratchBytes = store[scratchPath];
+
+      pickRecordingSavePath = async () => "/fake/e2e-retry.cttc-record"; // retry succeeds
+      await stopRecording();
+      eq(recording.status, "idle");
+      eq(store["/fake/e2e-retry.cttc-record"], scratchBytes, "retried save wrote the already-finalized bytes, no re-flush");
+    } finally {
+      recordingScratchPath = realScratch;
+      pickRecordingSavePath = realPick;
+      readRecordingBytes = realRead;
+      writeRecordingBytes = realWrite;
+    }
+  });
+
+  await T("Record/Pause/Resume/Stop each land in status bar History (regression: these go through setStatus, not notifyEvent)", async () => {
+    const realScratch = recordingScratchPath,
+      realPick = pickRecordingSavePath,
+      realRead = readRecordingBytes,
+      realWrite = writeRecordingBytes;
+    const store = {};
+    recordingScratchPath = async () => "/fake/scratch-history.cttc-record";
+    pickRecordingSavePath = async () => "/fake/e2e-history-recording.cttc-record";
+    readRecordingBytes = async (p) => {
+      if (!(p in store)) throw new Error("no such file");
+      return store[p];
+    };
+    writeRecordingBytes = async (p, bytes) => { store[p] = bytes; };
+    statusBarHistory.length = 0;
+    try {
+      // Defensive: an earlier test failing before its own cleanup can leave
+      // `recording` non-idle (it's shared module state) -- force a clean
+      // baseline so this test's own "started" (vs. "resumed") assertion
+      // isn't at the mercy of test execution order.
+      if (recording.status !== "idle") await stopRecording();
+      eq(recording.status, "idle", "clean baseline before this test's own assertions");
+      await startRecording();
+      await pauseRecording();
+      await startRecording(); // resume
+      await stopRecording();
+      const texts = statusBarHistory.map((e) => e.text);
+      ok(texts.some((t) => t.startsWith("Recording started")), `expected a "Recording started" entry: ${texts}`);
+      ok(texts.some((t) => t.startsWith("Recording paused")), `expected a "Recording paused" entry: ${texts}`);
+      ok(texts.some((t) => t.startsWith("Recording resumed")), `expected a "Recording resumed" entry: ${texts}`);
+      ok(texts.some((t) => t.startsWith("Recording stopped")), `expected a "Recording stopped" entry: ${texts}`);
+    } finally {
+      recordingScratchPath = realScratch;
+      pickRecordingSavePath = realPick;
+      readRecordingBytes = realRead;
+      writeRecordingBytes = realWrite;
+    }
+  });
+
+  // No e2e coverage for startRecording()'s "no window.cttc at all" guard
+  // (setStatus("Recording needs desktop file access — unavailable here")):
+  // window.cttc's own properties are read-only (contextBridge), so that
+  // environment can't be simulated from here -- the real Electron preload
+  // is always present in this test harness.
 
   await T("Pause/Stop are no-ops when not recording", async () => {
     eq(recording.status, "idle");
@@ -1325,8 +2514,42 @@
       await recoverInterruptedRecording();
       eq(recording.status, "paused");
       eq(recording.path, "/fake/stale.cttc-record");
-      ok($("status").textContent.includes("interrupted"), $("status").textContent);
+      ok($("app-status-bar-text").textContent.includes("interrupted"), $("app-status-bar-text").textContent);
       ok(lastSet && lastSet.status === "paused", "corrected marker persisted as paused");
+      ok(dlgResumeChoice.open, "ui-REC-019: a genuinely mid-segment interruption also offers the resume-choice prompt");
+    } finally {
+      dlgResumeChoice.close();
+      getRecordingMarkerFromDisk = realGetMarker;
+      setRecordingMarkerOnDisk = realSetMarker;
+      setRecordingState({ status: "idle", path: null, segmentStart: null });
+      await persistRecordingMarker();
+    }
+  });
+
+  await T("recoverInterruptedRecording keeps a stale 'stopped' marker stopped, not paused", async () => {
+    // br-REC-UI-002: a crash after Stop already finalized the recording
+    // (scratch file fully written, just waiting on the save dialog) has
+    // nothing left to resume into -- recovering it as "paused" would let
+    // Start Recording silently begin a fresh segment on top of already-
+    // finished data instead of just re-asking where to save it.
+    const realGetMarker = getRecordingMarkerFromDisk, realSetMarker = setRecordingMarkerOnDisk;
+    let lastSet = null;
+    getRecordingMarkerFromDisk = async () => ({
+      path: "/fake/stale-stopped.cttc-record",
+      status: "stopped",
+      segmentStart: null,
+      segments: [{ from: 1, to: 2 }],
+    });
+    setRecordingMarkerOnDisk = async (m) => { lastSet = m; };
+    try {
+      await recoverInterruptedRecording();
+      eq(recording.status, "stopped");
+      eq(recording.path, "/fake/stale-stopped.cttc-record");
+      eq(recording.segments.length, 0, "nothing left to highlight -- the recording is already over");
+      eq($("btn-start-recording").disabled, true, "can't resume into a finished recording");
+      ok($("app-status-bar-text").textContent.includes("wasn't saved"), $("app-status-bar-text").textContent);
+      ok(lastSet && lastSet.status === "stopped", "marker persisted still as stopped, not paused");
+      eq(dlgResumeChoice.open, false, "no resume-choice prompt for an already-finalized recording -- nothing left to resume into");
     } finally {
       getRecordingMarkerFromDisk = realGetMarker;
       setRecordingMarkerOnDisk = realSetMarker;
@@ -1335,7 +2558,287 @@
     }
   });
 
-  await T("multi-segment .cttc-record upload surfaces the picker, choosing a segment loads it", async () => {
+  await T("'Resume from the interruption point' pins segmentStart to the original marker value (ui-REC-019)", async () => {
+    const realGetMarker = getRecordingMarkerFromDisk, realSetMarker = setRecordingMarkerOnDisk;
+    const interruptedFrom = 987654;
+    getRecordingMarkerFromDisk = async () => ({ path: "/fake/stale.cttc-record", status: "recording", segmentStart: interruptedFrom });
+    setRecordingMarkerOnDisk = async () => {};
+    try {
+      await recoverInterruptedRecording();
+      $("dlg-recording-resume-choice-interruption").click();
+      await until(() => recording.status === "recording", "resumed from interruption point");
+      eq(recording.segmentStart, interruptedFrom, "segmentStart pinned to the original interruption point, not now");
+      eq(dlgResumeChoice.open, false);
+    } finally {
+      getRecordingMarkerFromDisk = realGetMarker;
+      setRecordingMarkerOnDisk = realSetMarker;
+      setRecordingState({ status: "idle", path: null, segmentStart: null, segments: [] });
+      await persistRecordingMarker();
+    }
+  });
+
+  await T("resuming from the interruption point genuinely backfills whatever survived in Redis (br-ORPHAN-005)", async () => {
+    const realGetMarker = getRecordingMarkerFromDisk, realSetMarker = setRecordingMarkerOnDisk;
+    const scratchPath = "/tmp/cttc-e2e-resume-backfill.cttc-record";
+    await window.cttc.writeBinaryFile(scratchPath, new Uint8Array(0)); // clear any leftover from a prior run
+    getRecordingMarkerFromDisk = async () => ({ path: scratchPath, status: "recording", segmentStart: R.min_ts });
+    setRecordingMarkerOnDisk = async () => {};
+    let opened = [];
+    try {
+      await recoverInterruptedRecording();
+      $("dlg-recording-resume-choice-interruption").click();
+      await until(() => recording.status === "recording", "resumed from interruption point");
+      eq(recording.segmentStart, R.min_ts, "resumed with the original, pre-crash segment start");
+
+      // real flush -- flushRecordingSegment(Date.now()) posts to the real
+      // /sample/record, asking Redis for [R.min_ts, now) exactly like an
+      // ordinary Pause. No new backfill code exists to test directly --
+      // this proves the deferred-flush design genuinely recovers real data
+      // with zero new server calls.
+      await pauseRecording();
+      eq(recording.status, "paused");
+      eq(recording.segments.length, 1);
+      eq(recording.segments[0].from, R.min_ts, "the resumed segment's start is the original interruption point, not the restart time");
+
+      const r = await uploadAndResolveSegment(scratchPath);
+      eq(r.errors.length, 0, JSON.stringify(r.errors));
+      opened = r.opened;
+      ok(opened.length >= 1, "the backfilled segment holds real, genuinely-captured data from the fixture's Redis-stored range");
+    } finally {
+      for (const sid of opened) await post("/close", { id: sid });
+      await refreshAll();
+      getRecordingMarkerFromDisk = realGetMarker;
+      setRecordingMarkerOnDisk = realSetMarker;
+      setRecordingState({ status: "idle", path: null, segmentStart: null, segments: [] });
+      await persistRecordingMarker();
+    }
+  });
+
+  await T("'Resume from now' pins segmentStart to recovery time, not whenever the user actually clicks (ui-REC-019)", async () => {
+    const realGetMarker = getRecordingMarkerFromDisk, realSetMarker = setRecordingMarkerOnDisk;
+    getRecordingMarkerFromDisk = async () => ({ path: "/fake/stale.cttc-record", status: "recording", segmentStart: 123 });
+    setRecordingMarkerOnDisk = async () => {};
+    try {
+      const before = Date.now();
+      await recoverInterruptedRecording();
+      const afterRecover = Date.now();
+      await new Promise((r) => setTimeout(r, 250)); // simulate the user taking a moment to decide
+      $("dlg-recording-resume-choice-now").click();
+      await until(() => recording.status === "recording", "resumed from now");
+      ok(
+        recording.segmentStart >= before && recording.segmentStart <= afterRecover,
+        `segmentStart (${recording.segmentStart}) must be pinned to recovery time [${before}, ${afterRecover}], not the later click time`
+      );
+    } finally {
+      getRecordingMarkerFromDisk = realGetMarker;
+      setRecordingMarkerOnDisk = realSetMarker;
+      setRecordingState({ status: "idle", path: null, segmentStart: null, segments: [] });
+      await persistRecordingMarker();
+    }
+  });
+
+  await T("dismissing the resume-choice prompt ('Decide later') leaves the recording paused, unchanged (ui-REC-019)", async () => {
+    const realGetMarker = getRecordingMarkerFromDisk, realSetMarker = setRecordingMarkerOnDisk;
+    getRecordingMarkerFromDisk = async () => ({ path: "/fake/stale.cttc-record", status: "recording", segmentStart: 123 });
+    setRecordingMarkerOnDisk = async () => {};
+    try {
+      await recoverInterruptedRecording();
+      eq(dlgResumeChoice.open, true);
+      $("dlg-recording-resume-choice-later").click();
+      eq(dlgResumeChoice.open, false);
+      eq(recording.status, "paused", "declining the prompt leaves the recording exactly as before this dialog existed");
+    } finally {
+      getRecordingMarkerFromDisk = realGetMarker;
+      setRecordingMarkerOnDisk = realSetMarker;
+      setRecordingState({ status: "idle", path: null, segmentStart: null, segments: [] });
+      await persistRecordingMarker();
+    }
+  });
+
+  await T("boot never auto-opens the Set Docker Host wizard while the resume-choice prompt is showing (dialog-stacking regression)", async () => {
+    // Both #dlg-set and #dlg-recording-resume-choice are native <dialog>s
+    // opened via showModal() -- stacking a second one on top silently
+    // buries the first (still "open" in the DOM per its own .open
+    // property, but no longer visible or reachable), which is exactly
+    // what a fresh/empty profile with an interrupted recording used to
+    // hit: the boot sequence's "no sources yet -> auto-open Set Docker
+    // Host" step didn't know or care that the resume-choice prompt was
+    // already open, and clicking #btn-set buried it. Caught via manual
+    // Electron + CDP verification (a fresh profile + a seeded interrupted
+    // marker, screenshotted): the resume-choice dialog was technically
+    // .open === true in the DOM the whole time, but invisible and
+    // unreachable underneath "New Docker Host". shouldPromptSetSourcesOnBoot
+    // is the extracted, directly-testable condition behind that fix.
+    const realSources = state.sources;
+    try {
+      state.sources = [];
+      dlgResumeChoice.showModal();
+      eq(shouldPromptSetSourcesOnBoot(), false, "resume-choice prompt showing -> never also open Set Docker Host, even with zero sources");
+      dlgResumeChoice.close();
+      eq(shouldPromptSetSourcesOnBoot(), true, "resume-choice prompt closed and still zero sources -> Set Docker Host is allowed to open");
+    } finally {
+      state.sources = realSources;
+      if (dlgResumeChoice.open) dlgResumeChoice.close();
+    }
+  });
+
+  await T("autoReconnectLastDockerSessions sets activeDockerHost to the most recently configured session (regression, br-DHOST-030)", async () => {
+    // A stale local session replayed alongside a newer remote one (both
+    // legitimately present in the undeduped lastDockerSessions list) used
+    // to leave activeDockerHost stuck on whatever it defaulted to --
+    // refreshAll()'s self-heal treats *any* still-open host as a valid
+    // match, local included, so it never corrected this -- silently
+    // hiding the remote host's containers/telemetry even though it's the
+    // one actually just (re)connected. Reported 2026-08-12, right after
+    // this exact host-scoping change shipped.
+    const realSessions = prefs.get("lastDockerSessions", []);
+    const realActiveHost = state.activeDockerHost;
+    const realPost = post;
+    post = async (path, body) => (path === "/docker/collect" ? { opened: [], sources: [] } : realPost(path, body));
+    try {
+      prefs.set("lastDockerSessions", [
+        { host: null, stats: true, logs: [], transforms: [], interval: 5 },
+        { host: "ssh://u@h", stats: true, logs: [], transforms: [], interval: 5 },
+      ]);
+      state.activeDockerHost = "local";
+      await autoReconnectLastDockerSessions();
+      eq(state.activeDockerHost, "ssh://u@h", "the last (most recently configured) session's host becomes active, not the stale local one");
+    } finally {
+      post = realPost;
+      prefs.set("lastDockerSessions", realSessions);
+      state.activeDockerHost = realActiveHost;
+    }
+  });
+
+  await T("Recording capture-range band uses the configurable recordingBandColor (Preferences > Appearance)", async () => {
+    // Spy on fillRect the same way the "now" line test spies on stroke --
+    // the band is otherwise only observable as pixels, not DOM state.
+    const realFillRect = CanvasRenderingContext2D.prototype.fillRect;
+    const fillStyles = [];
+    CanvasRenderingContext2D.prototype.fillRect = function (...args) {
+      fillStyles.push(this.fillStyle);
+      return realFillRect.apply(this, args);
+    };
+    const realView = state.view;
+    const realColor = recordingBandColor;
+    try {
+      setView(Date.now() - 5 * 60000, Date.now() + 5 * 60000, { broadcast: false });
+      $("theme-recording-color").oninput({ target: { value: "#ff00ff" } }); // live preview, matches dialog wiring
+      eq(recordingBandColor, "#ff00ff", "live preview applied");
+      setRecordingState({ status: "recording", path: "/fake/band-test.cttc-record", segmentStart: Date.now() - 60000, segments: [] });
+      fillStyles.length = 0;
+      drawAll();
+      ok(fillStyles.includes("#ff00ff"), "capture-range band painted in the configured color");
+    } finally {
+      CanvasRenderingContext2D.prototype.fillRect = realFillRect;
+      if (realView) setView(realView.t0, realView.t1, { broadcast: false });
+      recordingBandColor = realColor;
+      setRecordingState({ status: "idle", path: null, segmentStart: null, segments: [] });
+      await persistRecordingMarker();
+    }
+  });
+
+  await T("Recording capture-range band's sprocket holes and frame lines (isStrip), toggleable off", async () => {
+    // drawHighlightBands directly against a mock ctx, not drawAll() against the
+    // real canvas prototype: the full render draws plenty of other shapes
+    // too, and roundRect/line calls are otherwise only observable as pixels.
+    const mockCtx = {
+      fillStyle: null,
+      globalAlpha: 1,
+      strokeStyle: null,
+      lineWidth: 1,
+      roundRectCalls: [],
+      lineToCalls: [],
+      beginPath() {},
+      fillRect() {},
+      fill() {},
+      stroke() {},
+      setLineDash() {},
+      moveTo() {},
+      roundRect(...args) { this.roundRectCalls.push(args); },
+      lineTo(...args) { this.lineToCalls.push(args); },
+    };
+    const realView = state.view;
+    const realSprockets = recordingSprocketHoles;
+    const realCursorT = state.cursorT, realHoverX = state.hoverX, realLiveHidden = state.liveHidden;
+    try {
+      setView(Date.now() - 5 * 60000, Date.now() + 5 * 60000, { broadcast: false });
+      setRecordingState({ status: "recording", path: "/fake/sprocket-test.cttc-record", segmentStart: Date.now() - 60000, segments: [] });
+      // Neither drawVerticals' own cursor, hover crosshair, nor "now" line
+      // use roundRect, so they never pollute roundRectCalls -- but all
+      // three also call lineTo (ending at the same y=h a frame line
+      // would), so they're neutralized here to keep lineToCalls
+      // attributable to this decoration alone.
+      state.cursorT = null;
+      state.hoverX = null;
+      state.liveHidden = true;
+
+      $("theme-recording-sprockets-toggle").onchange({ target: { checked: true } });
+      eq(recordingSprocketHoles, true);
+
+      // CPU (isFirst, isStrip): top row of holes -- every call lands at the
+      // same (small, near-zero) y. Asserts the invariant, not exact pixel
+      // values, so tuning hole size/spacing later doesn't require also
+      // updating this test. Also draws frame-division lines spanning the
+      // strip's full height (endpoint y === h).
+      mockCtx.roundRectCalls.length = 0;
+      mockCtx.lineToCalls.length = 0;
+      drawHighlightBands(mockCtx, 200, true, false, true);
+      ok(mockCtx.roundRectCalls.length > 0, "CPU strip (isFirst) draws holes");
+      const topY = mockCtx.roundRectCalls[0][1];
+      ok(mockCtx.roundRectCalls.every((args) => args[1] === topY), "CPU strip's holes all share one top-row y");
+      ok(topY < 20, `top row sits near the strip's top edge (y=${topY})`);
+      ok(mockCtx.lineToCalls.length > 0, "CPU strip draws frame-division lines");
+      ok(mockCtx.lineToCalls.every((args) => args[1] === 200), "frame lines span the strip's full height");
+
+      // NET (isLast, isStrip): bottom row of holes, at a single y well
+      // below the top row, plus its own frame lines.
+      mockCtx.roundRectCalls.length = 0;
+      mockCtx.lineToCalls.length = 0;
+      drawHighlightBands(mockCtx, 200, false, true, true);
+      ok(mockCtx.roundRectCalls.length > 0, "NET strip (isLast) draws holes");
+      const bottomY = mockCtx.roundRectCalls[0][1];
+      ok(mockCtx.roundRectCalls.every((args) => args[1] === bottomY), "NET strip's holes all share one bottom-row y");
+      ok(bottomY > 150, `bottom row sits near the strip's bottom edge (y=${bottomY})`);
+      ok(mockCtx.lineToCalls.length > 0, "NET strip draws frame-division lines");
+
+      // MEM (isStrip, but neither first nor last): no holes, but frame
+      // lines still draw -- at the same x-cadence as CPU/NET's own, since
+      // all three read the same view -- so the group's line reads as one
+      // continuous frame division once stacked, not just bookending ends.
+      mockCtx.roundRectCalls.length = 0;
+      mockCtx.lineToCalls.length = 0;
+      drawHighlightBands(mockCtx, 200, false, false, true);
+      eq(mockCtx.roundRectCalls.length, 0, "MEM strip (neither first nor last) draws no holes");
+      ok(mockCtx.lineToCalls.length > 0, "MEM strip still draws frame-division lines, despite no holes");
+
+      // Density lane (isStrip omitted, same as the real drawLane() call):
+      // neither holes nor frame lines -- this decoration is strip-only.
+      mockCtx.roundRectCalls.length = 0;
+      mockCtx.lineToCalls.length = 0;
+      drawHighlightBands(mockCtx, 8);
+      eq(mockCtx.roundRectCalls.length, 0, "a density lane (not a strip) draws no holes");
+      eq(mockCtx.lineToCalls.length, 0, "a density lane (not a strip) draws no frame lines either");
+
+      $("theme-recording-sprockets-toggle").onchange({ target: { checked: false } });
+      eq(recordingSprocketHoles, false);
+      mockCtx.roundRectCalls.length = 0;
+      mockCtx.lineToCalls.length = 0;
+      drawHighlightBands(mockCtx, 200, true, true, true);
+      eq(mockCtx.roundRectCalls.length, 0, "no sprocket holes drawn once the toggle is off, even for isFirst/isLast");
+      eq(mockCtx.lineToCalls.length, 0, "no frame lines drawn once the toggle is off either");
+    } finally {
+      if (realView) setView(realView.t0, realView.t1, { broadcast: false });
+      recordingSprocketHoles = realSprockets;
+      state.cursorT = realCursorT;
+      state.hoverX = realHoverX;
+      state.liveHidden = realLiveHidden;
+      setRecordingState({ status: "idle", path: null, segmentStart: null, segments: [] });
+      await persistRecordingMarker();
+    }
+  });
+
+  await T("multi-segment .cttc-record upload auto-loads the first segment without prompting", async () => {
     // build a real 2-segment recording server-side via /sample/record
     const t0 = R.min_ts;
     const firstRes = await fetch(`${API}/sample/record`, {
@@ -1355,19 +2858,824 @@
     const realPath = "/tmp/cttc-e2e-multi-segment.cttc-record";
     await window.cttc.writeBinaryFile(realPath, secondBytes);
 
-    const realPickSegment = pickSegment;
-    let shownSegments = null;
-    pickSegment = async (segments) => { shownSegments = segments; return 1; };
+    const r = await uploadAndResolveSegment(realPath);
+    eq(r.errors.length, 0, JSON.stringify(r.errors));
+    ok(r.opened.length >= 1, "first segment's sources opened, no user choice needed");
+
+    // #record-sections (right of Back to live tracking) is populated
+    // immediately with every segment, first one selected, so the others
+    // aren't permanently inaccessible.
+    await until(() => !$("record-sections").hidden, "record-sections dropdown shown");
+    eq($("record-sections").options.length, 2, "both segments listed");
+    eq($("record-sections").value, "0", "first segment selected by default");
+    eq(activeRecordSections.path, realPath);
+    eq(activeRecordSections.activeIndex, 0);
+
+    // the auto-loaded recording must switch the app out of live mode just
+    // like the old prompt-driven flow did -- see setLiveHidden.
+    await refreshAll();
+    eq(state.liveHidden, true, "auto-loading a recording enters analysis mode");
+    eq($("live-data-group").hidden, true, "Frequency/Live tracking hidden once the recording is auto-loaded");
+
+    for (const sid of r.opened) await post("/close", { id: sid });
+    await refreshAll();
+    eq($("record-sections").hidden, true, "hidden again once its sources are gone (self-heals via setLiveHidden)");
+  });
+
+  await T("#record-sections dropdown switches segments after the automatic first-segment load", async () => {
+    const t0 = R.min_ts;
+    const firstRes = await fetch(`${API}/sample/record`, {
+      method: "POST", body: new Uint8Array(0),
+      headers: { "X-CTTC-From": String(t0), "X-CTTC-To": String(t0 + 60000) },
+    });
+    const firstBytes = new Uint8Array(await firstRes.arrayBuffer());
+    const secondRes = await fetch(`${API}/sample/record`, {
+      method: "POST", body: firstBytes,
+      headers: { "X-CTTC-From": String(t0 + 60000), "X-CTTC-To": String(t0 + 120000) },
+    });
+    const secondBytes = new Uint8Array(await secondRes.arrayBuffer());
+    const realPath = "/tmp/cttc-e2e-record-sections-switch.cttc-record";
+    await window.cttc.writeBinaryFile(realPath, secondBytes);
+
+    const first = await uploadAndResolveSegment(realPath);
+    ok(first.opened.length >= 1, "first segment's sources opened");
+    const firstIds = first.opened.slice();
+    eq(activeRecordSections.activeIndex, 0);
+
+    $("record-sections").value = "1";
+    $("record-sections").dispatchEvent(new Event("change"));
+    await until(() => activeRecordSections?.activeIndex === 1, "switched to segment 1");
+    eq($("record-sections").value, "1");
+    for (const sid of firstIds) {
+      ok(!state.sources.some((s) => s.id === sid), `segment 0's source ${sid} was closed on switch`);
+    }
+    ok(activeRecordSections.openedIds.length >= 1, "segment 1's sources opened");
+
+    // BUG-0077: switching segments used to leave the chart's view window
+    // wherever it was (segment 0's own range), so segment 1's data --
+    // genuinely loaded, per the assertions above -- fell entirely outside
+    // what was actually drawn and looked empty.
+    const seg1Starts = state.sources
+      .filter((s) => activeRecordSections.openedIds.includes(s.id) && s.min_ts != null)
+      .map((s) => s.min_ts);
+    ok(seg1Starts.length > 0, "segment 1 has real, datable sources to check the view against");
+    const seg1MinTs = Math.min(...seg1Starts);
+    ok(
+      state.view.t0 <= seg1MinTs && state.view.t1 >= seg1MinTs,
+      `view must re-center on segment 1's own data (min_ts=${seg1MinTs}) after switching, not stay on segment 0's -- got view [${state.view.t0}, ${state.view.t1}]`
+    );
+
+    for (const sid of activeRecordSections.openedIds) await post("/close", { id: sid });
+    await refreshAll();
+  });
+
+  await T("Recording controls hide along with live-data controls in analysis mode (ui-REC-013)", async () => {
+    // #section-recording (Start/Pause/Stop/Open Recording) lives outside
+    // #live-data-group in the DOM -- a structural fix for br-REC-UI-001 (it
+    // used to be nested there and vanish as an accidental side effect of
+    // that group's own hide toggle). It's still explicitly hidden together
+    // with the rest of the live-data controls in analysis mode, just via
+    // its own toggle in setLiveHidden rather than incidental DOM nesting.
+    ok(
+      !$("live-data-group").contains($("section-recording")),
+      "#section-recording must live outside #live-data-group"
+    );
+    const res = await fetch(
+      `${API}/files/download?from=${R.min_ts}&to=${R.max_ts}&include_host=0`,
+      { headers: authHeaders() }
+    );
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const realPath = "/tmp/cttc-e2e-recording-controls-hidden.cttc-metric";
+    await window.cttc.writeBinaryFile(realPath, bytes);
+    const r = await uploadAndResolveSegment(realPath);
     try {
-      const r = await uploadAndResolveSegment(realPath);
-      ok(shownSegments, "picker was invoked");
-      eq(shownSegments.length, 2, "both segments offered");
-      eq(r.errors.length, 0, JSON.stringify(r.errors));
-      ok(r.opened.length >= 1, "chosen segment's sources opened");
+      ok(r.opened.length >= 1, "sample opened");
+      await refreshAll();
+      eq(state.liveHidden, true, "now viewing loaded metrics");
+      eq($("live-data-group").hidden, true, "Frequency/Live tracking hidden while viewing a sample");
+      eq($("section-recording").hidden, true, "Recording controls hidden too, by explicit design");
+    } finally {
       for (const sid of r.opened) await post("/close", { id: sid });
       await refreshAll();
+      eq($("section-recording").hidden, false, "Recording controls visible again once back in live mode");
+    }
+  });
+
+  await T("The 'now' line does not advance/draw once a metric/recording is the active view (BUG-0078)", async () => {
+    // Spy on the canvas 2D stroke calls to detect whether drawVerticals'
+    // "now" marker (strokeStyle === nowLineColor) actually gets painted --
+    // it's otherwise only observable as pixels, not DOM state.
+    const realStroke = CanvasRenderingContext2D.prototype.stroke;
+    const strokeStyles = [];
+    CanvasRenderingContext2D.prototype.stroke = function (...args) {
+      strokeStyles.push(this.strokeStyle);
+      return realStroke.apply(this, args);
+    };
+    const realView = state.view;
+    try {
+      // A window guaranteed to straddle "now" regardless of where the
+      // demo data's own range happens to sit relative to it.
+      setView(Date.now() - 5 * 60000, Date.now() + 5 * 60000, { broadcast: false });
+
+      eq(state.liveHidden, false, "starts in Live -- baseline for this test");
+      strokeStyles.length = 0;
+      drawAll();
+      ok(strokeStyles.includes(nowLineColor), "now line drawn while Live is the active view (sanity check)");
+
+      const res = await fetch(
+        `${API}/files/download?from=${R.min_ts}&to=${R.max_ts}&include_host=0`,
+        { headers: authHeaders() }
+      );
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      const realPath = "/tmp/cttc-e2e-now-line-hidden.cttc-metric";
+      await window.cttc.writeBinaryFile(realPath, bytes);
+      const r = await uploadAndResolveSegment(realPath);
+      try {
+        ok(r.opened.length >= 1, "sample opened");
+        await refreshAll();
+        eq(state.liveHidden, true, "now viewing a loaded metric");
+        setView(Date.now() - 5 * 60000, Date.now() + 5 * 60000, { broadcast: false });
+
+        strokeStyles.length = 0;
+        drawAll();
+        ok(
+          !strokeStyles.includes(nowLineColor),
+          "now line must not be drawn while a metric/recording is the active view, even though the window still straddles 'now'"
+        );
+      } finally {
+        for (const sid of r.opened) await post("/close", { id: sid });
+        await refreshAll();
+      }
     } finally {
-      pickSegment = realPickSegment;
+      CanvasRenderingContext2D.prototype.stroke = realStroke;
+      if (realView) setView(realView.t0, realView.t1, { broadcast: false });
+    }
+  });
+
+  await T("Status-bar mode icon doesn't swap to analysis mode while actively recording", async () => {
+    const realStatus = recording.status;
+    setRecordingState({ status: "recording" });
+    const res = await fetch(
+      `${API}/files/download?from=${R.min_ts}&to=${R.max_ts}&include_host=0`,
+      { headers: authHeaders() }
+    );
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const realPath = "/tmp/cttc-e2e-recording-plus-metric.cttc-metric";
+    await window.cttc.writeBinaryFile(realPath, bytes);
+    const r = await uploadAndResolveSegment(realPath);
+    try {
+      ok(r.opened.length >= 1, "sample opened");
+      await refreshAll();
+      eq(state.liveHidden, true, "still functionally in analysis mode");
+      eq($("live-data-group").hidden, true, "live-data controls still hide normally");
+      eq(
+        $("status-bar-mode-live").hidden,
+        false,
+        "status-bar mode icon left showing live -- must not swap while actively recording"
+      );
+      eq($("status-bar-mode-record").hidden, true, "analysis-mode icon must not appear either, for the same reason");
+    } finally {
+      for (const sid of r.opened) await post("/close", { id: sid });
+      setRecordingState({ status: realStatus });
+      await refreshAll();
+    }
+  });
+
+  await T("centerViewOnLoadedRange centers on the midpoint of just-opened sources, data occupying 75% of the view", () => {
+    // A direct unit check against a fabricated state.sources entry, rather
+    // than a real upload: entity names are shared/reused across this whole
+    // long-running suite's many recordings, so a real source's reported
+    // min_ts/max_ts reflects the earliest/latest sample *ever* stored
+    // under that name this run, not just what this one test loaded --
+    // exactly the kind of cross-source bleed this function must center
+    // past when it's the *live* feed doing the accumulating, but not what
+    // this unit itself should be judged against.
+    const realSources = state.sources;
+    const realView = state.view;
+    const fileStart = 1_700_000_000_000; // arbitrary, fixed, unrelated to any real fixture data
+    const fileEnd = fileStart + 30000;
+    state.sources = [
+      ...state.sources,
+      { id: "e2e-fake-source", path: "upload://fake.cttc-metric", live: false, min_ts: fileStart, max_ts: fileEnd },
+    ];
+    try {
+      centerViewOnLoadedRange(["e2e-fake-source"]);
+      const center = (state.view.t0 + state.view.t1) / 2;
+      eq(center, (fileStart + fileEnd) / 2, "view centered exactly on the fabricated source's own midpoint");
+      const totalSpan = state.view.t1 - state.view.t0;
+      near((fileEnd - fileStart) / totalSpan, 0.75, 0.001, "loaded data occupies 75% of the view");
+    } finally {
+      state.sources = realSources;
+      state.view = realView;
+    }
+  });
+
+  await T("Returning to live mode restores the exact prior view instead of leaving it wherever analysis mode was", async () => {
+    const t0 = Date.now() - 999_000, t1 = Date.now() - 900_000; // a distinctive, non-default window
+    setView(t0, t1);
+    const wasLive = state.live;
+    eq(wasLive, false, "sanity: setView (no _follow) turns live-follow off");
+
+    const res = await fetch(
+      `${API}/files/download?from=${R.min_ts}&to=${R.max_ts}&include_host=0`,
+      { headers: authHeaders() }
+    );
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const realPath = "/tmp/cttc-e2e-restore-view.cttc-metric";
+    await window.cttc.writeBinaryFile(realPath, bytes);
+    const r = await uploadAndResolveSegment(realPath);
+    try {
+      ok(r.opened.length >= 1, "sample opened");
+      await refreshAll();
+      centerViewOnLoadedRange(r.opened); // matches what the real Load Analysis/Open Recording button flow does
+      eq(state.liveHidden, true, "now in analysis mode");
+      ok(
+        state.view.t0 !== t0 || state.view.t1 !== t1,
+        "analysis mode must actually change the view, not leave the old live window showing"
+      );
+    } finally {
+      for (const sid of r.opened) await post("/close", { id: sid });
+      await refreshAll();
+      eq(state.liveHidden, false, "back in live mode");
+      eq(state.view.t0, t0, "the exact prior view's start is restored");
+      eq(state.view.t1, t1, "the exact prior view's end is restored");
+      eq(state.live, wasLive, "the prior live-follow flag is restored too");
+    }
+  });
+
+  await T("Loading a single (non-segmented) metric still populates the metric(s) dropdown with one entry", async () => {
+    // Generalizes what #record-sections used to only do for a real
+    // multi-segment .cttc-record: it now always reflects whatever is
+    // currently loaded, even a plain single .cttc-metric with no segment
+    // ambiguity at all -- previously this case called
+    // setActiveRecordSections(null), hiding the dropdown outright.
+    const res = await fetch(
+      `${API}/files/download?from=${R.min_ts}&to=${R.max_ts}&include_host=0`,
+      { headers: authHeaders() }
+    );
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const realPath = "/tmp/cttc-e2e-single-metric-dropdown.cttc-metric";
+    await window.cttc.writeBinaryFile(realPath, bytes);
+    const r = await uploadAndResolveSegment(realPath);
+    try {
+      ok(r.opened.length >= 1, "sample opened");
+      await until(() => !$("record-sections").hidden, "metric(s) dropdown shown even for a single metric");
+      eq($("record-sections").options.length, 1, "exactly one entry -- nothing else to switch to");
+      eq($("record-sections").title, "metric(s)");
+      eq(activeRecordSections.activeIndex, 0);
+    } finally {
+      for (const sid of r.opened) await post("/close", { id: sid });
+      await refreshAll();
+      eq($("record-sections").hidden, true, "hidden again once back in live mode");
+    }
+  });
+
+  await T("Back to live tracking reads as a flat action, not a boxed button", async () => {
+    const res = await fetch(
+      `${API}/files/download?from=${R.min_ts}&to=${R.max_ts}&include_host=0`,
+      { headers: authHeaders() }
+    );
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const realPath = "/tmp/cttc-e2e-back-to-live-style.cttc-metric";
+    await window.cttc.writeBinaryFile(realPath, bytes);
+    const r = await uploadAndResolveSegment(realPath);
+    try {
+      ok(r.opened.length >= 1, "sample opened");
+      await refreshAll();
+      eq($("btn-back-to-live").hidden, false);
+      const style = getComputedStyle($("btn-back-to-live"));
+      eq(style.borderStyle === "none" || style.borderWidth === "0px", true, `expected no border, got ${style.borderStyle}/${style.borderWidth}`);
+      eq(style.backgroundColor, "rgba(0, 0, 0, 0)", "expected a transparent background");
+      ok($("btn-back-to-live").querySelector("svg.flat-action-icon"), "has a leading icon");
+    } finally {
+      for (const sid of r.opened) await post("/close", { id: sid });
+      await refreshAll();
+    }
+  });
+
+  await T("Back to live tracking preserves loaded files -- it switches the view, it never closes anything (ui-LIVE-016, BUG-0090)", async () => {
+    // Used to close every non-live source outright on the way back to
+    // Live -- silently discarding analysis state the user could still
+    // come back to via Opened Metrics, contradicting ui-LIVE-016's own
+    // "no loss of data" contract. Now a thin wrapper around
+    // setActiveView("live"), same as switching to any other open file.
+    const res = await fetch(
+      `${API}/files/download?from=${R.min_ts}&to=${R.max_ts}&include_host=0`,
+      { headers: authHeaders() }
+    );
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const realPath = "/tmp/cttc-e2e-back-to-live-preserves.cttc-metric";
+    await window.cttc.writeBinaryFile(realPath, bytes);
+    const r = await uploadAndResolveSegment(realPath);
+    try {
+      ok(r.opened.length >= 1, "sample opened");
+      await refreshAll();
+      eq(state.liveHidden, true, "sanity: in analysis mode");
+      const uploadPath = `upload://${basename(realPath)}`;
+
+      $("btn-back-to-live").click();
+      eq(state.liveHidden, false, "switched to Live");
+      ok(r.opened.every((sid) => state.sources.some((s) => s.id === sid)), "sources NOT closed");
+      ok(sampleFileGroups().some((g) => g.path === uploadPath), "file still listed in Opened Metrics");
+
+      // And it's genuinely still switchable back to, not just present:
+      setActiveView(uploadPath);
+      eq(state.liveHidden, true, "switched back into analysis mode");
+      eq(state.activeSamplePath, uploadPath, "resumed the same file, no re-upload needed");
+    } finally {
+      for (const sid of r.opened) await post("/close", { id: sid });
+      await refreshAll();
+    }
+  });
+
+  await T("Back to live tracking doesn't rubber-band back to analysis mode when refreshAll() re-runs with the old sample still open (regression)", async () => {
+    // refreshAll()'s own self-heal used to force liveHidden back to true
+    // the moment *anything* re-ran refreshAll() (an SSE event, a periodic
+    // poll, ...) after Back to Live -- it predates ui-LIVE-016 (Back to
+    // Live never closes loaded samples) and couldn't tell "stale, force
+    // analysis mode back on" apart from "the user just explicitly chose
+    // Live with an old sample still parked open in the background": both
+    // look identical (hasSample=true, liveHidden=false) from refreshAll()'s
+    // own point of view. Symptom: click Back to Live, briefly see Live,
+    // then rubber-band straight back to the sample.
+    const res = await fetch(
+      `${API}/files/download?from=${R.min_ts}&to=${R.max_ts}&include_host=0`,
+      { headers: authHeaders() }
+    );
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const realPath = "/tmp/cttc-e2e-back-to-live-no-rubberband.cttc-metric";
+    await window.cttc.writeBinaryFile(realPath, bytes);
+    const r = await uploadAndResolveSegment(realPath);
+    try {
+      ok(r.opened.length >= 1, "sample opened");
+      await refreshAll();
+      eq(state.liveHidden, true, "sanity: in analysis mode");
+
+      $("btn-back-to-live").click();
+      eq(state.liveHidden, false, "switched to Live");
+
+      // Simulates whatever re-triggers a refresh after the click in real
+      // usage (an SSE /events push, a periodic poll, ...) -- the sample is
+      // still open (Back to Live never closes it), so hasSample is still
+      // true here, same as the moment the bug used to fire.
+      await refreshAll();
+      eq(state.liveHidden, false, "still Live -- refreshAll() must not rubber-band this back to analysis mode");
+    } finally {
+      for (const sid of r.opened) await post("/close", { id: sid });
+      await refreshAll();
+    }
+  });
+
+  await T("strict live/analysis separation: a sample's data hides again once back in live view (extremely hard rule)", async () => {
+    // isLiveDataHidden already correctly hid live data during analysis
+    // mode; isSampleHidden never symmetrically hid a sample's data once
+    // back in live view, since state.activeSamplePath isn't cleared by
+    // Back to Live (ui-LIVE-016 -- loaded samples aren't closed). Fixed by
+    // also checking !state.liveHidden in isSampleHidden; this guards the
+    // regression.
+    // A 5-minute slice (not the full demo range) -- these tests only need
+    // *a* sample with a real span, and a smaller download/upload/parse
+    // keeps this test's own added runtime down.
+    const res = await fetch(
+      `${API}/files/download?from=${R.min_ts}&to=${R.min_ts + 5 * 60000}&include_host=0`,
+      { headers: authHeaders() }
+    );
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const realPath = "/tmp/cttc-e2e-live-analysis-separation.cttc-metric";
+    await window.cttc.writeBinaryFile(realPath, bytes);
+    const r = await uploadAndResolveSegment(realPath);
+    try {
+      ok(r.opened.length >= 1, "sample opened");
+      await refreshAll();
+      eq(state.liveHidden, true, "sanity: in analysis mode");
+      const sampleSid = r.opened[0];
+      const liveSid = state.sources.find((s) => s.live !== false && !r.opened.includes(s.id))?.id;
+      ok(liveSid, "sanity: a live source is open alongside the sample");
+      ok(!isSampleHidden(sampleSid), "sample visible in analysis mode");
+      ok(isLiveDataHidden(liveSid), "live data hidden in analysis mode");
+
+      $("btn-back-to-live").click();
+      eq(state.liveHidden, false, "switched to Live");
+      ok(isSampleHidden(sampleSid), "sample must hide once back in live view");
+      ok(!isLiveDataHidden(liveSid), "live data visible again");
+    } finally {
+      for (const sid of r.opened) await post("/close", { id: sid });
+      await refreshAll();
+    }
+  });
+
+  await T("analysis view is a static, centered view of the sample -- no time-driven movement (extremely hard rule)", async () => {
+    goLive();
+    eq(state.live, true, "sanity: live-following");
+    // A 5-minute slice (not the full demo range) -- these tests only need
+    // *a* sample with a real span, and a smaller download/upload/parse
+    // keeps this test's own added runtime down.
+    const res = await fetch(
+      `${API}/files/download?from=${R.min_ts}&to=${R.min_ts + 5 * 60000}&include_host=0`,
+      { headers: authHeaders() }
+    );
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const realPath = "/tmp/cttc-e2e-analysis-static-center.cttc-metric";
+    await window.cttc.writeBinaryFile(realPath, bytes);
+    const r = await uploadAndResolveSegment(realPath);
+    try {
+      ok(r.opened.length >= 1, "sample opened");
+      await refreshAll();
+      eq(state.liveHidden, true, "sanity: entered analysis mode");
+      eq(state.live, false, "live-follow stopped on entering analysis mode");
+      const range = activeViewRange();
+      ok(range && range.min_ts != null, "sanity: sample has a real range");
+      const mid = (range.min_ts + range.max_ts) / 2;
+      const viewMid = (state.view.t0 + state.view.t1) / 2;
+      near(viewMid, mid, 5, "view is centered on the sample's own midpoint, not wherever Live was");
+      const before = { t0: state.view.t0, t1: state.view.t1 };
+      await sleep(1150); // let the 1s heartbeat tick at least once
+      eq(state.view.t0, before.t0, "view must not move while in analysis mode");
+      eq(state.view.t1, before.t1, "view must not move while in analysis mode");
+    } finally {
+      for (const sid of r.opened) await post("/close", { id: sid });
+      await refreshAll();
+    }
+  });
+
+  await T("removing the only open metric reverts to Live view immediately (regression guard)", async () => {
+    // A 5-minute slice (not the full demo range) -- these tests only need
+    // *a* sample with a real span, and a smaller download/upload/parse
+    // keeps this test's own added runtime down.
+    const res = await fetch(
+      `${API}/files/download?from=${R.min_ts}&to=${R.min_ts + 5 * 60000}&include_host=0`,
+      { headers: authHeaders() }
+    );
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const realPath = "/tmp/cttc-e2e-remove-reverts-live.cttc-metric";
+    await window.cttc.writeBinaryFile(realPath, bytes);
+    const r = await uploadAndResolveSegment(realPath);
+    await refreshAll();
+    eq(state.liveHidden, true, "sanity: in analysis mode");
+    await removeOpenedDataRow(`upload://${basename(realPath)}`);
+    eq(state.liveHidden, false, "reverted to Live immediately on remove, no extra refresh needed");
+    eq(state.activeSamplePath, null, "no sample left active");
+  });
+
+  /* ── export metrics: the active file's stats/logs as text or JSON ───────── */
+
+  // Shared by every export-metrics test below: uploads the demo range as a
+  // real .cttc-metric and resolves it into the active view, same pattern as
+  // the metric(s)-dropdown/Back-to-live tests just above -- returns the
+  // opened source ids so the caller's own finally can close them.
+  async function loadMetricsFileForExportTest(name) {
+    const res = await fetch(`${API}/files/download?from=${R.min_ts}&to=${R.max_ts}&include_host=0`, { headers: authHeaders() });
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const realPath = `/tmp/cttc-e2e-${name}.cttc-metric`;
+    await window.cttc.writeBinaryFile(realPath, bytes);
+    const r = await uploadAndResolveSegment(realPath);
+    await refreshAll();
+    return r.opened;
+  }
+
+  await T("the export-metrics button is hidden while Live, shown once a metrics file is loaded", async () => {
+    eq($("btn-export-metrics").hidden, true, "sanity: hidden in live mode");
+    const opened = await loadMetricsFileForExportTest("visibility");
+    try {
+      eq($("btn-export-metrics").hidden, false, "shown once a metrics file is the active view");
+    } finally {
+      for (const sid of opened) await post("/close", { id: sid });
+      await refreshAll();
+      eq($("btn-export-metrics").hidden, true, "hidden again once back in live mode");
+    }
+  });
+
+  await T("the export-metrics dialog: Next is gated on at least one checkbox, and Back returns to step 1", async () => {
+    const opened = await loadMetricsFileForExportTest("flow");
+    try {
+      $("btn-export-metrics").click();
+      try {
+        eq(dlgExportMetrics.open, true, "dialog open");
+        eq($("export-metrics-step1").hidden, false, "starts on step 1");
+        eq($("export-metrics-step2").hidden, true);
+        eq($("dlg-export-metrics-next").disabled, false, "both stats and logs checked by default");
+
+        $("export-metrics-stats").checked = false;
+        $("export-metrics-stats").dispatchEvent(new Event("change"));
+        $("export-metrics-logs").checked = false;
+        $("export-metrics-logs").dispatchEvent(new Event("change"));
+        eq($("dlg-export-metrics-next").disabled, true, "Next disabled with nothing checked");
+
+        $("export-metrics-logs").checked = true;
+        $("export-metrics-logs").dispatchEvent(new Event("change"));
+        eq($("dlg-export-metrics-next").disabled, false, "Next enabled again once logs alone is checked");
+
+        // stats stays unchecked from above -- the granularity choice (only
+        // meaningful for stats) must not appear in step 2.
+        $("dlg-export-metrics-next").click();
+        eq($("export-metrics-step1").hidden, true);
+        eq($("export-metrics-step2").hidden, false);
+        eq($("export-metrics-granularity-row").hidden, true, "no granularity choice when stats isn't included");
+
+        $("dlg-export-metrics-back").click();
+        eq($("export-metrics-step1").hidden, false, "Back returns to step 1");
+        eq($("export-metrics-step2").hidden, true);
+
+        $("export-metrics-stats").checked = true;
+        $("export-metrics-stats").dispatchEvent(new Event("change"));
+        $("dlg-export-metrics-next").click();
+        eq($("export-metrics-granularity-row").hidden, false, "granularity choice shown once stats is included");
+      } finally {
+        dlgExportMetrics.close();
+      }
+    } finally {
+      for (const sid of opened) await post("/close", { id: sid });
+      await refreshAll();
+    }
+  });
+
+  await T("the export-metrics dialog's format/granularity toggles swap which button is primary", async () => {
+    const opened = await loadMetricsFileForExportTest("toggles");
+    try {
+      $("btn-export-metrics").click();
+      try {
+        $("dlg-export-metrics-next").click();
+        eq($("export-metrics-format-text").classList.contains("primary"), true, "text is the default format");
+        $("export-metrics-format-json").click();
+        eq($("export-metrics-format-json").classList.contains("primary"), true);
+        eq($("export-metrics-format-text").classList.contains("primary"), false);
+        eq(exportMetricsFormat, "json");
+
+        eq($("export-metrics-granularity-summary").classList.contains("primary"), true, "summary is the default granularity");
+        $("export-metrics-granularity-full").click();
+        eq($("export-metrics-granularity-full").classList.contains("primary"), true);
+        eq($("export-metrics-granularity-summary").classList.contains("primary"), false);
+        eq(exportMetricsGranularity, "full");
+      } finally {
+        dlgExportMetrics.close();
+        exportMetricsFormat = "text";
+        exportMetricsGranularity = "summary";
+      }
+    } finally {
+      for (const sid of opened) await post("/close", { id: sid });
+      await refreshAll();
+    }
+  });
+
+  // window.cttc is a contextBridge-exposed object -- read-only in the main
+  // world by design (context isolation), so its methods can't be monkey-
+  // patched the way plain app.js functions elsewhere in this file are.
+  // Same reasoning as snapshotToText's own test (below, unaffected by this
+  // change): exercise the formatting/data functions directly instead of
+  // clicking the real Export/Save button, which would need a real native
+  // save dialog. An earlier version of these three tests tried mocking
+  // window.cttc.saveText/saveJson directly -- the resulting "Cannot assign
+  // to read only property" throw happened *before* each test's own
+  // `finally`, leaking that test's uploaded source into every test that
+  // ran after it and cascading into unrelated failures elsewhere in the
+  // suite ("too many values to unpack").
+  await T("exportMetricsToText renders formatted content, including the stats field explanations", () => {
+    const text = exportMetricsToText({
+      generated_at: "2026-01-01T00:00:00.000Z",
+      from: R.min_ts,
+      to: R.max_ts,
+      stats: {
+        granularity: "summary",
+        services: [{ name: "api", host: false, sid: "s1", count: 3, cpu: { min: 1, avg: 2, max: 3 }, mem: { min: 4, avg: 5, max: 6 }, mem_bytes: null, net: { min: 0, avg: 0, max: 0 } }],
+      },
+      logs: [{ source: "api", path: "api.log", rows: [{ ts: R.min_ts, text: "hello" }] }],
+    });
+    ok(text.includes("Metrics export @ 2026-01-01T00:00:00.000Z"), text);
+    ok(text.includes("== Stats (summary) =="), text);
+    ok(text.includes("cpu: percent of one CPU core in use"), "stats field explanation present verbatim");
+    ok(text.includes("mem: percent of the container's own memory limit"), text);
+    ok(text.includes("[api]"), text);
+    ok(text.includes("cpu: min 1.0%  avg 2.0%  max 3.0%  (3 samples)"), text);
+    ok(text.includes("== Logs =="), text);
+    ok(text.includes("hello"), text);
+  });
+
+  await T("exportMetricsToText's full-time-series branch lists every sample instead of a summary", () => {
+    const text = exportMetricsToText({
+      generated_at: "2026-01-01T00:00:00.000Z", from: R.min_ts, to: R.max_ts,
+      stats: { granularity: "full", services: [{ name: "api", host: false, sid: "s1", samples: [{ ts: R.min_ts, cpu: 10, mem: 20, mem_bytes: 1000, net: 5 }] }] },
+    });
+    ok(text.includes("== Stats (full time series) =="), text);
+    ok(text.includes("cpu=10  mem=20  mem_bytes=1000  net=5"), text);
+  });
+
+  await T("gatherExportMetricsData scopes stats/logs to the active file's own range and sources", async () => {
+    const opened = await loadMetricsFileForExportTest("gather");
+    try {
+      const range = activeViewRange();
+      const data = await gatherExportMetricsData(true, true);
+      eq(data.from, range.min_ts);
+      eq(data.to, range.max_ts);
+      eq(data.stats.granularity, "summary");
+      ok(data.stats.services.length >= 1, "at least one service's stats included");
+      ok(data.stats.services.every((s) => !isSampleHidden(s.sid) && !isLiveDataHidden(s.sid)), "no stats from another loaded file or Live");
+      ok(Array.isArray(data.logs) && data.logs.length >= 1, "at least one log source included");
+      ok(data.logs.every((l) => l.rows.every((r) => r.ts >= range.min_ts && r.ts <= range.max_ts)), "every log row within the active file's range");
+
+      const statsOnly = await gatherExportMetricsData(true, false);
+      ok(statsOnly.stats && !statsOnly.logs, "logs omitted when not requested");
+      const logsOnly = await gatherExportMetricsData(false, true);
+      ok(!logsOnly.stats && logsOnly.logs, "stats omitted when not requested");
+    } finally {
+      for (const sid of opened) await post("/close", { id: sid });
+      await refreshAll();
+    }
+  });
+
+  await T("Cancel closes the export-metrics dialog", async () => {
+    const opened = await loadMetricsFileForExportTest("cancel");
+    try {
+      $("btn-export-metrics").click();
+      eq(dlgExportMetrics.open, true, "sanity: dialog open");
+      $("dlg-export-metrics-cancel").click();
+      eq(dlgExportMetrics.open, false, "dialog closed");
+    } finally {
+      for (const sid of opened) await post("/close", { id: sid });
+      await refreshAll();
+    }
+  });
+
+  /* ── File menu: Load Data…/Export Metrics… ───────────────────────────────
+     Both entries duplicate an existing action-bar/toolbar button rather
+     than reimplementing it (#btn-load-sample / #btn-export-metrics), so
+     coverage here is about the menu's own wiring -- dispatch and the cloned
+     icon/disabled-state mirroring -- not the underlying flows themselves,
+     which are already covered by the tests above/around btn-load-sample. */
+
+  await T("File > Load Data…/Opened Data…/Export Metrics… carry an icon cloned from their action-bar/toolbar counterpart", () => {
+    ok($("menu-load-metrics").querySelector(".ctxmenu-icon svg"), "Load Data… has a cloned icon");
+    ok($("menu-opened-data").querySelector(".ctxmenu-icon svg"), "Opened Data… has a cloned icon");
+    ok($("menu-export-metrics").querySelector(".ctxmenu-icon svg"), "Export Metrics… has a cloned icon");
+  });
+
+  await T("File > Export Metrics… is disabled while Live, enabled once a metrics file is loaded", async () => {
+    eq($("menu-export-metrics").disabled, true, "sanity: disabled in live mode");
+    const opened = await loadMetricsFileForExportTest("menu-visibility");
+    try {
+      eq($("menu-export-metrics").disabled, false, "enabled once a metrics file is the active view");
+    } finally {
+      for (const sid of opened) await post("/close", { id: sid });
+      await refreshAll();
+      eq($("menu-export-metrics").disabled, true, "disabled again once back in live mode");
+    }
+  });
+
+  await T("File > Export Metrics… opens the same dialog as the toolbar button", async () => {
+    const opened = await loadMetricsFileForExportTest("menu-open-dialog");
+    try {
+      $("menu-export-metrics").click();
+      try {
+        eq(dlgExportMetrics.open, true, "dialog opened via the File menu entry");
+      } finally {
+        dlgExportMetrics.close();
+      }
+    } finally {
+      for (const sid of opened) await post("/close", { id: sid });
+      await refreshAll();
+    }
+  });
+
+  await T("File > Load Data… reuses the sidebar's Load Data flow", async () => {
+    const out = "/tmp/cttc-e2e-menu-load.cttc-metric";
+    await post("/sample/export", { path: out, from: R.min_ts, to: R.min_ts + 5 * 60000 });
+    const realPick = pickAnalysisFiles;
+    try {
+      pickAnalysisFiles = async () => [out];
+      $("menu-load-metrics").click();
+      await sleep(200);
+      const path = `upload://${basename(out)}`;
+      ok(sampleFileGroups().find((g) => g.path === path), "file opened via the File menu's Load Data… entry");
+      eq(state.activeSamplePath, path, "became the active view");
+    } finally {
+      pickAnalysisFiles = realPick;
+      for (const s of state.sources.filter((s) => s.path === `upload://${basename(out)}`)) {
+        await post("/close", { id: s.id });
+      }
+      await refreshAll();
+    }
+  });
+
+  /* ── Opened Data: switch among currently open files (#btn-opened-data in
+     the sidebar, #menu-opened-data in the File menu) ─────────────────────── */
+
+  // Exports and loads two distinct sample files, leaving both open -- B
+  // (loaded last) becomes the active view, same as Load Data's own
+  // behavior -- returns their upload:// paths for assertions/cleanup.
+  async function openTwoSamplesForOpenedDataTest(name) {
+    const outA = `/tmp/cttc-e2e-opened-data-${name}-a.cttc-metric`;
+    const outB = `/tmp/cttc-e2e-opened-data-${name}-b.cttc-metric`;
+    await post("/sample/export", { path: outA, from: R.min_ts, to: R.min_ts + 5 * 60000 });
+    await post("/sample/export", { path: outB, from: R.min_ts, to: R.min_ts + 5 * 60000 });
+    const realPick = pickAnalysisFiles;
+    try {
+      pickAnalysisFiles = async () => [outA];
+      await $("btn-load-sample").onclick();
+      pickAnalysisFiles = async () => [outB];
+      await $("btn-load-sample").onclick();
+    } finally {
+      pickAnalysisFiles = realPick;
+    }
+    return { pathA: `upload://${basename(outA)}`, pathB: `upload://${basename(outB)}` };
+  }
+  async function closeOpenedDataTestFiles(pathA, pathB) {
+    for (const s of state.sources.filter((s) => s.path === pathA || s.path === pathB)) {
+      await post("/close", { id: s.id });
+    }
+    await refreshAll();
+  }
+
+  // The two tests below share one upload of two files each (rather than
+  // each test uploading its own pair) -- e2e uploads are the slow part of
+  // this suite and the harness enforces a fixed wall-clock budget across
+  // the whole spec (see main.js's 120s "global timeout"), so duplicating
+  // that setup per assertion isn't free the way it would be in a unit test.
+
+  // Opened Metrics rows are looked up by their data-path attribute (the
+  // list is rebuilt fresh via populateOpenedDataList() every time the
+  // dialog opens or a row is removed -- no stable index to rely on).
+  function openedDataRow(path) {
+    return document.querySelector(`#opened-data-list .opened-data-row[data-path="${CSS.escape(path)}"]`);
+  }
+
+  await T("Opened Data lists every currently open file as its own row, marks the active one, and clicking a row switches to it", async () => {
+    const { pathA, pathB } = await openTwoSamplesForOpenedDataTest("open-flow");
+    try {
+      eq(state.activeSamplePath, pathB, "sanity: B is the active view before switching");
+      $("btn-opened-data").click();
+      eq(dlgOpenedData.open, true, "dialog open");
+      ok(openedDataRow(pathA), "A has its own row");
+      ok(openedDataRow(pathB), "B has its own row");
+      eq(openedDataRow(pathB).dataset.active, "true", "active view's row is marked");
+      eq(openedDataRow(pathA).dataset.active, undefined, "non-active row isn't marked");
+
+      openedDataRow(pathA).click();
+      eq(dlgOpenedData.open, false, "dialog closed after clicking a row");
+      eq(state.activeSamplePath, pathA, "switched to A");
+      // BUG-0091: setActiveView alone left the view wherever it was --
+      // resetZoom() must actually restore A's own range, not B's stale one.
+      ok(state.view && state.view.t0 != null, "a real view range was set");
+    } finally {
+      if (dlgOpenedData.open) dlgOpenedData.close();
+      await closeOpenedDataTestFiles(pathA, pathB);
+    }
+  });
+
+  await T("Cancel closes Opened Data without switching", async () => {
+    const { pathA, pathB } = await openTwoSamplesForOpenedDataTest("cancel-flow");
+    try {
+      $("btn-opened-data").click();
+      $("dlg-opened-data-cancel").click();
+      eq(dlgOpenedData.open, false, "dialog closed after Cancel");
+      eq(state.activeSamplePath, pathB, "still on B -- Cancel didn't switch");
+    } finally {
+      if (dlgOpenedData.open) dlgOpenedData.close();
+      await closeOpenedDataTestFiles(pathA, pathB);
+    }
+  });
+
+  await T("Opened Data shows an empty-state message when nothing is open", () => {
+    const realGroups = sampleFileGroups;
+    try {
+      sampleFileGroups = () => [];
+      populateOpenedDataList();
+      const list = $("opened-data-list");
+      eq(list.querySelectorAll(".opened-data-row").length, 0, "no rows");
+      ok(list.querySelector(".opened-data-empty"), "empty-state message shown");
+    } finally {
+      sampleFileGroups = realGroups;
+    }
+  });
+
+  await T("Remove in Opened Metrics closes that row's file and refreshes the list without closing the dialog", async () => {
+    // Applies uniformly to metric and recording files (explicit user
+    // direction, superseding the old View pill's .cttc-record exemption
+    // -- see ui-EXPORT-019, retired). The file on disk is never touched;
+    // this only frees the current session's working set.
+    const { pathA, pathB } = await openTwoSamplesForOpenedDataTest("remove-flow");
+    try {
+      $("btn-opened-data").click();
+      await openedDataRow(pathA).querySelector(".opened-data-row-remove").onclick({ stopPropagation() {} });
+      eq(dlgOpenedData.open, true, "dialog stays open after Remove, unlike clicking a row/Cancel");
+      ok(!state.sources.some((s) => s.path === pathA), "A's sources are gone");
+      ok(state.sources.some((s) => s.path === pathB), "B is untouched");
+      ok(!openedDataRow(pathA), "A's row is gone");
+      ok(openedDataRow(pathB), "B's row remains");
+    } finally {
+      if (dlgOpenedData.open) dlgOpenedData.close();
+      await closeOpenedDataTestFiles(pathA, pathB);
+    }
+  });
+
+  await T("Removing the active view's row falls back to another open file (refreshAll's existing self-heal)", async () => {
+    const { pathA, pathB } = await openTwoSamplesForOpenedDataTest("remove-active");
+    try {
+      eq(state.activeSamplePath, pathB, "sanity: B is active (opened last)");
+      $("btn-opened-data").click();
+      await openedDataRow(pathB).querySelector(".opened-data-row-remove").onclick({ stopPropagation() {} });
+      eq(state.activeSamplePath, pathA, "self-healed to the remaining open file");
+    } finally {
+      if (dlgOpenedData.open) dlgOpenedData.close();
+      await closeOpenedDataTestFiles(pathA, pathB);
     }
   });
 
@@ -1379,21 +3687,26 @@
     }
   });
 
-  await T("Create Event/Edit Events buttons live inside the Metrics sidebar section", () => {
-    const metricsGroup = document.querySelector('.ab-group[data-section="metrics"]');
-    ok(metricsGroup, "Metrics section exists");
-    ok(metricsGroup.contains($("btn-event-create")), "btn-event-create is inside the Metrics section");
-    ok(metricsGroup.contains($("btn-event-edit")), "btn-event-edit is inside the Metrics section");
+  await T("Create Event/Edit Events buttons live inside their own Events Capture sidebar section, between Docker Host and Analysis", () => {
+    const eventsGroup = document.querySelector('.ab-group[data-section="events-capture"]');
+    ok(eventsGroup, "Events Capture section exists");
+    ok(eventsGroup.contains($("btn-event-create")), "btn-event-create is inside Events Capture");
+    ok(eventsGroup.contains($("btn-event-edit")), "btn-event-edit is inside Events Capture");
+    const groups = [...document.querySelectorAll(".ab-group[data-section]")].map((g) => g.dataset.section);
+    const sourcesIdx = groups.indexOf("sources");
+    const eventsIdx = groups.indexOf("events-capture");
+    const analysisIdx = groups.indexOf("analysis");
+    ok(sourcesIdx < eventsIdx && eventsIdx < analysisIdx, `expected sources < events-capture < analysis, got ${JSON.stringify(groups)}`);
   });
 
   await T("sidebar sections start collapsed and expand on header click", () => {
-    const metricsGroup = document.querySelector('.ab-group[data-section="metrics"]');
-    const header = metricsGroup.querySelector(".ab-group-header");
-    const body = metricsGroup.querySelector(".ab-group-body");
+    const analysisGroup = document.querySelector('.ab-group[data-section="analysis"]');
+    const header = analysisGroup.querySelector(".ab-group-header");
+    const body = analysisGroup.querySelector(".ab-group-body");
     eq(body.hidden, true, "starts collapsed");
     header.click();
     eq(body.hidden, false, "expands on click");
-    eq(metricsGroup.dataset.expanded, "true");
+    eq(analysisGroup.dataset.expanded, "true");
     header.click();
     eq(body.hidden, true, "collapses again on a second click");
   });
@@ -1415,8 +3728,8 @@
     try {
       $("btn-ship-logs").click();
       await until(() => called, "shipLogs invoked");
-      await until(() => $("status").textContent.includes("/tmp/x.zip"), "status reflects the result");
-      ok($("status").textContent.includes("erased"));
+      await until(() => $("app-status-bar-text").textContent.includes("/tmp/x.zip"), "status reflects the result");
+      ok($("app-status-bar-text").textContent.includes("erased"));
     } finally {
       shipLogsViaMain = real;
     }
@@ -1427,9 +3740,25 @@
     shipLogsViaMain = async () => ({ canceled: true });
     try {
       $("btn-ship-logs").click();
-      await until(() => $("status").textContent.includes("canceled"), "status reflects the cancel");
+      await until(() => $("app-status-bar-text").textContent.includes("canceled"), "status reflects the cancel");
     } finally {
       shipLogsViaMain = real;
+    }
+  });
+
+  await T("Preferences toolbar button defaults to the Settings pane, not Appearance (regression)", () => {
+    // The toolbar's single flat "Preferences" entry used to default to
+    // pane-preferences (Appearance) -- a deliberate-at-the-time collapse
+    // of the old separate Settings…/Appearance… buttons into one, but
+    // reversed per explicit user direction: opening Preferences must land
+    // on Settings.
+    openSettingsDialog();
+    try {
+      eq($("pane-settings").hidden, false, "Settings pane visible");
+      eq($("pane-preferences").hidden, true, "Appearance pane hidden");
+      eq($("dlg-preferences").querySelector('.mac-settings-item[data-pane="pane-settings"]').dataset.active, "true", "Settings marked active in the sidebar");
+    } finally {
+      dlgPreferences.close();
     }
   });
 
@@ -1447,7 +3776,7 @@
     } finally {
       $("theme-status-bar-toggle").checked = true;
       $("theme-status-bar-toggle").dispatchEvent(new Event("change"));
-      dlgTheme.close();
+      dlgPreferences.close();
     }
     eq($("app-status-bar").hidden, false, "restored visible for later tests");
   });
@@ -1455,6 +3784,129 @@
   await T("notifyEvent updates the status bar text with a timestamp", () => {
     notifyEvent("something happened");
     ok($("app-status-bar-text").textContent.includes("something happened"));
+  });
+
+  await T("application-starting/shutting-down status messages", () => {
+    // The real "application starting" call already fired once at this
+    // window's own boot, before any test ran -- re-invoking notifyEvent
+    // here with the exact same strings the boot-time code uses confirms
+    // the wording/wiring is correct without needing to re-run boot itself.
+    statusBarHistory.length = 0;
+    notifyEvent("application starting");
+    ok($("app-status-bar-text").textContent.includes("application starting"));
+    eq(statusBarHistory.at(-1).text, "application starting");
+
+    eq(typeof window.cttc?.onAppShuttingDown, "function", "preload exposes onAppShuttingDown");
+
+    notifyEvent("application shutting down");
+    ok($("app-status-bar-text").textContent.includes("application shutting down"));
+    eq(statusBarHistory.at(-1).text, "application shutting down");
+  });
+
+  await T("notifyEventWithCap force-clears the status bar after its timeout (ui-SBAR-006)", async () => {
+    notifyEventWithCap("e2e cap test message", 200);
+    ok($("app-status-bar-text").textContent.includes("e2e cap test message"));
+    await sleep(300);
+    eq($("app-status-bar-text").textContent, "", "cleared once nothing else replaced it within the cap");
+  });
+
+  await T("notifyEventWithCap's clear is skipped once something else already replaced the message", async () => {
+    notifyEventWithCap("e2e cap test message 2", 200);
+    notifyEvent("something else happened in the meantime");
+    await sleep(300);
+    ok(
+      $("app-status-bar-text").textContent.includes("something else happened in the meantime"),
+      "the newer message must survive the stale cap timer, not get clobbered back to blank"
+    );
+  });
+
+  await T("notifyEvent auto-clears after the configured statusBarClearSecs", async () => {
+    const real = statusBarClearSecs;
+    statusBarClearSecs = 0.2; // 200ms -- the real UI only allows whole seconds >= 1
+    try {
+      notifyEvent("e2e general auto-clear test message");
+      ok($("app-status-bar-text").textContent.includes("e2e general auto-clear test message"));
+      await sleep(350);
+      eq($("app-status-bar-text").textContent, "", "cleared without needing notifyEventWithCap's own separate cap");
+    } finally {
+      statusBarClearSecs = real;
+    }
+  });
+
+  await T("setStatusBarClearSecs clamps below 1 and persists", () => {
+    const real = statusBarClearSecs;
+    try {
+      setStatusBarClearSecs(0);
+      eq(statusBarClearSecs, 1, "clamped up to the 1s floor");
+      setStatusBarClearSecs(12);
+      eq(statusBarClearSecs, 12);
+      eq($("status-bar-clear-secs-sidebar").value, "12");
+      eq(prefs.get("statusBarClearSecs", null), 12, "persisted");
+    } finally {
+      setStatusBarClearSecs(real);
+      prefs.set("statusBarClearSecs", real);
+    }
+  });
+
+  await T("notifyEvent appends after a separator instead of replacing while actively recording", () => {
+    const realStatus = recording.status;
+    try {
+      setRecordingState({ status: "recording" });
+      notifyEvent("first message while recording");
+      const first = $("app-status-bar-text").textContent;
+      ok(first.includes("first message while recording"));
+      notifyEvent("second message while recording");
+      const second = $("app-status-bar-text").textContent;
+      ok(second.startsWith(first), "the first message must survive, not get replaced");
+      ok(second.includes(" | "), "joined by a single bar separator");
+      ok(second.includes("second message while recording"));
+    } finally {
+      setRecordingState({ status: realStatus });
+    }
+  });
+
+  await T("status bar History records notifyEvent/flashStatus and renders newest-first", () => {
+    statusBarHistory.length = 0;
+    notifyEvent("first e2e history event");
+    flashStatus("second e2e history event", 50000);
+    eq(statusBarHistory.length, 2);
+    eq(statusBarHistory[0].text, "first e2e history event");
+    eq(statusBarHistory[1].text, "second e2e history event");
+
+    eq($("status-bar-history-popup").hidden, true, "starts closed");
+    $("status-bar-history-btn").onclick();
+    try {
+      eq($("status-bar-history-popup").hidden, false, "opens on click");
+      const rows = [...$("status-bar-history-list").querySelectorAll(".status-bar-history-row")];
+      eq(rows.length, 2);
+      // newest first
+      ok(rows[0].textContent.includes("second e2e history event"));
+      ok(rows[1].textContent.includes("first e2e history event"));
+    } finally {
+      $("status-bar-history-btn").onclick(); // close again
+    }
+    eq($("status-bar-history-popup").hidden, true, "closes on a second click");
+  });
+
+  await T("status bar History: Clear empties it", () => {
+    statusBarHistory.length = 0;
+    notifyEvent("to be cleared");
+    $("status-bar-history-btn").onclick();
+    try {
+      eq($("status-bar-history-list").querySelectorAll(".status-bar-history-row").length, 1);
+      $("status-bar-history-clear").onclick();
+      eq(statusBarHistory.length, 0);
+      ok($("status-bar-history-list").textContent.includes("Nothing yet"));
+    } finally {
+      $("status-bar-history-btn").onclick();
+    }
+  });
+
+  await T("status bar History icon matches the Set Docker Host 'Logs' section icon", () => {
+    const historyPath = $("status-bar-history-btn").querySelector("svg path").getAttribute("d");
+    const logsLegend = document.querySelector("#dlg-set fieldset:has(#docker-targets) legend svg path");
+    ok(logsLegend, "Logs legend icon found");
+    eq(historyPath, logsLegend.getAttribute("d"));
   });
 
   await T("creating an event notifies the status bar", async () => {
@@ -1563,6 +4015,75 @@
     eq(list[list.length - 1].name, "e2e ui event");
     eq(list[list.length - 1].armed, true, "starts armed/watching");
     saveUiEvents(list.slice(0, before)); // clean up after ourselves
+  });
+
+  await T("creating a UI-hosted event with a non-numeric threshold is rejected, not silently stored (ui-EVT-003)", async () => {
+    // Gateway-hosted events get this for free server-side (events.py's
+    // _validate 400s a NaN-turned-null threshold); UI-hosted ones have no
+    // server to reject them, so this used to be stored as-is and every
+    // future comparison against it silently broke forever.
+    const before = loadUiEvents().length;
+    openEventCreateDialog();
+    try {
+      $("event-name").value = "e2e bad threshold";
+      $("event-hosted").value = "ui";
+      // Number("") is 0 (a valid threshold) -- only a genuinely non-numeric
+      // string actually reproduces the NaN this bug is about.
+      $("event-conditions").children[0].querySelector('[data-field="threshold"]').value = "abc";
+      await $("dlg-event-create").onclick();
+      eq(loadUiEvents().length, before, "must not be saved with an invalid threshold");
+      ok($("app-status-bar-text").textContent.includes("threshold"), "status explains why");
+      ok(dlgEventForm.open, "dialog stays open so the user can fix it");
+    } finally {
+      dlgEventForm.close();
+    }
+  });
+
+  await T("creating a UI-hosted event with an invalid regex is rejected, not silently stored (ui-EVT-004)", async () => {
+    // Gateway-hosted events get this for free server-side too (events.py's
+    // _validate 400s an uncompilable regex at create time); UI-hosted ones
+    // used to reach `new RegExp()` with no try/catch inside uiEventTick's
+    // setInterval callback, throwing uncaught on every tick and (since that
+    // throw aborted the loop before saveUiEvents ran) silently freezing
+    // every OTHER UI-hosted event's status/log-cursor progress too.
+    const before = loadUiEvents().length;
+    openEventCreateDialog();
+    try {
+      $("event-name").value = "e2e bad regex";
+      $("event-hosted").value = "ui";
+      const row = $("event-conditions").children[0];
+      row.querySelector('[data-field="type"]').value = "log";
+      row.querySelector('[data-field="type"]').dispatchEvent(new Event("change"));
+      row.querySelector('[data-field="pattern"]').value = "(unclosed";
+      await $("dlg-event-create").onclick();
+      eq(loadUiEvents().length, before, "must not be saved with an invalid regex");
+      ok($("app-status-bar-text").textContent.includes("invalid regex"), "status explains why");
+      ok(dlgEventForm.open, "dialog stays open so the user can fix it");
+    } finally {
+      dlgEventForm.close();
+    }
+  });
+
+  await T("editing a UI event with an invalid regex is rejected, leaving the saved event unchanged (ui-EVT-004)", async () => {
+    const list = loadUiEvents();
+    list.push({
+      id: "ui-e2e-badregex-edit", name: "before bad edit", sourceIds: [], match: "any",
+      conditions: [{ type: "log", pattern: "ok" }],
+      action: { kind: "recording", duration_minutes: 5 },
+      enabled: true, status: "armed", armed: true, logCursors: {},
+    });
+    saveUiEvents(list);
+    try {
+      const ev = loadUiEvents().find((e) => e.id === "ui-e2e-badregex-edit");
+      openEventEditForm(ev, "ui");
+      $("event-conditions").children[0].querySelector('[data-field="pattern"]').value = "(unclosed";
+      await $("dlg-event-create").onclick();
+      const stillSaved = loadUiEvents().find((e) => e.id === "ui-e2e-badregex-edit");
+      eq(stillSaved.conditions[0].pattern, "ok", "the bad edit must not have overwritten the saved event");
+    } finally {
+      dlgEventForm.close();
+      saveUiEvents(loadUiEvents().filter((e) => e.id !== "ui-e2e-badregex-edit"));
+    }
   });
 
   await T("Edit Events lists both gateway and UI events with an Update button", async () => {
@@ -1764,7 +4285,6 @@
       eq($("gw-title").textContent, "New Gateway");
       eq($("gw-intro").hidden, false);
       eq($("gw-select-row").hidden, true);
-      eq($("gw-btn-uninstall").hidden, true);
       eq($("gw-btn-connect").textContent, "Connect");
       eq(typeof window.cttc?.addGateway, "function", "addGateway exposed via preload");
       ok(!window.cttc?.newGateway, "old separate-window IPC method is gone");
@@ -1780,12 +4300,37 @@
       eq($("gw-title").textContent, "Edit Gateways");
       eq($("gw-intro").hidden, true);
       eq($("gw-select-row").hidden, false);
-      eq($("gw-btn-uninstall").hidden, false);
       // nothing picked yet -- ssh/image/connect fields start disabled
       eq($("gw-btn-connect").disabled, true);
       eq($("gw-ssh-user").disabled, true);
     } finally {
       dlgGatewaySetup.close();
+    }
+  });
+
+  await T("Uninstall Gateway opens its own dialog, populated from getGateways, excluding This machine", async () => {
+    await openUninstallGatewayDialog();
+    try {
+      ok(dlgGatewayUninstall.open, "dialog opened");
+      const options = [...$("gw-uninstall-select").options].map((o) => o.textContent);
+      ok(!options.some((t) => t.includes("This machine")), "embedded gateway excluded");
+      eq($("gw-uninstall-delete").disabled, true, "nothing picked yet");
+    } finally {
+      dlgGatewayUninstall.close();
+    }
+  });
+
+  await T("Uninstall Gateway: picking an entry enables the Uninstall button", async () => {
+    await openUninstallGatewayDialog();
+    try {
+      const select = $("gw-uninstall-select");
+      if (select.options.length > 1) {
+        select.value = select.options[1].value;
+        select.onchange();
+        eq($("gw-uninstall-delete").disabled, false);
+      }
+    } finally {
+      dlgGatewayUninstall.close();
     }
   });
 
@@ -1816,7 +4361,7 @@
     eq(dlgGatewaySetup.open, false);
   });
 
-  await T("gateway connection failure notifies the status bar, not just the pill's tooltip", async () => {
+  await T("gateway connection failure notifies the status bar", async () => {
     // capture notifyEvent's own calls rather than reading the DOM after the
     // fact -- other concurrent background notifiers (uiEventTick, etc.)
     // share the same status bar text and could overwrite a one-time
@@ -1829,7 +4374,6 @@
     try {
       await until(() => $("server-status").dataset.state === "down", "went down", 100);
       ok(calls.some((m) => m.includes("Gateway connection failed")), JSON.stringify(calls));
-      eq($("server-status-btn").title, "Switch gateway…", "pill tooltip stays generic, no error text");
       get = realGet;
       await until(() => $("server-status").dataset.state === "up", "recovered", 100);
       ok(calls.some((m) => m.includes("Gateway connection restored")), JSON.stringify(calls));
@@ -1862,6 +4406,519 @@
     ok(!$("server-status").classList.contains("open"), "wrapper no longer marked open");
   });
 
+  await T("gateway dropdown separates each entry with a divider, one fewer than the row count", async () => {
+    $("server-status-btn").click();
+    await sleep(50);
+    try {
+      const items = $("gateway-dropdown").querySelectorAll(".gateway-item");
+      const seps = $("gateway-dropdown").querySelectorAll(".gateway-item-sep");
+      eq(seps.length, Math.max(0, items.length - 1), "one separator between each pair of entries, none trailing");
+    } finally {
+      document.body.click();
+    }
+  });
+
+  await T("hovering the Gateway pill shows nothing anymore", async () => {
+    mouse($("server-status"), "mouseenter", 5);
+    await sleep(20);
+    try {
+      ok($("connection-info-popup").hidden, "no popup on hover");
+    } finally {
+      mouse($("server-status"), "mouseleave", 5);
+    }
+  });
+
+  await T("right-clicking the Gateway pill opens New/Edit/Uninstall Gateway plus Current Status, separated by a divider", async () => {
+    mouse($("server-status"), "contextmenu", 5);
+    try {
+      ok($("connection-info-popup").hidden, "info popup not shown just from opening the menu");
+      const menu = document.getElementById("ctxmenu");
+      ok(menu, "actions menu open");
+      const buttons = [...menu.querySelectorAll("button")];
+      const labels = buttons.map((b) => b.textContent);
+      ok(labels.some((l) => l.includes("New Gateway")), labels.join(", "));
+      ok(labels.some((l) => l === "Edit Gateway"), labels.join(", "));
+      ok(labels.some((l) => l.includes("Uninstall Gateway")), labels.join(", "));
+      ok(labels.some((l) => l === "Current Status"), labels.join(", "));
+      ok(buttons.every((b) => b.querySelector(".ctxmenu-icon svg")), "every entry has an icon to the left of its label");
+      ok(buttons.every((b) => !b.disabled), "the Gateway pill's action entries are never gated, mirroring their always-enabled sidebar buttons");
+      const statusBtn = buttons.find((b) => b.textContent === "Current Status");
+      ok(statusBtn.previousElementSibling?.classList.contains("ctxmenu-sep"), "Current Status is preceded by a divider, separating it from the action entries");
+    } finally {
+      document.body.click(); // closes the ctxmenu synchronously
+      if (dlgGatewaySetup.open) dlgGatewaySetup.close();
+    }
+  });
+
+  await T("clicking Current Status on the Gateway pill's right-click menu shows the connection info above the button", async () => {
+    mouse($("server-status"), "contextmenu", 5);
+    const menu = document.getElementById("ctxmenu");
+    [...menu.querySelectorAll("button")].find((b) => b.textContent === "Current Status").click();
+    await sleep(20); // loadConnectionInfo() is awaited before the popup renders
+    try {
+      ok(!$("connection-info-popup").hidden, "popup shown after clicking Current Status");
+      const text = $("connection-info-popup").textContent;
+      ok(text.includes("Connection"), `Connection row present: ${text}`);
+      const popupRect = $("connection-info-popup").getBoundingClientRect();
+      const btnRect = $("server-status-btn").getBoundingClientRect();
+      ok(popupRect.bottom <= btnRect.top, `popup (bottom ${popupRect.bottom}) sits above the button (top ${btnRect.top})`);
+    } finally {
+      document.body.click();
+      ok($("connection-info-popup").hidden, "clicking outside closes the popup");
+    }
+  });
+
+  /* ── Docker Host pill: Current Status, right-click actions, click separators ── */
+
+  await T("hovering the Docker Host pill shows nothing anymore", () => {
+    mouse($("docker-host-status"), "mouseenter", 5);
+    try {
+      ok($("docker-host-info-popup").hidden, "no popup on hover");
+    } finally {
+      mouse($("docker-host-status"), "mouseleave", 5);
+    }
+  });
+
+  const openDockerHostCurrentStatus = () => {
+    mouse($("docker-host-status"), "contextmenu", 5);
+    const menu = document.getElementById("ctxmenu");
+    [...menu.querySelectorAll("button")].find((b) => b.textContent === "Current Status").click();
+  };
+
+  await T("Current Status on the Docker Host pill shows 'not connected' when nothing is watched", async () => {
+    ok(!hasDockerDaemon(), "sanity: nothing connected in this suite's baseline state");
+    openDockerHostCurrentStatus();
+    await sleep(0); // the outside-click listener is registered via setTimeout(0) to dodge the same-click race (see showDockerHostStatus)
+    try {
+      ok(!$("docker-host-info-popup").hidden, "popup shown after clicking Current Status");
+      ok($("docker-host-info-popup").textContent.includes("not connected"), $("docker-host-info-popup").textContent);
+      const popupRect = $("docker-host-info-popup").getBoundingClientRect();
+      const btnRect = $("docker-host-status-btn").getBoundingClientRect();
+      ok(popupRect.bottom <= btnRect.top, `popup (bottom ${popupRect.bottom}) sits above the button (top ${btnRect.top})`);
+    } finally {
+      document.body.click();
+      ok($("docker-host-info-popup").hidden, "clicking outside closes the popup");
+    }
+  });
+
+  await T("Current Status on the Docker Host pill shows SSH connection/key and which transforms are on", async () => {
+    await window.cttc.recordDockerHost({ hostKey: "ssh://u@h", host: "ssh://u@h", sshKey: "/path/to/key", transforms: ["json_message"] });
+    const fakeSrc = { id: "__hover_test", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
+    state.sources.push(fakeSrc);
+    const savedActiveHost = state.activeDockerHost;
+    state.activeDockerHost = "ssh://u@h"; // currentDockerHost() (br-DHOST-030) reflects this, not state.sources
+    syncDockerDaemonButtons();
+    try {
+      openDockerHostCurrentStatus();
+      // showDockerHostStatus is async (looks the active host up via
+      // dockerHostHistory(), an IPC round-trip) -- give it a moment before
+      // reading the popup it fills in.
+      await sleep(20);
+      const text = $("docker-host-info-popup").textContent;
+      ok(text.includes("SSH Connection") && text.includes("u@h"), text);
+      ok(text.includes("SSH Key") && text.includes("/path/to/key"), text);
+      ok(text.includes("drop healthchecks") && text.includes("False"), text);
+      ok(text.includes("JSON message") && text.includes("True"), text);
+      ok(text.includes("parse level") && text.includes("False"), text);
+    } finally {
+      document.body.click();
+      state.sources = state.sources.filter((s) => s.id !== "__hover_test");
+      state.activeDockerHost = savedActiveHost;
+      syncDockerDaemonButtons();
+      await window.cttc.retireDockerHost("ssh://u@h");
+    }
+  });
+
+  await T("Current Status on the Docker Host pill shows '---' for an unset SSH key", async () => {
+    await window.cttc.recordDockerHost({ hostKey: "local", host: null, sshKey: null, transforms: [] });
+    const fakeSrc = { id: "__hover_local_test", path: "docker://local/stats", kind: "stats", live: true };
+    state.sources.push(fakeSrc);
+    syncDockerDaemonButtons();
+    try {
+      openDockerHostCurrentStatus();
+      await sleep(20); // see the previous test -- showDockerHostStatus is async now
+      const text = $("docker-host-info-popup").textContent;
+      ok(text.includes("SSH Connection") && text.includes("localhost"), text);
+      ok(text.includes("SSH Key") && text.includes("---"), text);
+    } finally {
+      document.body.click();
+      state.sources = state.sources.filter((s) => s.id !== "__hover_local_test");
+      syncDockerDaemonButtons();
+      await window.cttc.retireDockerHost("local");
+    }
+  });
+
+  await T("right-clicking the Docker Host pill opens New/Edit/Remove plus Current Status, separated by a divider; Edit/Remove mirror the sidebar's disabled state", async () => {
+    ok(!hasDockerDaemon(), "sanity: nothing connected in this suite's baseline state");
+    // Forced empty rather than assumed -- by this point in the suite other
+    // tests may have legitimately left real saved hosts in the catalog
+    // (Set/Update Docker Host persists on a successful connect), so an
+    // un-isolated "sanity: nothing saved" assumption here would be flaky.
+    // gateways.json is the sole store now (no bulk-clear IPC) -- retire
+    // whatever's there, restoring each entry by re-recording it in finally
+    // (recordDockerHost revives a retired entry rather than leaving it
+    // hidden, see lib/gateway-registry.js's recordDockerHostForGateway).
+    const saved = await dockerHostHistory();
+    for (const entry of saved) await window.cttc.retireDockerHost(entry.hostKey);
+    syncDockerDaemonButtons();
+    await sleep(20); // syncDockerDaemonButtons' own Remove-button update is an IPC round-trip now
+    try {
+      ok($("btn-edit-docker-host").disabled, "sanity: sidebar's own Edit Docker Host is disabled with nothing connected");
+      ok($("btn-remove-docker-daemon").disabled, "sanity: sidebar's own Remove Docker Host is disabled with no saved hosts");
+      mouse($("docker-host-status"), "contextmenu", 5);
+      try {
+        const menu = document.getElementById("ctxmenu");
+        ok(menu, "actions menu open");
+        const buttons = [...menu.querySelectorAll("button")];
+        const labels = buttons.map((b) => b.textContent);
+        ok(labels.some((l) => l.includes("New Docker Host")), labels.join(", "));
+        ok(labels.some((l) => l === "Edit Docker Host"), labels.join(", "));
+        ok(labels.some((l) => l.includes("Remove Docker Host")), labels.join(", "));
+        ok(labels.some((l) => l === "Current Status"), labels.join(", "));
+        ok(buttons.every((b) => b.querySelector(".ctxmenu-icon svg")), "every entry has an icon to the left of its label");
+        const statusBtn = buttons.find((b) => b.textContent === "Current Status");
+        ok(statusBtn.previousElementSibling?.classList.contains("ctxmenu-sep"), "Current Status is preceded by a divider, separating it from the action entries");
+        const editBtn = buttons.find((b) => b.textContent === "Edit Docker Host");
+        const removeBtn = buttons.find((b) => b.textContent.includes("Remove Docker Host"));
+        ok(editBtn.disabled, "Edit Docker Host disabled in the menu, mirroring its sidebar button");
+        ok(removeBtn.disabled, "Remove Docker Host disabled in the menu, mirroring its sidebar button");
+        editBtn.click();
+        eq(dlg.open, false, "disabled -- clicking it does nothing, nothing connected to edit");
+      } finally {
+        document.body.click();
+        if (dlg.open) dlg.close();
+      }
+    } finally {
+      for (const entry of saved) await window.cttc.recordDockerHost(entry);
+      syncDockerDaemonButtons();
+    }
+  });
+
+  await T("right-clicking the Docker Host pill's Edit Docker Host opens edit mode when a daemon is connected", async () => {
+    const fakeSrc = { id: "__ctx_edit_test", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
+    state.sources.push(fakeSrc);
+    syncDockerDaemonButtons();
+    const realPost = post;
+    const realGet = get;
+    post = async (path, body) => (path === "/docker/ps" ? { containers: [], services: [], log: [] } : realPost(path, body));
+    get = async (path) => (path === "/transforms" ? { transforms: [] } : realGet(path));
+    try {
+      mouse($("docker-host-status"), "contextmenu", 5);
+      const menu = document.getElementById("ctxmenu");
+      const editBtn = [...menu.querySelectorAll("button")].find((b) => b.textContent === "Edit Docker Host");
+      ok(!editBtn.disabled, "Edit Docker Host enabled in the menu now that a daemon is connected");
+      editBtn.click();
+      await sleep(20);
+      eq(dlg.open, true, "dialog opened");
+      eq($("dlg-set-title").textContent, "Edit Docker Host", "opened in edit mode");
+    } finally {
+      post = realPost;
+      get = realGet;
+      state.sources = state.sources.filter((s) => s.id !== "__ctx_edit_test");
+      syncDockerDaemonButtons();
+      if (dlg.open) dlg.close();
+    }
+  });
+
+  await T("right-clicking the Docker Host pill's Remove Docker Host is enabled once a host is saved", async () => {
+    await window.cttc.recordDockerHost({ hostKey: "ssh://u@h", host: "ssh://u@h", transforms: [] });
+    syncDockerDaemonButtons();
+    await sleep(20); // syncDockerDaemonButtons' own Remove-button update is an IPC round-trip now
+    try {
+      ok(!$("btn-remove-docker-daemon").disabled, "sanity: sidebar's own Remove Docker Host is enabled with a saved host");
+      mouse($("docker-host-status"), "contextmenu", 5);
+      const menu = document.getElementById("ctxmenu");
+      const removeBtn = [...menu.querySelectorAll("button")].find((b) => b.textContent.includes("Remove Docker Host"));
+      ok(!removeBtn.disabled, "Remove Docker Host enabled in the menu now that a host is saved");
+    } finally {
+      document.body.click();
+      await window.cttc.retireDockerHost("ssh://u@h");
+      syncDockerDaemonButtons();
+    }
+  });
+
+  await T("Docker Host dropdown separates each entry with a divider", async () => {
+    // gateways.json is the sole store now (no bulk-clear IPC) -- retire
+    // whatever's already there so only the two entries below are listed,
+    // restoring each by re-recording it in finally (recordDockerHost
+    // revives a retired entry, see lib/gateway-registry.js).
+    const saved = await dockerHostHistory();
+    for (const entry of saved) await window.cttc.retireDockerHost(entry.hostKey);
+    await window.cttc.recordDockerHost({ hostKey: "ssh://a@h", host: "ssh://a@h", transforms: [] });
+    await window.cttc.recordDockerHost({ hostKey: "ssh://b@h", host: "ssh://b@h", transforms: [] });
+    try {
+      $("docker-host-status-btn").click();
+      await sleep(20); // the dropdown's render() reads dockerHostHistory(), an IPC round-trip
+      const items = $("docker-host-dropdown").querySelectorAll(".gateway-item");
+      const seps = $("docker-host-dropdown").querySelectorAll(".gateway-item-sep");
+      eq(items.length, 2, "both saved hosts listed");
+      eq(seps.length, 1, "one divider between the two entries");
+    } finally {
+      document.body.click();
+      await window.cttc.retireDockerHost("ssh://a@h");
+      await window.cttc.retireDockerHost("ssh://b@h");
+      for (const entry of saved) await window.cttc.recordDockerHost(entry);
+    }
+  });
+
+  /* ── Gateway/Docker Host pills close each other's overlay while either is
+     engaged -- the pill (button) itself is never hidden, only ever a
+     *different* pill's own already-open tooltip/dropdown/menu. ─────────── */
+
+  const pillVisible = (el) => getComputedStyle(el).visibility !== "hidden" && getComputedStyle(el).display !== "none";
+
+  const openGatewayCurrentStatus = () => {
+    mouse($("server-status"), "contextmenu", 5);
+    const menu = document.getElementById("ctxmenu");
+    [...menu.querySelectorAll("button")].find((b) => b.textContent === "Current Status").click();
+  };
+
+  await T("opening the Docker Host pill's Current Status closes the Gateway pill's own popup, but never hides the Gateway pill", async () => {
+    openGatewayCurrentStatus();
+    await sleep(20); // Gateway's Current Status is async (loadConnectionInfo), unlike Docker Host's
+    ok(!$("connection-info-popup").hidden, "Gateway's own status popup shown first");
+    openDockerHostCurrentStatus();
+    try {
+      ok(pillVisible($("server-status")), "Gateway pill's own control stays fully visible");
+      ok($("server-status-btn").disabled !== true, "Gateway pill's button stays interactive");
+      ok($("connection-info-popup").hidden, "Gateway's popup closed now that Docker Host is engaged");
+    } finally {
+      document.body.click();
+    }
+  });
+
+  await T("opening the Gateway pill's Current Status closes the Docker Host pill's own popup, but never hides the Docker Host pill", async () => {
+    openDockerHostCurrentStatus();
+    ok(!$("docker-host-info-popup").hidden, "Docker Host's own status popup shown first");
+    openGatewayCurrentStatus();
+    await sleep(20);
+    try {
+      ok(pillVisible($("docker-host-status")), "Docker Host pill's own control stays fully visible");
+      ok($("docker-host-info-popup").hidden, "Docker Host's popup closed now that Gateway is engaged");
+    } finally {
+      document.body.click();
+    }
+  });
+
+  await T("right-clicking the Docker Host pill closes the Gateway pill's own dropdown, but never hides the Gateway pill", () => {
+    // None of these overlays self-close on their own -- only an outside
+    // click or a peer pill engaging closes them -- so this genuinely
+    // exercises the cross-pill close (nothing else would ever close it).
+    $("server-status-btn").click();
+    ok(!$("gateway-dropdown").hidden, "Gateway's own dropdown shown first");
+    mouse($("docker-host-status"), "contextmenu", 5);
+    try {
+      ok(pillVisible($("server-status")), "Gateway pill's own control stays fully visible");
+      ok($("gateway-dropdown").hidden, "Gateway's dropdown closed now that Docker Host's actions menu is open");
+    } finally {
+      document.body.click(); // closes the ctxmenu and, if still open, the dropdown
+    }
+  });
+
+  await T("clicking the Docker Host pill's switcher closes the Gateway pill's own dropdown, but never hides the Gateway pill", () => {
+    $("server-status-btn").click();
+    ok(!$("gateway-dropdown").hidden, "Gateway's own dropdown shown first");
+    $("docker-host-status-btn").click();
+    try {
+      ok(pillVisible($("server-status")), "Gateway pill's own control stays fully visible");
+      ok($("gateway-dropdown").hidden, "Gateway's dropdown closed now that Docker Host's switcher is open");
+    } finally {
+      document.body.click(); // outside click closes whatever's still open
+    }
+  });
+
+  await T("Edit Docker Host: picking a different saved host from Load Docker Host swaps the checklist but leaves host/ssh-key locked", async () => {
+    // Confirmed behavior: unlike New Docker Host, Edit Docker Host's Load
+    // Docker Host stays visible+enabled, but picking a different entry only
+    // re-targets which host's checklist is being edited -- it must never
+    // unlock the connection-string fields, since editing is about which
+    // containers/services to follow for an already-identified host, not
+    // retyping its connection string.
+    const saved = await dockerHostHistory();
+    await window.cttc.recordDockerHost({ hostKey: "ssh://u@h", host: "ssh://u@h", sshKey: "/path/to/key", transforms: [] });
+    await window.cttc.recordDockerHost({ hostKey: "ssh://other@h2", host: "ssh://other@h2", sshKey: "/other/key", transforms: [] });
+    const fakeSrc = { id: "__editpick_test", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
+    state.sources.push(fakeSrc);
+    syncDockerDaemonButtons();
+    dockerHostKeys.set("ssh://u@h", "/path/to/key");
+    state.activeDockerHost = "ssh://u@h"; // br-DHOST-030: currentDockerHost() now reflects this, not state.sources
+    const realPost = post;
+    const realGet = get;
+    post = async (path, body) => (path === "/docker/ps" ? { containers: [], services: [], log: [] } : realPost(path, body));
+    get = async (path) => (path === "/transforms" ? { transforms: [] } : realGet(path));
+    try {
+      await enterDockerHostEditMode(currentDockerHost() || "local");
+      eq($("docker-host-history-row").hidden, false, "Load Docker Host visible in Edit mode");
+      eq($("docker-host").disabled, true, "sanity: locked while editing");
+      $("docker-host-history").value = "ssh://other@h2";
+      await $("docker-host-history").onchange();
+      eq($("docker-host").value, "other@h2", "checklist context switched to the picked host");
+      eq($("docker-ssh-key").value, "/other/key", "ssh key field reflects the picked host's own saved key");
+      eq($("docker-host").disabled, true, "still locked -- picking a host in Edit mode never unlocks the connection string");
+      eq($("docker-ssh-key").disabled, true, "ssh key still locked too");
+      eq($("docker-ssh-key-browse").disabled, true, "browse still locked too");
+    } finally {
+      post = realPost;
+      get = realGet;
+      dockerHostKeys.delete("ssh://u@h");
+      state.activeDockerHost = "local";
+      state.sources = state.sources.filter((s) => s.id !== "__editpick_test");
+      syncDockerDaemonButtons();
+      await window.cttc.retireDockerHost("ssh://u@h");
+      await window.cttc.retireDockerHost("ssh://other@h2");
+      for (const entry of saved) await window.cttc.recordDockerHost(entry);
+      dlg.close();
+      $("btn-set").click();
+      dlg.close();
+    }
+  });
+
+  /* ── Exactly one view (Live or one loaded file) visible at a time ──────── */
+
+  await T("Load Data auto-switches to the newly opened file, hiding (not disposing) whatever was active before", async () => {
+    const out1 = "/tmp/cttc-e2e-view-a.cttc-metric";
+    const out2 = "/tmp/cttc-e2e-view-b.cttc-metric";
+    await post("/sample/export", { path: out1, from: R.min_ts, to: R.min_ts + 5 * 60000 });
+    await post("/sample/export", { path: out2, from: R.min_ts, to: R.min_ts + 5 * 60000 });
+    const realPick = pickAnalysisFiles;
+    try {
+      pickAnalysisFiles = async () => [out1];
+      await $("btn-load-sample").onclick();
+      const pathA = `upload://${basename(out1)}`;
+      let groupA = sampleFileGroups().find((g) => g.path === pathA);
+      ok(groupA, "file A opened");
+      eq(state.activeSamplePath, pathA, "A became the active view");
+      ok([...groupA.ids].every((id) => !isSampleHidden(id)), "A's sources visible");
+
+      pickAnalysisFiles = async () => [out2];
+      await $("btn-load-sample").onclick();
+      const pathB = `upload://${basename(out2)}`;
+      const groupB = sampleFileGroups().find((g) => g.path === pathB);
+      ok(groupB, "file B opened");
+      eq(state.activeSamplePath, pathB, "B became the active view");
+      ok([...groupB.ids].every((id) => !isSampleHidden(id)), "B's sources visible");
+      groupA = sampleFileGroups().find((g) => g.path === pathA);
+      ok([...groupA.ids].every((id) => isSampleHidden(id)), "A's sources now hidden");
+      ok(state.sources.some((s) => groupA.ids.has(s.id)), "A's sources still open server-side, not disposed");
+    } finally {
+      pickAnalysisFiles = realPick;
+      for (const s of state.sources.filter((s) => s.path === `upload://${basename(out1)}` || s.path === `upload://${basename(out2)}`)) {
+        await post("/close", { id: s.id });
+      }
+      await refreshAll();
+    }
+  });
+
+  await T("Legend and log panels show only the active view's own containers, never piling up across loads or live (BUG-0082)", async () => {
+    const out1 = "/tmp/cttc-e2e-legend-a.cttc-metric";
+    const out2 = "/tmp/cttc-e2e-legend-b.cttc-metric";
+    await post("/sample/export", { path: out1, from: R.min_ts, to: R.min_ts + 5 * 60000 });
+    await post("/sample/export", { path: out2, from: R.min_ts, to: R.min_ts + 5 * 60000 });
+    const realPick = pickAnalysisFiles;
+    try {
+      pickAnalysisFiles = async () => [out1];
+      await $("btn-load-sample").onclick();
+      renderLegend();
+      syncPanels();
+      const legendA = [...$("legend").querySelectorAll(".legend-item")].map((i) => i.textContent);
+      ok(new Set(legendA).size === legendA.length, `no duplicate legend entries after loading one file: ${legendA}`);
+      ok(legendA.length > 0, "sanity: the loaded file's own containers are listed");
+      ok(legendA.every((l) => !l.includes(".cttc-metric") && !l.includes(".cttc-record")), `legend labels must not append the originating file's name: ${legendA}`);
+      const visibleA = [...panels.values()].filter((p) => !p.el.hidden).map((p) => p.src.name);
+      ok(visibleA.length > 0, "sanity: at least one log panel visible for the loaded file");
+
+      pickAnalysisFiles = async () => [out2];
+      await $("btn-load-sample").onclick();
+      renderLegend();
+      syncPanels();
+      const legendB = [...$("legend").querySelectorAll(".legend-item")].map((i) => i.textContent);
+      eq(
+        legendB.length, legendA.length,
+        `switching to a second file must not accumulate the first file's (or Live's) legend entries -- was ${JSON.stringify(legendA)}, now ${JSON.stringify(legendB)}`
+      );
+      const visibleB = [...panels.values()].filter((p) => !p.el.hidden).map((p) => p.src.name);
+      eq(visibleB.length, visibleA.length, "same number of visible log panels for the newly active file, not accumulated");
+      const hiddenCount = [...panels.values()].filter((p) => p.el.hidden).length;
+      ok(hiddenCount >= visibleA.length, "the first file's (and Live's) panels still exist, just correctly hidden -- not disposed");
+    } finally {
+      pickAnalysisFiles = realPick;
+      for (const s of state.sources.filter((s) => s.path === `upload://${basename(out1)}` || s.path === `upload://${basename(out2)}`)) {
+        await post("/close", { id: s.id });
+      }
+      await refreshAll();
+    }
+  });
+
+  await T("Re-opening an already-open file switches to its existing view instead of duplicating or no-op'ing", async () => {
+    const outA = "/tmp/cttc-e2e-view-reopen-a.cttc-metric";
+    const outB = "/tmp/cttc-e2e-view-reopen-b.cttc-metric";
+    await post("/sample/export", { path: outA, from: R.min_ts, to: R.min_ts + 5 * 60000 });
+    await post("/sample/export", { path: outB, from: R.min_ts, to: R.min_ts + 5 * 60000 });
+    const pathA = `upload://${basename(outA)}`;
+    const pathB = `upload://${basename(outB)}`;
+    const realPick = pickAnalysisFiles;
+    try {
+      pickAnalysisFiles = async () => [outA];
+      await $("btn-load-sample").onclick();
+      const idsA = new Set(state.sources.filter((s) => s.path === pathA).map((s) => s.id));
+
+      pickAnalysisFiles = async () => [outB];
+      await $("btn-load-sample").onclick(); // B becomes active, A hidden
+      eq(state.activeSamplePath, pathB, "sanity: B is active");
+
+      pickAnalysisFiles = async () => [outA]; // re-"open" A -- already open
+      await $("btn-load-sample").onclick();
+      eq(state.activeSamplePath, pathA, "switched back to A's existing view");
+      const idsAAfter = new Set(state.sources.filter((s) => s.path === pathA).map((s) => s.id));
+      eq(idsAAfter.size, idsA.size, "no duplicate sources -- same set as before");
+      ok([...idsAAfter].every((id) => idsA.has(id)), "exact same source ids, not re-uploaded");
+    } finally {
+      pickAnalysisFiles = realPick;
+      for (const s of state.sources.filter((s) => s.path === pathA || s.path === pathB)) {
+        await post("/close", { id: s.id });
+      }
+      await refreshAll();
+    }
+  });
+
+  await T("viewing a loaded file locks resetZoom/the navigator to that file's own range, not the combined one", async () => {
+    // System Observability spec's "Synchronization Continuity": the log
+    // viewer must always be locked to the current metric's own temporal
+    // window -- exercised here via resetZoom/totalSpanBounds, which the
+    // navigator and the log panel's own bounds both derive from.
+    const out = "/tmp/cttc-e2e-view-range-scope.cttc-metric";
+    await post("/sample/export", { path: out, from: R.min_ts, to: R.min_ts + 60000 });
+    const path = `upload://${basename(out)}`;
+    const realPick = pickAnalysisFiles;
+    try {
+      pickAnalysisFiles = async () => [out];
+      await $("btn-load-sample").onclick();
+      eq(state.activeSamplePath, path, "sanity: the narrow file is the active view");
+
+      const scoped = activeViewRange();
+      const fullSpan = R.max_ts - R.min_ts;
+      const scopedSpan = scoped.max_ts - scoped.min_ts;
+      ok(scopedSpan < fullSpan / 2, `scoped span (${scopedSpan}) should be far narrower than the full demo range (${fullSpan})`);
+
+      resetZoom();
+      ok(state.view.t1 - state.view.t0 < fullSpan / 2, "resetZoom fit only the active file's own range");
+      ok(state.view.t0 >= R.min_ts - fullSpan, "didn't drift into the unrelated combined range");
+
+      const { lo, hi } = totalSpanBounds();
+      ok(hi - lo < fullSpan / 2, "navigator span locked to the file, not stretched out to 'now'");
+
+      setActiveView("live");
+      eq(state.liveHidden, false, "sanity: back to Live");
+      const backToFull = activeViewRange();
+      eq(backToFull, state.range, "Live uses the full combined range again");
+    } finally {
+      pickAnalysisFiles = realPick;
+      for (const s of state.sources.filter((s) => s.path === path)) await post("/close", { id: s.id });
+      await refreshAll();
+      resetZoom();
+    }
+  });
+
   await T("host block shows the loading state before first host sample, titled for the local machine", () => {
     state.sources.push({ id: "__hload", kind: "stats", is_host: true,
                          path: "docker://local/host", live: true, name: "host@local" });
@@ -1870,7 +4927,7 @@
       eq(hostBlockEl.hidden, false, "host block appears");
       eq($("host-loading").hidden, false, "loading indicator shown");
       eq(hostChartsEl.hidden, true, "charts hidden while loading");
-      eq($("host-title").textContent, "Host telemetry — this machine", "titled for the local daemon");
+      eq($("host-title").textContent, "Host telemetry — localhost", "titled for the local daemon");
     } finally {
       state.sources = state.sources.filter((s) => s.id !== "__hload");
       drawAll();
@@ -1890,22 +4947,6 @@
     }
   });
 
-  await T("log panel order toggle flips newest/oldest-first and persists", async () => {
-    const p = [...panels.values()][0];
-    const startReversed = p.reversed;
-    ok(p.total >= 2, "panel has rows");
-    eq(p.dataIndexAt(0), startReversed ? p.total - 1 : 0, "visual->data mapping");
-    eq(p.visualIndexOf(p.dataIndexAt(5)), 5, "mapping is its own inverse");
-    const toggle = [...p.el.querySelectorAll("button")].find(
-      (b) => b.textContent === "⬆" || b.textContent === "⬇");
-    ok(toggle, "order toggle present");
-    toggle.click();
-    eq(p.reversed, !startReversed, "flipped");
-    eq(prefs.get("logNewestFirst", null), p.reversed, "persisted");
-    eq(p.dataIndexAt(0), p.reversed ? p.total - 1 : 0, "mapping follows the flip");
-    toggle.click();
-    eq(p.reversed, startReversed, "restored");
-  });
 
   await T("log panels default to newest-first and land pinned to the very top on the boot-time cursor sync (goLive -> setCursor(now))", async () => {
     // fresh panels (see Panel's constructor) always default to reversed --
@@ -2118,6 +5159,20 @@
     $("dlg-export-ok").click();
     const opts = await p;
     eq(opts.includeHost, false, "host choice returned");
+  });
+
+  await T("Esc-dismissing the export dialog resolves the promise as a cancel instead of hanging forever (ui-EXPORT-003)", async () => {
+    const p = askExportOptions();
+    await until(() => dlgExport.open, "export dialog open");
+    dlgExport.close(); // native <dialog> Esc behavior: closes without touching either button
+    const opts = await p; // must not hang
+    eq(opts, null, "Esc must resolve as a cancel");
+    // the next real open must still work normally -- proof the close-event
+    // listener/handlers were cleaned up, not left stale from the Esc above
+    const p2 = askExportOptions();
+    await until(() => dlgExport.open, "export dialog reopened");
+    $("dlg-export-ok").click();
+    ok((await p2) !== null, "OK still resolves normally after a prior Esc");
   });
 
   await T("Hard Reset asks for confirmation first, and does nothing if declined", () => {

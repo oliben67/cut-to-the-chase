@@ -50,7 +50,7 @@ class Gen:
 
     def stats_tick(self, ts: float, t_off: float):
         for svc in SERVICES:
-            f, cause = spike_factor(t_off, svc)
+            f, _cause = spike_factor(t_off, svc)
             base_cpu = {"c3_api": 6, "c3_worker": 10, "c3_redis": 3}[svc]
             cpu = base_cpu + random.uniform(-1.5, 1.5) + f * 70
             mem = {"c3_api": 22, "c3_worker": 30, "c3_redis": 12}[svc] + f * 35 + random.uniform(-1, 1)

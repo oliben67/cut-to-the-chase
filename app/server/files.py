@@ -14,6 +14,7 @@ files, many concurrent uploads) without the collector code ever noticing.
 
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
 from datetime import UTC, datetime
@@ -21,17 +22,23 @@ from pathlib import Path
 
 from cttc_format import METRIC_EXT, is_cttc_archive
 
+logger = logging.getLogger("cttc")
 
-def download_sample(state, t0: float, t1: float, include_host: bool):
+
+async def download_sample(
+    state, t0: float, t1: float, include_host: bool, source_ids: set[str] | None = None
+):
     """-> (data, filename, source_count) for the .cttc-metric sample covering
-    [t0, t1] -- the byte-returning counterpart to State.export_sample()."""
-    data, meta = state.build_sample_bytes(t0, t1, include_host)
+    [t0, t1] -- the byte-returning counterpart to State.export_sample().
+    `source_ids`, if given, restricts the archive to that subset of sources
+    (see State.build_sample_bytes, which this passes straight through to)."""
+    data, meta = await state.build_sample_bytes(t0, t1, include_host, source_ids)
     ts = datetime.fromtimestamp(t0 / 1000, tz=UTC).strftime("%Y-%m-%d-%H-%M-%S")
     filename = f"sample-{ts}{METRIC_EXT}"
     return data, filename, len(meta)
 
 
-def upload_and_open(
+async def upload_and_open(
     state, filename: str, data: bytes, transforms: list[str], segment: int | None = None
 ):
     """Write the uploaded bytes to a scratch file, open it exactly like a
@@ -45,8 +52,8 @@ def upload_and_open(
     read their input into memory (LogSource.ingest_chunk /
     StatsSource.ingest_chunk, or the whole zip for load_sample) and a
     non-live source's .path is never read again afterward (tail_loop skips
-    anything with live=False; export reads s.rows/s.series, not s.path) --
-    safe to delete it immediately after.
+    anything with live=False; export reads Redis via the source's name, not
+    s.path) -- safe to delete it immediately after.
 
     Returns the list of opened source ids. Any exception open_file/
     load_sample themselves raise propagates -- callers should catch and
@@ -60,7 +67,7 @@ def upload_and_open(
         with os.fdopen(fd, "wb") as f:
             f.write(data)
         if is_cttc_archive(filename):
-            opened = state.load_sample(tmp_path, segment=segment)
+            opened = await state.load_sample(tmp_path, segment=segment)
         else:
             src = state.open_file(tmp_path, "auto", filename, live=False, transforms=transforms)
             opened = [src.id]
@@ -73,5 +80,8 @@ def upload_and_open(
     finally:
         try:
             os.unlink(tmp_path)
-        except OSError:
-            pass
+        except OSError as e:
+            # scratch file, not the uploaded data itself -- a leftover here
+            # is a nuisance (cleaned up by the OS temp dir eventually), not
+            # data loss, so this is fine to swallow, just not silently.
+            logger.debug("files: could not remove scratch upload %s: %s", tmp_path, e)

@@ -46,7 +46,7 @@ function waitForPortOpen(host, port, { timeoutMs = 15000, intervalMs = 150, sign
 // opening doesn't mean the FastAPI app inside it has actually finished
 // starting up, so this polls GET /health (added for the renderer's own
 // server-status indicator) instead of just a raw TCP connect.
-function waitForHttpOk(url, { timeoutMs = 15000, intervalMs = 300, fetchFn = fetch } = {}) {
+function waitForHttpOk(url, { timeoutMs = 15000, intervalMs = 300, fetchFn = fetch, headers } = {}) {
   const deadline = Date.now() + timeoutMs;
   return new Promise((resolve, reject) => {
     const attempt = async () => {
@@ -56,7 +56,10 @@ function waitForHttpOk(url, { timeoutMs = 15000, intervalMs = 300, fetchFn = fet
         // SYN rather than sending RST) never reaches the catch block below,
         // so the deadline check never runs and the whole wait can hang well
         // past timeoutMs regardless of how short it was set.
-        const r = await fetchFn(url, { signal: AbortSignal.timeout(Math.min(intervalMs * 3, 5000)) });
+        const r = await fetchFn(url, {
+          signal: AbortSignal.timeout(Math.min(intervalMs * 3, 5000)),
+          ...(headers ? { headers } : {}),
+        });
         if (r.ok) {
           resolve();
           return;

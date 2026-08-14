@@ -9,25 +9,31 @@ psutil and the HTTP stack are exercised for real. Run:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import hashlib
 import http.client
 import io
 import json
 import re
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
 import types
 import urllib.error
 import urllib.request
+import uuid
 import zipfile
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 import uvicorn
+from conftest import unique_redis_tcp_port
 
+import redis_log
 import server
 
 
@@ -202,153 +208,209 @@ class TestApplyTransforms:
 # ── LogSource ────────────────────────────────────────────────────────────────
 
 
-def log_source(transforms=()):
-    return server.LogSource(
-        "s1", "svc", Path("/nonexistent"), live=False, transforms=list(transforms)
+async def _flush():
+    # ingest_chunk's redis_log.record() enqueues via call_soon_threadsafe
+    # and is pumped asynchronously; give the pump a beat before any read
+    # that expects the write to already be visible in Redis.
+    await asyncio.sleep(0.15)
+
+
+def _restamp_gateway_id(cttc_path: Path, gateway_id: str) -> None:
+    """Test helper: rewrites every source entry's gateway_id in an
+    already-exported .cttc's manifest.json, simulating a sample collected
+    by a genuinely different gateway install rather than just a different
+    file -- the integrity hash is deliberately left stale (load_sample's
+    verification is warn-only, see _manifest_hash, not a load-blocking
+    gate), so this only needs to touch the one field under test."""
+    with zipfile.ZipFile(cttc_path, "r") as z:
+        members = {n: z.read(n) for n in z.namelist()}
+    man = json.loads(members["manifest.json"])
+    for seg in man["segments"]:
+        for src in seg["sources"]:
+            src["gateway_id"] = gateway_id
+    members["manifest.json"] = json.dumps(man).encode()
+    with zipfile.ZipFile(cttc_path, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, data in members.items():
+            z.writestr(name, data)
+
+
+def log_source(redis_log_instance, transforms=(), sid="s1"):
+    src = server.LogSource(
+        sid, "svc", Path("/nonexistent"), live=False, transforms=list(transforms)
     )
+    src._state = types.SimpleNamespace(redis_log=redis_log_instance)
+    return src
+
+
+async def ingest_and_flush(src, data: bytes) -> int:
+    n = src.ingest_chunk(data)
+    await _flush()
+    return n
 
 
 class TestLogSource:
-    def test_docker_t_line(self):
-        src = log_source()
-        n = src.ingest_chunk(b"2026-01-02T03:04:05.000000000Z hello world\n")
+    async def test_docker_t_line(self, redis_log_instance):
+        src = log_source(redis_log_instance)
+        n = await ingest_and_flush(src, b"2026-01-02T03:04:05.000000000Z hello world\n")
         assert n == 1
-        row = src.slice(0, 10)[0]
+        row = (await src.slice(0, 10))[0]
         assert row["text"] == "hello world"
         assert row["ts"] == ms(2026, 1, 2, 3, 4, 5)
         assert row["i"] == 0 and len(row["uid"]) == 16
 
-    def test_swarm_service_prefix_stripped(self):
-        src = log_source()
-        src.ingest_chunk(b"2026-01-02T03:04:05Z api.1.abc123@node1    | msg here\n")
-        assert src.slice(0, 1)[0]["text"] == "msg here"
+    async def test_swarm_service_prefix_stripped(self, redis_log_instance):
+        src = log_source(redis_log_instance)
+        await ingest_and_flush(src, b"2026-01-02T03:04:05Z api.1.abc123@node1    | msg here\n")
+        assert (await src.slice(0, 1))[0]["text"] == "msg here"
 
-    def test_json_line_ts_from_fields(self):
-        src = log_source()
-        src.ingest_chunk(b'{"time": "2026-01-02T03:04:05Z", "msg": "x"}\n')
-        assert src.slice(0, 1)[0]["ts"] == ms(2026, 1, 2, 3, 4, 5)
+    async def test_json_line_ts_from_fields(self, redis_log_instance):
+        src = log_source(redis_log_instance)
+        await ingest_and_flush(src, b'{"time": "2026-01-02T03:04:05Z", "msg": "x"}\n')
+        assert (await src.slice(0, 1))[0]["ts"] == ms(2026, 1, 2, 3, 4, 5)
 
-    def test_json_numeric_ts_seconds_and_ms(self):
-        src = log_source()
-        src.ingest_chunk(b'{"ts": 1700000000}\n{"ts": 1700000000500}\n')
-        rows = src.slice(0, 2)
+    async def test_json_numeric_ts_seconds_and_ms(self, redis_log_instance):
+        src = log_source(redis_log_instance)
+        await ingest_and_flush(src, b'{"ts": 1700000000}\n{"ts": 1700000000500}\n')
+        rows = await src.slice(0, 2)
         assert rows[0]["ts"] == 1700000000000.0
         assert rows[1]["ts"] == 1700000000500.0
 
-    def test_bad_json_body_ignored(self):
-        src = log_source()
+    async def test_bad_json_body_ignored(self, redis_log_instance):
+        src = log_source(redis_log_instance)
         # looks like JSON but is not parseable, and has a leading timestamp
-        src.ingest_chunk(b"2026-01-02T03:04:05Z {broken json}\n")
-        assert src.total() == 1
+        await ingest_and_flush(src, b"2026-01-02T03:04:05Z {broken json}\n")
+        assert await src.total() == 1
 
-    def test_continuation_within_batch(self):
-        src = log_source()
-        src.ingest_chunk(b"2026-01-02T03:04:05Z line one\n  at Some.stack(Frame.java:1)\n")
-        assert src.total() == 1
-        assert "Frame.java" in src.slice(0, 1)[0]["text"]
+    async def test_continuation_within_batch(self, redis_log_instance):
+        src = log_source(redis_log_instance)
+        await ingest_and_flush(
+            src, b"2026-01-02T03:04:05Z line one\n  at Some.stack(Frame.java:1)\n"
+        )
+        assert await src.total() == 1
+        assert "Frame.java" in (await src.slice(0, 1))[0]["text"]
 
-    def test_continuation_across_chunks(self):
-        src = log_source()
-        src.ingest_chunk(b"2026-01-02T03:04:05Z line one\n")
-        src.ingest_chunk(b"continued\n")
-        assert src.total() == 1
-        assert src.slice(0, 1)[0]["text"] == "line one\ncontinued"
+    async def test_continuation_across_chunks(self, redis_log_instance):
+        src = log_source(redis_log_instance)
+        await ingest_and_flush(src, b"2026-01-02T03:04:05Z line one\n")
+        await ingest_and_flush(src, b"continued\n")
+        assert await src.total() == 1
+        assert (await src.slice(0, 1))[0]["text"] == "line one\ncontinued"
 
-    def test_continuation_with_no_previous_is_skipped(self):
-        src = log_source()
-        src.ingest_chunk(b"no timestamp at all\n")
-        assert src.total() == 0
+    async def test_continuation_with_no_previous_is_skipped(self, redis_log_instance):
+        src = log_source(redis_log_instance)
+        await ingest_and_flush(src, b"no timestamp at all\n")
+        assert await src.total() == 0
         assert src.skipped == 1
 
-    def test_blank_lines_ignored(self):
-        src = log_source()
-        src.ingest_chunk(b"\n   \n2026-01-02T03:04:05Z x\n")
-        assert src.total() == 1
+    async def test_blank_lines_ignored(self, redis_log_instance):
+        src = log_source(redis_log_instance)
+        await ingest_and_flush(src, b"\n   \n2026-01-02T03:04:05Z x\n")
+        assert await src.total() == 1
 
-    def test_partial_trailing_line_buffered(self):
-        src = log_source()
-        src.ingest_chunk(b"2026-01-02T03:04:05Z first\n2026-01-02T03:04:06Z par")
-        assert src.total() == 1
-        src.ingest_chunk(b"tial\n")
-        assert src.total() == 2
-        assert src.slice(1, 1)[0]["text"] == "partial"
+    async def test_partial_trailing_line_buffered(self, redis_log_instance):
+        src = log_source(redis_log_instance)
+        await ingest_and_flush(src, b"2026-01-02T03:04:05Z first\n2026-01-02T03:04:06Z par")
+        assert await src.total() == 1
+        await ingest_and_flush(src, b"tial\n")
+        assert await src.total() == 2
+        assert (await src.slice(1, 1))[0]["text"] == "partial"
 
-    def test_out_of_order_chunks_sorted(self):
-        src = log_source()
-        src.ingest_chunk(b"2026-01-02T03:04:10Z late\n")
-        src.ingest_chunk(b"2026-01-02T03:04:05Z early\n")
-        texts = [r["text"] for r in src.slice(0, 10)]
+    async def test_out_of_order_chunks_sorted(self, redis_log_instance):
+        src = log_source(redis_log_instance)
+        await ingest_and_flush(src, b"2026-01-02T03:04:10Z late\n")
+        await ingest_and_flush(src, b"2026-01-02T03:04:05Z early\n")
+        texts = [r["text"] for r in await src.slice(0, 10)]
         assert texts == ["early", "late"]
 
-    def test_unsorted_within_chunk_sorted(self):
-        src = log_source()
-        src.ingest_chunk(b"2026-01-02T03:04:10Z b\n2026-01-02T03:04:05Z a\n")
-        assert [r["text"] for r in src.slice(0, 10)] == ["a", "b"]
+    async def test_unsorted_within_chunk_sorted(self, redis_log_instance):
+        src = log_source(redis_log_instance)
+        await ingest_and_flush(src, b"2026-01-02T03:04:10Z b\n2026-01-02T03:04:05Z a\n")
+        assert [r["text"] for r in await src.slice(0, 10)] == ["a", "b"]
 
-    def test_transform_drop_and_fanout_and_missing_ts(self):
+    async def test_transform_drop_and_fanout_and_missing_ts(self, redis_log_instance):
+        # NOTE: the `dup` fanout below produces two records sharing the
+        # exact same source ts -- Redis's schema keys each record by
+        # `str(ts)` (see redis_log.py's module docstring), so an exact-ts
+        # collision coalesces into a single stored record instead of two
+        # (the old RAM version kept both, distinguished only by list
+        # position). This is a pre-existing schema property, not something
+        # this test can change -- asserted here rather than silently
+        # ignored, since a real fanout transform hitting this is worth
+        # knowing about.
         drop = ("drop", lambda r: None if "drop" in r["text"] else r)
         dup = ("dup", lambda r: [r, dict(r)])
         nots = ("nots", lambda r: {**r, "ts": None} if "no-ts" in r["text"] else r)
-        src = log_source([drop, dup, nots])
-        src.ingest_chunk(
-            b"2026-01-02T03:04:05Z keep\n2026-01-02T03:04:06Z drop me\n2026-01-02T03:04:07Z no-ts\n"
+        src = log_source(redis_log_instance, [drop, dup, nots])
+        await ingest_and_flush(
+            src,
+            b"2026-01-02T03:04:05Z keep\n2026-01-02T03:04:06Z drop me\n2026-01-02T03:04:07Z no-ts\n",
         )
-        assert src.total() == 2  # "keep" duplicated; "drop me" gone; "no-ts" skipped
+        assert (
+            await src.total() == 1
+        )  # "keep" x2 coalesce (same ts); "drop me" gone; "no-ts" skipped
         assert src.skipped == 2
 
-    def test_index_at(self):
-        src = log_source()
-        src.ingest_chunk(
-            b"2026-01-02T03:00:00Z a\n2026-01-02T03:00:10Z b\n2026-01-02T03:00:20Z c\n"
+    async def test_index_at(self, redis_log_instance):
+        src = log_source(redis_log_instance)
+        await ingest_and_flush(
+            src, b"2026-01-02T03:00:00Z a\n2026-01-02T03:00:10Z b\n2026-01-02T03:00:20Z c\n"
         )
         t0 = ms(2026, 1, 2, 3, 0, 0)
-        assert src.index_at(t0 - 1000) == 0
-        assert src.index_at(t0 + 4000) == 0  # nearer to a than b
-        assert src.index_at(t0 + 6000) == 1
-        assert src.index_at(t0 + 99999999) == 2
+        assert await src.index_at(t0 - 1000) == 0
+        assert await src.index_at(t0 + 4000) == 0  # nearer to a than b
+        assert await src.index_at(t0 + 6000) == 1
+        assert await src.index_at(t0 + 99999999) == 2
 
-    def test_index_at_empty(self):
-        assert log_source().index_at(0) == -1
+    async def test_index_at_empty(self, redis_log_instance):
+        assert await log_source(redis_log_instance).index_at(0) == -1
 
-    def test_ticks(self):
-        src = log_source()
-        src.ingest_chunk(
-            b"2026-01-02T03:00:00Z a\n2026-01-02T03:00:00Z b\n2026-01-02T03:00:09Z c\n"
+    async def test_ticks(self, redis_log_instance):
+        src = log_source(redis_log_instance)
+        # a/b land in the same 1s bucket without sharing an exact
+        # timestamp -- see test_transform_drop_and_fanout_and_missing_ts's
+        # note on why an exact-ts collision can't be used here.
+        await ingest_and_flush(
+            src,
+            b"2026-01-02T03:00:00.000000000Z a\n"
+            b"2026-01-02T03:00:00.500000000Z b\n"
+            b"2026-01-02T03:00:09Z c\n",
         )
         t0 = ms(2026, 1, 2, 3, 0, 0)
-        counts = src.ticks(t0, t0 + 10000, 10)
+        counts = await src.ticks(t0, t0 + 10000, 10)
         assert counts[0] == 2 and counts[9] == 1 and sum(counts) == 3
-        assert src.ticks(t0, t0 + 10000, 0) != []  # px clamped to >= 1
+        assert await src.ticks(t0, t0 + 10000, 0) != []  # px clamped to >= 1
 
-    def test_range(self):
-        src = log_source()
-        assert src.range() is None
-        src.ingest_chunk(b"2026-01-02T03:00:00Z a\n2026-01-02T03:00:10Z b\n")
-        assert src.range() == (ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 10))
+    async def test_range(self, redis_log_instance):
+        src = log_source(redis_log_instance)
+        assert await src.range() is None
+        await ingest_and_flush(src, b"2026-01-02T03:00:00Z a\n2026-01-02T03:00:10Z b\n")
+        assert await src.range() == (ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 10))
 
-    def test_slice_clamps_negative_start(self):
-        src = log_source()
-        src.ingest_chunk(b"2026-01-02T03:00:00Z a\n")
-        assert src.slice(-5, 10)[0]["text"] == "a"
+    async def test_slice_clamps_negative_start(self, redis_log_instance):
+        src = log_source(redis_log_instance)
+        await ingest_and_flush(src, b"2026-01-02T03:00:00Z a\n")
+        assert (await src.slice(-5, 10))[0]["text"] == "a"
 
-    def test_find_forward_backward_wrap_and_case(self):
-        src = log_source()
-        src.ingest_chunk(
+    async def test_find_forward_backward_wrap_and_case(self, redis_log_instance):
+        src = log_source(redis_log_instance)
+        await ingest_and_flush(
+            src,
             b"2026-01-02T03:00:00Z Alpha ERROR one\n"
             b"2026-01-02T03:00:01Z beta ok\n"
-            b"2026-01-02T03:00:02Z gamma ERROR two\n"
+            b"2026-01-02T03:00:02Z gamma ERROR two\n",
         )
-        assert src.find("error", 0) == 0  # case-insensitive
-        assert src.find("error", 1) == 2  # forward from middle
-        assert src.find("error", 1, forward=False) == 0  # backward from middle
-        assert src.find("ERROR one", 1) == 0  # wraps past the end
-        assert src.find("two", 0, forward=False) == 2  # wraps backward
-        assert src.find("nothing-here", 0) is None
-        assert src.find("   ", 0) is None  # blank query
-        assert src.find("x", 99) is None or src.find("x", 99) >= 0  # start clamped
+        assert await src.find("error", 0) == 0  # case-insensitive
+        assert await src.find("error", 1) == 2  # forward from middle
+        assert await src.find("error", 1, forward=False) == 0  # backward from middle
+        assert await src.find("ERROR one", 1) == 0  # wraps past the end
+        assert await src.find("two", 0, forward=False) == 2  # wraps backward
+        assert await src.find("nothing-here", 0) is None
+        assert await src.find("   ", 0) is None  # blank query
+        got = await src.find("x", 99)
+        assert got is None or got >= 0  # start clamped
 
-    def test_find_empty_log(self):
-        assert log_source().find("x", 0) is None
+    async def test_find_empty_log(self, redis_log_instance):
+        assert await log_source(redis_log_instance).find("x", 0) is None
 
 
 # ── StatsSource ──────────────────────────────────────────────────────────────
@@ -365,19 +427,35 @@ def stats_entry(name, ts, cpu="10%", mem="20%", memuse="100MiB / 1GiB", netio="1
     }
 
 
-def stats_source():
-    return server.StatsSource("s2", "stats", Path("/nonexistent"), live=False)
+def stats_source(redis_log_instance, sid="s2"):
+    src = server.StatsSource(sid, "stats", Path("/nonexistent"), live=False)
+    src._state = types.SimpleNamespace(redis_log=redis_log_instance)
+    return src
 
 
-def feed_stats(src, entries):
+async def feed_stats(src, entries):
     payload = "\n".join(json.dumps(e) for e in entries) + "\n"
-    return src.ingest_chunk(payload.encode())
+    n = src.ingest_chunk(payload.encode())
+    await _flush()
+    return n
+
+
+async def stats_rows(redis_log_instance, svc, sid="s2"):
+    """Redis is the store now (see redis_log.py) -- test stand-in for what
+    used to be a direct `src.series[svc]` read. `svc` is the bare/host-
+    qualified name a caller would pass to StatsSource._entity_for. `sid`
+    must match stats_source()'s own (default "s2") -- a plain StatsSource
+    (no `host` attribute at all, unlike the Docker subclasses) is qualified
+    by its own id instead, so two unrelated file-based sources sharing a
+    service name never interleave (see LogSource._entity's docstring)."""
+    rows = await redis_log_instance.range_by_score_with_payload(server._entity_id("stats", svc, sid), 0, 10**15)
+    return [(ts, p.get("cpu"), p.get("mem"), p.get("mem_bytes"), p.get("net")) for ts, p in rows]
 
 
 class TestStatsSource:
-    def test_jsonl_ingest_and_net_rate(self):
-        src = stats_source()
-        n = feed_stats(
+    async def test_jsonl_ingest_and_net_rate(self, redis_log_instance):
+        src = stats_source(redis_log_instance)
+        n = await feed_stats(
             src,
             [
                 stats_entry("api", "2026-01-02T03:00:00Z", netio="1kB / 2kB"),
@@ -385,54 +463,73 @@ class TestStatsSource:
             ],
         )
         assert n == 2 and src.count == 2
-        rows = src.series["api"]
+        rows = await stats_rows(redis_log_instance, "api")
         assert rows[0][4] is None  # first sample: no rate yet
         assert rows[1][4] == pytest.approx(300.0)  # 3000 B over 10 s
         assert rows[0][1] == 10.0 and rows[0][2] == 20.0
         assert rows[0][3] == pytest.approx(100 * 1024**2)
 
-    def test_net_counter_reset_gives_none(self):
-        src = stats_source()
-        feed_stats(
+    async def test_net_counter_reset_gives_none(self, redis_log_instance):
+        src = stats_source(redis_log_instance)
+        await feed_stats(
             src,
             [
                 stats_entry("api", "2026-01-02T03:00:00Z", netio="9kB / 9kB"),
                 stats_entry("api", "2026-01-02T03:00:10Z", netio="1kB / 1kB"),
             ],
         )
-        assert src.series["api"][1][4] is None
+        rows = await stats_rows(redis_log_instance, "api")
+        assert rows[1][4] is None
 
-    def test_net_same_timestamp_gives_none(self):
-        src = stats_source()
-        feed_stats(
+    async def test_net_same_timestamp_gives_none(self, redis_log_instance):
+        src = stats_source(redis_log_instance)
+        await feed_stats(
             src,
             [
                 stats_entry("api", "2026-01-02T03:00:00Z"),
                 stats_entry("api", "2026-01-02T03:00:00Z", netio="5kB / 5kB"),
             ],
         )
-        assert src.series["api"][1][4] is None
+        rows = await stats_rows(redis_log_instance, "api")
+        assert rows[-1][4] is None
 
-    def test_bad_netio_gives_none(self):
-        src = stats_source()
-        feed_stats(src, [stats_entry("api", "2026-01-02T03:00:00Z", netio="weird")])
-        assert src.series["api"][0][4] is None
+    async def test_bad_netio_gives_none(self, redis_log_instance):
+        src = stats_source(redis_log_instance)
+        await feed_stats(src, [stats_entry("api", "2026-01-02T03:00:00Z", netio="weird")])
+        rows = await stats_rows(redis_log_instance, "api")
+        assert rows[0][4] is None
 
-    def test_unparsable_netio_sides_give_none(self):
-        src = stats_source()
-        feed_stats(src, [stats_entry("api", "2026-01-02T03:00:00Z", netio="abc / def")])
-        assert src.series["api"][0][4] is None
+    async def test_unparsable_netio_sides_give_none(self, redis_log_instance):
+        src = stats_source(redis_log_instance)
+        await feed_stats(src, [stats_entry("api", "2026-01-02T03:00:00Z", netio="abc / def")])
+        rows = await stats_rows(redis_log_instance, "api")
+        assert rows[0][4] is None
 
-    def test_blank_lines_in_jsonl_ignored(self):
-        src = stats_source()
+    async def test_blank_lines_in_jsonl_ignored(self, redis_log_instance):
+        src = stats_source(redis_log_instance)
         n = src.ingest_chunk(
             b"\n   \n" + json.dumps(stats_entry("api", "2026-01-02T03:00:00Z")).encode() + b"\n"
         )
         assert n == 1 and src.skipped == 0
 
-    def test_swarm_grouping_and_detection(self):
-        src = stats_source()
-        feed_stats(
+    def test_stop_is_a_no_op(self, redis_log_instance):
+        # static/file-tailed StatsSource has nothing to tear down -- just
+        # confirms calling it doesn't raise.
+        stats_source(redis_log_instance).stop()
+
+    async def test_range_skips_a_service_with_no_data_yet(self, redis_log_instance):
+        """_services can include a service that redis_log.first_last()
+        returns None for (e.g. its very first sample is still in the write
+        queue -- see redis_log.py's record()/_pump split) -- range() must
+        skip it rather than choke on a None result."""
+        src = stats_source(redis_log_instance)
+        await feed_stats(src, [stats_entry("api", "2026-01-02T03:00:00Z")])
+        src._services.add("ghost")  # known, but never actually recorded
+        assert await src.range() == (ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 0))
+
+    async def test_swarm_grouping_and_detection(self, redis_log_instance):
+        src = stats_source(redis_log_instance)
+        await feed_stats(
             src,
             [
                 stats_entry("api.1.abc", "2026-01-02T03:00:00Z"),
@@ -440,11 +537,11 @@ class TestStatsSource:
                 stats_entry("plain", "2026-01-02T03:00:00Z"),
             ],
         )
-        assert sorted(src.series) == ["api", "plain"]
+        assert src.services() == ["api", "plain"]
         assert src._swarm == {"api"}
 
-    def test_skips(self):
-        src = stats_source()
+    async def test_skips(self, redis_log_instance):
+        src = stats_source(redis_log_instance)
         n = src.ingest_chunk(
             b'{"Name": "--", "timestamp": "2026-01-02T03:00:00Z"}\n'
             b'{"Name": "", "timestamp": "2026-01-02T03:00:00Z"}\n'
@@ -454,8 +551,8 @@ class TestStatsSource:
         )
         assert n == 0 and src.count == 0 and src.skipped == 5
 
-    def test_whole_array_mode(self):
-        src = stats_source()
+    async def test_whole_array_mode(self, redis_log_instance):
+        src = stats_source(redis_log_instance)
         payload = json.dumps(
             [
                 stats_entry("api", "2026-01-02T03:00:00Z"),
@@ -464,27 +561,28 @@ class TestStatsSource:
         ).encode()
         assert src.ingest_chunk(payload) == 2
 
-    def test_partial_array_buffered(self):
-        src = stats_source()
+    async def test_partial_array_buffered(self, redis_log_instance):
+        src = stats_source(redis_log_instance)
         payload = json.dumps([stats_entry("api", "2026-01-02T03:00:00Z")]).encode()
         assert src.ingest_chunk(payload[:10]) == 0
         assert src.ingest_chunk(payload[10:]) == 1
 
-    def test_out_of_order_insort(self):
-        src = stats_source()
-        feed_stats(
+    async def test_out_of_order_insort(self, redis_log_instance):
+        src = stats_source(redis_log_instance)
+        await feed_stats(
             src,
             [
                 stats_entry("api", "2026-01-02T03:00:10Z"),
                 stats_entry("api", "2026-01-02T03:00:00Z"),
             ],
         )
-        ts = [r[0] for r in src.series["api"]]
+        rows = await stats_rows(redis_log_instance, "api")
+        ts = [r[0] for r in rows]
         assert ts == sorted(ts)
 
-    def test_services_range_bucketed(self):
-        src = stats_source()
-        feed_stats(
+    async def test_services_range_bucketed(self, redis_log_instance):
+        src = stats_source(redis_log_instance)
+        await feed_stats(
             src,
             [
                 stats_entry("b", "2026-01-02T03:00:00Z", cpu="10%"),
@@ -493,9 +591,9 @@ class TestStatsSource:
             ],
         )
         assert src.services() == ["a", "b"]
-        lo, hi = src.range()
+        lo, hi = await src.range()
         assert lo == ms(2026, 1, 2, 3, 0, 0) and hi == ms(2026, 1, 2, 3, 0, 5)
-        out = src.bucketed(lo, lo + 10000, 5)  # dt = 2 s: both b samples share bucket 0
+        out = await src.bucketed(lo, lo + 10000, 5)  # dt = 2 s: both b samples share bucket 0
         by_name = {o["name"]: o for o in out}
         assert by_name["b"]["cpu"][0] == 50.0  # max-merged in one bucket
         assert by_name["a"]["ttype"] == "service"
@@ -503,36 +601,38 @@ class TestStatsSource:
         assert all(o["host"] is False for o in out)
         assert all(o["sid"] == "s2" for o in out)
 
-    def test_bucketed_ignores_out_of_window(self):
-        src = stats_source()
-        feed_stats(src, [stats_entry("api", "2026-01-02T03:00:00Z")])
+    async def test_bucketed_ignores_out_of_window(self, redis_log_instance):
+        src = stats_source(redis_log_instance)
+        await feed_stats(src, [stats_entry("api", "2026-01-02T03:00:00Z")])
         t0 = ms(2026, 1, 2, 4, 0, 0)
-        out = src.bucketed(t0, t0 + 1000, 5)
+        out = await src.bucketed(t0, t0 + 1000, 5)
         assert len(out) == 1  # service listed, but no samples land
         assert all(v is None for v in out[0]["cpu"] + out[0]["mem"] + out[0]["net"])
 
-    def test_empty_range(self):
-        assert stats_source().range() is None
+    async def test_empty_range(self, redis_log_instance):
+        assert await stats_source(redis_log_instance).range() is None
 
-    def test_point_at_nearest(self):
-        src = stats_source()
-        feed_stats(
+    async def test_point_at_nearest(self, redis_log_instance):
+        src = stats_source(redis_log_instance)
+        await feed_stats(
             src,
             [
                 stats_entry("api", "2026-01-02T03:00:00Z", cpu="10%"),
                 stats_entry("api", "2026-01-02T03:00:10Z", cpu="90%"),
             ],
         )
-        src.series["empty"] = []  # skipped without crashing
+        src._services.add("empty")  # skipped without crashing -- no data recorded
         t0 = ms(2026, 1, 2, 3, 0, 0)
-        assert src.point_at(t0 + 2000)["api"]["cpu"] == 10.0  # nearest is earlier
-        assert src.point_at(t0 + 8000)["api"]["cpu"] == 90.0  # nearest is later
-        after = src.point_at(t0 + 60000)["api"]  # past the end
+        assert (await src.point_at(t0 + 2000))["api"]["cpu"] == 10.0  # nearest is earlier
+        assert (await src.point_at(t0 + 8000))["api"]["cpu"] == 90.0  # nearest is later
+        after = (await src.point_at(t0 + 60000))["api"]  # past the end
         assert after["cpu"] == 90.0 and after["ts"] == t0 + 10000
-        before = src.point_at(t0 - 60000)["api"]  # before the start
+        before = (await src.point_at(t0 - 60000))["api"]  # before the start
         assert before["cpu"] == 10.0
-        assert src.point_at(t0)["api"]["host"] is False
-        assert "empty" not in src.point_at(t0)
+        at_t0 = await src.point_at(t0)
+        assert at_t0["api"]["host"] is False
+        assert at_t0["api"]["sid"] == src.id  # so callers can host-scope /point the same way as /series
+        assert "empty" not in at_t0
 
 
 # ── sniff_kind / read_all / tail_loop ────────────────────────────────────────
@@ -556,7 +656,8 @@ class TestSniffAndTail:
     async def test_tail_loop_appends_truncates_and_skips(self, tmp_path):
         f = tmp_path / "t.log"
         f.write_text("2026-01-02T03:00:00Z one\n")
-        st = server.State(tmp_path)
+        st = server.State(tmp_path, redis_flush_interval_seconds=0.05, redis_data_dir=str(tmp_path / "redis-data"))
+        await st.redis_log.start()
         src = st.open_file(str(f), "log", None, live=True, transforms=[])
         # non-Path source and vanished file are skipped without crashing
         st.sources["fake"] = types.SimpleNamespace(live=True, path="docker://x")
@@ -570,23 +671,25 @@ class TestSniffAndTail:
             with open(f, "a") as fh:
                 fh.write("2026-01-02T03:00:01Z two\n")
             deadline = time.time() + 3
-            while src.total() < 2 and time.time() < deadline:
+            while await src.total() < 2 and time.time() < deadline:
                 await asyncio.sleep(0.05)
-            assert src.total() == 2
+            assert await src.total() == 2
 
             f.write_text("2026-01-02T03:00:02Z rewritten\n")  # truncation -> re-read
             deadline = time.time() + 3
-            while src.total() < 3 and time.time() < deadline:
+            while await src.total() < 3 and time.time() < deadline:
                 await asyncio.sleep(0.05)
-            assert src.total() == 3
-            assert gsrc.total() == 1  # unchanged, stat() failed quietly
+            assert await src.total() == 3
+            assert await gsrc.total() == 1  # unchanged, stat() failed quietly
         finally:
             task.cancel()
+            await st.redis_log.stop()
 
     async def test_tail_loop_survives_read_failure(self, tmp_path, monkeypatch):
         f = tmp_path / "r.log"
         f.write_text("2026-01-02T03:00:00Z one\n")
-        st = server.State(tmp_path)
+        st = server.State(tmp_path, redis_flush_interval_seconds=0.05, redis_data_dir=str(tmp_path / "redis-data"))
+        await st.redis_log.start()
         src = st.open_file(str(f), "log", None, live=True, transforms=[])
 
         def broken_read(_src):
@@ -598,9 +701,51 @@ class TestSniffAndTail:
             with open(f, "a") as fh:
                 fh.write("2026-01-02T03:00:01Z two\n")
             await asyncio.sleep(0.3)  # loop hits OSError and keeps running
-            assert src.total() == 1
+            assert await src.total() == 1
         finally:
             task.cancel()
+            await st.redis_log.stop()
+
+    async def test_tail_loop_survives_a_non_oserror_failure_on_one_source(self, tmp_path, monkeypatch):
+        # br-ORCH-005: only OSError used to be caught per-source -- any other
+        # exception (a malformed transform raising inside ingest_chunk, say)
+        # propagated out of the for-loop and killed tail_loop's `while True`
+        # outright, silently stopping log tailing for every OTHER live file
+        # source too, for the rest of the gateway's uptime.
+        broken_path = tmp_path / "broken.log"
+        broken_path.write_text("2026-01-02T03:00:00Z one\n")
+        healthy_path = tmp_path / "healthy.log"
+        healthy_path.write_text("2026-01-02T03:00:00Z one\n")
+        st = server.State(tmp_path, redis_flush_interval_seconds=0.05, redis_data_dir=str(tmp_path / "redis-data"))
+        await st.redis_log.start()
+        broken_src = st.open_file(str(broken_path), "log", None, live=True, transforms=[])
+        healthy_src = st.open_file(str(healthy_path), "log", None, live=True, transforms=[])
+
+        real_read_all = server.read_all
+
+        def flaky_read(src):
+            if src is broken_src:
+                raise ValueError("malformed transform blew up mid-ingest")
+            return real_read_all(src)
+
+        monkeypatch.setattr(server, "read_all", flaky_read)
+        task = asyncio.ensure_future(server.tail_loop(st, 0.03))
+        try:
+            with open(broken_path, "a") as fh:
+                fh.write("2026-01-02T03:00:01Z two\n")
+            with open(healthy_path, "a") as fh:
+                fh.write("2026-01-02T03:00:01Z two\n")
+            deadline = time.time() + 3
+            while await healthy_src.total() < 2 and time.time() < deadline:
+                await asyncio.sleep(0.05)
+            # the broken source's ValueError must not have killed the loop --
+            # the healthy source, ticked in the same and later iterations,
+            # still picked up its own growth.
+            assert await healthy_src.total() == 2
+            assert await broken_src.total() == 1  # never advanced past its failure, but didn't crash anything else
+        finally:
+            task.cancel()
+            await st.redis_log.stop()
 
 
 # ── ssh helpers ──────────────────────────────────────────────────────────────
@@ -626,7 +771,7 @@ class TestSshHelpers:
         locked.chmod(0o000)
         try:
             keys = server.list_ssh_keys()
-            assert keys == [str(d / "id_ed25519")]  # unreadable key skipped quietly
+            assert keys == ["id_ed25519"]  # unreadable key skipped quietly, basename only
         finally:
             locked.chmod(0o644)
 
@@ -828,9 +973,48 @@ class TestNormalizeDockerHost:
     def test_bare_user_at_host_gets_ssh_scheme(self):
         assert server.normalize_docker_host("user@other-server") == "ssh://user@other-server"
 
-    def test_already_schemed_left_alone(self):
+    def test_already_schemed_ssh_left_alone(self):
         assert server.normalize_docker_host("ssh://user@other-server") == "ssh://user@other-server"
-        assert server.normalize_docker_host("tcp://1.2.3.4:2375") == "tcp://1.2.3.4:2375"
+
+    def test_non_ssh_scheme_raises_a_clean_error(self):
+        # br-CONN-002: used to be passed through untouched, then silently
+        # parsed into garbage further down (_parse_ssh_target/
+        # ssh_host_and_port strip a literal "ssh://" -- exactly 6 chars --
+        # off *any* scheme prefix unconditionally, since every scheme here
+        # happens to also be 6 characters long) instead of ever surfacing
+        # a clean "unsupported transport" error.
+        with pytest.raises(ValueError, match="unsupported docker host transport 'tcp'"):
+            server.normalize_docker_host("tcp://1.2.3.4:2375")
+
+    def test_bad_port_raises_a_clean_error(self):
+        # br-CONN-005: _parse_ssh_target's bare `int(port_s)` used to raise
+        # Python's own raw "invalid literal for int()..." ValueError, and
+        # only late -- mid ssh-connect, inside a background poll loop (an
+        # opaque self.error string) or wrapped into a 502 DockerPsError by
+        # docker_ps -- instead of a clean error raised immediately here.
+        with pytest.raises(ValueError, match=r"invalid ssh port 'notaport'"):
+            server.normalize_docker_host("ssh://h:notaport")
+
+    def test_bad_port_raises_a_clean_error_with_user(self):
+        with pytest.raises(ValueError, match=r"invalid ssh port 'notaport'"):
+            server.normalize_docker_host("ssh://user@h:notaport")
+
+    def test_bare_host_with_bad_port_also_raises(self):
+        # the bare `user@host:port` shorthand (no explicit ssh:// scheme
+        # yet) must be validated too, not just an already-schemed host.
+        with pytest.raises(ValueError, match=r"invalid ssh port 'notaport'"):
+            server.normalize_docker_host("user@h:notaport")
+
+    def test_port_zero_and_out_of_range_rejected(self):
+        with pytest.raises(ValueError, match=r"invalid ssh port '0'"):
+            server.normalize_docker_host("ssh://h:0")
+        with pytest.raises(ValueError, match=r"invalid ssh port '99999999'"):
+            server.normalize_docker_host("ssh://h:99999999")
+
+    def test_valid_port_is_left_alone(self):
+        assert server.normalize_docker_host("ssh://user@h:2222") == "ssh://user@h:2222"
+        with pytest.raises(ValueError, match="unsupported docker host transport 'http'"):
+            server.normalize_docker_host("http://example.com")
 
 
 class TestDockerPs:
@@ -887,7 +1071,10 @@ class TestDockerPs:
             if "service" in args:
                 return FakeAsyncProc(returncode=1, communicate_result=(b"", b"not a swarm manager"))
             return FakeAsyncProc(
-                communicate_result=(web_line + b"\n" + gw_line + b"\n" + gw_line_tagless + b"\n", b"")
+                communicate_result=(
+                    web_line + b"\n" + gw_line + b"\n" + gw_line_tagless + b"\n",
+                    b"",
+                )
             )
 
         monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
@@ -1038,11 +1225,58 @@ class TestGatherOwnContainerLogs:
 
 
 class FakeState:
-    def __init__(self):
+    def __init__(self, redis_log=None):
         self.events = []
+        self.redis_log = redis_log
 
     def broadcast(self, ev):
         self.events.append(ev)
+
+
+async def stats_rows_of(fake_state, svc):
+    """Test stand-in for what used to be a direct `src.series[svc]` read
+    -- Redis is the store now (see redis_log.py). `svc` is the bare/host-
+    qualified name a caller would pass to StatsSource._entity_for; the
+    "stats:" kind prefix (br-DEDUP-006) is added here to match."""
+    rows = await fake_state.redis_log.range_by_score_with_payload(f"stats:{svc}", 0, 10**15)
+    return [(ts, p.get("cpu"), p.get("mem"), p.get("mem_bytes"), p.get("net")) for ts, p in rows]
+
+
+class TestEntityId:
+    """br-DEDUP-006: the Redis entity id every Source read/write actually
+    keys on (see LogSource._entity/StatsSource._entity_for)."""
+
+    def test_bare_for_no_host(self):
+        assert server._entity_id("log", "nginx", None) == "log:nginx"
+        assert server._entity_id("log", "nginx", "") == "log:nginx"
+
+    def test_qualified_for_a_remote_host(self):
+        assert server._entity_id("log", "nginx", "ssh://u@h") == "log:nginx@h"
+
+    def test_hostname_derivation_matches_the_rest_of_the_module(self):
+        # same `host.split("@")[-1]` collect_docker itself already uses for
+        # host@<hostname> naming -- consistent, even where that derivation
+        # has its own separate known gap (br-DEDUP-007, ssh port handling).
+        assert server._entity_id("log", "nginx", "ssh://u@h:2222") == "log:nginx@h:2222"
+
+    def test_already_qualified_name_is_left_untouched(self):
+        # HostStatsSource pre-builds "host@<hostname>" itself before ever
+        # reaching ingest_row -- must not double-qualify into
+        # "host@<hostname>@<hostname>".
+        assert server._entity_id("stats", "host@h", "ssh://u@h") == "stats:host@h"
+
+    def test_two_different_hosts_never_produce_the_same_entity_id(self):
+        assert server._entity_id("log", "nginx", "ssh://u@h1") != server._entity_id("log", "nginx", "ssh://u@h2")
+        assert server._entity_id("log", "nginx", "ssh://u@h1") != server._entity_id("log", "nginx", None)
+
+    def test_log_and_stats_never_collide_for_the_same_name_and_host(self):
+        # br-DEDUP-006 regression: a local container's log entity and its
+        # stats entity used to both resolve to the exact same bare name,
+        # sharing one Redis key -- every stats sample (no "text" field)
+        # then rendered as a blank-text row in that container's log panel,
+        # at the stats poll interval.
+        assert server._entity_id("log", "web", None) != server._entity_id("stats", "web", None)
+        assert server._entity_id("log", "web", "ssh://u@h") != server._entity_id("stats", "web", "ssh://u@h")
 
 
 class TestDockerStatsSource:
@@ -1060,9 +1294,9 @@ class TestDockerStatsSource:
         src = server.DockerStatsSource("d1", "stats@local", None, 0.05, st)
         try:
             deadline = time.time() + 3
-            while not src.series and time.time() < deadline:
+            while not src._services and time.time() < deadline:
                 await asyncio.sleep(0.02)
-            assert "api" in src.series
+            assert "api" in src._services
             assert src.error is None
             assert any(e["type"] == "update" for e in st.events)
             assert src.path == "docker://local/stats"
@@ -1092,10 +1326,10 @@ class TestDockerStatsSource:
         src = server.DockerStatsSource("d3", "stats@local", None, 0.05, FakeState())
         try:
             deadline = time.time() + 3
-            while "good" not in src.series and time.time() < deadline:
+            while "good" not in src._services and time.time() < deadline:
                 await asyncio.sleep(0.02)
-            assert "good" in src.series
-            assert "bad" not in src.series
+            assert "good" in src._services
+            assert "bad" not in src._services
         finally:
             src.stop()
 
@@ -1119,9 +1353,9 @@ class TestDockerStatsSource:
         src = server.DockerStatsSource("d4", "stats@h", "ssh://u@h", 0.05, FakeState())
         try:
             deadline = time.time() + 3
-            while not src.series and time.time() < deadline:
+            while not src._services and time.time() < deadline:
                 await asyncio.sleep(0.02)
-            assert "web" in src.series
+            assert "web" in src._services
             assert captured[0] == ["stats", "--no-stream", "--format", "{{json .}}"]
             assert src.path == "docker://ssh://u@h/stats"
         finally:
@@ -1146,6 +1380,65 @@ class TestDockerStatsSource:
             assert not clients
         finally:
             src.stop()
+
+    async def test_same_service_name_from_different_hosts_does_not_interleave_data(
+        self, docker_cli, monkeypatch, redis_log_instance
+    ):
+        # br-DEDUP-006: a local and a remote DockerStatsSource that both
+        # happen to discover a service named "nginx" must not collide into
+        # the same Redis entity -- each host's history stays independent.
+        local_client = FakeDockerClient(
+            containers=[FakeContainer("nginx", stats_raw=raw_stats(cpu_pct=1.0))]
+        )
+        monkeypatch.setattr(server, "docker_client", lambda host: local_client)
+
+        remote_row = {
+            "Name": "nginx",
+            "CPUPerc": "9.00%",
+            "MemPerc": "5.00%",
+            "MemUsage": "10MiB / 100MiB",
+            "NetIO": "0B / 0B",
+        }
+        remote_client = FakeSSHClient()
+        monkeypatch.setattr(server, "_connect_ssh", lambda host, key: remote_client)
+        monkeypatch.setattr(
+            server, "_exec_remote_docker", lambda c, a, timeout=15: (json.dumps(remote_row) + "\n", "", 0)
+        )
+
+        st = FakeState(redis_log=redis_log_instance)
+        local_src = server.DockerStatsSource("d10", "stats@local", None, 0.05, st)
+        remote_src = server.DockerStatsSource("d11", "stats@remotehost", "ssh://u@remotehost", 0.05, st)
+        try:
+            deadline = time.time() + 3
+            while (
+                "nginx" not in local_src._services or "nginx" not in remote_src._services
+            ) and time.time() < deadline:
+                await asyncio.sleep(0.02)
+            assert "nginx" in local_src._services
+            assert "nginx" in remote_src._services
+
+            # _services (in-memory) landing doesn't mean the matching
+            # record() call has been *flushed* to Redis yet (sRate, see
+            # redis_log.py) -- poll the actual read path too, not just the
+            # in-memory signal.
+            deadline = time.time() + 3
+            while not (await stats_rows_of(st, "nginx")) and time.time() < deadline:
+                await asyncio.sleep(0.02)
+
+            # each Source's own read methods must see only its own host's data
+            local_rows = await stats_rows_of(st, "nginx")
+            remote_rows = await stats_rows_of(st, "nginx@remotehost")
+            assert local_rows and local_rows[0][1] == pytest.approx(1.0), local_rows
+            assert remote_rows and remote_rows[0][1] == pytest.approx(9.0), remote_rows
+
+            # and via the Source-level API actually used by /series etc.
+            local_point = await local_src.point_at(local_rows[0][0])
+            remote_point = await remote_src.point_at(remote_rows[0][0])
+            assert local_point["nginx"]["cpu"] == pytest.approx(1.0)
+            assert remote_point["nginx"]["cpu"] == pytest.approx(9.0)
+        finally:
+            local_src.stop()
+            remote_src.stop()
 
 
 class FakeAsyncStdout:
@@ -1198,33 +1491,49 @@ class FakeAsyncProc:
 
 
 class TestDockerLogSource:
-    async def test_follows_and_reports_end(self, docker_cli, monkeypatch):
+    async def test_follows_and_reports_end(self, docker_cli, monkeypatch, redis_log_instance):
         proc = FakeAsyncProc([b"2026-01-02T03:04:05Z hello\n2026-01-02T03:04:06Z world\n"])
 
         async def fake_exec(*a, **k):
             return proc
 
         monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
-        st = FakeState()
+        st = FakeState(redis_log=redis_log_instance)
         src = server.DockerLogSource("l1", "web", None, "container", "web", [], st)
         deadline = time.time() + 3
         while src.error is None and time.time() < deadline:
             await asyncio.sleep(0.02)
-        assert src.total() == 2
-        assert src.error == "log stream ended"
+        # src.error lands as soon as the fake stream ends (in-memory,
+        # immediate) -- the matching record() calls still need their own
+        # flush cycle to actually land in Redis (sRate), so poll total()
+        # too rather than asserting on it right away.
+        deadline = time.time() + 3
+        while await src.total() < 2 and time.time() < deadline:
+            await asyncio.sleep(0.02)
+        assert await src.total() == 2
+        assert src.error == "log stream ended -- reconnecting"
         assert src.path == "docker://local/container/web"
         src.stop()
 
-    async def test_service_target_uses_service_logs(self, docker_cli, monkeypatch):
+    async def test_service_target_uses_service_logs(
+        self, docker_cli, monkeypatch, redis_log_instance
+    ):
         client = FakeSSHClientStreaming([b"2026-01-02T03:04:05Z hello\n"])
         monkeypatch.setattr(server, "_connect_ssh", lambda host, key: client)
         src = server.DockerLogSource(
-            "l2", "api", "ssh://u@h", "service", "api", [], FakeState(), ssh_key="/tmp/k"
+            "l2",
+            "api",
+            "ssh://u@h",
+            "service",
+            "api",
+            [],
+            FakeState(redis_log=redis_log_instance),
+            ssh_key="/tmp/k",
         )
         deadline = time.time() + 3
-        while src.total() < 1 and time.time() < deadline:
+        while await src.total() < 1 and time.time() < deadline:
             await asyncio.sleep(0.02)
-        assert src.total() == 1
+        assert await src.total() == 1
         assert src.path == "docker://ssh://u@h/service/api"
         assert client.last_cmd.startswith("sudo docker service logs")
         src.stop()
@@ -1237,7 +1546,37 @@ class TestDockerLogSource:
         deadline = time.time() + 3
         while src.error is None and time.time() < deadline:
             await asyncio.sleep(0.02)
-        assert src.error == "log stream ended"
+        assert src.error == "log stream ended -- reconnecting"
+        src.stop()
+
+    async def test_stream_end_triggers_a_reconnect_rather_than_giving_up(
+        self, docker_cli, monkeypatch, redis_log_instance
+    ):
+        # br-DEDUP-009: a dead/restarted container must not leave the log
+        # feed permanently stale -- once the first stream ends, _follow has
+        # to reconnect (a fresh create_subprocess_exec call) rather than
+        # returning for good.
+        procs = [
+            FakeAsyncProc([b"2026-01-02T03:04:05Z first\n"]),
+            FakeAsyncProc([b"2026-01-02T03:04:06Z second\n"]),
+        ]
+        calls = {"n": 0}
+
+        async def fake_exec(*a, **k):
+            proc = procs[min(calls["n"], len(procs) - 1)]
+            calls["n"] += 1
+            return proc
+
+        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+        real_sleep = asyncio.sleep
+        monkeypatch.setattr(server.asyncio, "sleep", lambda _s: real_sleep(0))  # skip the backoff
+        st = FakeState(redis_log=redis_log_instance)
+        src = server.DockerLogSource("l7", "web", None, "container", "web", [], st)
+        deadline = time.time() + 3
+        while await src.total() < 2 and time.time() < deadline:
+            await asyncio.sleep(0.02)
+        assert await src.total() == 2  # reconnected and ingested the second stream's line too
+        assert calls["n"] >= 2
         src.stop()
 
     async def test_remote_ssh_connect_failure_recorded(self, docker_cli, monkeypatch):
@@ -1264,7 +1603,9 @@ class TestDockerLogSource:
         assert "exec failed" in src.error
         src.stop()
 
-    async def test_stop_terminates_the_subprocess(self, docker_cli, monkeypatch):
+    async def test_stop_terminates_the_subprocess(
+        self, docker_cli, monkeypatch, redis_log_instance
+    ):
         # hang_after=True keeps the fake stream "live but idle" (as a real
         # tailing `docker logs -f` would be between log lines) so stop()
         # has to actually terminate it rather than finding it already ended.
@@ -1274,13 +1615,55 @@ class TestDockerLogSource:
             return proc
 
         monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
-        src = server.DockerLogSource("l4", "web", None, "container", "web", [], FakeState())
+        src = server.DockerLogSource(
+            "l4", "web", None, "container", "web", [], FakeState(redis_log=redis_log_instance)
+        )
         deadline = time.time() + 3
-        while src.total() < 1 and time.time() < deadline:
+        while await src.total() < 1 and time.time() < deadline:
             await asyncio.sleep(0.02)
-        assert src.total() == 1
+        assert await src.total() == 1
         src.stop()
         assert proc.terminated
+
+    async def test_same_container_name_from_different_hosts_does_not_interleave_data(
+        self, docker_cli, monkeypatch, redis_log_instance
+    ):
+        # br-DEDUP-006: a local and a remote DockerLogSource for the same
+        # container name ("web") must not collide into the same Redis
+        # entity -- each host's history stays independent.
+        local_proc = FakeAsyncProc([b"2026-01-02T03:04:05Z from local\n"])
+        remote_client = FakeSSHClientStreaming([b"2026-01-02T03:04:05Z from remote\n"])
+
+        async def fake_exec(*a, **k):
+            return local_proc
+
+        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(server, "_connect_ssh", lambda host, key: remote_client)
+
+        st = FakeState(redis_log=redis_log_instance)
+        local_src = server.DockerLogSource("l10", "web", None, "container", "web", [], st)
+        remote_src = server.DockerLogSource(
+            "l11", "web", "ssh://u@remotehost", "container", "web", [], st
+        )
+        try:
+            deadline = time.time() + 3
+            while (
+                await local_src.total() < 1 or await remote_src.total() < 1
+            ) and time.time() < deadline:
+                await asyncio.sleep(0.02)
+            assert await local_src.total() == 1
+            assert await remote_src.total() == 1
+            local_rows = await local_src.slice(0, 10)
+            remote_rows = await remote_src.slice(0, 10)
+            assert local_rows[0]["text"] == "from local"
+            assert remote_rows[0]["text"] == "from remote"
+            # confirm they're actually different Redis entities, not just
+            # coincidentally-consistent reads through each Source's own view
+            assert await redis_log_instance.total("log:web") == 1
+            assert await redis_log_instance.total("log:web@remotehost") == 1
+        finally:
+            local_src.stop()
+            remote_src.stop()
 
 
 # ── HostStatsSource ──────────────────────────────────────────────────────────
@@ -1303,15 +1686,17 @@ def proc_files(user, system, idle, iowait, rx, tx):
 
 
 class TestHostStatsSource:
-    async def test_local_psutil_samples(self):
-        src = server.HostStatsSource("h1", "host@local", None, 0.05, FakeState())
+    async def test_local_psutil_samples(self, redis_log_instance):
+        st = FakeState(redis_log=redis_log_instance)
+        src = server.HostStatsSource("h1", "host@local", None, 0.05, st)
         try:
             deadline = time.time() + 5
-            while not src.series.get("host@local") and time.time() < deadline:
+            rows = []
+            while not rows and time.time() < deadline:
                 await asyncio.sleep(0.05)
-            rows = src.series["host@local"]
+                rows = await stats_rows_of(st, "host@local")
             assert rows, "expected at least one host sample"
-            ts, cpu, mem, mem_bytes, rate = rows[0]
+            _ts, cpu, mem, mem_bytes, _rate = rows[0]
             assert 0 <= cpu <= 100 * 64  # cpu_percent can exceed 100 on multicore? no; be lax
             assert 0 < mem <= 100
             assert mem_bytes > 0
@@ -1320,7 +1705,7 @@ class TestHostStatsSource:
         finally:
             src.stop()
 
-    async def test_ssh_sampling_and_interface_filter(self, monkeypatch):
+    async def test_ssh_sampling_and_interface_filter(self, monkeypatch, redis_log_instance):
         samples = [
             proc_files(100, 100, 700, 100, 1000, 2000),
             proc_files(150, 150, 900, 100, 4000, 5000),
@@ -1333,16 +1718,19 @@ class TestHostStatsSource:
             return FakeAsyncProc(communicate_result=(sample.encode(), b""))
 
         monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+        st = FakeState(redis_log=redis_log_instance)
         src = server.HostStatsSource(
-            "h2", "host@h", "ssh://user@h:2222", 0.05, FakeState(), ssh_key="/tmp/key"
+            "h2", "host@h", "ssh://user@h:2222", 0.05, st, ssh_key="/tmp/key"
         )
         try:
             deadline = time.time() + 5
-            while not src.series.get("host@h") and time.time() < deadline:
+            rows = []
+            while not rows and time.time() < deadline:
                 await asyncio.sleep(0.05)
+                rows = await stats_rows_of(st, "host@h")
             assert "-p" in calls[0] and "2222" in calls[0]
             assert calls[0][-4:] == ("cat", "/proc/stat", "/proc/meminfo", "/proc/net/dev")
-            ts, cpu, mem, mem_bytes, rate = src.series["host@h"][0]
+            _ts, cpu, mem, mem_bytes, rate = rows[0]
             # busy: 200 -> 300 (delta 100) of total 1000 -> 1300 (delta 300)
             assert cpu == pytest.approx(100 / 300 * 100, rel=1e-3)
             assert mem == pytest.approx(60.0)
@@ -1356,7 +1744,7 @@ class TestHostStatsSource:
         try:
             assert "ssh://" in src.error
             await asyncio.sleep(0.12)  # loop must idle without sampling
-            assert src.series == {}
+            assert src._services == set()
         finally:
             src.stop()
 
@@ -1386,7 +1774,7 @@ class TestHostStatsSource:
 
 
 @pytest.fixture
-def state(tmp_path):
+async def state(tmp_path):
     tdir = tmp_path / "transforms"
     tdir.mkdir()
     (tdir / "upper.py").write_text(
@@ -1395,7 +1783,10 @@ def state(tmp_path):
         '    r["text"] = r["text"].upper()\n'
         "    return r\n"
     )
-    return server.State(tdir)
+    st = server.State(tdir, redis_flush_interval_seconds=0.05, redis_data_dir=str(tdir / "redis-data"))
+    await st.redis_log.start()
+    yield st
+    await st.redis_log.stop()
 
 
 @pytest.fixture
@@ -1430,22 +1821,24 @@ def _no_op_docker(monkeypatch):
 
 
 class TestState:
-    def test_open_file_auto_and_kinds(self, state, log_file, stats_file):
+    async def test_open_file_auto_and_kinds(self, state, log_file, stats_file):
         lg = state.open_file(str(log_file), "auto", None, live=False, transforms=[])
         stt = state.open_file(str(stats_file), "auto", None, live=False, transforms=[])
-        assert lg.kind == "log" and lg.total() == 2 and lg.name == "svc"
+        await _flush()
+        assert lg.kind == "log" and await lg.total() == 2 and lg.name == "svc"
         assert stt.kind == "stats" and stt.count == 3
 
-    def test_open_file_with_transform_and_name(self, state, log_file):
+    async def test_open_file_with_transform_and_name(self, state, log_file):
         src = state.open_file(str(log_file), "log", "custom", live=True, transforms=["upper"])
+        await _flush()
         assert src.name == "custom"
-        assert src.slice(0, 1)[0]["text"] == "ALPHA"
+        assert (await src.slice(0, 1))[0]["text"] == "ALPHA"
 
-    def test_open_file_missing(self, state):
+    async def test_open_file_missing(self, state):
         with pytest.raises(FileNotFoundError):
             state.open_file("/no/such/file.log", "auto", None, live=False, transforms=[])
 
-    def test_close_source(self, state, log_file):
+    async def test_close_source(self, state, log_file):
         src = state.open_file(str(log_file), "log", None, live=False, transforms=[])
         stopped = []
         src.stop = lambda: stopped.append(True)
@@ -1454,16 +1847,43 @@ class TestState:
         assert src.id not in state.sources
         state.close_source("ghost")  # no-op
 
-    def test_describe(self, state, log_file, stats_file):
+    async def test_describe(self, state, log_file, stats_file):
         state.open_file(str(log_file), "auto", None, live=False, transforms=["upper"])
         state.open_file(str(stats_file), "auto", None, live=False, transforms=[])
-        d = {s["name"]: s for s in state.describe()}
+        await _flush()
+        d = {s["name"]: s for s in await state.describe()}
         assert d["svc"]["kind"] == "log" and d["svc"]["total"] == 2
         assert d["svc"]["transforms"] == ["upper"]
         assert d["stats"]["kind"] == "stats" and d["stats"]["services"] == ["api"]
         assert d["stats"]["min_ts"] is not None
         assert d["stats"]["is_host"] is False
         assert "is_host" not in d["svc"]  # log sources don't carry the flag
+        # br-DHOST-030: a loaded file is never docker-collected, so it has no
+        # real host identity -- distinct from a *local* docker source, which
+        # also reports None here (see test_collect_docker_describe_host below).
+        assert d["svc"]["host"] is None
+        assert d["stats"]["host"] is None
+
+    async def test_collect_docker_describe_host(self, state, docker_cli, monkeypatch):
+        """describe()'s "host" field (br-DHOST-030) is the real Docker host
+        identity -- None for the local daemon, the ssh:// string for a
+        remote one -- not to be confused with bucketed()'s own "host" field
+        (is_host boolean), which describe() doesn't touch."""
+        _no_op_docker(monkeypatch)
+        local_ids = state.collect_docker(
+            None, stats=True, logs=[], transforms=[], interval=0.05, host_stats=True
+        )
+        remote_ids = state.collect_docker(
+            "ssh://u@remotehost", stats=True, logs=[], transforms=[], interval=0.05, host_stats=True
+        )
+        await _flush()
+        d = {s["id"]: s for s in await state.describe()}
+        for sid in local_ids:
+            assert d[sid]["host"] is None
+        for sid in remote_ids:
+            assert d[sid]["host"] == "ssh://u@remotehost"
+        for sid in local_ids + remote_ids:
+            state.close_source(sid)
 
     async def test_collect_docker_all_sources(self, state, docker_cli, monkeypatch):
         _no_op_docker(monkeypatch)
@@ -1614,7 +2034,7 @@ class TestState:
         assert len(state.sources) == 1
         state.close_source(results[0])
 
-    def test_broadcast_full_queue_dropped(self, state):
+    async def test_broadcast_full_queue_dropped(self, state):
         full = asyncio.Queue(maxsize=1)
         full.put_nowait({"x": 1})
         state.listeners.append(full)
@@ -1623,49 +2043,215 @@ class TestState:
 
 
 class TestSampleRoundTrip:
-    def test_export_and_load(self, state, log_file, stats_file, tmp_path):
+    async def test_export_and_load(self, state, log_file, stats_file, tmp_path):
         state.open_file(str(log_file), "auto", None, live=False, transforms=[])
         st_src = state.open_file(str(stats_file), "auto", None, live=False, transforms=[])
         st_src.is_host = True  # exercise the host flag
         st_src._swarm.add("api")
+        await _flush()
         t0, t1 = ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 5)
         out = tmp_path / "slice.cttc"
-        r = state.export_sample(str(out), t0, t1)
+        r = await state.export_sample(str(out), t0, t1)
         assert r["sources"] == 2
 
         names = zipfile.ZipFile(out).namelist()
         assert "manifest.json" in names
 
-        st2 = server.State(tmp_path)
-        opened = st2.load_sample(str(out))
-        assert len(opened) == 2
-        d = {s["name"]: s for s in st2.describe()}
-        assert d["svc"]["total"] == 1  # only "alpha" is inside [t0, t1]
-        lg = st2.sources[[s for s in opened if st2.sources[s].kind == "log"][0]]
-        assert lg.slice(0, 1)[0]["text"] == "alpha"
-        stt = st2.sources[[s for s in opened if st2.sources[s].kind == "stats"][0]]
-        assert stt.is_host is True
-        assert stt._swarm == {"api"}
-        assert stt.live is False and lg.live is False
+        # A genuinely separate RedisLog (own redis-server, own unix socket)
+        # -- st2's re-loaded "svc" source must not see `state`'s original
+        # "svc" history, exactly as two independent Source objects sharing
+        # an entity name would collide if they shared one Redis (see
+        # redis_log.py's module docstring on the sole-source-of-truth
+        # scope boundary).
+        st2 = server.State(tmp_path, redis_flush_interval_seconds=0.05, redis_data_dir=str(tmp_path / "redis-data"))
+        st2.redis_log = redis_log.RedisLog(
+            socket_path=f"/tmp/cttc-test-{uuid.uuid4().hex[:8]}.sock",
+            tcp_port=unique_redis_tcp_port(),
+            flush_interval_seconds=0.05,
+            data_dir=tmp_path / "redis-data-2",
+        )
+        await st2.redis_log.start()
+        try:
+            opened = await st2.load_sample(str(out))
+            assert len(opened) == 2
+            d = {s["name"]: s for s in await st2.describe()}
+            assert d["svc"]["total"] == 1  # only "alpha" is inside [t0, t1]
+            lg = st2.sources[[s for s in opened if st2.sources[s].kind == "log"][0]]
+            assert (await lg.slice(0, 1))[0]["text"] == "alpha"
+            stt = st2.sources[[s for s in opened if st2.sources[s].kind == "stats"][0]]
+            assert stt.is_host is True
+            assert stt._swarm == {"api"}
+            assert stt.live is False and lg.live is False
+        finally:
+            await st2.redis_log.stop()
 
-    def test_export_empty_range(self, state, log_file, stats_file, tmp_path):
+    async def test_load_sample_twice_with_same_provenance_reuses_the_same_entity(
+        self, state, tmp_path
+    ):
+        """Content-addressed identity (System Observability spec's
+        "Collision Prevention": Gateway + Docker Host + Container):
+        the identical (gateway, docker host, container) loaded twice
+        resolves to the same Redis entity -- idempotent, not duplicated.
+        "Should not be able to re-open that data more than once" now holds
+        at the storage layer too, not just the client's own path-based
+        dedup (ui-EXPORT-017/018)."""
+        log = tmp_path / "svc.log"
+        log.write_text("2026-01-02T03:00:00Z only-line\n")
+        state.open_file(str(log), "auto", None, live=False, transforms=[])
+        await _flush()
+        t0, t1 = ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 5)
+        out = tmp_path / "sample.cttc"
+        r = await state.export_sample(str(out), t0, t1)
+        assert r["sources"] == 1
+
+        opened1 = await state.load_sample(str(out))
+        opened2 = await state.load_sample(str(out))
+        loaded1 = state.sources[opened1[0]]
+        loaded2 = state.sources[opened2[0]]
+        assert loaded1._entity == loaded2._entity, "same provenance -- same content-addressed entity"
+        assert await loaded1.total() == 1, "re-loading the identical file doesn't duplicate rows"
+        assert await loaded2.total() == 1
+
+    async def test_load_sample_different_gateway_provenance_does_not_collide(self, state, tmp_path):
+        """Two loads sharing a bare container name but genuinely different
+        provenance (a different gateway, here) must never collide --
+        content-addressing keeps them apart the same way host-qualification
+        already keeps two live docker hosts' same-named containers apart
+        (br-DEDUP-006)."""
+        f1 = tmp_path / "first"
+        f1.mkdir()
+        log1 = f1 / "svc.log"
+        log1.write_text("2026-01-02T03:00:00Z first-only\n")
+        state.open_file(str(log1), "auto", None, live=False, transforms=[])
+        await _flush()
+        t0, t1 = ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 5)
+        out1 = tmp_path / "first.cttc"
+        r1 = await state.export_sample(str(out1), t0, t1)
+        assert r1["sources"] == 1
+
+        f2 = tmp_path / "second"
+        f2.mkdir()
+        log2 = f2 / "svc.log"
+        log2.write_text("2026-01-02T04:00:00Z second-only\n")
+        state.open_file(str(log2), "auto", None, live=False, transforms=[])
+        await _flush()
+        t2_0, t2_1 = ms(2026, 1, 2, 4, 0, 0), ms(2026, 1, 2, 4, 0, 5)
+        out2 = tmp_path / "second.cttc"
+        r2 = await state.export_sample(str(out2), t2_0, t2_1)
+        assert r2["sources"] == 1
+        _restamp_gateway_id(out2, "a-genuinely-different-gateway")
+
+        opened1 = await state.load_sample(str(out1))
+        opened2 = await state.load_sample(str(out2))
+        loaded1 = state.sources[opened1[0]]
+        loaded2 = state.sources[opened2[0]]
+        assert loaded1._entity != loaded2._entity, "different gateway provenance -- must not collide"
+        assert await loaded1.total() == 1, "first load's entity shows only its own row"
+        assert await loaded2.total() == 1, "second load's entity shows only its own row -- not merged with the first"
+        assert (await loaded1.slice(0, 1))[0]["text"] == "first-only"
+        assert (await loaded2.slice(0, 1))[0]["text"] == "second-only"
+
+    async def test_manifest_carries_provenance_and_a_verifying_integrity_hash(
+        self, state, log_file, tmp_path
+    ):
+        """System Observability spec's "Manifest & Security": every
+        exported source is stamped with its gateway/docker-host/container
+        identity, and the manifest carries a hash of itself (everything
+        but the hash field) for tamper-evidence."""
+        state.open_file(str(log_file), "auto", None, live=False, transforms=[])
+        await _flush()
+        t0, t1 = ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 5)
+        out = tmp_path / "slice.cttc"
+        await state.export_sample(str(out), t0, t1)
+
+        man = json.loads(zipfile.ZipFile(out).read("manifest.json"))
+        assert man["version"] == 3
+        assert "integrity_sha256" in man
+        src = man["segments"][0]["sources"][0]
+        assert src["gateway_id"] == state.gateway_id
+        assert src["docker_host_id"] == "local"
+        assert src["container_id"] == "svc"
+
+        # Recomputing the same way load_sample does must match -- the hash
+        # actually verifies a clean export, not just "a field exists."
+        without_hash = dict(man)
+        without_hash.pop("integrity_sha256")
+        assert server._manifest_hash(without_hash) == man["integrity_sha256"]
+
+    async def test_tampered_manifest_hash_still_loads_but_logs_a_warning(
+        self, state, log_file, tmp_path, caplog
+    ):
+        """Tamper-evidence, not an access-control gate (confirmed with the
+        user): a manifest whose integrity hash no longer matches still
+        loads -- same bias toward a permissive read over a hard failure on
+        an unexpected file as the rest of this codebase -- but is logged
+        so the discrepancy isn't silent."""
+        state.open_file(str(log_file), "auto", None, live=False, transforms=[])
+        await _flush()
+        t0, t1 = ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 5)
+        out = tmp_path / "slice.cttc"
+        await state.export_sample(str(out), t0, t1)
+        _restamp_gateway_id(out, "tampered-after-the-hash-was-computed")
+
+        with caplog.at_level("WARNING", logger="cttc"):
+            opened = await state.load_sample(str(out))
+        assert len(opened) == 1, "still loads despite the mismatched hash"
+        assert any("integrity" in rec.message for rec in caplog.records)
+
+    async def test_load_sample_accepts_a_legacy_v2_manifest_with_no_provenance(
+        self, state, log_file, tmp_path
+    ):
+        """A pre-v3 export (no gateway_id/docker_host_id/container_id, no
+        integrity_sha256) must still load -- backward compatible, just
+        without content-addressed reuse (falls back to this gateway's own
+        id / "local" / the bare name, see load_sample)."""
+        state.open_file(str(log_file), "auto", None, live=False, transforms=[])
+        await _flush()
+        t0, t1 = ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 5)
+        out = tmp_path / "legacy.cttc"
+        await state.export_sample(str(out), t0, t1)
+
+        with zipfile.ZipFile(out, "r") as z:
+            members = {n: z.read(n) for n in z.namelist()}
+        man = json.loads(members["manifest.json"])
+        for seg in man["segments"]:
+            for src in seg["sources"]:
+                src.pop("gateway_id", None)
+                src.pop("docker_host_id", None)
+                src.pop("container_id", None)
+        man.pop("integrity_sha256", None)
+        man["version"] = 2
+        members["manifest.json"] = json.dumps(man).encode()
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+            for name, data in members.items():
+                z.writestr(name, data)
+
+        opened = await state.load_sample(str(out))
+        assert len(opened) == 1
+        assert await state.sources[opened[0]].total() == 1
+
+    async def test_export_empty_range(self, state, log_file, stats_file, tmp_path):
         state.open_file(str(log_file), "auto", None, live=False, transforms=[])
         state.open_file(str(stats_file), "auto", None, live=False, transforms=[])
+        await _flush()
         out = tmp_path / "empty.cttc"
-        r = state.export_sample(str(out), 0.0, 1.0)  # both log and stats out of range
+        r = await state.export_sample(str(out), 0.0, 1.0)  # both log and stats out of range
         assert r["sources"] == 0
         assert zipfile.ZipFile(out).namelist() == ["manifest.json"]
 
-    def test_export_include_host_false(self, state, stats_file, tmp_path):
+    async def test_export_include_host_false(self, state, stats_file, tmp_path):
         src = state.open_file(str(stats_file), "auto", None, live=False, transforms=[])
         src.is_host = True
+        await _flush()
         out = tmp_path / "nohost.cttc"
         t0 = ms(2026, 1, 2, 3, 0, 0)
-        r = state.export_sample(str(out), t0, t0 + 60000, include_host=False)
+        r = await state.export_sample(str(out), t0, t0 + 60000, include_host=False)
         assert r["sources"] == 0
-        assert server.State(tmp_path).load_sample(str(out)) == []
+        st2 = server.State(tmp_path, redis_flush_interval_seconds=0.05, redis_data_dir=str(tmp_path / "redis-data"))
+        st2.redis_log = state.redis_log
+        assert await st2.load_sample(str(out)) == []
 
-    def test_load_sample_skips_blank_log_lines(self, state, tmp_path):
+    async def test_load_sample_skips_blank_log_lines(self, state, tmp_path):
         out = tmp_path / "crafted.cttc"
         with zipfile.ZipFile(out, "w") as z:
             z.writestr("logs/0.jsonl", '{"ts": 1000, "text": "a"}\n\n   \n{"ts": 2000}\n')
@@ -1678,10 +2264,11 @@ class TestSampleRoundTrip:
                     }
                 ),
             )
-        opened = state.load_sample(str(out))
+        opened = await state.load_sample(str(out))
+        await _flush()
         src = state.sources[opened[0]]
-        assert src.total() == 2
-        assert src.slice(1, 1)[0]["text"] == ""  # missing text defaults to empty
+        assert await src.total() == 2
+        assert (await src.slice(1, 1))[0]["text"] == ""  # missing text defaults to empty
 
 
 class TestMultiSegmentSample:
@@ -1690,22 +2277,24 @@ class TestMultiSegmentSample:
     load_sample() must ask (via MultiSegmentSample) which one to load once
     there's more than one."""
 
-    def test_merge_from_scratch_is_a_single_segment(self, state, log_file):
+    async def test_merge_from_scratch_is_a_single_segment(self, state, log_file):
         state.open_file(str(log_file), "auto", None, live=False, transforms=[])
+        await _flush()
         t0, t1 = ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 5)
-        data, meta, seg_idx = state.merge_sample_bytes(None, t0, t1)
+        data, meta, seg_idx = await state.merge_sample_bytes(None, t0, t1)
         assert seg_idx == 0
         assert len(meta) == 1
         man = json.loads(zipfile.ZipFile(io.BytesIO(data)).read("manifest.json"))
         assert len(man["segments"]) == 1
         assert man["segments"][0]["from"] == t0 and man["segments"][0]["to"] == t1
 
-    def test_merge_appends_a_second_segment_without_losing_the_first(self, state, log_file):
+    async def test_merge_appends_a_second_segment_without_losing_the_first(self, state, log_file):
         state.open_file(str(log_file), "auto", None, live=False, transforms=[])
+        await _flush()
         t0, t1 = ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 5)
-        first, _meta1, idx1 = state.merge_sample_bytes(None, t0, t1)
+        first, _meta1, idx1 = await state.merge_sample_bytes(None, t0, t1)
         t2, t3 = ms(2026, 1, 2, 3, 0, 5), ms(2026, 1, 2, 3, 0, 10)
-        second, meta2, idx2 = state.merge_sample_bytes(first, t2, t3)
+        second, meta2, idx2 = await state.merge_sample_bytes(first, t2, t3)
         assert idx1 == 0 and idx2 == 1
         assert len(meta2) == 1
         man = json.loads(zipfile.ZipFile(io.BytesIO(second)).read("manifest.json"))
@@ -1716,49 +2305,144 @@ class TestMultiSegmentSample:
         z = zipfile.ZipFile(io.BytesIO(second))
         assert z.read(man["segments"][0]["sources"][0]["file"])
 
-    def test_merge_onto_a_legacy_single_segment_file(self, state, log_file, tmp_path):
+    async def test_merge_onto_a_legacy_single_segment_file(self, state, log_file, tmp_path):
         # a file exported before the Recording feature (build_sample_bytes'
         # own one-segment shape) must still be a valid base to append onto
         state.open_file(str(log_file), "auto", None, live=False, transforms=[])
+        await _flush()
         t0, t1 = ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 5)
-        legacy, _meta = state.build_sample_bytes(t0, t1)
+        legacy, _meta = await state.build_sample_bytes(t0, t1)
         t2, t3 = ms(2026, 1, 2, 3, 0, 5), ms(2026, 1, 2, 3, 0, 10)
-        merged, meta2, idx2 = state.merge_sample_bytes(legacy, t2, t3)
+        merged, meta2, idx2 = await state.merge_sample_bytes(legacy, t2, t3)
         assert idx2 == 1 and len(meta2) == 1
-        st2 = server.State(tmp_path)
+        st2 = server.State(tmp_path, redis_flush_interval_seconds=0.05, redis_data_dir=str(tmp_path / "redis-data"))
+        st2.redis_log = state.redis_log
         out = tmp_path / "merged.cttc"
         out.write_bytes(merged)
         with pytest.raises(server.MultiSegmentSample) as ei:
-            st2.load_sample(str(out))
+            await st2.load_sample(str(out))
         assert [s["index"] for s in ei.value.segments] == [0, 1]
 
-    def test_load_sample_with_explicit_segment_picks_that_one(self, state, log_file, tmp_path):
+    async def test_load_sample_with_explicit_segment_picks_that_one(
+        self, state, log_file, tmp_path
+    ):
         state.open_file(str(log_file), "auto", None, live=False, transforms=[])
+        await _flush()
         t0, t1 = ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 5)
-        first, _m1, _i1 = state.merge_sample_bytes(None, t0, t1)
+        first, _m1, _i1 = await state.merge_sample_bytes(None, t0, t1)
         t2, t3 = ms(2026, 1, 2, 3, 0, 5), ms(2026, 1, 2, 3, 0, 10)
-        merged, _m2, _i2 = state.merge_sample_bytes(first, t2, t3)
+        merged, _m2, _i2 = await state.merge_sample_bytes(first, t2, t3)
         out = tmp_path / "two-segments.cttc"
         out.write_bytes(merged)
 
-        st2 = server.State(tmp_path)
-        opened0 = st2.load_sample(str(out), segment=0)
-        assert len(opened0) == 1
-        assert st2.sources[opened0[0]].slice(0, 1)[0]["text"] == "alpha"
+        # Two genuinely separate RedisLogs -- both segments' sources are
+        # named "svc" (same original file), so sharing one Redis between
+        # st2 and st3 would merge their histories under that one entity
+        # name (see redis_log.py's sole-source-of-truth scope boundary).
+        st2 = server.State(tmp_path, redis_flush_interval_seconds=0.05, redis_data_dir=str(tmp_path / "redis-data"))
+        st2.redis_log = redis_log.RedisLog(
+            socket_path=f"/tmp/cttc-test-{uuid.uuid4().hex[:8]}.sock",
+            tcp_port=unique_redis_tcp_port(),
+            flush_interval_seconds=0.05,
+            data_dir=tmp_path / "redis-data-2",
+        )
+        await st2.redis_log.start()
+        st3 = server.State(tmp_path, redis_flush_interval_seconds=0.05, redis_data_dir=str(tmp_path / "redis-data"))
+        st3.redis_log = redis_log.RedisLog(
+            socket_path=f"/tmp/cttc-test-{uuid.uuid4().hex[:8]}.sock",
+            tcp_port=unique_redis_tcp_port(),
+            flush_interval_seconds=0.05,
+            data_dir=tmp_path / "redis-data-3",
+        )
+        await st3.redis_log.start()
+        try:
+            opened0 = await st2.load_sample(str(out), segment=0)
+            await _flush()
+            assert len(opened0) == 1
+            assert (await st2.sources[opened0[0]].slice(0, 1))[0]["text"] == "alpha"
 
-        st3 = server.State(tmp_path)
-        opened1 = st3.load_sample(str(out), segment=1)
-        assert len(opened1) == 1
-        assert st3.sources[opened1[0]].slice(0, 1)[0]["text"] == "beta"
+            opened1 = await st3.load_sample(str(out), segment=1)
+            await _flush()
+            assert len(opened1) == 1
+            assert (await st3.sources[opened1[0]].slice(0, 1))[0]["text"] == "beta"
+        finally:
+            await st2.redis_log.stop()
+            await st3.redis_log.stop()
 
-    def test_single_segment_file_loads_without_a_segment_arg(self, state, log_file, tmp_path):
+    async def test_switching_segments_in_one_state_keeps_each_segments_own_data(
+        self, state, log_file, tmp_path
+    ):
+        """Regression for the recording feature's segment-switch path
+        (#record-sections' onchange -> uploadFile(path, index)): unlike
+        test_load_sample_with_explicit_segment_picks_that_one, this uses one
+        shared State/Redis for both loads (closing segment 0's sources
+        before loading segment 1), exactly like the real app switching
+        between recorded segments -- confirms content-addressing (see
+        _content_entity_id) keeps them from colliding even without two
+        separate Redis instances to fall back on."""
         state.open_file(str(log_file), "auto", None, live=False, transforms=[])
+        await _flush()
         t0, t1 = ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 5)
-        data, _meta, _idx = state.merge_sample_bytes(None, t0, t1)
+        first, _m1, _i1 = await state.merge_sample_bytes(None, t0, t1)
+        t2, t3 = ms(2026, 1, 2, 3, 0, 5), ms(2026, 1, 2, 3, 0, 10)
+        merged, _m2, _i2 = await state.merge_sample_bytes(first, t2, t3)
+        out = tmp_path / "two-segments.cttc"
+        out.write_bytes(merged)
+
+        opened0 = await state.load_sample(str(out), segment=0)
+        await _flush()
+        assert (await state.sources[opened0[0]].slice(0, 1))[0]["text"] == "alpha"
+        for sid in opened0:
+            state.close_source(sid)
+
+        opened1 = await state.load_sample(str(out), segment=1)
+        await _flush()
+        assert (await state.sources[opened1[0]].slice(0, 1))[0]["text"] == "beta"
+
+    async def test_single_segment_file_loads_without_a_segment_arg(self, state, log_file, tmp_path):
+        state.open_file(str(log_file), "auto", None, live=False, transforms=[])
+        await _flush()
+        t0, t1 = ms(2026, 1, 2, 3, 0, 0), ms(2026, 1, 2, 3, 0, 5)
+        data, _meta, _idx = await state.merge_sample_bytes(None, t0, t1)
         out = tmp_path / "one-segment.cttc"
         out.write_bytes(data)
-        st2 = server.State(tmp_path)
-        assert len(st2.load_sample(str(out))) == 1  # no MultiSegmentSample raised
+        st2 = server.State(tmp_path, redis_flush_interval_seconds=0.05, redis_data_dir=str(tmp_path / "redis-data"))
+        st2.redis_log = state.redis_log
+        assert len(await st2.load_sample(str(out))) == 1  # no MultiSegmentSample raised
+
+    async def test_merge_over_a_wide_range_only_returns_genuinely_captured_rows(self, state, log_file):
+        """br-ORPHAN-005 (REQ-0067): resuming a crash-interrupted recording
+        from its original segmentStart, however long ago, must never
+        fabricate data for the stretch where nothing was actually
+        collected -- it should just come back empty for that portion while
+        still picking up whatever genuinely exists. Simulates that by
+        requesting a segment far wider than the fixture's actual data
+        range, the same shape as flushRecordingSegment's real call once a
+        recording is resumed via "Resume from the interruption point"."""
+        state.open_file(str(log_file), "auto", None, live=False, transforms=[])
+        await _flush()
+        # log_file's only two rows are at 03:00:00 and 03:00:10 -- request
+        # a segment spanning a full hour around them, well past both ends.
+        t0, t1 = ms(2026, 1, 2, 2, 0, 0), ms(2026, 1, 2, 4, 0, 0)
+        data, meta, seg_idx = await state.merge_sample_bytes(None, t0, t1)
+        assert seg_idx == 0
+        assert len(meta) == 1
+        man = json.loads(zipfile.ZipFile(io.BytesIO(data)).read("manifest.json"))
+        # the manifest honestly records the full requested range as the
+        # segment's span (what the resumed recording's highlight band will
+        # show) ...
+        assert man["segments"][0]["from"] == t0 and man["segments"][0]["to"] == t1
+        # ... but the row content underneath is only ever the two rows
+        # that genuinely exist -- nothing fabricated for the empty hour on
+        # either side.
+        rows = (
+            zipfile.ZipFile(io.BytesIO(data))
+            .read(man["segments"][0]["sources"][0]["file"])
+            .decode()
+            .splitlines()
+        )
+        assert len(rows) == 2
+        assert [json.loads(r)["text"] for r in rows] == ["alpha", "beta"]
 
 
 # ── HTTP API ─────────────────────────────────────────────────────────────────
@@ -1799,26 +2483,49 @@ def boot_server(state):
 
 
 @pytest.fixture
-def api(state, log_file, stats_file):
+def api(tmp_path, log_file, stats_file):
+    """Deliberately does NOT reuse the `state` fixture (which starts its
+    own RedisLog on the pytest event loop): the HTTP server here runs on a
+    *separate* event loop in a background thread (see boot_server), and
+    redis.asyncio's client/connection pool is bound to whichever loop
+    first used it -- reusing a client across two different loops raises
+    ("Future attached to a different loop"). Building a fresh, unstarted
+    State here and letting boot_server's lifespan() start its RedisLog
+    keeps everything -- client, pump task, and every route handler's reads
+    -- on the one loop that actually serves requests. Sources are opened
+    only *after* boot_server returns (i.e. after lifespan has finished),
+    via `state.open_file()`'s call_soon_threadsafe write path, which is
+    safe to call from any thread."""
+    tdir = tmp_path / "transforms"
+    tdir.mkdir()
+    (tdir / "upper.py").write_text(
+        '"""Uppercase text."""\n'
+        "def transform(r):\n"
+        '    r["text"] = r["text"].upper()\n'
+        "    return r\n"
+    )
+    state = server.State(tdir, redis_flush_interval_seconds=0.05, redis_data_dir=str(tdir / "redis-data"))
+    base, srv, t = boot_server(state)
     state.open_file(str(log_file), "auto", None, live=False, transforms=[])
     state.open_file(str(stats_file), "auto", None, live=False, transforms=[])
-    base, srv, t = boot_server(state)
+    time.sleep(0.3)  # let redis_log's pump (on the server's own loop) catch up
     yield base, state
     srv.should_exit = True
     t.join(timeout=5)
 
 
-def get(base, path):
+def get(base, path, headers=None):
+    req = urllib.request.Request(base + path, headers=headers or {})
     try:
-        with urllib.request.urlopen(base + path, timeout=5) as r:
+        with urllib.request.urlopen(req, timeout=5) as r:
             return r.status, json.loads(r.read())
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read())
 
 
-def post(base, path, body=None):
+def post(base, path, body=None, headers=None):
     data = json.dumps(body or {}).encode()
-    req = urllib.request.Request(base + path, data=data, method="POST")
+    req = urllib.request.Request(base + path, data=data, method="POST", headers=headers or {})
     try:
         with urllib.request.urlopen(req, timeout=5) as r:
             return r.status, json.loads(r.read())
@@ -1885,7 +2592,9 @@ class TestHttpApi:
         sid = next(s.id for s in st.sources.values() if s.kind == "log")
         with caplog.at_level("INFO", logger="cttc"):
             get(base, f"/logs?source={sid}&start=0&count=10")
-        match = next((r.message for r in caplog.records if r.name == "cttc" and "/logs" in r.message), None)
+        match = next(
+            (r.message for r in caplog.records if r.name == "cttc" and "/logs" in r.message), None
+        )
         assert match
         assert f"?source={sid}&start=0&count=10" in match
         assert "127.0.0.1" in match
@@ -1894,11 +2603,13 @@ class TestHttpApi:
         base, _ = api
         with caplog.at_level("INFO", logger="cttc"):
             get(base, "/logs?source=nope")
-        match = next((r.message for r in caplog.records if r.name == "cttc" and "/logs" in r.message), None)
+        match = next(
+            (r.message for r in caplog.records if r.name == "cttc" and "/logs" in r.message), None
+        )
         assert match and " 400 " in match
 
     def test_range_empty(self, tmp_path):
-        base, srv, t = boot_server(server.State(tmp_path))
+        base, srv, t = boot_server(server.State(tmp_path, redis_flush_interval_seconds=0.05, redis_data_dir=str(tmp_path / "redis-data")))
         try:
             _, j = get(base, "/range")
             assert j == {"min_ts": None, "max_ts": None}
@@ -1919,6 +2630,50 @@ class TestHttpApi:
         t0 = ms(2026, 1, 2, 3, 0, 0)
         _, j = get(base, f"/series?from={t0}&to={t0 + 1000}")
         assert j["px"] == 800
+
+    def test_stats_export_summary(self, api):
+        base, st = api
+        sid = next(s.id for s in st.sources.values() if s.kind == "stats")
+        t0 = ms(2026, 1, 2, 3, 0, 0)
+        _, j = get(base, f"/stats_export?from={t0}&to={t0 + 10000}&granularity=summary")
+        assert j["granularity"] == "summary"
+        assert [s["name"] for s in j["services"]] == ["api"]
+        svc = j["services"][0]
+        assert svc["sid"] == sid  # lets the client scope results to the active sample, like bucketed()'s own "sid"
+        assert svc["count"] == 3  # stats_file seeds 3 rows, see its own fixture
+        assert svc["cpu"] == {"min": 10.0, "avg": 10.0, "max": 10.0}
+        assert svc["mem"] == {"min": 20.0, "avg": 20.0, "max": 20.0}
+
+    def test_stats_export_full(self, api):
+        base, st = api
+        sid = next(s.id for s in st.sources.values() if s.kind == "stats")
+        t0 = ms(2026, 1, 2, 3, 0, 0)
+        _, j = get(base, f"/stats_export?from={t0}&to={t0 + 10000}&granularity=full")
+        assert j["granularity"] == "full"
+        svc = j["services"][0]
+        assert svc["sid"] == sid
+        assert len(svc["samples"]) == 3
+        assert svc["samples"][0]["cpu"] == 10.0
+        assert svc["samples"][0]["mem"] == 20.0
+
+    def test_stats_export_default_granularity_is_summary(self, api):
+        base, _ = api
+        t0 = ms(2026, 1, 2, 3, 0, 0)
+        _, j = get(base, f"/stats_export?from={t0}&to={t0 + 10000}")
+        assert j["granularity"] == "summary"
+
+    def test_stats_export_requires_from_and_to(self, api):
+        base, _ = api
+        status, _ = get(base, "/stats_export?from=1")
+        assert status == 400
+        status, _ = get(base, "/stats_export?to=1")
+        assert status == 400
+
+    def test_stats_export_rejects_a_bad_granularity(self, api):
+        base, _ = api
+        t0 = ms(2026, 1, 2, 3, 0, 0)
+        status, _ = get(base, f"/stats_export?from={t0}&to={t0 + 1000}&granularity=bogus")
+        assert status == 400
 
     def test_logs_index_ticks(self, api):
         base, st = api
@@ -1951,10 +2706,41 @@ class TestHttpApi:
         _, j = get(base, "/ssh/keys")
         assert j["keys"] == ["/home/u/.ssh/id_rsa"]
 
+    def test_ssh_keys_endpoint_never_discloses_full_paths(self, api, tmp_path, monkeypatch):
+        # br-NET-005: any client reachable on the port could enumerate the
+        # operator's private-key file paths (and thus their username/home
+        # dir); only basenames may cross the wire.
+        base, _ = api
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        d = tmp_path / ".ssh"
+        d.mkdir()
+        (d / "id_ed25519").write_text("-----BEGIN OPENSSH PRIVATE KEY-----\n...")
+        _, j = get(base, "/ssh/keys")
+        assert j["keys"] == ["id_ed25519"]
+        assert all("/" not in k and str(tmp_path) not in k for k in j["keys"])
+
     def test_missing_params_400(self, api):
         base, _ = api
         code, j = get(base, "/series")
         assert code == 400 and "bad request" in j["error"]
+
+    def test_index_at_and_ticks_missing_params_400(self, api):
+        base, st = api
+        sid = next(s.id for s in st.sources.values() if s.kind == "log")
+        code, j = get(base, f"/index_at?source={sid}")  # missing t
+        assert code == 400 and "'t' is required" in j["error"]
+        code, j = get(base, f"/ticks?source={sid}&from=0")  # missing to
+        assert code == 400 and "'from' and 'to' are required" in j["error"]
+
+    def test_close_missing_id_400(self, api):
+        base, _ = api
+        code, j = post(base, "/close", {})
+        assert code == 400 and "'id' is required" in j["error"]
+
+    def test_health(self, api):
+        base, _ = api
+        code, j = get(base, "/health")
+        assert code == 200 and j == {"ok": True}
 
     def test_unknown_paths_404(self, api):
         base, _ = api
@@ -2032,13 +2818,13 @@ class TestHttpApi:
         man = json.loads(zipfile.ZipFile(io.BytesIO(second)).read("manifest.json"))
         assert len(man["segments"]) == 2
 
-    def test_sample_record_include_host_false(self, api, state):
-        base, _ = api
+    def test_sample_record_include_host_false(self, api):
+        base, state = api
         for s in state.sources.values():
             if s.kind == "stats":
                 s.is_host = True
         t0 = ms(2026, 1, 2, 3, 0, 0)
-        code, headers, data = post_raw_binary(
+        code, _headers, data = post_raw_binary(
             base,
             "/sample/record",
             b"",
@@ -2090,6 +2876,24 @@ class TestHttpApi:
         monkeypatch.setattr(server, "docker_ps", fake_ps)
         _, j = post(base, "/docker/ps", {"host": "ssh://u@h", "ssh_key": "/k"})
         assert j["host"] == "ssh://u@h" and j["key"] == "/k"
+
+    def test_docker_ps_endpoint_rejects_a_non_ssh_scheme(self, api):
+        # br-CONN-002: used to be silently parsed into garbage (an ssh
+        # attempt to a nonsense host:port) instead of rejected with a
+        # clean error. Real docker_ps, not monkeypatched -- normalize_docker_host
+        # raises before it ever touches a subprocess/ssh client.
+        base, _ = api
+        code, j = post(base, "/docker/ps", {"host": "tcp://1.2.3.4:2375"})
+        assert code == 400
+        assert "unsupported docker host transport" in j["error"]
+
+    def test_docker_ps_endpoint_rejects_a_bad_port(self, api):
+        # br-CONN-005: real docker_ps, not monkeypatched -- normalize_docker_host
+        # raises before it ever touches a subprocess/ssh client.
+        base, _ = api
+        code, j = post(base, "/docker/ps", {"host": "ssh://h:notaport"})
+        assert code == 400
+        assert "invalid ssh port" in j["error"]
 
     def test_docker_ps_endpoint_reports_runtime_error(self, api, monkeypatch):
         # a failed ssh/docker call must still get a real response (not a
@@ -2151,6 +2955,47 @@ class TestHttpApi:
         for sid in j["opened"]:
             st.close_source(sid)
 
+    def test_docker_collect_endpoint_rejects_a_non_ssh_scheme(self, api):
+        # br-CONN-002
+        base, st = api
+        before = set(st.sources)
+        code, j = post(
+            base,
+            "/docker/collect",
+            {"host": "tcp://1.2.3.4:2375", "stats": True, "host_stats": False, "logs": []},
+        )
+        assert code == 400
+        assert "unsupported docker host transport" in j["error"]
+        assert set(st.sources) == before, "nothing should have been opened"
+
+    def test_docker_collect_endpoint_rejects_a_bad_port(self, api):
+        # br-CONN-005
+        base, st = api
+        before = set(st.sources)
+        code, j = post(
+            base,
+            "/docker/collect",
+            {"host": "ssh://h:notaport", "stats": True, "host_stats": False, "logs": []},
+        )
+        assert code == 400
+        assert "invalid ssh port" in j["error"]
+        assert set(st.sources) == before, "nothing should have been opened"
+
+    def test_docker_forget_endpoint_calls_forget_daemon_with_the_normalized_host(self, api, monkeypatch):
+        # br-REDIS-017: Remove Docker Host must actually reach the server's
+        # Redis-side daemon registry, not just close in-memory sources --
+        # this is the route that lets it do so.
+        base, st = api
+        captured = {}
+
+        async def fake_forget(host):
+            captured["host"] = host
+
+        monkeypatch.setattr(st.redis_log, "forget_daemon", fake_forget)
+        code, j = post(base, "/docker/forget", {"host": "u@h"})
+        assert code == 200 and j == {"ok": True}
+        assert captured["host"] == "ssh://u@h"  # normalize_docker_host adds the scheme
+
     def test_point_endpoint(self, api):
         base, _ = api
         t = ms(2026, 1, 2, 3, 0, 1)
@@ -2200,7 +3045,7 @@ class TestHttpApi:
         assert code == 500 and "error" in j
 
     def test_sse_keepalive_comment(self, api, monkeypatch):
-        base, st = api
+        base, _st = api
         monkeypatch.setattr(server, "SSE_KEEPALIVE_INTERVAL", 0.05)  # shrink the 15s wait
         conn = http.client.HTTPConnection(base.split("//")[1], timeout=5)
         conn.request("GET", "/events")
@@ -2236,11 +3081,186 @@ class TestHttpApi:
         assert st.listeners == []
 
     def test_shutdown_endpoint(self, tmp_path):
-        base, srv, t = boot_server(server.State(tmp_path))
+        base, _srv, t = boot_server(server.State(tmp_path, redis_flush_interval_seconds=0.05, redis_data_dir=str(tmp_path / "redis-data")))
         code, j = post(base, "/shutdown")
         assert code == 200 and j["ok"] is True
         t.join(timeout=5)
         assert not t.is_alive()
+
+
+class TestBufferSessionSchedulerEndpoints:
+    """HTTP-level coverage for /buffer/*, /session/*, /logs/rate, and
+    /scheduler/* -- these managers (rolling_buffer.py, recording_session.py,
+    scheduler.py) each have their own thorough unit tests, but none of that
+    exercised the actual FastAPI routes wrapping them (request body
+    parsing, 404 mapping for unknown ids, response shapes) until now."""
+
+    def test_buffer_start_pause_stop(self, api):
+        base, _ = api
+        code, j = post(base, "/buffer/start", {"minutes": 5})
+        assert code == 200 and j["buffer_id"]
+        buffer_id = j["buffer_id"]
+
+        code, j = post(base, f"/buffer/{buffer_id}/pause")
+        assert code == 200 and j["ok"] is True
+
+        code, headers, data = post_raw_binary(base, f"/buffer/{buffer_id}/stop", b"")
+        assert code == 200
+        # source count isn't asserted here: the buffer's window is
+        # [start_ts, now], and the api fixture's sources are static files
+        # with fixed historical timestamps unrelated to wall-clock "now" --
+        # the header's presence/shape is what this test is really after.
+        assert "X-CTTC-Source-Count" in headers
+        assert data[:2] == b"PK"  # zip magic
+
+    def test_buffer_pause_and_stop_unknown_id_is_404(self, api):
+        base, _ = api
+        assert post(base, "/buffer/nope/pause")[0] == 404
+        assert post_raw_binary(base, "/buffer/nope/stop", b"")[0] == 404
+
+    def test_buffer_start_rejects_once_the_ad_hoc_cap_is_reached(self, api):
+        # br-RBUF-005: POST /buffer/start used to be completely uncapped.
+        import rolling_buffer
+
+        base, state = api
+        for _ in range(rolling_buffer.MAX_OPEN):
+            state.rolling_buffers.start(5)
+        code, j = post(base, "/buffer/start", {"minutes": 5})
+        assert code == 400 and "error" in j
+        for bid in list(state.rolling_buffers._buffers):
+            state.rolling_buffers._buffers.pop(bid)  # clean up after ourselves
+
+    def test_session_start_stop_status_download(self, api):
+        base, _ = api
+        code, j = post(base, "/session/start", {"safe": True})
+        assert code == 200 and j["session_id"]
+        session_id = j["session_id"]
+
+        code, j = get(base, f"/session/{session_id}/status")
+        assert code == 200 and j["status"] == "running" and j["ready"] is False
+
+        code, j = post(base, f"/session/{session_id}/stop")
+        assert code == 200 and j["ok"] is True
+
+        code, j = get(base, f"/session/{session_id}/status")
+        assert code == 200 and j["status"] == "completed" and j["ready"] is True
+
+        code, headers, data = get_raw(base, f"/session/{session_id}/download")
+        assert code == 200
+        assert headers["Content-Disposition"].endswith(f'{session_id}.cttc-record"')
+        assert data[:2] == b"PK"
+
+    def test_session_safe_flags_a_running_session(self, api):
+        base, _ = api
+        session_id = post(base, "/session/start")[1]["session_id"]
+        code, j = post(base, f"/session/{session_id}/safe", {"max_keep_seconds": 3600})
+        assert code == 200 and j["ok"] is True
+        post(base, f"/session/{session_id}/stop")
+
+    def test_session_download_before_completion_is_404(self, api):
+        base, _ = api
+        session_id = post(base, "/session/start")[1]["session_id"]
+        assert get_raw(base, f"/session/{session_id}/download")[0] == 404
+        post(base, f"/session/{session_id}/stop")  # avoid leaking a running session
+
+    def test_session_unknown_id_is_404_everywhere(self, api):
+        base, _ = api
+        assert post(base, "/session/nope/stop")[0] == 404
+        assert post(base, "/session/nope/safe", {"max_keep_seconds": 60})[0] == 404
+        assert get(base, "/session/nope/status")[0] == 404
+        assert get_raw(base, "/session/nope/download")[0] == 404
+
+    def test_session_ttl(self, api):
+        base, state = api
+        code, j = post(base, "/session/ttl", {"seconds": 60})
+        assert code == 200 and j["ok"] is True
+        assert state.recording_sessions.default_ttl_seconds == 60
+
+    def test_logs_rate_get_returns_current_flush_interval(self, api):
+        base, state = api
+        code, j = get(base, "/logs/rate")
+        assert code == 200 and j["seconds"] == state.redis_log.flush_interval_seconds
+
+    def test_logs_rate_post_updates_it(self, api):
+        base, state = api
+        code, j = post(base, "/logs/rate", {"seconds": 5.0})
+        assert code == 200 and j["ok"] is True
+        assert state.redis_log.flush_interval_seconds == 5.0
+        code, j = get(base, "/logs/rate")
+        assert code == 200 and j["seconds"] == 5.0
+
+    def test_logs_rate_post_rejects_too_small_a_value(self, api):
+        import redis_log
+
+        base, state = api
+        original = state.redis_log.flush_interval_seconds
+        code, j = post(base, "/logs/rate", {"seconds": redis_log.MIN_FLUSH_INTERVAL_SECONDS / 2})
+        assert code == 400 and "error" in j
+        assert state.redis_log.flush_interval_seconds == original, "rejected calls must not change the rate"
+
+    def test_logs_rate_post_broadcasts_a_rate_event(self, api):
+        base, st = api
+        host = base.split("//")[1]
+        conn = http.client.HTTPConnection(host, timeout=5)
+        conn.request("GET", "/events")
+        sock = conn.sock  # getresponse() may detach conn.sock
+        resp = conn.getresponse()
+        deadline = time.time() + 3
+        while not st.listeners and time.time() < deadline:
+            time.sleep(0.02)
+        code, j = post(base, "/logs/rate", {"seconds": 3.0})
+        assert code == 200 and j["ok"] is True
+        line = resp.readline()
+        assert line.startswith(b"data:") and b'"rate"' in line and b"3.0" in line
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        resp.close()
+        sock.close()
+        conn.close()
+
+    def test_scheduler_create_status_cancel_one_shot(self, api):
+        base, _ = api
+        code, j = post(
+            base,
+            "/scheduler/create",
+            {"duration_minutes": 5, "start_at": (time.time() + 3600) * 1000.0},
+        )
+        assert code == 200 and j["schedule_id"]
+        schedule_id = j["schedule_id"]
+
+        code, j = get(base, f"/scheduler/{schedule_id}")
+        assert code == 200 and j["schedule_id"] == schedule_id
+
+        code, j = post(base, f"/scheduler/{schedule_id}/cancel")
+        assert code == 200 and j["ok"] is True
+        assert get(base, f"/scheduler/{schedule_id}")[0] == 404
+
+    def test_scheduler_create_recurring_with_cron(self, api):
+        base, _ = api
+        code, j = post(base, "/scheduler/create", {"duration_minutes": 1, "cron": "*/5 * * * *"})
+        assert code == 200 and j["schedule_id"]
+
+    def test_scheduler_create_requires_exactly_one_of_start_at_or_cron(self, api):
+        base, _ = api
+        code, j = post(base, "/scheduler/create", {"duration_minutes": 1})
+        assert code == 400 and "error" in j
+        code, j = post(
+            base,
+            "/scheduler/create",
+            {"duration_minutes": 1, "start_at": time.time() * 1000.0, "cron": "*/5 * * * *"},
+        )
+        assert code == 400
+
+    def test_scheduler_create_invalid_cron_is_400(self, api):
+        base, _ = api
+        code, j = post(
+            base, "/scheduler/create", {"duration_minutes": 1, "cron": "not a cron expr"}
+        )
+        assert code == 400 and "error" in j
+
+    def test_scheduler_status_and_cancel_unknown_id_is_404(self, api):
+        base, _ = api
+        assert get(base, "/scheduler/nope")[0] == 404
+        assert post(base, "/scheduler/nope/cancel")[0] == 404
 
 
 class TestEventsEndpoints:
@@ -2318,7 +3338,11 @@ class TestEventsEndpoints:
         code, j = post(
             base,
             "/events/create",
-            {"name": "x", "conditions": [{"type": "bogus"}], "action": {"kind": "snapshot", "minutes": 5}},
+            {
+                "name": "x",
+                "conditions": [{"type": "bogus"}],
+                "action": {"kind": "snapshot", "minutes": 5},
+            },
         )
         assert code == 400 and "error" in j
 
@@ -2367,8 +3391,823 @@ class TestEventsEndpoints:
         code, j = post(base, f"/events/{event_id}/update", {"conditions": [{"type": "bogus"}]})
         assert code == 400 and "error" in j
 
+    def test_create_with_semantically_invalid_condition_is_a_400(self, api):
+        """Unlike test_create_with_invalid_condition_is_a_400 (a bad
+        condition *type*, rejected by _parse_condition itself), this one
+        parses fine but fails EventManager._validate()'s own semantic check
+        (unknown metric name) -- a different exception type (InvalidEvent)
+        taking a different except branch in route_events_create."""
+        base, _ = api
+        code, j = post(
+            base,
+            "/events/create",
+            {
+                "name": "x",
+                "conditions": [{"type": "metric", "metric": "disk", "op": ">", "threshold": 1}],
+                "action": {"kind": "snapshot", "minutes": 5},
+            },
+        )
+        assert code == 400 and "unknown metric" in j["error"]
+
+    def test_update_with_semantically_invalid_condition_is_a_400(self, api):
+        base, _ = api
+        event_id = post(
+            base,
+            "/events/create",
+            {
+                "name": "x",
+                "conditions": [{"type": "log", "pattern": "ERROR"}],
+                "action": {"kind": "recording", "duration_minutes": 5},
+            },
+        )[1]["event_id"]
+        code, j = post(
+            base,
+            f"/events/{event_id}/update",
+            {"conditions": [{"type": "metric", "metric": "disk", "op": ">", "threshold": 1}]},
+        )
+        assert code == 400 and "unknown metric" in j["error"]
+
+    def test_create_with_missing_condition_fields_is_a_400(self, api):
+        """A metric condition missing its required keys (metric/op/threshold)
+        raises a KeyError inside _parse_condition -- route_events_create
+        must map that to a 400, not let it become an unhandled 500."""
+        base, _ = api
+        code, j = post(
+            base,
+            "/events/create",
+            {
+                "name": "x",
+                "conditions": [{"type": "metric"}],  # missing metric/op/threshold
+                "action": {"kind": "snapshot", "minutes": 5},
+            },
+        )
+        assert code == 400 and "malformed event request" in j["error"]
+
+    def test_create_with_invalid_action_kind_is_a_400(self, api):
+        base, _ = api
+        code, j = post(
+            base,
+            "/events/create",
+            {
+                "name": "x",
+                "conditions": [{"type": "log", "pattern": "ERROR"}],
+                "action": {"kind": "bogus"},
+            },
+        )
+        assert code == 400 and "action.kind" in j["error"]
+
+    def test_update_with_missing_condition_fields_is_a_400(self, api):
+        base, _ = api
+        event_id = post(
+            base,
+            "/events/create",
+            {
+                "name": "x",
+                "conditions": [{"type": "log", "pattern": "ERROR"}],
+                "action": {"kind": "recording", "duration_minutes": 5},
+            },
+        )[1]["event_id"]
+        code, j = post(base, f"/events/{event_id}/update", {"conditions": [{"type": "metric"}]})
+        assert code == 400 and "malformed event request" in j["error"]
+
+    def test_update_with_invalid_action_kind_is_a_400(self, api):
+        base, _ = api
+        event_id = post(
+            base,
+            "/events/create",
+            {
+                "name": "x",
+                "conditions": [{"type": "log", "pattern": "ERROR"}],
+                "action": {"kind": "recording", "duration_minutes": 5},
+            },
+        )[1]["event_id"]
+        code, j = post(base, f"/events/{event_id}/update", {"action": {"kind": "bogus"}})
+        assert code == 400 and "action.kind" in j["error"]
+
 
 # ── /files/* (phase 3: upload/download, docs/architecture/remote-server.md) ──
+
+
+class TestApiTokenAuth:
+    """br-NET-004: every route is gated behind X-CTTC-Token once a token is
+    configured (app.state.api_token, set from --api-token/CTTC_API_TOKEN --
+    see TestMain for the CLI/env-var wiring itself). Left unset, behavior is
+    byte-for-byte what it always was -- this only ever tightens a
+    deployment that opted into one."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_token_after(self):
+        # server.app is a module-level singleton shared by every test in
+        # this file (see boot_server) -- leaving a token set here would
+        # otherwise 401 every other test's requests too.
+        yield
+        server.app.state.api_token = None
+
+    def test_no_token_configured_is_unauthenticated_as_before(self, api):
+        base, _ = api
+        assert getattr(server.app.state, "api_token", None) is None
+        code, _ = get(base, "/sources")
+        assert code == 200
+
+    def test_missing_token_is_rejected_once_one_is_configured(self, api):
+        base, _ = api
+        server.app.state.api_token = "s3cr3t"
+        code, j = get(base, "/sources")
+        assert code == 401
+        assert "X-CTTC-Token" in j["error"]
+
+    def test_wrong_token_is_rejected(self, api):
+        base, _ = api
+        server.app.state.api_token = "s3cr3t"
+        code, _ = get(base, "/sources", headers={"X-CTTC-Token": "wrong"})
+        assert code == 401
+
+    def test_correct_token_is_accepted_on_get_routes(self, api):
+        base, _ = api
+        server.app.state.api_token = "s3cr3t"
+        code, j = get(base, "/sources", headers={"X-CTTC-Token": "s3cr3t"})
+        assert code == 200 and len(j["sources"]) == 2
+
+    def test_correct_token_is_accepted_on_post_routes_too(self, api):
+        base, _ = api
+        server.app.state.api_token = "s3cr3t"
+        code, j = post(base, "/close", {"id": "nonexistent"}, headers={"X-CTTC-Token": "s3cr3t"})
+        assert code == 200 and j == {"ok": True}  # reached the real route, not a 401
+
+    def test_options_preflight_is_exempt_even_with_a_token_configured(self, api):
+        base, _ = api
+        server.app.state.api_token = "s3cr3t"
+        req = urllib.request.Request(base + "/sources", method="OPTIONS")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            assert r.status == 204
+            assert "X-CTTC-Token" in r.headers.get("Access-Control-Allow-Headers", "")
+
+    def test_rejected_requests_are_logged(self, api, caplog):
+        base, _ = api
+        server.app.state.api_token = "s3cr3t"
+        with caplog.at_level("WARNING", logger="cttc"):
+            code, _ = get(base, "/sources")
+        assert code == 401
+        assert any(
+            "X-CTTC-Token" in r.message for r in caplog.records if r.name == "cttc"
+        ), caplog.text
+
+    def test_correct_token_via_query_param_is_accepted(self, api):
+        # EventSource (app.js's /events SSE stream) can't attach a custom
+        # header at all -- the query param is its only channel, so it must
+        # work as a fallback alongside (not instead of) the header.
+        base, _ = api
+        server.app.state.api_token = "s3cr3t"
+        code, j = get(base, "/sources?token=s3cr3t")
+        assert code == 200 and len(j["sources"]) == 2
+
+    def test_wrong_token_via_query_param_is_still_rejected(self, api):
+        base, _ = api
+        server.app.state.api_token = "s3cr3t"
+        code, _ = get(base, "/sources?token=wrong")
+        assert code == 401
+
+
+class TestGatewayOwnershipClaim:
+    """br-OWNER-001 (REQ-0069): the deploying client becomes owner, once,
+    at install -- POST /gateway/ownership/claim is idempotent (first claim
+    wins, SET NX under the hood) so a later reconnect can never rewrite an
+    already-established ownership record."""
+
+    def test_claim_writes_the_ownership_record(self, api):
+        base, _ = api
+        code, j = post(
+            base,
+            "/gateway/ownership/claim",
+            {"ownerLabel": "alice-laptop", "ownerPublicKey": "ssh-ed25519 AAAAC3abc"},
+        )
+        assert code == 200
+        assert j["ownerLabel"] == "alice-laptop"
+        assert j["ownerPublicKey"] == "ssh-ed25519 AAAAC3abc"
+        assert j["ownerKeyFingerprint"] == hashlib.sha256(b"ssh-ed25519 AAAAC3abc").hexdigest()
+        assert j["installedAt"] == j["updatedAt"]
+        assert j["installedAt"].endswith("Z")  # now_iso()'s UTC ISO-8601 shape
+
+    def test_reclaiming_an_already_owned_gateway_is_a_no_op(self, api):
+        # A second client (or the same one, reconnecting) must never
+        # rewrite who owns the gateway -- REQ-0069's Requirement 1
+        # acceptance criterion.
+        base, _ = api
+        _code, first = post(
+            base,
+            "/gateway/ownership/claim",
+            {"ownerLabel": "alice-laptop", "ownerPublicKey": "ssh-ed25519 AAAAC3abc"},
+        )
+        code, second = post(
+            base,
+            "/gateway/ownership/claim",
+            {"ownerLabel": "mallory-vps", "ownerPublicKey": "ssh-ed25519 AAAAC3evil"},
+        )
+        assert code == 200
+        assert second == first  # untouched -- still alice, not mallory
+
+    def test_missing_fields_are_rejected(self, api):
+        base, _ = api
+        code, j = post(base, "/gateway/ownership/claim", {"ownerLabel": "alice-laptop"})
+        assert code == 400
+        assert "ownerPublicKey" in j["error"]
+
+    def test_concurrent_claims_never_both_win(self, api):
+        # write_ownership's SET NX makes the write itself atomic -- two
+        # requests racing to claim the same fresh gateway must converge on
+        # exactly one owner, not whichever happened to be read last.
+        base, _ = api
+
+        def claim(label):
+            return post(
+                base,
+                "/gateway/ownership/claim",
+                {"ownerLabel": label, "ownerPublicKey": f"ssh-ed25519 {label}"},
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(claim, ["first-client", "second-client"]))
+        assert all(code == 200 for code, _ in results)
+        winners = {j["ownerLabel"] for _, j in results}
+        assert len(winners) == 1, f"both claims report a different winner: {results}"
+
+
+def _generate_admin_keypair(tmp_path, name):
+    """A real ed25519 keypair for admin-auth tests -- exercises the actual
+    `ssh-keygen -Y sign`/`-Y verify` contract _verify_owner_signature shells
+    out to, not a faked signature (openssh-client is a hard requirement
+    elsewhere in this project already -- see the Dockerfile)."""
+    key_path = tmp_path / name
+    subprocess.run(
+        ["ssh-keygen", "-t", "ed25519", "-N", "", "-f", str(key_path)],
+        check=True,
+        capture_output=True,
+    )
+    pub = (tmp_path / f"{name}.pub").read_text().strip()
+    return key_path, pub
+
+
+def _sign(nonce, key_path, namespace="cttc-admin-auth"):
+    """Mirrors ssh-key-file.js's signChallenge, in Python, for tests."""
+    nonce_file = key_path.parent / f"{key_path.name}.nonce"
+    nonce_file.write_text(nonce)
+    subprocess.run(
+        ["ssh-keygen", "-Y", "sign", "-f", str(key_path), "-n", namespace, str(nonce_file)],
+        check=True,
+        capture_output=True,
+    )
+    return Path(f"{nonce_file}.sig").read_text()
+
+
+class TestGatewayAdminAuth:
+    """br-OWNER-002/003/005 (REQ-0069): challenge-response gates
+    POST /gateway/ownership/rotate -- the only admin route added so far
+    (upgrade/delete aren't added yet, see REQ-0069's Requirement 2 scope
+    note)."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_token_after(self):
+        yield
+        server.app.state.api_token = None
+
+    def test_no_owner_claimed_yet_is_rejected(self, api):
+        base, _ = api
+        code, j = post(
+            base,
+            "/gateway/ownership/rotate",
+            {"newOwnerLabel": "bob", "newOwnerPublicKey": "ssh-ed25519 AAA"},
+        )
+        assert code == 403
+        assert "no owner" in j["detail"].lower()
+
+    def test_full_rotation_round_trip(self, api, tmp_path):
+        base, _ = api
+        owner_key, owner_pub = _generate_admin_keypair(tmp_path, "owner")
+        _new_key, new_pub = _generate_admin_keypair(tmp_path, "newowner")
+
+        _code, claimed = post(
+            base, "/gateway/ownership/claim", {"ownerLabel": "alice", "ownerPublicKey": owner_pub}
+        )
+
+        code, challenge = get(base, "/gateway/admin/challenge")
+        assert code == 200 and challenge["nonce"] and challenge["expiresInSeconds"] > 0
+
+        signature = _sign(challenge["nonce"], owner_key)
+        code, rotated = post(
+            base,
+            "/gateway/ownership/rotate",
+            {
+                "nonce": challenge["nonce"],
+                "signature": signature,
+                "newOwnerLabel": "bob",
+                "newOwnerPublicKey": new_pub,
+            },
+        )
+        assert code == 200
+        assert rotated["ownerLabel"] == "bob"
+        assert rotated["ownerPublicKey"] == new_pub
+        assert rotated["ownerKeyFingerprint"] == hashlib.sha256(new_pub.encode()).hexdigest()
+        assert rotated["installedAt"] == claimed["installedAt"]  # carried over, not reset
+        assert rotated["updatedAt"] != claimed["updatedAt"]
+
+        # And the record actually stuck -- a fresh read agrees.
+        _code, current = post(
+            base, "/gateway/ownership/claim", {"ownerLabel": "someone-else", "ownerPublicKey": "x"}
+        )
+        assert current == rotated  # claim on an owned gateway just echoes it back, unchanged
+
+    def test_missing_nonce_or_signature_is_rejected(self, api):
+        base, _ = api
+        post(
+            base,
+            "/gateway/ownership/claim",
+            {"ownerLabel": "alice", "ownerPublicKey": "ssh-ed25519 AAA"},
+        )
+        code, j = post(
+            base,
+            "/gateway/ownership/rotate",
+            {"newOwnerLabel": "bob", "newOwnerPublicKey": "ssh-ed25519 BBB"},
+        )
+        assert code == 403
+        assert "nonce" in j["detail"].lower()
+
+    def test_wrong_key_signature_is_rejected(self, api, tmp_path):
+        base, _ = api
+        _owner_key, owner_pub = _generate_admin_keypair(tmp_path, "owner")
+        attacker_key, _attacker_pub = _generate_admin_keypair(tmp_path, "attacker")
+        post(base, "/gateway/ownership/claim", {"ownerLabel": "alice", "ownerPublicKey": owner_pub})
+        _code, challenge = get(base, "/gateway/admin/challenge")
+        signature = _sign(challenge["nonce"], attacker_key)  # signed by the wrong key
+        code, j = post(
+            base,
+            "/gateway/ownership/rotate",
+            {
+                "nonce": challenge["nonce"],
+                "signature": signature,
+                "newOwnerLabel": "mallory",
+                "newOwnerPublicKey": "ssh-ed25519 CCC",
+            },
+        )
+        assert code == 403
+        assert "signature" in j["detail"].lower()
+
+    def test_reused_nonce_is_rejected(self, api, tmp_path):
+        base, _ = api
+        owner_key, owner_pub = _generate_admin_keypair(tmp_path, "owner")
+        post(base, "/gateway/ownership/claim", {"ownerLabel": "alice", "ownerPublicKey": owner_pub})
+        _code, challenge = get(base, "/gateway/admin/challenge")
+        signature = _sign(challenge["nonce"], owner_key)
+        body = {
+            "nonce": challenge["nonce"],
+            "signature": signature,
+            "newOwnerLabel": "bob",
+            "newOwnerPublicKey": "ssh-ed25519 DDD",
+        }
+        code1, _ = post(base, "/gateway/ownership/rotate", body)
+        assert code1 == 200
+        code2, j2 = post(base, "/gateway/ownership/rotate", body)  # same nonce again
+        assert code2 == 403
+        assert "nonce" in j2["detail"].lower()
+
+    def test_expired_nonce_is_rejected(self, api, tmp_path, monkeypatch):
+        base, _ = api
+        owner_key, owner_pub = _generate_admin_keypair(tmp_path, "owner")
+        post(base, "/gateway/ownership/claim", {"ownerLabel": "alice", "ownerPublicKey": owner_pub})
+        monkeypatch.setattr(server, "ADMIN_NONCE_TTL_SECONDS", 1)
+        _code, challenge = get(base, "/gateway/admin/challenge")
+        signature = _sign(challenge["nonce"], owner_key)
+        time.sleep(1.5)
+        code, j = post(
+            base,
+            "/gateway/ownership/rotate",
+            {
+                "nonce": challenge["nonce"],
+                "signature": signature,
+                "newOwnerLabel": "bob",
+                "newOwnerPublicKey": "ssh-ed25519 EEE",
+            },
+        )
+        assert code == 403
+        assert "nonce" in j["detail"].lower()
+
+    def test_correct_network_token_but_no_signature_is_still_rejected(self, api, tmp_path):
+        # STORY-0002: "the network token alone is never sufficient for
+        # admin actions" -- a valid X-CTTC-Token gets past br-NET-004's
+        # blanket gate but must not get anywhere near ownership/rotate.
+        base, _ = api
+        server.app.state.api_token = "s3cr3t"
+        headers = {"X-CTTC-Token": "s3cr3t"}
+        _owner_key, owner_pub = _generate_admin_keypair(tmp_path, "owner")
+        post(
+            base,
+            "/gateway/ownership/claim",
+            {"ownerLabel": "alice", "ownerPublicKey": owner_pub},
+            headers=headers,
+        )
+        code, j = post(
+            base,
+            "/gateway/ownership/rotate",
+            {"newOwnerLabel": "bob", "newOwnerPublicKey": "ssh-ed25519 FFF"},
+            headers=headers,
+        )
+        assert code == 403
+        assert "nonce" in j["detail"].lower()
+
+    def test_successful_rotation_is_audit_logged(self, api, tmp_path, caplog):
+        base, _ = api
+        owner_key, owner_pub = _generate_admin_keypair(tmp_path, "owner")
+        post(base, "/gateway/ownership/claim", {"ownerLabel": "alice", "ownerPublicKey": owner_pub})
+        _code, challenge = get(base, "/gateway/admin/challenge")
+        signature = _sign(challenge["nonce"], owner_key)
+        with caplog.at_level("INFO", logger="cttc"):
+            code, _ = post(
+                base,
+                "/gateway/ownership/rotate",
+                {
+                    "nonce": challenge["nonce"],
+                    "signature": signature,
+                    "newOwnerLabel": "bob",
+                    "newOwnerPublicKey": "ssh-ed25519 GGG",
+                },
+            )
+        assert code == 200
+        assert any(
+            "ownership.rotate" in r.message and "alice" in r.message
+            for r in caplog.records
+            if r.name == "cttc"
+        ), caplog.text
+
+    def test_rejected_admin_action_is_audit_logged(self, api, caplog):
+        base, _ = api
+        with caplog.at_level("WARNING", logger="cttc"):
+            code, _ = post(
+                base,
+                "/gateway/ownership/rotate",
+                {"newOwnerLabel": "bob", "newOwnerPublicKey": "ssh-ed25519 HHH"},
+            )
+        assert code == 403
+        assert any(
+            "ownership.rotate" in r.message and "rejected" in r.message
+            for r in caplog.records
+            if r.name == "cttc"
+        ), caplog.text
+
+
+class TestGatewayPing:
+    """br-MESH-006 (REQ-0070): GET /ping identifies this as a gateway and
+    is the one deliberate, narrow exemption from br-NET-004's blanket
+    token requirement -- /health stays exactly as gated as before."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_token_after(self):
+        yield
+        server.app.state.api_token = None
+
+    def test_ping_shape(self, api):
+        base, _ = api
+        code, j = get(base, "/ping")
+        assert code == 200
+        assert j == {"service": "gateway", "version": server.GATEWAY_VERSION}
+
+    def test_ping_is_unauthenticated_even_with_a_token_configured(self, api):
+        base, _ = api
+        server.app.state.api_token = "s3cr3t"
+        code, _ = get(base, "/ping")
+        assert code == 200
+
+    def test_health_still_requires_the_token_ping_is_not_a_blanket_exemption(self, api):
+        base, _ = api
+        server.app.state.api_token = "s3cr3t"
+        code, _ = get(base, "/health")
+        assert code == 401
+
+
+class TestGatewaysSync:
+    """br-MESH-001..005 (REQ-0070): the gateway list, its self-entry, and
+    the /gateways/sync merge rules."""
+
+    def test_new_key_is_added_with_existence_forced_to_unknown(self, api):
+        base, _ = api
+        code, j = post(
+            base,
+            "/gateways/sync",
+            {
+                "entries": [
+                    {
+                        "host": "10.0.0.5",
+                        "port": 8765,
+                        "lastContactAt": "2026-08-01T00:00:00.000Z",
+                        "lastContactResult": "ok",
+                        "existence": "existing",
+                    }
+                ]
+            },
+        )
+        assert code == 200
+        entry = next(e for e in j["entries"] if e["host"] == "10.0.0.5")
+        assert entry["existence"] == "unknown"  # relayed existence is never trusted for a new key
+
+    def test_self_entry_always_present_and_existing(self, api):
+        base, _ = api
+        code, j = post(base, "/gateways/sync", {"entries": []})
+        assert code == 200
+        host, _, port_str = base.partition("://")[2].partition("/")[0].rpartition(":")
+        self_entries = [e for e in j["entries"] if e["host"] == host and str(e["port"]) == port_str]
+        assert len(self_entries) == 1
+        self_entry = self_entries[0]
+        assert self_entry["existence"] == "existing"
+        assert self_entry["lastContactResult"] == "ok"
+        assert self_entry["lastContactAt"].endswith("Z")
+
+    def test_self_entry_never_flaps_from_a_relayed_entry_for_the_same_address(self, api):
+        base, _ = api
+        host, _, port_str = base.partition("://")[2].partition("/")[0].rpartition(":")
+        code, j = post(
+            base,
+            "/gateways/sync",
+            {
+                "entries": [
+                    {
+                        "host": host,
+                        "port": int(port_str),
+                        "lastContactAt": "2099-01-01T00:00:00.000Z",
+                        "lastContactResult": "failed",
+                        "existence": "absent",
+                    }
+                ]
+            },
+        )
+        assert code == 200
+        self_entry = next(
+            e for e in j["entries"] if e["host"] == host and str(e["port"]) == port_str
+        )
+        assert self_entry["existence"] == "existing"
+        assert self_entry["lastContactResult"] == "ok"
+
+    def test_most_recent_lastContactAt_wins(self, api):
+        base, _ = api
+        post(
+            base,
+            "/gateways/sync",
+            {
+                "entries": [
+                    {
+                        "host": "10.0.0.9",
+                        "port": 8765,
+                        "lastContactAt": "2026-08-01T00:00:00.000Z",
+                        "lastContactResult": "ok",
+                        "existence": "unknown",
+                    }
+                ]
+            },
+        )
+        code, j = post(
+            base,
+            "/gateways/sync",
+            {
+                "entries": [
+                    {
+                        "host": "10.0.0.9",
+                        "port": 8765,
+                        "lastContactAt": "2026-08-02T00:00:00.000Z",
+                        "lastContactResult": "failed",
+                        "existence": "absent",
+                    }
+                ]
+            },
+        )
+        assert code == 200
+        entry = next(e for e in j["entries"] if e["host"] == "10.0.0.9")
+        assert entry["lastContactAt"] == "2026-08-02T00:00:00.000Z"
+        assert entry["lastContactResult"] == "failed"
+        assert entry["existence"] == "absent"
+
+    # The next three exercise _merge_gateway_entry() directly rather than
+    # through the full /gateways/sync HTTP round trip: given the v1 design
+    # (client-mediated only, no gateway-to-gateway relay -- see REQ-0070's
+    # Open questions), there is currently no way for a *non-self* entry to
+    # legitimately become "existing"/"absent" via a sync payload at all
+    # (br-MESH-003/004 force every relayed claim to unknown on first
+    # insert, and the self-entry never goes through this function -- it's
+    # written directly by _self_gateway_entry, unconditionally, after the
+    # merge loop). Testing the merge function's own tie-break/never-
+    # downgrade rules in isolation is the accurate way to verify them
+    # without first having to fabricate a scenario the real system can't
+    # actually reach yet.
+
+    def test_merge_tie_prefers_verified_existence_over_unknown(self):
+        current = {
+            "host": "10.0.0.10",
+            "port": 8765,
+            "lastContactAt": "2026-08-01T00:00:00.000Z",
+            "lastContactResult": "ok",
+            "existence": "existing",
+        }
+        incoming = {
+            "host": "10.0.0.10",
+            "port": 8765,
+            "lastContactAt": "2026-08-01T00:00:00.000Z",
+            "lastContactResult": "ok",
+            "existence": "unknown",
+        }
+        merged = server._merge_gateway_entry(current, incoming)
+        assert merged["existence"] == "existing"
+
+    def test_merge_tie_the_other_direction_incoming_verified_beats_current_unknown(self):
+        current = {
+            "host": "10.0.0.10",
+            "port": 8765,
+            "lastContactAt": "2026-08-01T00:00:00.000Z",
+            "lastContactResult": "failed",
+            "existence": "unknown",
+        }
+        incoming = {
+            "host": "10.0.0.10",
+            "port": 8765,
+            "lastContactAt": "2026-08-01T00:00:00.000Z",
+            "lastContactResult": "ok",
+            "existence": "existing",
+        }
+        merged = server._merge_gateway_entry(current, incoming)
+        assert merged["existence"] == "existing"
+
+    def test_merge_never_downgrades_a_verified_entry_even_if_incoming_is_newer(self):
+        current = {
+            "host": "10.0.0.11",
+            "port": 8765,
+            "lastContactAt": "2026-08-01T00:00:00.000Z",
+            "lastContactResult": "ok",
+            "existence": "existing",
+        }
+        incoming = {
+            "host": "10.0.0.11",
+            "port": 8765,
+            "lastContactAt": "2026-08-02T00:00:00.000Z",
+            "lastContactResult": "failed",
+            "existence": "unknown",
+        }
+        merged = server._merge_gateway_entry(current, incoming)
+        assert merged["existence"] == "existing"
+
+    def test_oversized_payload_is_trimmed_not_persisted_whole(self, api, monkeypatch):
+        base, _ = api
+        monkeypatch.setattr(server, "GATEWAY_LIST_MAX_ENTRIES", 5)
+        entries = [
+            {
+                "host": f"10.0.1.{i}",
+                "port": 8765,
+                "lastContactAt": "2026-08-01T00:00:00.000Z",
+                "lastContactResult": "ok",
+                "existence": "unknown",
+            }
+            for i in range(20)
+        ]
+        code, j = post(base, "/gateways/sync", {"entries": entries})
+        assert code == 200
+        assert len(j["entries"]) <= 5
+
+    def test_entries_must_be_a_list(self, api):
+        base, _ = api
+        code, j = post(base, "/gateways/sync", {"entries": "not-a-list"})
+        assert code == 400
+        assert "list" in j["error"].lower()
+
+    def test_list_persists_across_multiple_sync_calls_within_the_same_process(self, api):
+        # The durable-store guarantee that's actually testable without a
+        # real redis-server process restart (this codebase's Redis is
+        # started fresh, non-persistent, per gateway process -- see
+        # redis_log.py's `--save ""`; the *same* limitation already
+        # applies to cttc:gateway:ownership). What's genuinely true and
+        # tested here: an entry written by one request is still present
+        # on a later, unrelated request -- it's in the durable store, not
+        # just that request's own response.
+        base, _ = api
+        post(
+            base,
+            "/gateways/sync",
+            {
+                "entries": [
+                    {
+                        "host": "10.0.0.20",
+                        "port": 8765,
+                        "lastContactAt": "2026-08-01T00:00:00.000Z",
+                        "lastContactResult": "ok",
+                        "existence": "existing",
+                    }
+                ]
+            },
+        )
+        code, j = post(base, "/gateways/sync", {"entries": []})
+        assert code == 200
+        assert any(e["host"] == "10.0.0.20" for e in j["entries"])
+
+    def test_sync_still_requires_the_network_token(self, api):
+        base, _ = api
+        server.app.state.api_token = "s3cr3t"
+        try:
+            code, _ = post(base, "/gateways/sync", {"entries": []})
+            assert code == 401
+        finally:
+            server.app.state.api_token = None
+
+
+class TestRedisCli:
+    """Developer-only Redis CLI (Help > Developers > Redis CLI…, app.js) --
+    POST /admin/redis-cli runs a raw command against this gateway's own
+    internal Redis and returns a type-tagged reply."""
+
+    def test_set_get_round_trip(self, api):
+        base, _ = api
+        code, j = post(base, "/admin/redis-cli", {"argv": ["SET", "cli:test:key", "hello"]})
+        assert code == 200
+        assert j == {"type": "status", "value": "OK"}
+        code, j = post(base, "/admin/redis-cli", {"argv": ["GET", "cli:test:key"]})
+        assert code == 200
+        assert j == {"type": "bulk", "value": "hello"}
+
+    def test_missing_key_returns_nil(self, api):
+        base, _ = api
+        code, j = post(base, "/admin/redis-cli", {"argv": ["GET", "cli:test:does-not-exist"]})
+        assert code == 200
+        assert j == {"type": "nil", "value": None}
+
+    def test_integer_reply(self, api):
+        base, _ = api
+        code, j = post(base, "/admin/redis-cli", {"argv": ["DEL", "cli:test:int-key"]})
+        assert code == 200
+        assert j["type"] == "integer"
+        code, j = post(base, "/admin/redis-cli", {"argv": ["INCR", "cli:test:int-key"]})
+        assert code == 200
+        assert j == {"type": "integer", "value": 1}
+
+    def test_array_reply(self, api):
+        base, _ = api
+        post(base, "/admin/redis-cli", {"argv": ["RPUSH", "cli:test:list", "a", "b"]})
+        code, j = post(base, "/admin/redis-cli", {"argv": ["LRANGE", "cli:test:list", "0", "-1"]})
+        assert code == 200
+        assert j == {
+            "type": "array",
+            "value": [{"type": "bulk", "value": "a"}, {"type": "bulk", "value": "b"}],
+        }
+
+    def test_unknown_command_returns_a_typed_error_reply_not_a_500(self, api):
+        base, _ = api
+        code, j = post(base, "/admin/redis-cli", {"argv": ["NOTACOMMAND", "foo"]})
+        assert code == 200  # the failure is Redis's, not this endpoint's -- 200 with an error reply
+        assert j["type"] == "error"
+        assert j["value"]
+
+    def test_empty_argv_is_a_bad_request(self, api):
+        base, _ = api
+        code, j = post(base, "/admin/redis-cli", {"argv": []})
+        assert code == 400
+        code, j = post(base, "/admin/redis-cli", {})
+        assert code == 400
+
+    def test_still_requires_the_network_token(self, api):
+        base, _ = api
+        server.app.state.api_token = "s3cr3t"
+        try:
+            code, _ = post(base, "/admin/redis-cli", {"argv": ["PING"]})
+            assert code == 401
+        finally:
+            server.app.state.api_token = None
+
+
+class TestDockerForget:
+    """br-REDIS-017: /docker/forget must actually clear the Redis-side
+    cttc:daemons registry entry /docker/collect's remember_daemon wrote --
+    reported bug: 'Remove Docker Host' sometimes can't find the just-
+    disconnected host. Seeds cttc:daemons directly (via /admin/redis-cli,
+    same as remember_daemon's own HSET would) rather than exercising the
+    full /docker/collect pipeline, which would need a real reachable SSH
+    target just to construct its sources -- this isolates exactly the
+    thing in question: does /docker/forget's own host-string handling
+    match whatever key the entry was actually stored under."""
+
+    def test_forget_removes_the_exact_host_it_was_remembered_under(self, api):
+        base, _ = api
+        host = "ssh://user@otherhost"
+        post(base, "/admin/redis-cli", {"argv": ["HSET", "cttc:daemons", host, '{"host":"ssh://user@otherhost"}']})
+        code, j = post(base, "/admin/redis-cli", {"argv": ["HGET", "cttc:daemons", host]})
+        assert code == 200 and j["type"] == "bulk", "sanity: seeded"
+        code, j = post(base, "/docker/forget", {"host": host})
+        assert code == 200 and j == {"ok": True}
+        code, j = post(base, "/admin/redis-cli", {"argv": ["HGET", "cttc:daemons", host]})
+        assert code == 200 and j == {"type": "nil", "value": None}, "forget must actually clear the registry entry"
+
+    def test_forget_normalizes_a_bare_user_host_shorthand_to_match_what_was_remembered(self, api):
+        base, _ = api
+        # collect_docker() always normalizes before remember_daemon() ever
+        # sees the host (server.py:1803-1854) -- so the registry is always
+        # keyed by the ssh:// form. A caller sending the bare shorthand
+        # (no scheme) must still resolve to the same key.
+        normalized = "ssh://user@otherhost"
+        post(base, "/admin/redis-cli", {"argv": ["HSET", "cttc:daemons", normalized, '{"host":"ssh://user@otherhost"}']})
+        code, j = post(base, "/docker/forget", {"host": "user@otherhost"})
+        assert code == 200 and j == {"ok": True}
+        code, j = post(base, "/admin/redis-cli", {"argv": ["HGET", "cttc:daemons", normalized]})
+        assert code == 200 and j == {"type": "nil", "value": None}
 
 
 class TestMlogEndpoint:
@@ -2401,7 +4240,7 @@ class TestFilesEndpoints:
     def test_download_exposes_source_count_header(self, api):
         base, _ = api
         t0 = ms(2026, 1, 2, 3, 0, 0)
-        code, headers, _data = get_raw(base, f"/files/download?from={t0}&to={t0 + 60000}")
+        _code, headers, _data = get_raw(base, f"/files/download?from={t0}&to={t0 + 60000}")
         assert (
             headers["X-CTTC-Source-Count"] == "2"
         )  # the log + stats sources the api fixture opens
@@ -2413,13 +4252,13 @@ class TestFilesEndpoints:
         assert get_raw(base, "/files/download")[0] == 400
         assert get_raw(base, "/files/download?from=0")[0] == 400
 
-    def test_download_include_host_false(self, api, state):
+    def test_download_include_host_false(self, api):
         base, st = api
         for s in st.sources.values():
             if s.kind == "stats":
                 s.is_host = True
         t0 = ms(2026, 1, 2, 3, 0, 0)
-        code, _h, data = get_raw(base, f"/files/download?from={t0}&to={t0 + 60000}&include_host=0")
+        _code, _h, data = get_raw(base, f"/files/download?from={t0}&to={t0 + 60000}&include_host=0")
         z = zipfile.ZipFile(io.BytesIO(data))
         sources = json.loads(z.read("manifest.json"))["segments"][0]["sources"]
         assert all(
@@ -2427,14 +4266,88 @@ class TestFilesEndpoints:
         )  # the host-marked stats source is excluded
         assert any(s["type"] == "log" for s in sources)  # the unrelated log source is unaffected
 
+    def test_download_host_param_scopes_by_docker_host(self, api, monkeypatch):
+        """br-DHOST-030: /files/download's `host` param resolves to the
+        right source_ids subset (State.build_sample_bytes' pre-existing
+        source_ids param, used today by the rolling-buffer feature) --
+        sources tagged for a different host are excluded, sources with no
+        `host` attribute at all (never docker-collected -- api's own
+        log/stats file sources) are untouched either way. Spies on
+        build_sample_bytes rather than inspecting a real exported archive:
+        _entity_for host-qualifies its Redis key once a source has a real
+        `host` (br-DEDUP-006), so retrofitting `.host` onto an
+        already-ingested test source would silently orphan its data from
+        a different key -- irrelevant to what's under test here, which is
+        purely the route's host-param-to-source_ids resolution."""
+        base, st = api
+        real_ids = set(st.sources.keys())  # the fixture's own sources, no .host attr at all
+
+        class _FakeHostSource:
+            def __init__(self, sid, host):
+                self.id = sid
+                self.host = host
+
+        fake_local = _FakeHostSource("fake-local", None)
+        fake_remote = _FakeHostSource("fake-remote", "ssh://u@remotehost")
+        st.sources[fake_local.id] = fake_local
+        st.sources[fake_remote.id] = fake_remote
+        captured = {}
+
+        async def spy(t0, t1, include_host=True, source_ids=None):
+            captured["source_ids"] = source_ids
+            return b"", []
+
+        monkeypatch.setattr(st, "build_sample_bytes", spy)
+        t0 = ms(2026, 1, 2, 3, 0, 0)
+        try:
+            get_raw(base, f"/files/download?from={t0}&to={t0 + 60000}&host=local")
+            ids = captured["source_ids"]
+            assert real_ids <= ids
+            assert fake_local.id in ids and fake_remote.id not in ids
+
+            get_raw(base, f"/files/download?from={t0}&to={t0 + 60000}&host=ssh://u@remotehost")
+            ids = captured["source_ids"]
+            assert real_ids <= ids
+            assert fake_remote.id in ids and fake_local.id not in ids
+
+            get_raw(base, f"/files/download?from={t0}&to={t0 + 60000}")
+            assert captured["source_ids"] is None  # no host param -> unfiltered, as before
+        finally:
+            del st.sources[fake_local.id]
+            del st.sources[fake_remote.id]
+
+    def test_download_without_host_param_is_unfiltered(self, api):
+        """Backward compatible: omitting `host` (every pre-existing caller)
+        keeps the old "every open source" behavior -- source_ids stays
+        None, not an empty/host-derived set."""
+        base, _ = api
+        t0 = ms(2026, 1, 2, 3, 0, 0)
+        _code, headers, _data = get_raw(base, f"/files/download?from={t0}&to={t0 + 60000}")
+        assert headers["X-CTTC-Source-Count"] == "2"
+
     def test_upload_plain_log(self, api):
+        # Checks total() over HTTP (/logs), not by awaiting src.total()
+        # directly -- src's redis_log client is bound to the server's own
+        # event loop (see the `api` fixture's docstring), a different loop
+        # than this (sync) test runs on.
         base, st = api
         data = b"2026-01-02T03:00:00Z hello\n2026-01-02T03:00:01Z world\n"
         code, j = post_raw(base, "/files/upload", data, {"X-CTTC-Filename": "up.log"})
         assert code == 200
         assert len(j["opened"]) == 1 and j["errors"] == []
-        src = st.sources[j["opened"][0]]
-        assert src.path == "upload://up.log" and src.total() == 2
+        sid = j["opened"][0]
+        src = st.sources[sid]
+        assert src.path == "upload://up.log"
+        # open_file's initial ingest goes through the same buffered
+        # record() path as live tailing (sRate) -- poll rather than assert
+        # on the very next request.
+        deadline = time.time() + 3
+        logs_j = {"total": 0}
+        while logs_j["total"] < 2 and time.time() < deadline:
+            _, logs_j = get(base, f"/logs?source={sid}")
+            if logs_j["total"] < 2:
+                time.sleep(0.02)
+        assert logs_j["total"] == 2
 
     def test_upload_multi_segment_cttc_returns_needs_selection(self, api):
         base, _ = api
@@ -2455,7 +4368,10 @@ class TestFilesEndpoints:
         assert [s["index"] for s in j["needs_selection"][0]["segments"]] == [0, 1]
 
         code, j = post_raw(
-            base, "/files/upload", second, {"X-CTTC-Filename": "rec.cttc-record", "X-CTTC-Segment": "0"}
+            base,
+            "/files/upload",
+            second,
+            {"X-CTTC-Filename": "rec.cttc-record", "X-CTTC-Segment": "0"},
         )
         assert code == 200
         assert len(j["opened"]) >= 1
@@ -2467,7 +4383,7 @@ class TestFilesEndpoints:
         assert code == 200 and len(j["opened"]) == 1
 
     def test_upload_applies_transforms_header(self, api):
-        base, st = api
+        base, _st = api
         code, j = post_raw(
             base,
             "/files/upload",
@@ -2475,11 +4391,21 @@ class TestFilesEndpoints:
             {"X-CTTC-Filename": "t.log", "X-CTTC-Transforms": "upper"},
         )
         assert code == 200
-        assert st.sources[j["opened"][0]].slice(0, 1)[0]["text"] == "HI"
+        sid = j["opened"][0]
+        # Same buffered-write settle reasoning as test_upload_plain_log above.
+        deadline = time.time() + 3
+        logs_j = {"rows": []}
+        while not logs_j["rows"] and time.time() < deadline:
+            _, logs_j = get(base, f"/logs?source={sid}&start=0&count=1")
+            if not logs_j["rows"]:
+                time.sleep(0.02)
+        assert logs_j["rows"][0]["text"] == "HI"
 
     def test_upload_bad_data_reports_error_not_500(self, api):
         base, _ = api
-        code, j = post_raw(base, "/files/upload", b"not a zip", {"X-CTTC-Filename": "bad.cttc-metric"})
+        code, j = post_raw(
+            base, "/files/upload", b"not a zip", {"X-CTTC-Filename": "bad.cttc-metric"}
+        )
         assert code == 200  # request itself succeeded; the failure is reported in errors
         assert j["opened"] == [] and len(j["errors"]) == 1
         assert "bad.cttc-metric" == j["errors"][0]["path"]
@@ -2534,6 +4460,21 @@ class TestMain:
                 "server.py",
                 "--port",
                 "0",
+                # a real redis-server gets spawned here (this test goes
+                # through the actual CLI/lifespan path, unlike the state/api
+                # fixtures) -- a unique port avoids colliding with another
+                # test's redis-server that hasn't fully released the true
+                # default (56379) yet.
+                "--redis-port",
+                str(unique_redis_tcp_port()),
+                # Default sRate (1.0s) would make this test race the
+                # buffered flush of the CLI-opened file's own initial
+                # ingest against the /range check below -- a short interval
+                # keeps this test fast without weakening what it's actually
+                # regression-testing (CLI files opening after redis_log.
+                # start(), not the flush cadence itself).
+                "--redis-flush-interval-seconds",
+                "0.05",
                 "--naive-tz",
                 "local",
                 "--transforms-dir",
@@ -2564,12 +4505,76 @@ class TestMain:
 
         _, j = get(f"http://127.0.0.1:{port}", "/sources")
         assert len(j["sources"]) == 1  # the bad file only warned
+
+        # Regression: CLI-supplied files used to be opened in _run(),
+        # *before* redis_log.start() ever ran (that only happens inside
+        # lifespan(), triggered later by uvicorn's own serve()) -- record()
+        # silently no-ops while disabled, so every sample from a CLI file
+        # was queued and dropped before Redis was even up, permanently
+        # leaving /range at {min_ts: null, max_ts: null} with nothing left
+        # to ever trigger a client re-check (an e2e-only symptom: the
+        # renderer hung forever on "server data loaded"). Opening CLI files
+        # now happens inside lifespan() itself, after redis_log.start().
+        # The file's initial ingest still has to clear its own flush cycle
+        # (sRate, --redis-flush-interval-seconds above) before /range
+        # reflects it -- poll rather than assert on the very first request.
+        deadline = time.time() + 3
+        j = {"min_ts": None, "max_ts": None}
+        while j["min_ts"] is None and time.time() < deadline:
+            _, j = get(f"http://127.0.0.1:{port}", "/range")
+            if j["min_ts"] is None:
+                time.sleep(0.02)
+        assert j["min_ts"] is not None and j["max_ts"] is not None
+
         post(f"http://127.0.0.1:{port}", "/shutdown")
         t.join(timeout=5)
         assert not t.is_alive()
         assert "could not open" in caplog.text
         assert server.NAIVE_TZ is not None and server.NAIVE_TZ != UTC or old_tz != UTC
         server.NAIVE_TZ = UTC  # restore module global for other tests
+
+    def test_api_token_flows_from_cli_through_to_the_real_server(self, tmp_path, monkeypatch, capsys):
+        # br-NET-004 end-to-end: --api-token (or CTTC_API_TOKEN, which it
+        # defaults from) actually gates the real server booted via main(),
+        # not just app.state poked directly (see TestApiTokenAuth).
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "server.py",
+                "--port",
+                "0",
+                "--redis-port",
+                str(unique_redis_tcp_port()),
+                "--transforms-dir",
+                str(tmp_path),
+                "--api-token",
+                "e2e-cli-secret",
+            ],
+        )
+        t = threading.Thread(target=server.main, daemon=True)
+        t.start()
+        out_accum = ""
+        port = None
+        deadline = time.time() + 5
+        while port is None and time.time() < deadline:
+            out_accum += capsys.readouterr().out
+            m = re.search(r'"port":\s*(\d+)', out_accum)
+            if m:
+                port = int(m.group(1))
+            else:
+                time.sleep(0.02)
+        assert port is not None, f"no port line seen: {out_accum!r}"
+        base = f"http://127.0.0.1:{port}"
+
+        code, _ = get(base, "/sources")
+        assert code == 401
+        code, _ = get(base, "/sources", headers={"X-CTTC-Token": "e2e-cli-secret"})
+        assert code == 200
+
+        post(base, "/shutdown", headers={"X-CTTC-Token": "e2e-cli-secret"})
+        t.join(timeout=5)
+        assert not t.is_alive()
 
     def test_main_keyboard_interrupt_exits_cleanly(self, tmp_path, monkeypatch):
         async def raise_interrupt(self):

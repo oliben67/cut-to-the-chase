@@ -24,8 +24,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import bisect
 import hashlib
+import importlib.metadata
 import importlib.util
 import io
 import logging
@@ -33,7 +33,9 @@ import os
 import re
 import shlex
 import sys
+import tempfile
 import time
+import uuid
 import zipfile
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timezone
@@ -50,9 +52,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 
 import files  # local sibling module (server/files.py) -- upload/download endpoints
+import redis_log
 from cttc_format import RECORD_EXT, is_cttc_archive
 from events import Action, EventManager, InvalidEvent, LogCondition, MetricCondition, UnknownEvent
 from recording_session import RecordingSessionManager, UnknownSession
+from redis_log import RedisLog
 from rolling_buffer import RollingBufferManager, UnknownBuffer
 from scheduler import InvalidSchedule, Scheduler, UnknownSchedule
 
@@ -209,6 +213,110 @@ def make_uid(source: str, line_no: int, raw: str) -> str:
     return hashlib.sha1(f"{source}\x00{line_no}\x00{raw}".encode(errors="replace")).hexdigest()[:16]
 
 
+def _entity_id(kind: str, name: str, host: str | None) -> str:
+    """The Redis entity id for one source's data (br-DEDUP-006): host-
+    qualified for any remote docker target, so the same container/service
+    name collected from two different hosts never collides into the same
+    cttc:log:<id>/cttc:idx:<id> and silently interleaves their history --
+    the scenario redis_log.py's own module docstring already claimed was
+    handled, but never actually was for anything except host telemetry
+    (HostStatsSource's `host@<hostname>` naming, which this mirrors). Bare
+    for a local target (today's existing on-disk data, unambiguous since
+    there's only one local machine) or anything with no host concept at
+    all (static/demo file replay, imported .cttc samples) -- `name` itself
+    is what every caller still uses for display/grouping (API responses,
+    exported sample files); only the Redis key changes here.
+
+    `kind` ("log" or "stats") is always prefixed on top of that, because a
+    container's log entity and its stats entity used to collide on the
+    exact same bare name (e.g. a local container named "web" produced both
+    a LogSource and a StatsSource entity id of plain "web") -- both then
+    shared the very same cttc:log:web/cttc:idx:web Redis keys, so every
+    docker-stats sample (no "text" field) landed in that container's log
+    stream too, rendering as a blank-text row at the stats poll interval.
+    Prefixing by kind keeps the two namespaces disjoint even when the
+    bare name and host are identical.
+
+    A `name` that already contains "@" is left untouched (beyond the kind
+    prefix): HostStatsSource builds its own already-unique `host@<hostname>`
+    name up front (used as both its display name *and* the single entity id
+    it ever passes through StatsSource.ingest_row), so host-qualifying it
+    again here would double up into `host@<hostname>@<hostname>`. "@" can't
+    appear in a real docker container/service name, so this is an
+    unambiguous signal, not a heuristic."""
+    if not host or "@" in name:
+        return f"{kind}:{name}"
+    hostname = host.split("@")[-1]
+    return f"{kind}:{name}@{hostname}"
+
+
+def _load_or_create_gateway_id(sessions_dir: Path) -> str:
+    """This gateway's own stable identity -- minted once on first boot and
+    persisted alongside its recording sessions (the one directory server.py
+    already treats as writable, per-instance, and durable across restarts),
+    so a Docker-deployed remote gateway, with no Electron main process to
+    source an id from, still gets one. Used to tell a sample this gateway
+    collected apart from an identically-named one collected by a different
+    gateway, once such samples start getting shared between installs (see
+    _content_entity_id)."""
+    path = sessions_dir / ".gateway-id"
+    try:
+        existing = path.read_text().strip()
+        if existing:
+            return existing
+    except FileNotFoundError:
+        pass
+    new_id = uuid.uuid4().hex
+    try:
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+        path.write_text(new_id)
+    except OSError as e:
+        # Non-fatal -- worst case this gateway mints a new id next boot too,
+        # which only costs content-addressing's idempotent-reload property
+        # (BUG-0073's per-load-unique fallback still keeps every sample's
+        # own data collision-free regardless).
+        logger.warning("could not persist gateway id to %s: %s", path, e)
+    return new_id
+
+
+def _content_entity_id(kind: str, name: str, content_key: tuple) -> str:
+    """The Redis entity id for a *loaded* sample's source (as opposed to a
+    live docker collector, see _entity_id) -- content-addressed by
+    (gateway id, docker host id, container/service id, segment start,
+    segment end) rather than qualified by anything ever-unique-per-load,
+    so re-loading the exact same recording/metric twice resolves to the
+    same entity: the second write just overwrites the same fields with
+    identical values, no duplicate storage, and "can't reopen the same
+    data more than once" holds at the storage layer, not just the
+    client's own path-based dedup (ui-EXPORT-017/018).
+
+    The time range *is* part of the key, deliberately -- two different
+    recordings/exports of "the same" container (same gateway/host/name,
+    different time windows) stay properly isolated, one entity per
+    recording, rather than silently accumulating into a single shared
+    timeline just because they happen to share a bare container name
+    (confirmed while testing this: a single long-running process, real
+    or a test suite, that loads several unrelated samples sharing common
+    container names like "web"/"api" over its lifetime would otherwise
+    merge all of them together). Re-loading the *identical* file still
+    resolves to the identical entity, since its segment's `from`/`to` are
+    always the same two values. `name` still prefixed by `kind` for the
+    same reason _entity_id's is (br-DEDUP-010)."""
+    digest = hashlib.sha256(repr(content_key).encode()).hexdigest()[:16]
+    return f"{kind}:sample:{digest}"
+
+
+def _manifest_hash(manifest_without_hash: dict) -> str:
+    """sha256 over the canonical (sorted-keys) JSON of a `.cttc` manifest,
+    excluding its own `integrity_sha256` field -- tamper-evidence, not an
+    access-control gate: load_sample recomputes and compares this, but
+    only ever logs a mismatch, never refuses to load (matches this
+    codebase's existing bias toward defensive/permissive reads over hard
+    failures on a stale/unexpected file, e.g. redis_log.py's stale-index
+    handling)."""
+    return hashlib.sha256(orjson.dumps(manifest_without_hash, option=orjson.OPT_SORT_KEYS)).hexdigest()
+
+
 DOCKER_SVCLOG_PREFIX = re.compile(r"^(\S+\.\d+\.\S+@\S+|\S+)\s+\|\s?")
 TS_FIELDS = ("timestamp", "ts", "time", "@timestamp", "datetime", "date")
 
@@ -222,12 +330,20 @@ class LogSource:
         self.path = path
         self.live = live
         self.transforms = transforms
-        self.rows: list[tuple[float, int, str, str]] = []  # (ts, seq, uid, text)
         self.seq = 0
         self.line_no = 0
         self.offset = 0
         self.skipped = 0
         self._pending_partial = b""
+        # single most-recent row, kept only for ingest_chunk's continuation-
+        # line-append heuristic below (Redis is the store now -- see
+        # redis_log.py's module docstring)
+        self._last_row: tuple[float, int, str, str] | None = None
+        # set once by State.open_file/collect_docker right after
+        # construction -- declared here (rather than left purely dynamic)
+        # so static analysis knows every Source has it by the time any of
+        # the read methods below run.
+        self._state: State | None = None
 
     def stop(self):
         pass  # static/file-tailed sources have nothing to tear down
@@ -237,6 +353,8 @@ class LogSource:
         lines = data.split(b"\n")
         self._pending_partial = lines.pop()  # incomplete trailing line, if any
         new = []
+        redis_log = getattr(getattr(self, "_state", None), "redis_log", None)
+        entity = self._entity
         for bline in lines:
             self.line_no += 1
             raw = bline.decode("utf-8", errors="replace").rstrip("\r")
@@ -248,9 +366,15 @@ class LogSource:
                     ts, seq, uid, text = new[-1]
                     new[-1] = (ts, seq, uid, text + "\n" + raw)
                     continue
-                if self.rows:
-                    ts, seq, uid, text = self.rows[-1]
-                    self.rows[-1] = (ts, seq, uid, text + "\n" + raw)
+                if self._last_row is not None:
+                    ts, seq, uid, text = self._last_row
+                    text = text + "\n" + raw
+                    self._last_row = (ts, seq, uid, text)
+                    if redis_log is not None:
+                        # re-record under the SAME ts field -- HSET on an
+                        # existing field overwrites naturally, no new
+                        # redis_log method needed
+                        redis_log.record(entity, ts, {"uid": uid, "text": text})
                     continue
                 self.skipped += 1
                 continue
@@ -262,12 +386,10 @@ class LogSource:
                 uid = out.get("uid") or make_uid(self.name, self.line_no, raw)
                 new.append((float(ts), self._next_seq(), uid, str(out.get("text", raw))))
         if new:
-            monotonic = not self.rows or new[0][0] >= self.rows[-1][0]
-            if monotonic and all(a[0] <= b[0] for a, b in zip(new, new[1:])):
-                self.rows.extend(new)
-            else:
-                for row in new:
-                    bisect.insort(self.rows, row)
+            self._last_row = new[-1]
+            if redis_log is not None:
+                for ts, _seq, uid, text in new:
+                    redis_log.record(entity, ts, {"uid": uid, "text": text})
         return len(new)
 
     def _next_seq(self) -> int:
@@ -310,63 +432,90 @@ class LogSource:
             "source": self.name,
         }
 
-    # API helpers (rows is only ever mutated from ingest_chunk, called either
-    # from the single-threaded event loop directly or via loop.call_soon_
-    # threadsafe -- never concurrently -- so plain reads here need no lock)
-    def total(self) -> int:
-        return len(self.rows)
+    @property
+    def _redis(self) -> RedisLog:
+        """`self._state` is only Optional to cover the brief window between
+        construction and State.open_file/collect_docker attaching it
+        (declared that way so static analysis catches an actually-missing
+        assignment) -- every one of these read methods is only ever called
+        once a source is registered on a State, so it's always set by then.
+        Centralizes that invariant in one assert instead of repeating it
+        (and the None-narrowing it gives the type checker) six times."""
+        assert self._state is not None, (
+            f"{self.name}: read before this source was attached to a State"
+        )
+        return self._state.redis_log
 
-    def slice(self, start: int, count: int):
-        rows = self.rows[max(0, start) : max(0, start) + count]
+    @property
+    def _entity(self) -> str:
+        """The Redis entity id every read/write below actually keys on --
+        `self.name` host-qualified when this source has one (see
+        _entity_id/br-DEDUP-006). Distinct from `self.name` itself, which
+        stays the bare display/grouping name everywhere else (API
+        responses, exported sample files).
+
+        Three cases, checked in priority order:
+        1. `self._content_key` -- set by load_sample from the manifest's
+           own provenance (gateway/docker-host/container id). Content-
+           addressed (_content_entity_id): the identical recording/metric
+           loaded twice, or the same live source exported again later,
+           resolves to the same entity -- idempotent, no duplicate storage
+           (System Observability spec's "Collision Prevention"; supersedes
+           this rule's own prior sid-qualified fallback below for anything
+           that actually carries provenance).
+        2. `self.host` -- only the Docker subclasses ever set this
+           attribute at all (explicitly, even when it's None for a local
+           target); existing host-qualified behavior (br-DEDUP-006).
+        3. Neither: an arbitrary open_file with no docker/manifest
+           provenance at all (e.g. a plain local file opened directly, or
+           --static demo replay). Qualify by this source's own id (unique
+           per load, never reused) so two such loads sharing a name still
+           can't collide, even with no real identity to hash instead."""
+        if getattr(self, "_content_key", None) is not None:
+            return _content_entity_id("log", self.name, self._content_key)
+        if hasattr(self, "host"):
+            return _entity_id("log", self.name, self.host)
+        return _entity_id("log", self.name, self.id)
+
+    # API helpers -- all Redis-backed now (see redis_log.py's module
+    # docstring): Redis is the sole source of truth for reads, Source
+    # objects keep no RAM copy of their own.
+    async def total(self) -> int:
+        return await self._redis.total(self._entity)
+
+    async def slice(self, start: int, count: int):
+        start = max(0, start)
+        rows = await self._redis.slice_by_rank(self._entity, start, count)
         return [
-            {"i": max(0, start) + i, "ts": r[0], "uid": r[2], "text": r[3]}
-            for i, r in enumerate(rows)
+            {"i": start + i, "ts": ts, "uid": payload.get("uid"), "text": payload.get("text", "")}
+            for i, (ts, payload) in enumerate(rows)
         ]
 
-    def index_at(self, t: float) -> int:
-        i = bisect.bisect_left(self.rows, (t,))
-        if i >= len(self.rows):
-            return len(self.rows) - 1
-        if i > 0 and t - self.rows[i - 1][0] < self.rows[i][0] - t:
-            return i - 1
-        return i
+    async def index_at(self, t: float) -> int:
+        # -1 on an empty log, matching bisect_left's old behavior on []
+        # (len(rows) - 1 == -1) -- preserved so callers don't need to
+        # special-case "no rows yet" differently from before.
+        rank = await self._redis.rank_at_score(self._entity, t)
+        return -1 if rank is None else rank
 
-    def ticks(self, t0: float, t1: float, px: int):
+    async def ticks(self, t0: float, t1: float, px: int):
         """Event-density strip: count of entries per pixel bucket."""
         px = max(1, px)
         dt = max(1.0, (t1 - t0) / px)
         counts = [0] * px
-        lo = bisect.bisect_left(self.rows, (t0,))
-        hi = bisect.bisect_right(self.rows, (t1 + 1,))
-        for ts, *_ in self.rows[lo:hi]:
+        timestamps = await self._redis.range_by_score(self._entity, t0, t1 + 1)
+        for ts in timestamps:
             b = int((ts - t0) / dt)
             if 0 <= b < px:
                 counts[b] += 1
         return counts
 
-    def range(self):
-        if not self.rows:
-            return None
-        return (self.rows[0][0], self.rows[-1][0])
+    async def range(self):
+        return await self._redis.first_last(self._entity)
 
-    def find(self, query: str, start: int, forward: bool = True) -> int | None:
+    async def find(self, query: str, start: int, forward: bool = True) -> int | None:
         """Case-insensitive substring search, wrapping around the whole log."""
-        q = query.strip().lower()
-        if not q:
-            return None
-        n = len(self.rows)
-        if n == 0:
-            return None
-        start = max(0, min(start, n - 1))
-        order = (
-            list(range(start, n)) + list(range(0, start))
-            if forward
-            else list(range(start, -1, -1)) + list(range(n - 1, start, -1))
-        )
-        for i in order:
-            if q in self.rows[i][3].lower():
-                return i
-        return None
+        return await self._redis.find_text(self._entity, query, start, forward)
 
 
 class StatsSource:
@@ -385,12 +534,22 @@ class StatsSource:
         self.skipped = 0
         self.count = 0
         self._pending_partial = b""
-        # per service: sorted [(ts, cpu%, mem%, mem_bytes, net_rate_Bps)]
-        self.series: dict[str, list[tuple]] = {}
+        # service names seen by this Source instance -- Redis entities are
+        # keyed by service name and there's no RAM series dict to enumerate
+        # them from anymore (Redis is the store, see redis_log.py)
+        self._services: set[str] = set()
         # services whose samples came from dotted instance names (swarm tasks)
         self._swarm: set[str] = set()
         # per container instance: last (ts, net_total) for rate calc
         self._net_prev: dict[str, tuple] = {}
+        # set once by State.open_file/collect_docker right after
+        # construction -- see LogSource.__init__'s matching field.
+        self._state: State | None = None
+        # only DockerStatsSource/HostStatsSource (below) actually poll and
+        # set this to a real value; declared here so _update_poll_interval
+        # can narrow on `isinstance(src, StatsSource)` instead of a bare
+        # getattr with no static type behind it.
+        self.interval: float | None = None
 
     def stop(self):
         pass  # static/file-tailed sources have nothing to tear down
@@ -475,17 +634,18 @@ class StatsSource:
         """Shared low-level append, used by both the CLI-JSON replay path
         above and the live docker-py collectors (DockerStatsSource), which
         compute cpu/mem/rate from a completely different (raw API) shape but
-        land in the same per-service series."""
+        land in the same per-service Redis entity (max-merged across
+        container instances at query time -- see bucketed())."""
         service = name.split(".")[0]
         if service != name:
             self._swarm.add(service)
-        lst = self.series.setdefault(service, [])
-        row = (ts, cpu, mem, mem_bytes, rate)
-        if not lst or ts >= lst[-1][0]:
-            lst.append(row)
-        else:
-            bisect.insort(lst, row)
+        self._services.add(service)
         self.count += 1
+        redis_log = getattr(getattr(self, "_state", None), "redis_log", None)
+        if redis_log is not None:
+            redis_log.record(
+                self._entity_for(service), ts, {"cpu": cpu, "mem": mem, "mem_bytes": mem_bytes, "net": rate}
+            )
 
     def _net_rate(self, container: str, ts: float, net_total: float | None) -> float | None:
         if net_total is None:
@@ -499,33 +659,75 @@ class StatsSource:
             return None
         return d / ((ts - prev[0]) / 1000.0)
 
-    def services(self):
-        return sorted(self.series.keys())
+    @property
+    def _redis(self) -> RedisLog:
+        """See LogSource._redis's matching docstring -- same invariant,
+        same reasoning."""
+        assert self._state is not None, (
+            f"{self.name}: read before this source was attached to a State"
+        )
+        return self._state.redis_log
 
-    def range(self):
+    def _entity_for(self, svc: str) -> str:
+        """The Redis entity id one service's read/write actually keys on --
+        `svc` host-qualified when this source has one (see
+        _entity_id/br-DEDUP-006). `svc` itself (bare) stays what every
+        caller uses for display/grouping (API responses, exported sample
+        files) -- it's also the dict key both bucketed()/point_at() already
+        return their per-service results under, so a caller reading two
+        different sources' same-named service still tells them apart via
+        each response entry's own "sid", exactly as it does today.
+
+        See LogSource._entity's matching docstring for the full three-case
+        priority order (content-addressed via `self._content_key` when
+        load_sample set one from the manifest's own provenance, then
+        host-qualified for a real Docker collector, then this source's own
+        id as a last resort with no identity to hash instead) -- same
+        reasoning here, `svc` playing `self.name`'s role as the thing being
+        qualified."""
+        if getattr(self, "_content_key", None) is not None:
+            return _content_entity_id("stats", svc, self._content_key)
+        if hasattr(self, "host"):
+            return _entity_id("stats", svc, self.host)
+        return _entity_id("stats", svc, self.id)
+
+    def services(self):
+        return sorted(self._services)
+
+    async def range(self):
+        """Redis-backed: first/last across every service, gathered
+        concurrently rather than N serial round trips."""
+        if not self._services:
+            return None
+        results = await asyncio.gather(
+            *(self._redis.first_last(self._entity_for(svc)) for svc in self._services)
+        )
         lo = hi = None
-        for lst in self.series.values():
-            if lst:
-                lo = lst[0][0] if lo is None else min(lo, lst[0][0])
-                hi = lst[-1][0] if hi is None else max(hi, lst[-1][0])
+        for r in results:
+            if r is None:
+                continue
+            lo = r[0] if lo is None else min(lo, r[0])
+            hi = r[1] if hi is None else max(hi, r[1])
         return None if lo is None else (lo, hi)
 
-    def bucketed(self, t0: float, t1: float, px: int):
+    async def bucketed(self, t0: float, t1: float, px: int):
         """Per service, per pixel bucket: max cpu%, max mem%, max net B/s."""
         px = max(1, px)
         dt = max(1.0, (t1 - t0) / px)
+        services = sorted(self._services)
+        rows_per_service = await asyncio.gather(
+            *(self._redis.range_by_score_with_payload(self._entity_for(svc), t0, t1 + 1) for svc in services)
+        )
         out = []
-        for svc in sorted(self.series):
-            lst = self.series[svc]
-            lo = bisect.bisect_left(lst, (t0,))
-            hi = bisect.bisect_right(lst, (t1 + 1,))
+        for svc, rows in zip(services, rows_per_service):
             cpu = [None] * px
             mem = [None] * px
             net = [None] * px
-            for ts, c, m, _mb, r in lst[lo:hi]:
+            for ts, payload in rows:
                 b = int((ts - t0) / dt)
                 if not (0 <= b < px):
                     continue
+                c, m, r = payload.get("cpu"), payload.get("mem"), payload.get("net")
                 if c is not None and (cpu[b] is None or c > cpu[b]):
                     cpu[b] = c
                 if m is not None and (mem[b] is None or m > mem[b]):
@@ -545,26 +747,67 @@ class StatsSource:
             )
         return out
 
-    def point_at(self, t: float):
+    async def export_stats(self, t0: float, t1: float, granularity: str):
+        """Per service, every raw sample in [t0, t1] ("full") or a min/avg/max
+        summary over them ("summary") -- used by the "Export metrics" dialog's
+        stats option. Unlike bucketed()'s per-pixel max (chart rendering),
+        this reads the exact stored samples, not a downsampled envelope."""
+        services = sorted(self._services)
+        rows_per_service = await asyncio.gather(
+            *(self._redis.range_by_score_with_payload(self._entity_for(svc), t0, t1 + 1) for svc in services)
+        )
+        out = []
+        for svc, rows in zip(services, rows_per_service):
+            if not rows:
+                continue
+            if granularity == "full":
+                out.append({
+                    "name": svc,
+                    "host": self.is_host,
+                    "sid": self.id,
+                    "samples": [
+                        {"ts": ts, "cpu": p.get("cpu"), "mem": p.get("mem"),
+                         "mem_bytes": p.get("mem_bytes"), "net": p.get("net")}
+                        for ts, p in rows
+                    ],
+                })
+                continue
+
+            def agg(key):
+                vals = [p.get(key) for _, p in rows if p.get(key) is not None]
+                return {"min": min(vals), "avg": sum(vals) / len(vals), "max": max(vals)} if vals else None
+
+            out.append({
+                "name": svc,
+                "host": self.is_host,
+                "sid": self.id,
+                "count": len(rows),
+                "cpu": agg("cpu"),
+                "mem": agg("mem"),
+                "mem_bytes": agg("mem_bytes"),
+                "net": agg("net"),
+            })
+        return out
+
+    async def point_at(self, t: float):
         """Per service, the single sample nearest time t — used to compare an
         arbitrary point (e.g. a loaded sample) against another point (e.g.
         live 'now') regardless of the current chart zoom window."""
+        services = sorted(self._services)
+        results = await asyncio.gather(*(self._redis.nearest(self._entity_for(svc), t) for svc in services))
         out = {}
-        for svc, lst in self.series.items():
-            if not lst:
+        for svc, best in zip(services, results):
+            if best is None:
                 continue
-            i = bisect.bisect_left(lst, (t,))
-            cands = [lst[i]] if i < len(lst) else []
-            if i > 0:
-                cands.append(lst[i - 1])
-            best = min(cands, key=lambda r: abs(r[0] - t))
+            ts, payload = best
             out[svc] = {
-                "ts": best[0],
-                "cpu": best[1],
-                "mem": best[2],
-                "mem_bytes": best[3],
-                "net": best[4],
+                "ts": ts,
+                "cpu": payload.get("cpu"),
+                "mem": payload.get("mem"),
+                "mem_bytes": payload.get("mem_bytes"),
+                "net": payload.get("net"),
                 "host": self.is_host,
+                "sid": self.id,
             }
         return out
 
@@ -577,15 +820,56 @@ Source = LogSource | StatsSource  # everything State.sources can hold
 _HOST_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
 
 
+def _validate_ssh_port(host: str) -> None:
+    """br-CONN-005: _parse_ssh_target/ssh_host_and_port both split a trailing
+    `:port` off an `ssh://[user@]host[:port]` target and hand it onward
+    assuming it's already a valid number -- _parse_ssh_target's `int(port_s)`
+    in particular raises a raw `ValueError` (Python's own "invalid literal
+    for int()..." message) for anything else, and only once something is
+    already mid ssh-connect (inside a background poll loop, where it ends up
+    as an opaque `self.error` string, or wrapped into a 502 DockerPsError by
+    docker_ps) instead of as a clean upfront error. Every caller reaches
+    _parse_ssh_target/ssh_host_and_port via a host that already passed
+    through normalize_docker_host (see its own docstring's br-CONN-002
+    note), so validating the port here rejects a bad one immediately."""
+    rest = host[len("ssh://") :]
+    userhost = rest.rsplit("@", 1)[-1]
+    if ":" not in userhost:
+        return
+    _, port_s = userhost.rsplit(":", 1)
+    if not port_s.isdigit() or not (0 < int(port_s) < 65536):
+        raise ValueError(f"invalid ssh port {port_s!r} in {host!r} -- must be 1-65535")
+
+
 def normalize_docker_host(host: str | None) -> str | None:
     """ssh is the only remote transport CTTC supports, so a host string with
     no scheme (e.g. "user@other-server") is unambiguous shorthand for
     ssh://user@other-server. The client already normalizes this (see
     normalizeDockerHost in app.js); this is defense in depth for any other
-    caller of the HTTP API."""
+    caller of the HTTP API.
+
+    br-CONN-002: any *other* explicit scheme (`tcp://`, `http://`, ...) is
+    rejected outright here instead of being passed through untouched.
+    Every caller downstream (docker_ps, and every DockerStatsSource/
+    DockerLogSource collect_docker() ever constructs) eventually reaches
+    _parse_ssh_target/ssh_host_and_port, which strip a literal `"ssh://"`
+    prefix unconditionally via `host[len("ssh://"):]` -- since every scheme
+    prefix here happens to also be exactly 6 characters, that silently
+    chopped off the wrong 6 and fed the remainder to ssh as a garbage
+    host[:port] (e.g. `tcp://1.2.3.4:2375` -> ssh to host `1.2.3.4` port
+    `2375`) instead of ever surfacing a clean "unsupported transport"
+    error."""
     if not host:
         return None
-    return host if _HOST_SCHEME_RE.match(host) else f"ssh://{host}"
+    if _HOST_SCHEME_RE.match(host) and not host.startswith("ssh://"):
+        scheme = host.split("://", 1)[0]
+        raise ValueError(
+            f"unsupported docker host transport {scheme!r} -- only ssh:// "
+            "(or a bare user@host, treated as ssh://user@host) is supported"
+        )
+    host = host if _HOST_SCHEME_RE.match(host) else f"ssh://{host}"
+    _validate_ssh_port(host)
+    return host
 
 
 def docker_client(host: str | None = None) -> docker.DockerClient:
@@ -636,10 +920,22 @@ def _connect_ssh(host: str, ssh_key: str | None) -> paramiko.SSHClient:
     source with no key of its own should try."""
     hostname, username, port = _parse_ssh_target(host)
     identity = ssh_key or "ssh-agent/default identity discovery"
-    logger.info("ssh: connecting to %s@%s:%d (key: %s)", username or "<default user>", hostname, port, identity)
+    logger.info(
+        "ssh: connecting to %s@%s:%d (key: %s)",
+        username or "<default user>",
+        hostname,
+        port,
+        identity,
+    )
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    kwargs: dict = {"hostname": hostname, "port": port, "timeout": 10, "banner_timeout": 10, "auth_timeout": 10}
+    kwargs: dict = {
+        "hostname": hostname,
+        "port": port,
+        "timeout": 10,
+        "banner_timeout": 10,
+        "auth_timeout": 10,
+    }
     if username:
         kwargs["username"] = username
     if ssh_key:
@@ -648,19 +944,30 @@ def _connect_ssh(host: str, ssh_key: str | None) -> paramiko.SSHClient:
     try:
         client.connect(**kwargs)
     except Exception as e:
-        logger.warning("ssh: connect to %s:%d failed after %.1fms: %s: %s", hostname, port, (time.monotonic() - t0) * 1000, type(e).__name__, e)
+        logger.warning(
+            "ssh: connect to %s:%d failed after %.1fms: %s: %s",
+            hostname,
+            port,
+            (time.monotonic() - t0) * 1000,
+            type(e).__name__,
+            e,
+        )
         raise
     transport = client.get_transport()
     logger.info(
         "ssh: connected to %s:%d in %.1fms (server: %s, cipher: %s)",
-        hostname, port, (time.monotonic() - t0) * 1000,
+        hostname,
+        port,
+        (time.monotonic() - t0) * 1000,
         transport.remote_version if transport else "?",
         transport.local_cipher if transport else "?",
     )
     return client
 
 
-def _exec_remote_docker(client: paramiko.SSHClient, args: list[str], timeout: float) -> tuple[str, str, int]:
+def _exec_remote_docker(
+    client: paramiko.SSHClient, args: list[str], timeout: float
+) -> tuple[str, str, int]:
     """Runs `sudo docker <args>` over an already-open ssh connection and
     returns (stdout, stderr, returncode). Always blocking (paramiko has no
     asyncio support) -- callers must run this via asyncio.to_thread. sudo is
@@ -701,7 +1008,7 @@ _SIZE_RE = re.compile(r"^([\d.]+)\s*([a-zA-Z]*)$")
 
 
 def _parse_docker_size(s: str) -> float:
-    """"12.3MiB" / "648B" / "1.9GB" -> bytes. The only place these human-
+    """ "12.3MiB" / "648B" / "1.9GB" -> bytes. The only place these human-
     formatted units come from is `docker stats`' own MemUsage/NetIO columns
     (binary KiB/MiB/GiB for memory, decimal kB/MB/GB for network -- matching
     Docker's own units.BytesSize/units.HumanSize) -- used for a remote
@@ -716,7 +1023,12 @@ def _parse_docker_size(s: str) -> float:
 
 
 def list_ssh_keys() -> list[str]:
-    """Private keys under ~/.ssh (files whose header says so)."""
+    """Filenames (not full paths) of private keys under ~/.ssh (files whose
+    header says so). Only the basename is returned -- the full path would
+    disclose the gateway operator's home directory/username to any client
+    that can reach this route (br-NET-005), and nothing needs it back:
+    `ssh_key` request params are never resolved through this list (see
+    docs/architecture/remote-connectivity-call-trace.md)."""
     keys = []
     d = Path.home() / ".ssh"
     if d.is_dir():
@@ -730,7 +1042,7 @@ def list_ssh_keys() -> list[str]:
                 logger.debug("could not read %s while listing ssh keys: %s", p, e)
                 continue
             if b"PRIVATE KEY" in head:
-                keys.append(str(p))
+                keys.append(p.name)
     return keys
 
 
@@ -798,7 +1110,7 @@ async def _find_own_container() -> tuple[str, str] | None:
             stderr=asyncio.subprocess.DEVNULL,
         )
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
-    except (TimeoutError, OSError):
+    except TimeoutError, OSError:
         return None
     for line in out.decode(errors="replace").splitlines():
         if not line.strip():
@@ -860,8 +1172,17 @@ async def docker_ps(host: str | None, ssh_key: str | None = None) -> dict:
         try:
             if client is None:
                 return await _run_docker_cli(desc, ["docker", *args], log, max(0.01, t_left))
-            out, err, rc = await asyncio.to_thread(_exec_remote_docker, client, args, max(0.01, t_left))
-            log.append({"cmd": desc, "returncode": rc, "ms": round((time.monotonic() - t0) * 1000), "stderr": err})
+            out, err, rc = await asyncio.to_thread(
+                _exec_remote_docker, client, args, max(0.01, t_left)
+            )
+            log.append(
+                {
+                    "cmd": desc,
+                    "returncode": rc,
+                    "ms": round((time.monotonic() - t0) * 1000),
+                    "stderr": err,
+                }
+            )
             if rc != 0:
                 raise DockerPsError(err or f"{desc} failed", log)
             return out
@@ -897,7 +1218,9 @@ async def docker_ps(host: str | None, ssh_key: str | None = None) -> dict:
 
         services = []
         try:
-            svc_out = await run(f"docker service ls @ {where}", ["service", "ls", "--format", "{{json .}}"])
+            svc_out = await run(
+                f"docker service ls @ {where}", ["service", "ls", "--format", "{{json .}}"]
+            )
             services = [
                 {"id": (r := jloads(line))["ID"][:12], "name": r["Name"], "replicas": r["Replicas"]}
                 for line in svc_out.splitlines()
@@ -960,15 +1283,18 @@ class DockerStatsSource(StatsSource):
         name: str,
         host: str | None,
         interval: float,
-        state,
+        state: State,
         ssh_key: str | None = None,
     ):
         super().__init__(sid, name, path=None, live=True)
         self.path = f"docker://{host or 'local'}/stats"
         self.host = host
         self.ssh_key = ssh_key
-        self.interval = interval
-        self._state = state
+        # narrows the base class's Optional declarations for the rest of
+        # this class's own methods -- DockerStatsSource always polls, so
+        # both are unconditionally real from construction on.
+        self.interval: float = interval
+        self._state: State = state
         self.error: str | None = None
         self._ssh_client: paramiko.SSHClient | None = None
         self._task = asyncio.ensure_future(self._loop())
@@ -1006,7 +1332,9 @@ class DockerStatsSource(StatsSource):
         return n
 
     def _sample_remote(self):
-        assert self.host is not None  # only ever called from _sample_once's own `if self.host` guard
+        assert (
+            self.host is not None
+        )  # only ever called from _sample_once's own `if self.host` guard
         if self._ssh_client is None:
             self._ssh_client = _connect_ssh(self.host, self.ssh_key)
         out, err, rc = _exec_remote_docker(
@@ -1023,9 +1351,13 @@ class DockerStatsSource(StatsSource):
             name = row.get("Name") or row.get("Container") or "?"
             cpu = float(row["CPUPerc"].rstrip("%")) if row.get("CPUPerc") else None
             mem_pct = float(row["MemPerc"].rstrip("%")) if row.get("MemPerc") else None
-            mem_bytes = _parse_docker_size(row["MemUsage"].split("/")[0]) if row.get("MemUsage") else None
+            mem_bytes = (
+                _parse_docker_size(row["MemUsage"].split("/")[0]) if row.get("MemUsage") else None
+            )
             net_total = (
-                sum(_parse_docker_size(p) for p in row["NetIO"].split("/")) if row.get("NetIO") else None
+                sum(_parse_docker_size(p) for p in row["NetIO"].split("/"))
+                if row.get("NetIO")
+                else None
             )
             rate = self._net_rate(name, ts_ms, net_total) if net_total is not None else None
             self.ingest_row(name, ts_ms, cpu, mem_pct, mem_bytes, rate)
@@ -1064,14 +1396,16 @@ class HostStatsSource(StatsSource):
         name: str,
         host: str | None,
         interval: float,
-        state,
+        state: State,
         ssh_key: str | None = None,
     ):
         super().__init__(sid, name, path=None, live=True)
         self.path = f"docker://{host or 'local'}/host"
         self.host = host
-        self.interval = interval
-        self._state = state
+        # narrows the base class's Optional declarations -- see
+        # DockerStatsSource.__init__'s matching comment.
+        self.interval: float = interval
+        self._state: State = state
         self.error: str | None = None
         self._prev = None  # (ts, cpu_busy, cpu_total, net_total) for delta rates
         self._ssh_cmd = None
@@ -1228,7 +1562,7 @@ class DockerLogSource(LogSource):
         target_type,
         target,
         transforms,
-        state,
+        state: State,
         tail=2000,
         ssh_key: str | None = None,
     ):
@@ -1236,7 +1570,9 @@ class DockerLogSource(LogSource):
         self.path = f"docker://{host or 'local'}/{target_type}/{target}"
         self.host = host
         self.ssh_key = ssh_key
-        self._state = state
+        # narrows the base class's Optional declaration -- see
+        # DockerStatsSource.__init__'s matching comment.
+        self._state: State = state
         self.error: str | None = None
         self._proc: asyncio.subprocess.Process | None = None
         self._ssh_client: paramiko.SSHClient | None = None
@@ -1246,43 +1582,67 @@ class DockerLogSource(LogSource):
         self._task = asyncio.ensure_future(self._follow())
 
     def stop(self):
+        self._task.cancel()
+        self._close_conn()
+
+    def _close_conn(self):
+        """Tears down whatever the current connection attempt holds, so a
+        reconnect (br-DEDUP-009) always starts from a clean slate -- also
+        used directly by stop()."""
         if self._proc is not None and self._proc.returncode is None:
             self._proc.terminate()
+        self._proc = None
         if self._channel is not None:
             try:
                 self._channel.close()
             except Exception as e:
                 logger.debug("error closing ssh channel for %s: %s", self.path, e)
+            self._channel = None
         if self._ssh_client is not None:
             try:
                 self._ssh_client.close()
             except Exception as e:
                 logger.debug("error closing ssh client for %s: %s", self.path, e)
-        self._task.cancel()
+            self._ssh_client = None
 
     async def _follow(self):
-        try:
-            read_chunk = await (self._start_remote() if self.host else self._start_local())
-            last_emit = 0.0
-            pending = 0
-            while True:
-                # blocks until data or true EOF -- never returns b"" while
-                # the stream is merely idle (docker logs -f between lines)
-                chunk = await read_chunk()
-                if not chunk:
-                    self.error = "log stream ended"
-                    self._state.broadcast({"type": "update", "source": self.id})
-                    return
-                pending += self.ingest_chunk(chunk)
-                now = time.time()
-                if pending and now - last_emit > 0.5:  # throttle SSE chatter
-                    self._state.broadcast({"type": "update", "source": self.id})
-                    pending, last_emit = 0, now
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.debug("log follow failed for %s: %s", self.path, e)
-            self.error = f"{type(e).__name__}: {e}"[:500]
+        # br-DEDUP-009: a dead/restarted container (or a transient ssh/
+        # docker hiccup) ends this stream with a clean EOF, not an
+        # exception -- reconnecting with backoff (mirroring
+        # DockerStatsSource._loop's own retry-forever pattern) instead of
+        # giving up for good means this source's log feed recovers the same
+        # way the paired stats source already does, rather than looking
+        # "healthy in stats but permanently stale in logs".
+        backoff = 1.0
+        while True:
+            try:
+                read_chunk = await (self._start_remote() if self.host else self._start_local())
+                self.error = None  # connected -- clears any error from a previous attempt
+                last_emit = 0.0
+                pending = 0
+                while True:
+                    # blocks until data or true EOF -- never returns b"" while
+                    # the stream is merely idle (docker logs -f between lines)
+                    chunk = await read_chunk()
+                    if not chunk:
+                        self.error = "log stream ended -- reconnecting"
+                        break
+                    pending += self.ingest_chunk(chunk)
+                    now = time.time()
+                    if pending and now - last_emit > 0.5:  # throttle SSE chatter
+                        self._state.broadcast({"type": "update", "source": self.id})
+                        pending, last_emit = 0, now
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.debug("log follow failed for %s: %s", self.path, e)
+                self.error = f"{type(e).__name__}: {e}"[:500]
+            else:
+                backoff = 1.0  # a stream that actually ran resets the backoff
+            self._state.broadcast({"type": "update", "source": self.id})
+            self._close_conn()
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
 
     async def _start_local(self):
         self._proc = await asyncio.create_subprocess_exec(
@@ -1331,17 +1691,31 @@ class MultiSegmentSample(Exception):
 
 
 class State:
-    def __init__(self, transforms_dir: Path, sessions_dir: Path | None = None):
+    def __init__(
+        self,
+        transforms_dir: Path,
+        sessions_dir: Path | None = None,
+        redis_tcp_port: int | None = None,
+        redis_ttl_seconds: float | None = None,
+        redis_flush_interval_seconds: float | None = None,
+        redis_data_dir: str | None = None,
+    ):
         self.sources: dict[str, Source] = {}
         self.registry = TransformRegistry(transforms_dir)
         self.listeners: list[asyncio.Queue] = []
         self.next_id = 1
         self.rolling_buffers = RollingBufferManager(self)
-        self.recording_sessions = RecordingSessionManager(
-            self, sessions_dir or transforms_dir / "sessions"
-        )
+        resolved_sessions_dir = sessions_dir or transforms_dir / "sessions"
+        self.recording_sessions = RecordingSessionManager(self, resolved_sessions_dir)
         self.scheduler = Scheduler(self.recording_sessions)
         self.events = EventManager(self, self.rolling_buffers, self.recording_sessions)
+        self.redis_log = RedisLog(
+            tcp_port=redis_tcp_port,
+            ttl_seconds=redis_ttl_seconds,
+            flush_interval_seconds=redis_flush_interval_seconds,
+            data_dir=redis_data_dir,
+        )
+        self.gateway_id = _load_or_create_gateway_id(resolved_sessions_dir)
 
     def broadcast(self, event: dict):
         for q in list(self.listeners):
@@ -1364,6 +1738,7 @@ class State:
         else:
             fns = self.registry.load(transforms)
             src = LogSource(sid, label, p, live, fns)
+        src._state = self
         read_all(src)
         self.sources[sid] = src
         logger.info("opened source %s: %s (%s, live=%s)", sid, path, kind, live)
@@ -1406,8 +1781,13 @@ class State:
         behavior -- only the interval, since that's the one thing the UI
         that triggers this (Update Docker Daemon) actually claims to change."""
         src = self.sources.get(sid)
-        if src is not None and getattr(src, "interval", None) != interval:
-            logger.info("collect_docker: updating poll interval for %s: %s -> %s", src.path, src.interval, interval)
+        if isinstance(src, StatsSource) and src.interval != interval:
+            logger.info(
+                "collect_docker: updating poll interval for %s: %s -> %s",
+                src.path,
+                src.interval,
+                interval,
+            )
             src.interval = interval
 
     def collect_docker(
@@ -1462,9 +1842,49 @@ class State:
                     ),
                 )
             )
+        if host:
+            # Remembered so the gateway can reconnect this remote daemon on
+            # its own restart (see redis_log.RedisLog.known_daemons, read at
+            # startup in lifespan()) -- no new secret involved: ssh_key here
+            # is only ever a path that must already resolve inside this
+            # container's own filesystem (see _connect_ssh's docstring), not
+            # key content transmitted over HTTP.
+            asyncio.ensure_future(
+                self.redis_log.remember_daemon(
+                    host,
+                    {
+                        "host": host,
+                        "ssh_key": ssh_key,
+                        "stats": stats,
+                        "logs": logs,
+                        "transforms": transforms,
+                        "interval": interval,
+                        "host_stats": host_stats,
+                    },
+                )
+            )
         return opened
 
-    def _write_segment(
+    def _provenance_of(self, s) -> tuple[str, str, str]:
+        """(gateway_id, docker_host_id, container_id) for one source,
+        recorded into every exported manifest entry (System Observability
+        spec, "Data Ownership & Hierarchy") -- preserved from a previously
+        loaded sample's own manifest if `s` came from load_sample
+        (re-exporting a loaded recording/metric keeps its original
+        provenance, not this gateway's own), otherwise this gateway's own:
+        a live docker collector's real host, or "local" for anything else
+        (the local daemon, or an arbitrary open_file with no docker/prior-
+        sample provenance at all)."""
+        content_key = getattr(s, "_content_key", None)
+        if content_key is not None:
+            # (gateway_id, docker_host_id, container_id, seg_from, seg_to) --
+            # only the first 3 are provenance, the segment window is for
+            # content-addressed identity (see where _content_key is set).
+            return content_key[:3]
+        host = getattr(s, "host", None)
+        return (self.gateway_id, host or "local", s.name)
+
+    async def _write_segment(
         self,
         z: zipfile.ZipFile,
         seg_idx: int,
@@ -1480,38 +1900,69 @@ class State:
         collide on filename. Returns that segment's manifest sources list.
         `source_ids`, if given, restricts output to that subset (used by the
         rolling buffer feature to freeze the set of sources live at
-        buffer-start time, ignoring sources opened/closed afterward)."""
+        buffer-start time, ignoring sources opened/closed afterward).
+        Redis-backed now (see redis_log.py) -- per-source slices are fetched
+        concurrently via asyncio.gather rather than serial round trips."""
+        items = [
+            (i, s)
+            for i, s in enumerate(self.sources.values())
+            if (source_ids is None or s.id in source_ids)
+            and (include_host or not getattr(s, "is_host", False))
+        ]
+
+        async def log_slice(s):
+            return await self.redis_log.range_by_score_with_payload(s._entity, t0, t1 + 1)
+
+        async def stats_slice(s):
+            svcs = sorted(s._services)
+            per_svc = await asyncio.gather(
+                *(self.redis_log.range_by_score_with_payload(s._entity_for(svc), t0, t1 + 1) for svc in svcs)
+            )
+            return dict(zip(svcs, per_svc))
+
+        results = await asyncio.gather(
+            *(log_slice(s) if s.kind == "log" else stats_slice(s) for _i, s in items)
+        )
+
         meta = []
-        for i, s in enumerate(self.sources.values()):
-            if source_ids is not None and s.id not in source_ids:
-                continue
-            if not include_host and getattr(s, "is_host", False):
-                continue
+        for (i, s), result in zip(items, results):
+            gateway_id, docker_host_id, container_id = self._provenance_of(s)
             if s.kind == "log":
-                lo = bisect.bisect_left(s.rows, (t0,))
-                hi = bisect.bisect_right(s.rows, (t1 + 1,))
-                rows = s.rows[lo:hi]
+                rows = result
                 if not rows:
                     continue
                 fn = f"seg{seg_idx}/logs/{i}.jsonl"
-                z.writestr(fn, b"\n".join(jdumps({"ts": r[0], "text": r[3]}) for r in rows))
-                meta.append({"type": "log", "name": s.name, "file": fn, "count": len(rows)})
+                z.writestr(
+                    fn,
+                    b"\n".join(
+                        jdumps({"ts": ts, "text": payload.get("text", "")}) for ts, payload in rows
+                    ),
+                )
+                meta.append({
+                    "type": "log", "name": s.name, "file": fn, "count": len(rows),
+                    "gateway_id": gateway_id, "docker_host_id": docker_host_id, "container_id": container_id,
+                })
             else:
-                ser = {}
-                for svc, lst in s.series.items():
-                    lo = bisect.bisect_left(lst, (t0,))
-                    hi = bisect.bisect_right(lst, (t1 + 1,))
-                    if hi > lo:
-                        ser[svc] = lst[lo:hi]
+                ser = {
+                    svc: [
+                        [ts, p.get("cpu"), p.get("mem"), p.get("mem_bytes"), p.get("net")]
+                        for ts, p in rows
+                    ]
+                    for svc, rows in result.items()
+                    if rows
+                }
                 swarm = sorted(s._swarm)
                 if not ser:
                     continue
                 fn = f"seg{seg_idx}/stats/{i}.json"
                 z.writestr(fn, jdumps({"series": ser, "swarm": swarm}))
-                meta.append({"type": "stats", "name": s.name, "file": fn, "is_host": s.is_host})
+                meta.append({
+                    "type": "stats", "name": s.name, "file": fn, "is_host": s.is_host,
+                    "gateway_id": gateway_id, "docker_host_id": docker_host_id, "container_id": container_id,
+                })
         return meta
 
-    def build_sample_bytes(
+    async def build_sample_bytes(
         self,
         t0: float,
         t1: float,
@@ -1526,9 +1977,11 @@ class State:
         rolling_buffer.RollingBufferManager)."""
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-            meta = self._write_segment(z, 0, t0, t1, include_host, source_ids)
+            meta = await self._write_segment(z, 0, t0, t1, include_host, source_ids)
             segment = {"from": t0, "to": t1, "created": now_iso(), "sources": meta}
-            z.writestr("manifest.json", jdumps({"version": 2, "segments": [segment]}))
+            manifest = {"version": 3, "segments": [segment]}
+            manifest["integrity_sha256"] = _manifest_hash(manifest)
+            z.writestr("manifest.json", jdumps(manifest))
         return buf.getvalue(), meta
 
     @staticmethod
@@ -1559,7 +2012,7 @@ class State:
                 segments.append({**seg, "_members": members})
         return segments
 
-    def merge_sample_bytes(
+    async def merge_sample_bytes(
         self, existing: bytes | None, t0: float, t1: float, include_host: bool = True
     ) -> tuple[bytes, list[dict], int]:
         """Append a new segment covering [t0, t1] to `existing` (raw bytes
@@ -1575,7 +2028,7 @@ class State:
             for seg in prior:
                 for relpath, content in seg["_members"].items():
                     z.writestr(relpath, content)
-            new_meta = self._write_segment(z, seg_idx, t0, t1, include_host)
+            new_meta = await self._write_segment(z, seg_idx, t0, t1, include_host)
             segments_manifest = [
                 {
                     "from": seg["from"],
@@ -1588,28 +2041,50 @@ class State:
             segments_manifest.append(
                 {"from": t0, "to": t1, "created": now_iso(), "sources": new_meta}
             )
-            z.writestr("manifest.json", jdumps({"version": 2, "segments": segments_manifest}))
+            manifest = {"version": 3, "segments": segments_manifest}
+            manifest["integrity_sha256"] = _manifest_hash(manifest)
+            z.writestr("manifest.json", jdumps(manifest))
         return buf.getvalue(), new_meta, seg_idx
 
-    def export_sample(self, path: str, t0: float, t1: float, include_host: bool = True) -> dict:
+    async def export_sample(
+        self, path: str, t0: float, t1: float, include_host: bool = True
+    ) -> dict:
         """Write a .cttc sample to a server-side path. See
         build_sample_bytes() for the format."""
-        data, meta = self.build_sample_bytes(t0, t1, include_host)
+        data, meta = await self.build_sample_bytes(t0, t1, include_host)
         p = Path(path).expanduser()
         p.write_bytes(data)
         return {"path": str(p), "sources": len(meta)}
 
-    def load_sample(self, path: str, segment: int | None = None) -> list[str]:
+    async def load_sample(self, path: str, segment: int | None = None) -> list[str]:
         """Open a .cttc sample as a set of static sources. If it holds more
         than one recorded segment and `segment` isn't given, raises
         MultiSegmentSample (carrying each segment's from/to/created/source
         count) so the caller can ask the user which one to load instead of
-        silently picking one."""
+        silently picking one.
+
+        Every row gets its own redis_log entry -- collected here and handed
+        to bulk_record() in one go at the end, rather than calling
+        redis_log.record() per row: record() is the non-blocking hot path
+        meant for real-time ingestion (see its docstring), and a recording
+        of any real length routinely holds far more rows than its queue's
+        capacity, arriving here in one synchronous burst instead of spread
+        over real time -- record() would silently drop most of it
+        (br-REDIS-018)."""
         p = Path(path).expanduser()
         opened = []
+        rows: list[tuple[str, float, dict]] = []
         raw = p.read_bytes()
         with zipfile.ZipFile(io.BytesIO(raw)) as z:
             man = jloads(z.read("manifest.json"))
+            stored_hash = man.pop("integrity_sha256", None)
+            if stored_hash is not None and _manifest_hash(man) != stored_hash:
+                # Tamper-evidence, not an access-control gate -- still loads,
+                # same bias toward a permissive read over a hard failure on
+                # a stale/unexpected file as the rest of this codebase.
+                logger.warning(
+                    "manifest integrity hash mismatch for %s -- file may be corrupted or modified", p
+                )
             raw_segments = man.get("segments")
             if raw_segments is None:
                 raw_segments = [
@@ -1637,34 +2112,61 @@ class State:
             for meta in seg["sources"]:
                 sid = f"s{self.next_id}"
                 self.next_id += 1
+                # (gateway_id, docker_host_id, container_id, segment from,
+                # segment to) -- provenance fields absent on a legacy
+                # (pre-v3) manifest fall back to this gateway's own id and
+                # "local"/the bare name, same as a source with no recorded
+                # provenance at all would (see _provenance_of). Preserved on
+                # the source itself so re-exporting a loaded sample keeps
+                # its *original* provenance, not this load's. The segment's
+                # own from/to (shared by every source in it) keep two
+                # different recordings of "the same" container properly
+                # isolated -- see _content_entity_id.
+                content_key = (
+                    meta.get("gateway_id", self.gateway_id),
+                    meta.get("docker_host_id", "local"),
+                    meta.get("container_id", meta["name"]),
+                    seg["from"],
+                    seg["to"],
+                )
                 if meta["type"] == "log":
                     src = LogSource(sid, meta["name"], p, live=False, transforms=[])
-                    rows = []
+                    src._state = self
+                    src._content_key = content_key
                     for line in z.read(meta["file"]).splitlines():
                         if not line.strip():
                             continue
                         e = jloads(line)
                         src.seq += 1
-                        rows.append(
-                            (
-                                float(e["ts"]),
-                                src.seq,
-                                make_uid(meta["name"], src.seq, e.get("text", "")),
-                                str(e.get("text", "")),
-                            )
-                        )
-                    rows.sort()
-                    src.rows = rows
+                        ts = float(e["ts"])
+                        text = str(e.get("text", ""))
+                        uid = make_uid(meta["name"], src.seq, text)
+                        row = (ts, src.seq, uid, text)
+                        src._last_row = row
+                        rows.append((src._entity, ts, {"uid": uid, "text": text}))
                 else:
                     src = StatsSource(sid, meta["name"], p, live=False)
+                    src._state = self
+                    src._content_key = content_key
                     d = jloads(z.read(meta["file"]))
-                    src.series = {svc: [tuple(r) for r in lst] for svc, lst in d["series"].items()}
+                    for svc, lst in d["series"].items():
+                        src._services.add(svc)
+                        for row in lst:
+                            ts, cpu, mem, mem_bytes, rate = tuple(row)
+                            src.count += 1
+                            rows.append(
+                                (
+                                    src._entity_for(svc),
+                                    ts,
+                                    {"cpu": cpu, "mem": mem, "mem_bytes": mem_bytes, "net": rate},
+                                )
+                            )
                     src._swarm = set(d.get("swarm", []))
-                    src.count = sum(len(v) for v in src.series.values())
                     if meta.get("is_host"):
                         src.is_host = True
                 self.sources[sid] = src
                 opened.append(sid)
+        await self.redis_log.bulk_record(rows)
         return opened
 
     def close_source(self, sid: str):
@@ -1675,11 +2177,21 @@ class State:
         src.stop()  # a no-op for static/file-tailed sources, see LogSource/StatsSource.stop
         logger.info("closed source %s (%s)", sid, src.path)
 
-    def describe(self):
-        out = []
+    async def describe(self):
+        """Per-source min/max/total, gathered concurrently across every
+        open source (Redis-backed now, see redis_log.py) rather than
+        serial awaits -- /sources and export requests fan out across every
+        source, so this stays one round trip of latency, not N."""
         items = list(self.sources.values())
-        for s in items:
-            rng = s.range()
+
+        async def one(s):
+            rng = await s.range()
+            total = await s.total() if s.kind == "log" else s.count
+            return rng, total
+
+        results = await asyncio.gather(*(one(s) for s in items))
+        out = []
+        for s, (rng, total) in zip(items, results):
             d = {
                 "id": s.id,
                 "name": s.name,
@@ -1690,12 +2202,16 @@ class State:
                 "min_ts": rng[0] if rng else None,
                 "max_ts": rng[1] if rng else None,
                 "error": getattr(s, "error", None),
+                "total": total,
+                # real Docker host identity (None for the local daemon and for
+                # any non-docker source, e.g. a loaded/uploaded file) -- not to
+                # be confused with bucketed()/point_at()/export_stats()'s own
+                # "host" field below, which is the unrelated is_host boolean.
+                "host": getattr(s, "host", None),
             }
             if s.kind == "log":
-                d["total"] = s.total()
                 d["transforms"] = [n for n, _ in s.transforms]
             else:
-                d["total"] = s.count
                 d["services"] = s.services()
                 d["is_host"] = getattr(s, "is_host", False)
             out.append(d)
@@ -1722,36 +2238,62 @@ def read_all(src):
 
 
 async def tail_loop(state: State, interval: float = 1.0):
+    """Polls every live file source for growth and re-reads it -- see
+    read_all(). Each source's stat/read/broadcast is isolated (br-ORCH-005):
+    an unhandled exception from one (a permissions error transient enough not
+    to be an OSError, a malformed transform raising mid-ingest, anything past
+    what the narrower OSError catches below predicted) is logged and skipped,
+    not left to kill this loop and silently stop tailing every OTHER live
+    file source for the rest of the gateway's uptime."""
     while True:
         await asyncio.sleep(interval)
         for src in list(state.sources.values()):
             if not src.live or not isinstance(src.path, Path):
                 continue
             try:
-                size = src.path.stat().st_size
-            except OSError as e:
-                logger.debug("tail: could not stat %s: %s", src.path, e)
-                continue
-            if size < src.offset:  # truncated/rotated: start over
-                src.offset = 0
-            if size > src.offset:
                 try:
-                    await asyncio.to_thread(read_all, src)
+                    size = src.path.stat().st_size
                 except OSError as e:
-                    logger.debug("tail: could not read %s: %s", src.path, e)
+                    logger.debug("tail: could not stat %s: %s", src.path, e)
                     continue
-                state.broadcast({"type": "update", "source": src.id})
+                if size < src.offset:  # truncated/rotated: start over
+                    src.offset = 0
+                if size > src.offset:
+                    try:
+                        await asyncio.to_thread(read_all, src)
+                    except OSError as e:
+                        logger.debug("tail: could not read %s: %s", src.path, e)
+                        continue
+                    state.broadcast({"type": "update", "source": src.id})
+            except Exception:
+                logger.exception("tail_loop: failed to tail %s", src.path)
 
 
 async def sessions_loop(state: State, interval: float = 1.0):
     """Drives recording_session.py's duration-elapsed/TTL-sweep checks,
-    scheduler.py's due-schedule firing, and events.py's condition checks --
-    see each module's docstring."""
+    scheduler.py's due-schedule firing, rolling_buffer.py's ad-hoc-buffer
+    TTL sweep (br-RBUF-005), and events.py's condition checks -- see each
+    module's docstring. Each tick is isolated so an unhandled exception
+    from one never stops the others, or this loop itself (br-ORCH-004): a
+    single bad beat is logged and skipped, not fatal."""
     while True:
         await asyncio.sleep(interval)
-        state.scheduler.tick()
-        state.recording_sessions.tick()
-        state.events.tick()
+        try:
+            state.scheduler.tick()
+        except Exception:
+            logger.exception("sessions_loop: scheduler tick failed")
+        try:
+            await state.recording_sessions.tick()
+        except Exception:
+            logger.exception("sessions_loop: recording_sessions tick failed")
+        try:
+            state.rolling_buffers.tick()
+        except Exception:
+            logger.exception("sessions_loop: rolling_buffers tick failed")
+        try:
+            await state.events.tick()
+        except Exception:
+            logger.exception("sessions_loop: events tick failed")
 
 
 # ── HTTP API (FastAPI) ────────────────────────────────────────────────────────
@@ -1766,7 +2308,77 @@ def bad_request(msg: str) -> ValueError:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    state: State = app.state.cttc
+    await state.redis_log.start()
+    # br-MESH-001/002: self-establish a gateway-list self-entry now if this
+    # gateway's address is already known (env override) -- there's no
+    # incoming request to read a Host header from at boot, so absent that
+    # override the self-entry is instead established lazily at the first
+    # POST /gateways/sync call, which always has a real Host to go by.
+    self_addr_at_boot = os.environ.get("PUBLIC_ADDRESS") or os.environ.get("ADVERTISED_HOST_PORT")
+    if self_addr_at_boot:
+        gateway_list = await state.redis_log.load_gateway_list()
+        self_host, self_port = _split_host_port(self_addr_at_boot)
+        gateway_list[_canonical_gateway_key(self_host, self_port)] = _self_gateway_entry(
+            self_addr_at_boot
+        )
+        await state.redis_log.save_gateway_list(gateway_list)
+    # Retention reconciliation (sTTL) -- runs once, right here, strictly
+    # *before* any Source starts writing (cli_files/auto-collect below), so
+    # there are zero live writers for this run's sweep to race against.
+    # Broad except, like every other lifespan startup step here: a
+    # reconciliation failure must never block the gateway from serving.
+    try:
+        await state.redis_log.reconcile_ttl()
+    except Exception as e:
+        logger.warning("lifespan: sTTL reconciliation failed: %s", e)
+    # Command-line files (uv run server.py file1 file2 ...) must be opened
+    # only *after* redis_log.start() above -- Redis is the sole store now
+    # (see redis_log.py's module docstring), and record() silently no-ops
+    # while self.enabled is still False (start() hasn't run yet). Opening
+    # these from _run() instead, before uvicorn's serve() ever triggers
+    # this lifespan, used to mean every CLI-supplied file's data was queued
+    # and dropped before there was anywhere for it to land -- /range would
+    # report {min_ts: null, max_ts: null} forever, since nothing else ever
+    # changes for a static (non-live) source to trigger a client re-check.
+    for f, live in getattr(app.state, "cli_files", []):
+        try:
+            state.open_file(f, "auto", None, live=live, transforms=[])
+        except Exception as e:
+            logger.warning("could not open %s: %s", f, e)
+    # Always-on collection: local Docker + local host telemetry start the
+    # moment the gateway boots, no client/Set Docker Daemon action needed.
+    # Remote hosts previously configured (see collect_docker's
+    # remember_daemon call) are replayed too, so the gateway can reconnect
+    # them on its own restart -- harmless if a client's own auto-reconnect
+    # (app.js) also calls /docker/collect for the same host moments later,
+    # since _open_or_reuse already dedupes by path. Gated on --auto-collect
+    # (see main()'s help text): off by default so the bare/embedded process
+    # and the test suite don't get an unprompted background collector.
+    if getattr(app.state, "auto_collect", False):
+        try:
+            state.collect_docker(None, True, [], [], 5.0, True, None)
+        except Exception as e:
+            logger.warning("lifespan: local auto-collect failed: %s", e)
+        for daemon in await state.redis_log.known_daemons():
+            try:
+                state.collect_docker(
+                    daemon.get("host"),
+                    daemon.get("stats", True),
+                    daemon.get("logs", []),
+                    daemon.get("transforms", []),
+                    daemon.get("interval", 5.0),
+                    daemon.get("host_stats", True),
+                    daemon.get("ssh_key"),
+                )
+            except Exception as e:
+                logger.warning(
+                    "lifespan: auto-collect for remembered daemon %s failed: %s",
+                    daemon.get("host"),
+                    e,
+                )
     yield
+    await state.redis_log.stop()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -1848,11 +2460,28 @@ async def _access_log(request: Request, call_next):
         response = await call_next(request)
     except Exception as e:
         elapsed_ms = (time.monotonic() - start) * 1000
-        logger.info("%s %s%s from %s -> unhandled exception after %.1fms: %s", request.method, request.url.path, query, client, elapsed_ms, e)
+        logger.info(
+            "%s %s%s from %s -> unhandled exception after %.1fms: %s",
+            request.method,
+            request.url.path,
+            query,
+            client,
+            elapsed_ms,
+            e,
+        )
         raise
     elapsed_ms = (time.monotonic() - start) * 1000
     size = response.headers.get("content-length", "?")
-    logger.info("%s %s%s from %s -> %d (%s bytes, %.1fms)", request.method, request.url.path, query, client, response.status_code, size, elapsed_ms)
+    logger.info(
+        "%s %s%s from %s -> %d (%s bytes, %.1fms)",
+        request.method,
+        request.url.path,
+        query,
+        client,
+        response.status_code,
+        size,
+        elapsed_ms,
+    )
     return response
 
 
@@ -1872,9 +2501,64 @@ async def _options_preflight(request: Request, call_next):
             headers={
                 "Access-Control-Allow-Origin": "*",
                 "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-                "Access-Control-Allow-Headers": "Content-Type, X-CTTC-Filename, X-CTTC-Private-Key, X-CTTC-Transforms",
+                "Access-Control-Allow-Headers": "Content-Type, X-CTTC-Filename, X-CTTC-Private-Key, X-CTTC-Transforms, X-CTTC-Token",
             },
         )
+    return await call_next(request)
+
+
+# br-MESH-006 (REQ-0070): the one deliberate, narrow exemption from
+# br-NET-004's blanket token requirement -- a client that just learned
+# about a peer via mesh sync has no token for it yet, so GET /ping must
+# answer without one to tell "a gateway is actually here" apart from
+# "nothing's listening". Every other route, including /health, stays
+# exactly as gated as it already was.
+_UNAUTHENTICATED_PATHS = {"/ping"}
+
+
+@app.middleware("http")
+async def _require_api_token(request: Request, call_next):
+    """Gates every route behind a shared-secret token when one is configured
+    (br-NET-004): Docker-based deployments (a local "This machine" container
+    or a remote gateway) always bind 0.0.0.0 with `network_mode: host` (see
+    docker-compose.yml/Dockerfile), so without this, anyone who could reach
+    the port at all -- the whole LAN, or further if port-forwarded -- had
+    full unauthenticated access: collect arbitrary docker sources, read
+    every log, upload files, even POST /shutdown. main.js generates a
+    random token at provision time (the same trust moment the ssh key
+    already establishes for a remote gateway) and passes it here via
+    CTTC_API_TOKEN; the bare/native embedded path (127.0.0.1 only, never
+    network-reachable) leaves this unset, so it stays exactly as permissive
+    as it always was -- this only ever tightens a deployment that opted
+    into being reachable from the network in the first place.
+
+    OPTIONS is exempt: a CORS preflight can't carry the real header yet
+    (that's exactly what it's asking permission for), so gating it here
+    would break every actual request that needs one, not just
+    unauthenticated ones. _UNAUTHENTICATED_PATHS is the other, narrower
+    exemption -- see its own comment.
+
+    A `?token=` query param is accepted as a fallback alongside the header
+    for one reason: the browser's native EventSource (app.js's /events SSE
+    stream) has no way to attach a custom header at all, by spec -- the
+    query string is the only channel it has. Every other request goes
+    through get()/post()/authHeaders() and always uses the header.
+    """
+    expected = getattr(request.app.state, "api_token", None)
+    if expected and request.method != "OPTIONS" and request.url.path not in _UNAUTHENTICATED_PATHS:
+        got = request.headers.get("x-cttc-token") or request.query_params.get("token")
+        if got != expected:
+            logger.warning(
+                "rejected %s %s from %s: missing/incorrect X-CTTC-Token",
+                request.method,
+                request.url.path,
+                request.client.host if request.client else "?",
+            )
+            return Response(
+                jdumps({"error": "missing or incorrect X-CTTC-Token"}),
+                media_type="application/json",
+                status_code=401,
+            )
     return await call_next(request)
 
 
@@ -1890,11 +2574,306 @@ def get_log_source(request: Request, source: str) -> LogSource:
     return src
 
 
+# ── admin-action authorization (br-OWNER-002/003/005, REQ-0069) ────────────
+
+ADMIN_NONCE_TTL_SECONDS = 120
+# The `-n` namespace ssh-keygen -Y sign/verify both must agree on -- scopes
+# a signature to this specific purpose, so a signature produced for some
+# other ssh-keygen -Y consumer (e.g. git commit signing with the same key)
+# could never be replayed here, and vice versa.
+ADMIN_SIGNATURE_NAMESPACE = "cttc-admin-auth"
+
+
+async def _verify_owner_signature(nonce: str, signature: str, owner_public_key: str) -> bool:
+    """Verifies `signature` -- an ssh-keygen -Y sign SSHSIG armor blob --
+    over `nonce`, against `owner_public_key`, by shelling out to
+    `ssh-keygen -Y verify`. NOT paramiko, despite it already being a server
+    dependency for Docker-host SSH (_connect_ssh below): paramiko's own
+    verify_ssh_sig() speaks the raw SSH auth-protocol signature format
+    (RFC 4252/8332), a different wire format from the SSHSIG envelope
+    ssh-keygen -Y sign produces (the same format `git commit -S` uses) --
+    paramiko has no SSHSIG parser, and hand-rolling one would be exactly
+    the kind of crypto-adjacent risk this codebase avoids elsewhere in
+    favor of shelling to the real OS tool (see _connect_ssh's own docstring
+    on TOFU/paramiko for the one place this module *does* use paramiko).
+    `openssh-client` is already in the container image (Dockerfile)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        allowed_signers = tmp_path / "allowed_signers"
+        allowed_signers.write_text(f"owner {owner_public_key}\n")
+        sig_file = tmp_path / "nonce.sig"
+        sig_file.write_text(signature)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ssh-keygen",
+                "-Y",
+                "verify",
+                "-f",
+                str(allowed_signers),
+                "-I",
+                "owner",
+                "-n",
+                ADMIN_SIGNATURE_NAMESPACE,
+                "-s",
+                str(sig_file),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            logger.error("ssh-keygen not found on PATH -- cannot verify any admin signature")
+            return False
+        try:
+            await asyncio.wait_for(proc.communicate(nonce.encode()), timeout=5.0)
+        except TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return False
+        return proc.returncode == 0
+
+
+async def _require_owner_signature(request: Request, body: dict, action: str) -> dict:
+    """The gate for every admin-tier action (br-OWNER-003/005): raises
+    HTTPException(403) unless `body` carries a {nonce, signature} pair
+    that verifies against the current owner's public key. Returns the
+    ownership record on success, for the caller's own use (e.g. rotate
+    needs the prior owner's installedAt). A plain function called at the
+    top of each admin handler, not a FastAPI Depends() -- this codebase
+    has no Depends() usage anywhere (verified), and each admin route needs
+    a different `action` label for its own audit-log line anyway.
+
+    consume_nonce runs *before* signature verification, deliberately: a
+    wrong-signature attempt still burns that nonce, so retrying the same
+    nonce with a different signature can never turn into a brute-force
+    loop against one still-valid challenge (matches br-OWNER-003's
+    "single-use", not just "single-use on success"). Every rejection path
+    is logged individually with its specific reason -- the audit log
+    records *why* a request was refused, not just that it was."""
+    st = get_state(request)
+    client_host = request.client.host if request.client else "?"
+    ownership = await st.redis_log.read_ownership()
+    if ownership is None:
+        logger.warning(
+            "admin action %r rejected (no owner claimed yet) from %s", action, client_host
+        )
+        raise HTTPException(status_code=403, detail="no owner has claimed this gateway yet")
+    nonce = body.get("nonce")
+    signature = body.get("signature")
+    if not nonce or not signature:
+        logger.warning(
+            "admin action %r rejected (missing nonce/signature) from %s", action, client_host
+        )
+        raise HTTPException(status_code=403, detail="'nonce' and 'signature' are required")
+    if not await st.redis_log.consume_nonce(nonce):
+        logger.warning(
+            "admin action %r rejected (invalid/expired/reused nonce) from %s", action, client_host
+        )
+        raise HTTPException(status_code=403, detail="invalid, expired, or already-used nonce")
+    if not await _verify_owner_signature(nonce, signature, ownership["ownerPublicKey"]):
+        logger.warning(
+            "admin action %r rejected (signature did not verify against owner %s) from %s",
+            action,
+            ownership.get("ownerLabel"),
+            client_host,
+        )
+        raise HTTPException(
+            status_code=403, detail="signature did not verify against the owner's public key"
+        )
+    logger.info(
+        "admin action %r authorized for owner %s from %s",
+        action,
+        ownership.get("ownerLabel"),
+        client_host,
+    )
+    return ownership
+
+
 @app.get("/health")
 async def route_health():
     """Cheap liveness probe -- no state/docker/disk access, just confirms the
     process is up and answering HTTP, for the renderer's status indicator."""
     return {"ok": True}
+
+
+# ── gateway peer-discovery mesh (br-MESH-001..006, REQ-0070) ───────────────
+
+try:
+    GATEWAY_VERSION = importlib.metadata.version("cttc-timeline-server")
+except importlib.metadata.PackageNotFoundError:
+    # Not installed as a package in every deployment mode (e.g. a bare
+    # `uv run server.py` checkout) -- /ping still needs to answer with
+    # something rather than raise, so this falls back to a literal rather
+    # than mirroring pyproject.toml's version by hand in two places.
+    GATEWAY_VERSION = "0.0.0-dev"
+
+GATEWAY_LIST_MAX_ENTRIES = 500
+
+
+def _split_host_port(addr: str) -> tuple[str, int]:
+    host, _, port_str = (addr or "").rpartition(":")
+    if host and port_str.isdigit():
+        return host, int(port_str)
+    return addr or "", 0
+
+
+def _canonical_gateway_key(host: str, port: int) -> str:
+    """br-MESH-001: the one identity model every gateway-list entry is
+    keyed by -- lower(host):port. This is also, deliberately, the fix for
+    REQ-0012's flagged host-vs-host:port inconsistency (the provisioning
+    guard's own key granularity is unchanged by this requirement; only
+    this list adopts the canonical form)."""
+    return f"{(host or '').lower()}:{port}"
+
+
+def _self_address(request: Request) -> str:
+    """This gateway's own host:port, as it should appear in its peer list
+    (br-MESH-002). PUBLIC_ADDRESS/ADVERTISED_HOST_PORT env wins if set --
+    the operator knows this gateway's real externally-reachable address
+    better than anything inferred -- else the incoming request's own Host
+    header, which reflects whatever address the client actually dialed to
+    reach us (direct HTTP or through an ssh tunnel's local forward,
+    either way a real answer, unlike a bind address like 0.0.0.0 would
+    be)."""
+    override = os.environ.get("PUBLIC_ADDRESS") or os.environ.get("ADVERTISED_HOST_PORT")
+    return override or request.headers.get("host", "")
+
+
+def _self_gateway_entry(self_addr: str) -> dict:
+    host, port = _split_host_port(self_addr)
+    return {
+        "host": host,
+        "port": port,
+        "lastContactAt": now_iso(),
+        "lastContactResult": "ok",
+        "existence": "existing",
+    }
+
+
+@app.get("/ping")
+async def route_ping():
+    """br-MESH-006: unauthenticated (see _UNAUTHENTICATED_PATHS) L7
+    liveness that identifies this as specifically a gateway, unlike the
+    existing /health -- lets a client tell "a gateway answered" from
+    "some port is open" for a peer discovered via mesh sync it has no
+    token for yet."""
+    return {"service": "gateway", "version": GATEWAY_VERSION}
+
+
+def _merge_gateway_entry(current: dict | None, incoming: dict) -> dict:
+    """One incoming (relayed, untrusted) entry merged against this
+    gateway's own persisted record for the same canonical key.
+    br-MESH-003/004: a brand-new key is always added with `existence`
+    forced to `unknown`, regardless of what was reported; an existing
+    key keeps whichever side has the more recent `lastContactAt` (ties
+    prefer a verified `existence` over `unknown`); and a locally verified
+    `existing`/`absent` is never downgraded to a relayed `unknown`, no
+    matter how recent that relayed value claims to be -- checked first,
+    ahead of (and overriding) the recency comparison."""
+    if current is None:
+        merged = dict(incoming)
+        merged["existence"] = "unknown"
+        return merged
+    current_verified = current.get("existence") in ("existing", "absent")
+    incoming_verified = incoming.get("existence") in ("existing", "absent")
+    if current_verified and not incoming_verified:
+        return current
+    incoming_ts = str(incoming.get("lastContactAt") or "")
+    current_ts = str(current.get("lastContactAt") or "")
+    if incoming_ts > current_ts:
+        return dict(incoming)
+    if incoming_ts < current_ts:
+        return current
+    return dict(incoming) if (incoming_verified and not current_verified) else current
+
+
+@app.post("/gateways/sync")
+async def route_gateways_sync(request: Request):
+    """br-MESH-003/004/005: merges the client's posted gateway list into
+    this gateway's own persisted one under trust rules that stop relayed/
+    stale belief from overwriting something directly verified, then
+    returns the full merged list. The self-entry is (re)written last and
+    unconditionally, so it's always authoritative for itself regardless
+    of anything the client happened to relay about this same address
+    (br-MESH-002's "never flaps from relayed input")."""
+    body = await request.json()
+    incoming_entries = body.get("entries")
+    if not isinstance(incoming_entries, list):
+        raise bad_request("'entries' must be a list")
+    st = get_state(request)
+    current = await st.redis_log.load_gateway_list()
+    # br-MESH-005: bound accepted list size -- trim the posted payload
+    # itself rather than let a pathologically large one grow the merge
+    # (and the persisted list) without limit.
+    for incoming in incoming_entries[:GATEWAY_LIST_MAX_ENTRIES]:
+        host, port = incoming.get("host"), incoming.get("port")
+        if not host or not port:
+            continue
+        key = _canonical_gateway_key(host, port)
+        current[key] = _merge_gateway_entry(current.get(key), incoming)
+    self_addr = _self_address(request)
+    self_host, self_port = _split_host_port(self_addr)
+    self_key = _canonical_gateway_key(self_host, self_port)
+    current[self_key] = _self_gateway_entry(self_addr)
+    if len(current) > GATEWAY_LIST_MAX_ENTRIES:
+        # Trim oldest-by-lastContactAt, but the self-entry is never the
+        # one to go -- re-added unconditionally after the trim if the cut
+        # happened to exclude it.
+        kept = sorted(
+            current.items(), key=lambda kv: kv[1].get("lastContactAt") or "", reverse=True
+        )
+        current = dict(kept[:GATEWAY_LIST_MAX_ENTRIES])
+        current[self_key] = _self_gateway_entry(self_addr)
+    await st.redis_log.save_gateway_list(current)
+    logger.debug(
+        "gateways/sync: merged %d incoming entries, %d total", len(incoming_entries), len(current)
+    )
+    return {"entries": list(current.values())}
+
+
+# Simple-status replies are a small, explicit allow-list -- redis-py's
+# execute_command() decodes RESP simple-strings and RESP bulk-strings to
+# the exact same Python str, so there's no way to tell a status reply
+# ("OK") apart from a same-valued bulk string reply from the value alone.
+_REDIS_STATUS_REPLIES = {"OK", "PONG", "QUEUED"}
+
+
+def _redis_type_reply(raw):
+    """Maps a redis-py execute_command() return value to the {type, value}
+    shape app.js's formatRedisReply() renders in real-redis-cli style."""
+    if raw is None:
+        return {"type": "nil", "value": None}
+    if isinstance(raw, bool):
+        return {"type": "integer", "value": int(raw)}
+    if isinstance(raw, int):
+        return {"type": "integer", "value": raw}
+    if isinstance(raw, (list, tuple)):
+        return {"type": "array", "value": [_redis_type_reply(item) for item in raw]}
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+    if isinstance(raw, str):
+        if raw in _REDIS_STATUS_REPLIES:
+            return {"type": "status", "value": raw}
+        return {"type": "bulk", "value": raw}
+    return {"type": "bulk", "value": str(raw)}
+
+
+@app.post("/admin/redis-cli")
+async def route_admin_redis_cli(request: Request):
+    """Developer-only Redis CLI (see app.js's Help > Developers menu) --
+    runs a raw command against this gateway's own internal Redis and
+    returns a type-tagged reply the renderer formats in real-redis-cli
+    style. Intentionally unrestricted (no blocked commands) -- dev-only
+    tool, per the feature's own spec."""
+    body = await request.json()
+    argv = body.get("argv")
+    if not isinstance(argv, list) or not argv:
+        raise bad_request("'argv' must be a non-empty list")
+    st = get_state(request)
+    try:
+        raw = await st.redis_log.execute_raw(*argv)
+    except Exception as e:
+        return {"type": "error", "value": str(e)}
+    return _redis_type_reply(raw)
 
 
 @app.get("/mlog")
@@ -1920,7 +2899,7 @@ async def route_mlog():
 @app.get("/sources")
 async def route_sources(request: Request):
     st = get_state(request)
-    return {"sources": st.describe(), "json_impl": JSON_IMPL}
+    return {"sources": await st.describe(), "json_impl": JSON_IMPL}
 
 
 @app.get("/transforms")
@@ -1936,7 +2915,7 @@ async def route_ssh_keys():
 @app.get("/range")
 async def route_range(request: Request):
     lo = hi = None
-    for s in get_state(request).describe():
+    for s in await get_state(request).describe():
         if s["min_ts"] is not None:
             lo = s["min_ts"] if lo is None else min(lo, s["min_ts"])
             hi = s["max_ts"] if hi is None else max(hi, s["max_ts"])
@@ -1954,7 +2933,7 @@ async def route_series(
     out = []
     for s in st.sources.values():
         if s.kind == "stats":
-            out.extend(s.bucketed(t0, t1, pxi))
+            out.extend(await s.bucketed(t0, t1, pxi))
     return {"from": t0, "to": t1, "px": pxi, "services": out}
 
 
@@ -1962,7 +2941,7 @@ async def route_series(
 async def route_logs(request: Request, source: str = "", start: str = "0", count: str = "200"):
     src = get_log_source(request, source)
     starti, counti = int(start), min(int(count), 2000)
-    return {"total": src.total(), "rows": src.slice(starti, counti)}
+    return {"total": await src.total(), "rows": await src.slice(starti, counti)}
 
 
 @app.get("/point")
@@ -1973,8 +2952,24 @@ async def route_point(request: Request, t: str = ""):
     out = {}
     for s in get_state(request).sources.values():
         if s.kind == "stats":
-            out.update(s.point_at(tf))
+            out.update(await s.point_at(tf))
     return {"t": tf, "services": out}
+
+
+@app.get("/stats_export")
+async def route_stats_export(
+    request: Request, from_: str = Query("", alias="from"), to: str = "", granularity: str = "summary"
+):
+    if not from_ or not to:
+        raise bad_request("'from' and 'to' are required")
+    if granularity not in ("summary", "full"):
+        raise bad_request("'granularity' must be 'summary' or 'full'")
+    t0, t1 = float(from_), float(to)
+    out = []
+    for s in get_state(request).sources.values():
+        if s.kind == "stats":
+            out.extend(await s.export_stats(t0, t1, granularity))
+    return {"from": t0, "to": t1, "granularity": granularity, "services": out}
 
 
 @app.get("/index_at")
@@ -1982,7 +2977,7 @@ async def route_index_at(request: Request, source: str = "", t: str = ""):
     src = get_log_source(request, source)
     if not t:
         raise bad_request("'t' is required")
-    return {"index": src.index_at(float(t))}
+    return {"index": await src.index_at(float(t))}
 
 
 @app.get("/ticks")
@@ -1996,7 +2991,7 @@ async def route_ticks(
     src = get_log_source(request, source)
     if not from_ or not to:
         raise bad_request("'from' and 'to' are required")
-    return {"counts": src.ticks(float(from_), float(to), int(px))}
+    return {"counts": await src.ticks(float(from_), float(to), int(px))}
 
 
 @app.get("/logs/find")
@@ -2004,20 +2999,37 @@ async def route_logs_find(
     request: Request, source: str = "", q: str = "", start: str = "0", dir: str = "fwd"
 ):
     src = get_log_source(request, source)
-    idx = src.find(q, int(start), dir != "back")
+    idx = await src.find(q, int(start), dir != "back")
     return {"index": idx}
 
 
 @app.get("/files/download")
 async def route_files_download(
-    request: Request, from_: str = Query("", alias="from"), to: str = "", include_host: str = "1"
+    request: Request,
+    from_: str = Query("", alias="from"),
+    to: str = "",
+    include_host: str = "1",
+    host: str = "",
 ):
     if not from_ or not to:
         raise bad_request("'from' and 'to' are required")
     st = get_state(request)
     t0, t1 = float(from_), float(to)
     inc = include_host.lower() not in ("0", "false")
-    data, filename, count = files.download_sample(st, t0, t1, inc)
+    source_ids = None
+    if host:
+        # br-DHOST-030 (host/telemetry scoping): restrict the export to the
+        # requested Docker host's own sources -- any source with no `host`
+        # attribute at all (a loaded/uploaded file, never docker-collected)
+        # is untouched by this filter, since host-scoping and sample-scoping
+        # are orthogonal axes (see isOtherDockerHostHidden in app.js).
+        normalized_host = None if host == "local" else normalize_docker_host(host)
+        source_ids = {
+            s.id
+            for s in st.sources.values()
+            if not hasattr(s, "host") or s.host == normalized_host
+        }
+    data, filename, count = await files.download_sample(st, t0, t1, inc, source_ids)
     return Response(
         content=data,
         media_type="application/octet-stream",
@@ -2071,7 +3083,7 @@ async def route_open(request: Request):
     for f in body.get("files", []):
         try:
             if is_cttc_archive(str(f["path"])):
-                opened.extend(st.load_sample(f["path"], segment=f.get("segment")))
+                opened.extend(await st.load_sample(f["path"], segment=f.get("segment")))
                 continue
             src = st.open_file(
                 f["path"],
@@ -2090,7 +3102,7 @@ async def route_open(request: Request):
         "opened": opened,
         "errors": errors,
         "needs_selection": needs_selection,
-        "sources": st.describe(),
+        "sources": await st.describe(),
     }
 
 
@@ -2110,7 +3122,7 @@ async def route_close(request: Request):
 async def route_sample_export(request: Request):
     body = await request.json()
     st = get_state(request)
-    return st.export_sample(
+    return await st.export_sample(
         body["path"],
         float(body["from"]),
         float(body["to"]),
@@ -2133,7 +3145,7 @@ async def route_sample_record(request: Request):
     t1 = float(request.headers.get("X-CTTC-To", ""))
     inc = (request.headers.get("X-CTTC-Include-Host") or "1").lower() not in ("0", "false")
     st = get_state(request)
-    data, meta, seg_idx = st.merge_sample_bytes(existing or None, t0, t1, inc)
+    data, meta, seg_idx = await st.merge_sample_bytes(existing or None, t0, t1, inc)
     return Response(
         content=data,
         media_type="application/octet-stream",
@@ -2168,7 +3180,7 @@ async def route_buffer_pause(buffer_id: str, request: Request):
 async def route_buffer_stop(buffer_id: str, request: Request):
     st = get_state(request)
     try:
-        data, meta = st.rolling_buffers.stop(buffer_id)
+        data, meta = await st.rolling_buffers.stop(buffer_id)
     except UnknownBuffer:
         raise HTTPException(status_code=404, detail=f"unknown buffer: {buffer_id}")
     return Response(
@@ -2202,7 +3214,7 @@ async def route_session_start(request: Request):
 async def route_session_stop(session_id: str, request: Request):
     st = get_state(request)
     try:
-        st.recording_sessions.stop(session_id)
+        await st.recording_sessions.stop(session_id)
     except UnknownSession:
         raise HTTPException(status_code=404, detail=f"unknown session: {session_id}")
     return {"ok": True}
@@ -2262,6 +3274,31 @@ async def route_session_ttl(request: Request):
     return {"ok": True}
 
 
+@app.get("/logs/rate")
+async def route_logs_rate(request: Request):
+    """Current sRate (seconds between buffered flushes to the durable
+    Redis-backed store, see redis_log.py) -- read by the renderer client
+    to clamp its own refresh rate up to whatever the server can actually
+    produce new data at (polling faster than sRate would never see
+    anything new)."""
+    st = get_state(request)
+    return {"seconds": st.redis_log.flush_interval_seconds}
+
+
+@app.post("/logs/rate")
+async def route_logs_rate_set(request: Request):
+    """Set sRate at runtime, no restart needed -- takes effect on the
+    *next* flush cycle, never dropping or interrupting whatever's already
+    buffered (see RedisLog.set_flush_interval). Broadcasts the change to
+    every connected client so their own clamp can react immediately
+    rather than waiting for their next poll of this same route."""
+    body = await request.json()
+    st = get_state(request)
+    st.redis_log.set_flush_interval(float(body["seconds"]))
+    st.broadcast({"type": "rate", "seconds": st.redis_log.flush_interval_seconds})
+    return {"ok": True}
+
+
 @app.post("/scheduler/create")
 async def route_scheduler_create(request: Request):
     """Register a schedule -- give exactly one of `start_at` (epoch ms,
@@ -2317,8 +3354,11 @@ def _parse_condition(body: dict):
 
 
 def _parse_action(body: dict) -> Action:
+    kind = body.get("kind")
+    if kind not in ("snapshot", "recording"):
+        raise bad_request(f"action.kind must be 'snapshot' or 'recording', got {kind!r}")
     return Action(
-        kind=body.get("kind"),
+        kind=kind,
         minutes=float(body["minutes"]) if body.get("minutes") is not None else None,
         duration_minutes=float(body["duration_minutes"])
         if body.get("duration_minutes") is not None
@@ -2345,7 +3385,7 @@ async def route_events_create(request: Request):
     try:
         conditions = [_parse_condition(c) for c in body.get("conditions") or []]
         action = _parse_action(body.get("action") or {})
-        event_id = st.events.create(
+        event_id = await st.events.create(
             name=body.get("name", ""),
             source_ids=set(body.get("source_ids") or []),
             conditions=conditions,
@@ -2420,11 +3460,13 @@ async def route_events_update(event_id: str, request: Request):
     body = await request.json()
     st = get_state(request)
     try:
-        st.events.update(
+        await st.events.update(
             event_id,
             name=body.get("name"),
             source_ids=set(body["source_ids"]) if "source_ids" in body else None,
-            conditions=[_parse_condition(c) for c in body["conditions"]] if "conditions" in body else None,
+            conditions=[_parse_condition(c) for c in body["conditions"]]
+            if "conditions" in body
+            else None,
             action=_parse_action(body["action"]) if "action" in body else None,
             match=body.get("match"),
         )
@@ -2441,7 +3483,7 @@ async def route_events_update(event_id: str, request: Request):
 async def route_events_cancel(event_id: str, request: Request):
     st = get_state(request)
     try:
-        st.events.cancel(event_id)
+        await st.events.cancel(event_id)
     except UnknownEvent:
         raise HTTPException(status_code=404, detail=f"unknown event: {event_id}")
     return {"ok": True}
@@ -2471,7 +3513,20 @@ async def route_docker_collect(request: Request):
         ssh_key,
     )
     st.broadcast({"type": "sources"})
-    return {"opened": opened, "sources": st.describe()}
+    return {"opened": opened, "sources": await st.describe()}
+
+
+@app.post("/docker/forget")
+async def route_docker_forget(request: Request):
+    """br-REDIS-017: the counterpart to /docker/collect's remember_daemon --
+    without this, Remove Docker Host only ever closed the in-memory sources
+    (see /close), leaving the Redis-side registry entry to be silently
+    replayed and reconnected on the gateway's own next restart."""
+    body = await request.json()
+    st = get_state(request)
+    host = normalize_docker_host(body.get("host") or None)
+    await st.redis_log.forget_daemon(host)
+    return {"ok": True}
 
 
 @app.post("/files/upload")
@@ -2484,7 +3539,7 @@ async def route_files_upload(request: Request):
     st = get_state(request)
     needs_selection = []
     try:
-        opened = files.upload_and_open(st, filename, data, transforms, segment=segment)
+        opened = await files.upload_and_open(st, filename, data, transforms, segment=segment)
         errors = []
     except MultiSegmentSample as e:
         opened, errors = [], []
@@ -2497,8 +3552,94 @@ async def route_files_upload(request: Request):
         "opened": opened,
         "errors": errors,
         "needs_selection": needs_selection,
-        "sources": st.describe(),
+        "sources": await st.describe(),
     }
+
+
+@app.post("/gateway/ownership/claim")
+async def route_gateway_ownership_claim(request: Request):
+    """br-OWNER-001 (REQ-0069): the deploying client becomes owner. Called
+    once, right after provisioning's health check succeeds (see
+    lib/server-provision.js's ensureRemoteContainer/ensureLocalContainer).
+    Idempotent by design -- if an ownership record already exists, this is
+    a no-op that returns it unchanged: connecting to an already-owned
+    gateway must never rewrite who owns it. The read here is just a fast
+    path; write_ownership's SET NX is what actually makes the write
+    atomic, so two clients racing to claim the same fresh gateway can
+    never both "win" (the loser reads back the winner's record below)."""
+    body = await request.json()
+    owner_label = body.get("ownerLabel") or None
+    owner_public_key = body.get("ownerPublicKey") or None
+    if not owner_label or not owner_public_key:
+        raise bad_request("'ownerLabel' and 'ownerPublicKey' are required")
+    st = get_state(request)
+    existing = await st.redis_log.read_ownership()
+    if existing is not None:
+        return existing
+    now = now_iso()
+    record = {
+        "ownerLabel": owner_label,
+        "ownerPublicKey": owner_public_key,
+        "ownerKeyFingerprint": hashlib.sha256(owner_public_key.encode()).hexdigest(),
+        "installedAt": now,
+        "updatedAt": now,
+    }
+    if not await st.redis_log.write_ownership(record):
+        return await st.redis_log.read_ownership()
+    logger.info(
+        "gateway ownership claimed by %s (fingerprint %s)",
+        owner_label,
+        record["ownerKeyFingerprint"],
+    )
+    return record
+
+
+@app.get("/gateway/admin/challenge")
+async def route_gateway_admin_challenge(request: Request):
+    """br-OWNER-003 (REQ-0069): issues a short-lived, single-use nonce for
+    the caller to sign and present back to an admin-tier route (currently
+    just /gateway/ownership/rotate -- upgrade/delete aren't added yet, see
+    REQ-0069's Requirement 2 scope note). Unauthenticated beyond the
+    existing blanket X-CTTC-Token requirement (br-NET-004) -- a nonce on
+    its own authorizes nothing; only a *signature* over it, verified
+    against the current owner's public key, does."""
+    nonce = uuid.uuid4().hex
+    st = get_state(request)
+    await st.redis_log.remember_nonce(nonce, ADMIN_NONCE_TTL_SECONDS)
+    return {"nonce": nonce, "expiresInSeconds": ADMIN_NONCE_TTL_SECONDS}
+
+
+@app.post("/gateway/ownership/rotate")
+async def route_gateway_ownership_rotate(request: Request):
+    """br-OWNER-003 (REQ-0069): transfers ownership to a new owner --
+    the one ownership-record write path that's allowed to *replace* an
+    existing record (see overwrite_ownership's docstring), gated on proof
+    the *current* owner authorized it. Does not rotate X-CTTC-Token (see
+    REQ-0069's Open questions: the token is supplied by every client's own
+    docker-compose reconnect, so an in-memory-only rotation here would be
+    silently undone by any other client's next ordinary reconnect)."""
+    body = await request.json()
+    current = await _require_owner_signature(request, body, "ownership.rotate")
+    new_owner_label = body.get("newOwnerLabel") or None
+    new_owner_public_key = body.get("newOwnerPublicKey") or None
+    if not new_owner_label or not new_owner_public_key:
+        raise bad_request("'newOwnerLabel' and 'newOwnerPublicKey' are required")
+    st = get_state(request)
+    record = {
+        "ownerLabel": new_owner_label,
+        "ownerPublicKey": new_owner_public_key,
+        "ownerKeyFingerprint": hashlib.sha256(new_owner_public_key.encode()).hexdigest(),
+        "installedAt": current.get("installedAt", now_iso()),
+        "updatedAt": now_iso(),
+    }
+    await st.redis_log.overwrite_ownership(record)
+    logger.info(
+        "gateway ownership rotated from %s to %s (fingerprint %s)",
+        current.get("ownerLabel"),
+        new_owner_label,
+        record["ownerKeyFingerprint"],
+    )
+    return record
 
 
 @app.post("/shutdown")
@@ -2543,6 +3684,61 @@ def main():
         help="timezone assumed for timestamps that carry no offset",
     )
     ap.add_argument("--static", action="store_true", help="open files without tailing")
+    ap.add_argument(
+        "--redis-port",
+        type=int,
+        default=redis_log.DEFAULT_TCP_PORT,
+        help="TCP port for the bundled Redis instance (see redis_log.py) -- bound to "
+        "127.0.0.1 only, for pointing an external tool (redis-cli, RedisInsight) at it "
+        "to inspect the store; the unix socket used for everything server.py itself does "
+        "is unaffected by this",
+    )
+    ap.add_argument(
+        "--redis-ttl-seconds",
+        type=float,
+        default=redis_log.DEFAULT_TTL_SECONDS,
+        help="sTTL: retention for the durable Redis-backed log/telemetry store -- read once "
+        "at startup, no longer runtime-mutable (the old POST /logs/ttl was removed). "
+        "Changing this between restarts triggers a one-time reconciliation pass over every "
+        "already-stored record (see RedisLog.reconcile_ttl)",
+    )
+    ap.add_argument(
+        "--redis-flush-interval-seconds",
+        type=float,
+        default=redis_log.DEFAULT_FLUSH_INTERVAL_SECONDS,
+        help="sRate: how often (seconds) buffered live records are flushed to Redis in one "
+        "batched pipeline, decoupled from any individual source's own sampling interval -- "
+        "runtime-adjustable without a restart via POST /logs/rate",
+    )
+    ap.add_argument(
+        "--redis-data-dir",
+        default=str(redis_log.DEFAULT_DATA_DIR),
+        help="where Redis's RDB/AOF persistence files live -- defaults to a directory beside "
+        "this file (resolves correctly in both bare mode and the containerized image with no "
+        "override needed, same as --sessions-dir's own default). In containers, this must be "
+        "the container-side path a host volume is bind-mounted to (see docker-compose.yml's "
+        "volumes:) or persistence is silently lost on container recreation",
+    )
+    ap.add_argument(
+        "--auto-collect",
+        action="store_true",
+        help="start collecting local Docker + local host telemetry immediately on boot "
+        "(and reconnect any remote hosts remembered in the Redis-backed daemon registry, "
+        "see redis_log.py), instead of waiting for a client's /docker/collect. Set by the "
+        "containerized gateway image's own entrypoint; off by default for the bare/embedded "
+        "process (see main.js) and for tests, where an unprompted background collector "
+        "would be a surprise.",
+    )
+    ap.add_argument(
+        "--api-token",
+        default=os.environ.get("CTTC_API_TOKEN"),
+        help="shared-secret required (as the X-CTTC-Token header) on every request when "
+        "set -- see _require_api_token (br-NET-004). Read from CTTC_API_TOKEN by default "
+        "so main.js's docker-compose invocations (which set the env var, not this flag "
+        "directly) and a bare `uv run server.py` both pick it up the same way. Unset for "
+        "the bare/embedded 127.0.0.1-only path, which was never network-reachable in the "
+        "first place.",
+    )
     ap.add_argument("files", nargs="*")
     args = ap.parse_args()
 
@@ -2556,14 +3752,20 @@ def main():
 async def _run(args):
     import socket as _socket
 
-    state = State(Path(args.transforms_dir), Path(args.sessions_dir))
+    state = State(
+        Path(args.transforms_dir),
+        Path(args.sessions_dir),
+        redis_tcp_port=args.redis_port,
+        redis_ttl_seconds=args.redis_ttl_seconds,
+        redis_flush_interval_seconds=args.redis_flush_interval_seconds,
+        redis_data_dir=args.redis_data_dir,
+    )
     app.state.cttc = state
-
-    for f in args.files:
-        try:
-            state.open_file(f, "auto", None, live=not args.static, transforms=[])
-        except Exception as e:
-            logger.warning("could not open %s: %s", f, e)
+    app.state.auto_collect = args.auto_collect
+    app.state.api_token = args.api_token
+    # Opened by lifespan() itself, *after* redis_log.start() -- see its own
+    # comment there for why this can't happen here anymore.
+    app.state.cli_files = [(f, not args.static) for f in args.files]
 
     # Bind our own socket first so the *actual* port (when --port 0 asks for
     # any free one) is known before uvicorn starts serving -- main.js reads

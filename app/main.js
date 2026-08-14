@@ -1,18 +1,41 @@
 "use strict";
 
-const { app, BrowserWindow, dialog, ipcMain, Menu, shell, nativeTheme } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain, Menu, shell, nativeTheme, safeStorage } = require("electron");
+// app.name otherwise falls back to package.json's "name" ("cttc-timeline"),
+// which is what an unpackaged dev run's Dock/taskbar hover tooltip and the
+// About dialog's title would show -- userData's default location is
+// derived from app.name too, so it's captured *before* renaming and pinned
+// back to it right after, or this would silently start a fresh, empty
+// profile (recording marker, saved daemons, gateways, etc.) under a new
+// path the very first time this runs.
+const defaultUserDataDir = app.getPath("userData");
+app.setName(`CTTC v${app.getVersion()}`);
+app.setPath("userData", defaultUserDataDir);
 const { spawn } = require("child_process");
+const { randomUUID } = require("crypto");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const readline = require("readline");
 const {
   loadConnectionConfig,
   saveConnectionConfig,
+  saveRunMode,
   clearConnectionConfig,
   hostFromTarget,
 } = require("./lib/connection-config");
 const { hasLocalDocker, canBeServerLocally } = require("./lib/docker-check");
-const { writeKeyFile, copyKeyFile } = require("./lib/ssh-key-file");
+const { shouldShowSkipButton } = require("./lib/gateway-setup-visibility");
+const {
+  getPublicKey,
+  writeGatewayKey,
+  copyGatewayKey,
+  withDecryptedGatewayKeyFile,
+  deleteGatewayKey,
+  migrateLegacyGatewayKeys,
+} = require("./lib/ssh-key-file");
+const keyVault = require("./lib/key-vault");
+const { auditGatewayList } = require("./lib/gateway-audit");
 const {
   ensureLocalContainer,
   ensureRemoteContainer,
@@ -20,10 +43,20 @@ const {
   uninstallRemoteContainer,
   checkStillInstalled,
 } = require("./lib/server-provision");
-const { readGateways, recordGateway, removeGateway, gatewayKey } = require("./lib/gateway-registry");
-const { readSelectedContainers, writeSelectedContainers } = require("./lib/container-selection");
+const {
+  readGateways,
+  recordGateway,
+  retireGateway,
+  gatewayKey,
+  recordDockerHostForGateway,
+  retireDockerHost,
+} = require("./lib/gateway-registry");
+const { readSelectedContainers, writeSelectedContainers, deleteSelectedContainers } = require("./lib/container-selection");
 const { openSshTunnel, closeSshTunnel } = require("./lib/ssh-tunnel");
 const { recordTunnel, removeTunnel, killOrphanedTunnels } = require("./lib/tunnel-registry");
+const { gracefulStop } = require("./lib/graceful-stop");
+const { getOrCreateApiToken, forgetApiToken } = require("./lib/api-token");
+const { isRoutineServerLine } = require("./lib/server-log-level");
 const {
   readSettings: readLogCollectorSettings,
   writeSettings: writeLogCollectorSettings,
@@ -39,12 +72,13 @@ const APP_TAGLINE = "Correlate container telemetry with service logs on a shared
 // in-app "?" help buttons and About > User Manual open this -- a local,
 // self-contained copy bundled next to the app (see package.json's
 // extraResources and build/build-manual.js, which generates it from
-// MANUAL.md) so the manual works offline and doesn't depend on GitHub being
-// reachable. Falls back to the GitHub copy only if that file is somehow
-// missing (e.g. an unpackaged dev checkout that never ran build:manual).
-const HELP_URL = "https://github.com/oliben67/cut-to-the-chase/blob/main/MANUAL.md";
+// MANUAL.md; "prestart" also builds it for dev-mode runs) so opening the
+// manual is always a local file access, never a network request -- there is
+// deliberately no web fallback here. If the local file is somehow still
+// missing (a dev checkout that skipped `npm run build:manual`), openManual()
+// reports that clearly instead of reaching out to GitHub.
 const HELP_TOPICS = {
-  frequency: "#the-cursor-and-the-frequency-window",
+  frequency: "#the-cursor-and-the-highlight-window",
 };
 function localManualPath() {
   const p = app.isPackaged
@@ -52,9 +86,18 @@ function localManualPath() {
     : path.join(__dirname, "build", "CTTC-Manual.html");
   return fs.existsSync(p) ? p : null;
 }
-function helpUrl(anchor) {
+async function openManual(anchor) {
   const local = localManualPath();
-  return local ? `file://${local}${anchor}` : HELP_URL + anchor;
+  if (!local) {
+    await dialog.showMessageBox({
+      type: "error",
+      title: "User Manual unavailable",
+      message: "The local copy of the User Manual is missing.",
+      detail: "Run `npm run build:manual` (from app/) to generate build/CTTC-Manual.html, then try again.",
+    });
+    return;
+  }
+  await shell.openExternal(`file://${local}${anchor}`);
 }
 let serverProc = null;
 // serverHost/serverPort are the actual address the client (renderer + this
@@ -72,6 +115,15 @@ let serverPort = null;
 let activeGatewayHost = "127.0.0.1";
 let activeGatewayPort = null;
 let serverConnectionType = "local";
+// The shared-secret required (as X-CTTC-Token) by the *currently active*
+// gateway's own HTTP API, once one is generated for it -- null only for the
+// bare/native 127.0.0.1-only embedded path (see startServer), which never
+// binds 0.0.0.0 and so was never network-reachable in the first place
+// (br-NET-004). Exposed to the renderer via get-api-token/preload.js; every
+// gateway connect path below (connectToServer, connectRemoteGateway,
+// gateway-manage-save, the boot-time local-container fallback) must set
+// this to whatever token it actually used to provision/reach that gateway.
+let currentApiToken = null;
 // The ssh -N -L child process backing a "remote-tunnel" connection, if any
 // -- see connectRemoteGateway/lib/ssh-tunnel.js. Tracked here (not just
 // left to whatever called openSshTunnel) so switching or disconnecting from
@@ -132,14 +184,17 @@ function recordCurrentGateway() {
 
 // Shared by get-gateways and switch-gateway's failure message (which needs
 // to name the gateway it's staying on).
-function listGatewaysWithActiveFlag() {
+async function listGatewaysWithActiveFlag() {
   const gateways = readGateways();
-  // "This machine" is always a selectable gateway, even if a local
-  // container has never actually been provisioned here (recordGateway only
-  // ever runs after one succeeds) -- it just won't have a real port yet, so
-  // there's nothing to re-verify/switch to until Edit Gateways' Save
-  // actually provisions one.
-  if (!gateways.some((g) => g.mode === "embedded")) {
+  // "This machine" is a selectable gateway even if a local container has
+  // never actually been provisioned here (recordGateway only ever runs
+  // after one succeeds) -- it just won't have a real port yet, so there's
+  // nothing to re-verify/switch to until Edit Gateways' Save actually
+  // provisions one. But it can only ever manage Docker hosts if Docker is
+  // actually installed here -- offering it regardless would send the user
+  // into gateway setup only to hit a dead end once Docker turns out to be
+  // missing.
+  if (!gateways.some((g) => g.mode === "embedded") && (await hasLocalDocker())) {
     gateways.unshift({ mode: "embedded", host: "127.0.0.1", port: null, label: "This machine" });
   }
   for (const g of gateways) g.active = isActiveGateway(g);
@@ -152,8 +207,15 @@ function listGatewaysWithActiveFlag() {
 // always treated as reachable.
 async function checkGatewayReachable(entry) {
   if (entry.mode === "embedded" && entry.port == null) return true;
+  // Every other entry here has been successfully connected to before (see
+  // recordGateway's own comment), so its token already exists -- this only
+  // ever retrieves it, never generates a new one.
+  const apiToken = getOrCreateApiToken(entry.mode === "embedded" ? "embedded" : hostFromTarget(entry.sshTarget));
   try {
-    const r = await fetch(`http://${entry.host}:${entry.port}/health`, { signal: AbortSignal.timeout(4000) });
+    const r = await fetch(`http://${entry.host}:${entry.port}/health`, {
+      signal: AbortSignal.timeout(4000),
+      headers: { "X-CTTC-Token": apiToken },
+    });
     return r.ok;
   } catch {
     return false;
@@ -245,14 +307,45 @@ function startServer(extraArgs) {
       ["run", "--project", SERVER_DIR, path.join(SERVER_DIR, "server.py"), "--port", "0", ...extraArgs],
       { stdio: ["ignore", "pipe", "pipe"] }
     );
+    let settled = false;
+    // redis-server is a hard dependency now (Redis is the sole source of
+    // truth for logs/telemetry, see redis_log.py) -- kept here purely to
+    // recognize *why* the process exited early and give an actionable
+    // message, same spirit as lib/docker-check.js's missing/unhealthy
+    // Docker probes, not to duplicate any check server.py itself does.
+    let stderrTail = "";
     serverProc.on("error", (err) =>
       reject(new Error(`could not start server via uv: ${err.message}`))
     );
-    serverProc.stderr.on("data", (d) => mainError(`[server] ${d}`.trimEnd()));
+    // server.py's own logging.basicConfig deliberately sends every level
+    // (including routine per-request INFO lines) to stderr, not just actual
+    // errors -- treating 100% of this stream as an error-level main-log
+    // entry (as a single unconditional mainError call used to) meant every
+    // normal request the embedded server handled showed up as a red
+    // "exception" in DevTools, burying any real warning/error in a flood of
+    // noise (br-LOG-001). Route each line by the level word its own
+    // formatter already put there ("HH:MM:SS LEVELNAME cttc: ..."); only
+    // WARNING/ERROR/CRITICAL -- or anything that doesn't match at all, e.g.
+    // a raw Python traceback -- still goes through mainError.
+    serverProc.stderr.on("data", (d) => {
+      const text = `${d}`;
+      stderrTail = (stderrTail + text).slice(-4000);
+      for (const line of text.split("\n")) {
+        if (!line.trim()) continue;
+        const logFn = isRoutineServerLine(line) ? mainLog : mainError;
+        logFn(`[server] ${line}`.trimEnd());
+      }
+    });
 
     const rl = readline.createInterface({ input: serverProc.stdout });
-    const timer = setTimeout(() => reject(new Error("server did not report a port in 30s")), 30000);
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error("server did not report a port in 30s"));
+    }, 30000);
     rl.once("line", (line) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
       try {
         const info = JSON.parse(line);
@@ -277,6 +370,24 @@ function startServer(extraArgs) {
     serverProc.on("exit", (code) => {
       mainLog(`[server] exited (${code})`);
       serverProc = null;
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      // The embedded/dev server.py path now requires redis-server on PATH,
+      // the same way uv/docker already are (see redis_log.py) -- a missing
+      // binary or a redis-server that failed to come up makes server.py
+      // raise and exit before ever printing its {"port": N} line, which
+      // otherwise surfaces only as an opaque "did not report a port"
+      // timeout. Recognize that case from the process's own stderr and give
+      // an actionable message instead.
+      const mentionsRedis = /redis[-_]?server/i.test(stderrTail);
+      const detail = mentionsRedis
+        ? "redis-server is required to run CTTC's embedded server but wasn't found (or failed to " +
+          "start). Install Redis and make sure `redis-server` is on your PATH, then restart CTTC " +
+          "(e.g. `brew install redis` on macOS, `apt install redis-server` on Debian/Ubuntu)."
+        : `the embedded server exited unexpectedly (code ${code}) before it finished starting.` +
+          (stderrTail.trim() ? `\n\n${stderrTail.trim()}` : "");
+      reject(new Error(detail));
     });
   });
 }
@@ -289,6 +400,7 @@ async function showAboutDialog() {
     "Python >=3.11 (via uv)",
     "orjson >=3.10",
     "psutil >=5.9",
+    "Redis >=5.0.0",
   ];
   const { response } = await dialog.showMessageBox({
     type: "info",
@@ -305,7 +417,7 @@ async function showAboutDialog() {
     defaultId: 0,
     noLink: true,
   });
-  if (response === 1) await shell.openExternal(helpUrl(""));
+  if (response === 1) await openManual("");
 }
 
 // menu items that just trigger something in the renderer (open a dialog,
@@ -360,6 +472,11 @@ ipcMain.handle("menubar-action", (e, action) => {
     case "minimize": win?.minimize(); break;
     case "close": win?.close(); break;
     case "quit": app.quit(); break;
+    // Full process restart, not just a page reload (see "reload" above) --
+    // relaunches the whole Electron app (fresh main process, re-spawns the
+    // embedded server child, re-runs every startup path) rather than just
+    // re-executing the renderer's JS in place.
+    case "restart": app.relaunch(); app.exit(); break;
   }
 });
 
@@ -376,8 +493,8 @@ let splashWindow = null;
 function showSplash() {
   if (splashWindow && !splashWindow.isDestroyed()) return splashWindow;
   splashWindow = new BrowserWindow({
-    width: 280,
-    height: 220,
+    width: 300,
+    height: 320,
     frame: false,
     resizable: false,
     alwaysOnTop: true,
@@ -481,7 +598,11 @@ async function createWindow() {
   });
   attachEditContextMenu(win);
   await win.loadFile(path.join(__dirname, "renderer", "index.html"), {
-    search: `host=${serverHost}&port=${serverPort}`,
+    // br-NET-004: token is whatever the active gateway actually requires
+    // (null for the bare/native 127.0.0.1-only embedded path, which never
+    // needed one) -- app.js reads it the same synchronous way it already
+    // reads host/port, so every request it ever makes can carry it.
+    search: `host=${serverHost}&port=${serverPort}&token=${currentApiToken || ""}`,
   });
   // e2e mode: CTTC_TEST=<spec.js> runs the spec in the page, reports results
   // + V8 byte coverage of app.js (as exercised by the spec) on stdout, then
@@ -555,17 +676,18 @@ async function createWindow() {
   }
 }
 
-ipcMain.handle("pick-files", async (_e, title) => {
+ipcMain.handle("pick-files", async (_e, title, filters) => {
   const r = await dialog.showOpenDialog({
     title: title || "Open log / stats files",
     properties: ["openFile", "multiSelections"],
+    filters: filters || [{ name: "All Files", extensions: ["*"] }],
   });
   return r.canceled ? [] : r.filePaths;
 });
 
 ipcMain.handle("open-help", async (_e, topic) => {
   const anchor = HELP_TOPICS[topic] || "";
-  await shell.openExternal(helpUrl(anchor));
+  await openManual(anchor);
 });
 
 // phase 3 of docs/architecture/remote-server.md: the renderer fetches a
@@ -598,12 +720,15 @@ ipcMain.handle("read-file", async (_e, filePath) => {
    renderer can't: show the native save dialog once, and read/write bytes
    to a path outside the sandbox. See renderer/app.js's recording section. */
 
-// Asked once, when Start Recording is clicked: after this, every
-// Pause/Stop segment flush overwrites the *same* path non-interactively
-// (see write-binary-file below) -- no repeated dialog per segment.
+// Asked once, at Stop -- not Start, so beginning a recording never
+// interrupts the user with a save dialog before they even know how long
+// they'll be recording for (every segment flushed in the meantime went to
+// RECORDING_SCRATCH_PATH instead, see get-recording-scratch-path above).
+// If Stop's own save is cancelled/fails, the renderer keeps the scratch
+// file around and can prompt again next time Stop is clicked.
 ipcMain.handle("pick-recording-path", async () => {
   const r = await dialog.showSaveDialog({
-    title: "Start Recording",
+    title: "Save Recording",
     defaultPath: `recording-${new Date().toISOString().slice(0, 19).replace(/[T:]/g, "-")}.cttc-record`,
     filters: [{ name: "CTTC recording", extensions: ["cttc-record"] }],
   });
@@ -612,6 +737,22 @@ ipcMain.handle("pick-recording-path", async () => {
 
 ipcMain.handle("write-binary-file", async (_e, filePath, bytes) => {
   await require("fs").promises.writeFile(filePath, Buffer.from(bytes));
+});
+
+/* ── log panel export (per-panel "Export .log" button, app.js) ────────────
+   Same dialog-first, write-later split as pick-recording-path/
+   write-binary-file above -- and for the same reason: exporting means
+   paginating through potentially every row a source has, which the
+   renderer must only do once the user has actually confirmed Save, not
+   before (the whole point of asking for the path here without touching
+   the log data at all). */
+ipcMain.handle("pick-log-export-path", async (_e, defaultName) => {
+  const r = await dialog.showSaveDialog({
+    title: "Export log",
+    defaultPath: defaultName,
+    filters: [{ name: "Log file", extensions: ["log"] }],
+  });
+  return r.canceled || !r.filePath ? null : r.filePath;
 });
 
 /* ── Events (renderer/app.js's UI-hosted event engine) ────────────────────
@@ -632,6 +773,21 @@ setInterval(() => sweepArtifacts(), 3600_000); // hourly, same cadence as the ga
 // connection.json, since it's per-install session state, not deployment
 // config.
 const RECORDING_MARKER_PATH = path.join(app.getPath("userData"), "recording.json");
+
+// A fixed, never-prompted-for path every Start/Pause/Resume segment flush
+// writes to (see renderer/app.js's flushRecordingSegment) -- the user only
+// ever picks a *real* destination once, at Stop (pick-recording-path,
+// below), which is exactly the point: asking upfront, before they even
+// know how long they'll be recording, was the whole UX complaint this
+// scratch file exists to fix. Using a fixed path rather than a fresh one
+// per session means a crash mid-recording still recovers cleanly (same
+// path recoverInterruptedRecording expects from RECORDING_MARKER_PATH) at
+// the cost of only ever tracking one in-progress recording at a time,
+// which the app's own UI already assumes throughout (a single `recording`
+// object, one set of transport buttons).
+const RECORDING_SCRATCH_PATH = path.join(app.getPath("userData"), "recording-in-progress.cttc-record");
+
+ipcMain.handle("get-recording-scratch-path", () => RECORDING_SCRATCH_PATH);
 
 ipcMain.handle("get-recording-marker", async () => {
   try {
@@ -693,7 +849,12 @@ ipcMain.handle("popout", async (e, kind, id, view) => {
   });
   popoutWindows.set(key, win);
   attachEditContextMenu(win);
-  const params = new URLSearchParams({ host: serverHost, port: String(serverPort), popout: kind });
+  const params = new URLSearchParams({
+    host: serverHost,
+    port: String(serverPort),
+    popout: kind,
+    token: currentApiToken || "",
+  });
   if (id) params.set("id", id);
   // hand the opener's current view/cursor over so the new window opens on
   // exactly the same time range instead of blank-then-reset
@@ -746,9 +907,17 @@ function resourcesDirForApp() {
 async function connectToServer(fileArgs) {
   const cfg = loadConnectionConfig();
   if (cfg.mode === "embedded") {
-    if (app.isPackaged && (await hasLocalDocker())) {
+    // cfg.runMode is the user's one-time choice (see the first-run dialog in
+    // app.whenReady()) between the local Docker container and a bare native
+    // process. Only an explicit "native" pick skips the container path
+    // outright; anything else (an explicit "container" pick, or no choice
+    // ever recorded -- e.g. pre-existing installs, or unpackaged/no-Docker
+    // runs where the dialog never fires) falls back to today's auto-detect.
+    const wantsContainer = cfg.runMode !== "native";
+    if (app.isPackaged && wantsContainer && (await hasLocalDocker())) {
       narrate("starting the local gateway container...");
-      const { port } = await ensureLocalContainer({ resourcesDir: resourcesDirForApp(), onLog: mainLog });
+      const apiToken = getOrCreateApiToken("embedded");
+      const { port } = await ensureLocalContainer({ resourcesDir: resourcesDirForApp(), apiToken, onLog: mainLog });
       serverHost = "127.0.0.1";
       serverPort = port;
       activeGatewayHost = "127.0.0.1";
@@ -756,11 +925,13 @@ async function connectToServer(fileArgs) {
       serverConnectionType = "local";
       activeSshTarget = null;
       activeSshPort = undefined;
+      currentApiToken = apiToken;
       mainLog(`[docker] server container running locally — port ${serverPort}`);
       recordGateway({ mode: "embedded", host: serverHost, port: serverPort, label: "This machine", connectionType: "local" });
       return;
     }
     narrate("starting the server...");
+    currentApiToken = null; // bare/native, 127.0.0.1-only -- never needed one (br-NET-004)
     await startServer(fileArgs);
     return;
   }
@@ -781,16 +952,21 @@ async function connectToServer(fileArgs) {
   serverConnectionType = result.connectionType;
   activeSshTarget = cfg.sshTarget;
   activeSshPort = cfg.sshPort;
+  currentApiToken = result.apiToken;
   mainLog(
     `[remote] connected to ${cfg.sshTarget} via ${result.connectionType} — http://${serverHost}:${serverPort}`
   );
   recordGateway({
+    // cfg.gatewayId (a GUI-managed gateway remembered via connection.json)
+    // and cfg.sshKey (a literal, scripted/env-var path) are mutually
+    // exclusive -- see lib/connection-config.js's loadConnectionConfig.
+    ...(cfg.gatewayId ? { id: cfg.gatewayId } : {}),
     mode: "remote",
     host: activeGatewayHost,
     port: activeGatewayPort,
     label: cfg.sshTarget,
     sshTarget: cfg.sshTarget,
-    sshKey: cfg.sshKey,
+    ...(cfg.gatewayId ? { sshKey: undefined, hasSshKey: true } : { sshKey: cfg.sshKey }),
     ...(cfg.sshPort ? { sshPort: cfg.sshPort } : {}),
     connectionType: result.connectionType,
     imageRef: result.imageRef,
@@ -803,12 +979,13 @@ async function connectToServer(fileArgs) {
 // informational: failure here doesn't block setup, it just tells the user
 // up front whether they'll need to type an explicit target in Set Sources
 // instead of relying on the default.
-async function checkServerHostDocker(host, port, onLog) {
+async function checkServerHostDocker(host, port, onLog, apiToken) {
   onLog?.("$ checking for docker on the server host...");
   try {
     const r = await fetch(`http://${host}:${port}/docker/ps`, {
       method: "POST",
       body: JSON.stringify({}),
+      ...(apiToken ? { headers: { "X-CTTC-Token": apiToken } } : {}),
     });
     const j = await r.json().catch(() => ({}));
     if (r.ok) {
@@ -847,17 +1024,33 @@ async function provisionRemoteGateway(payload, onLog) {
       `A gateway already exists at ${host} (${existing.label}) -- use File > Gateways > Edit Gateways to modify it instead.`
     );
   }
-  const sshKey = payload.keyMode === "paste" ? writeKeyFile(payload.keyContents) : copyKeyFile(payload.keyPath);
+  // Generated up front, before any gateway record exists -- this becomes
+  // the real, permanent id once recordGateway() below runs (it prefers a
+  // caller-supplied entry.id over minting its own), and is what the key
+  // just written gets stored under. Needed now, not lazily: the key has to
+  // be keyed on *something* stable before the very first connect attempt.
+  const gatewayId = randomUUID();
+  const keyOpts = { safeStorage, getPassphraseKey: ensureVaultUnlocked };
+  if (payload.keyMode === "paste") await writeGatewayKey(gatewayId, payload.keyContents, keyOpts);
+  else await copyGatewayKey(gatewayId, payload.keyPath, keyOpts);
   const cfg = {
     sshTarget: `${payload.sshUser}@${payload.sshHost}`,
-    sshKey,
+    gatewayId,
     sshPort: payload.sshPort,
     remotePort: 8765, // the CTTC server's fixed container port; see docker-compose.yml
   };
-  // First-time connect to this gateway -- direct HTTP first, ssh tunnel
-  // fallback if that times out/fails (see connectRemoteGateway).
-  const result = await connectRemoteGateway({ ...cfg, imageSource: payload.imageSource || undefined }, { onLog });
-  return { remote: result, cfg };
+  try {
+    // First-time connect to this gateway -- direct HTTP first, ssh tunnel
+    // fallback if that times out/fails (see connectRemoteGateway).
+    const result = await connectRemoteGateway({ ...cfg, imageSource: payload.imageSource || undefined }, { onLog });
+    return { remote: result, cfg };
+  } catch (err) {
+    // Nothing will ever reference this id (no gateway record was ever
+    // created for it) -- without this, a failed first connect leaves an
+    // orphaned vault entry behind forever.
+    await deleteGatewayKey(gatewayId, {}).catch(() => {});
+    throw err;
+  }
 }
 
 // Connects to a remote gateway, choosing plain direct HTTP or an ssh -L
@@ -881,13 +1074,104 @@ async function provisionRemoteGateway(payload, onLog) {
 // Returns the *client-facing* host/port (what serverHost/serverPort should
 // become -- 127.0.0.1 when tunneled) separately from the gateway's logical
 // identity (gatewayHost/gatewayPort -- always its real address, tunneled or
-// not), plus imageRef for the registry.
-async function connectRemoteGateway(cfg, { onLog, forceTunnel = false } = {}) {
+// not), plus imageRef for the registry and apiToken for every later request
+// (br-NET-004) -- callers must set currentApiToken from the result.
+// br-OWNER-001 (REQ-0069): claim ownership of a *remote* gateway once it's
+// confirmed reachable -- idempotent server-side (SET NX), so reconnecting
+// to an already-owned gateway is a harmless no-op there, never a rewrite.
+// Only called for remote gateways: the embedded/local ("This machine")
+// gateway is loopback-only (br-NET-001/003), already outside br-NET-004's
+// token requirement, and has no ssh keypair to claim with in the first
+// place. Best-effort -- a failure here (older gateway image with no
+// /gateway/ownership/claim route yet, network hiccup, etc.) must never
+// break an otherwise-successful connect.
+async function claimGatewayOwnership({ host, port, apiToken, sshKey }, onLog) {
+  if (!sshKey) return;
+  try {
+    const ownerPublicKey = getPublicKey(sshKey);
+    const r = await fetch(`http://${host}:${port}/gateway/ownership/claim`, {
+      method: "POST",
+      signal: AbortSignal.timeout(10000),
+      headers: {
+        "Content-Type": "application/json",
+        ...(apiToken ? { "X-CTTC-Token": apiToken } : {}),
+      },
+      body: JSON.stringify({ ownerLabel: os.hostname(), ownerPublicKey }),
+    });
+    if (!r.ok) {
+      onLog?.(`[ownership] claim request rejected (${r.status}) -- continuing unowned`);
+    }
+  } catch (err) {
+    onLog?.(`[ownership] could not claim ownership (${err.message || err}) -- continuing unowned`);
+  }
+}
+
+// br-MESH-003 / br-AUDIT-001/004 (REQ-0070/REQ-0071): posts this client's
+// known gateway list to the one just connected to, adopts the merged
+// list back, audits every entry (bounded concurrency, per-check
+// timeout), and persists the results locally to seed the next connect.
+// Entirely informational (REQ-0010's principle, reaffirmed by
+// br-AUDIT-004) -- never triggers a reconnect or switch, and never
+// speculatively adds a merely-*discovered* peer to the persistent
+// "recent gateways" history: recordGateway's own contract is "called
+// right after a connect actually succeeds -- never speculatively", so a
+// peer this client has never itself actually reached only ever gets
+// audited here, not written to disk, until/unless the user connects to
+// it for real. Best-effort, same as claimGatewayOwnership -- a failure
+// here must never break an otherwise-successful connect.
+async function syncAndAuditGateways({ host, port, apiToken }, onLog) {
+  try {
+    const registry = readGateways().filter((g) => g.mode !== "embedded");
+    const known = registry.map((g) => ({
+      host: g.host,
+      port: g.port,
+      lastContactAt: g.lastContactAt,
+      lastContactResult: g.lastContactResult,
+      existence: g.existence,
+    }));
+    const r = await fetch(`http://${host}:${port}/gateways/sync`, {
+      method: "POST",
+      signal: AbortSignal.timeout(10000),
+      headers: {
+        "Content-Type": "application/json",
+        ...(apiToken ? { "X-CTTC-Token": apiToken } : {}),
+      },
+      body: JSON.stringify({ entries: known }),
+    });
+    if (!r.ok) {
+      onLog?.(`[mesh] gateways/sync rejected (${r.status}) -- skipping this pass`);
+      return;
+    }
+    const { entries } = await r.json();
+    const audited = await auditGatewayList(entries || [], { onLog });
+    for (const entry of audited) {
+      const key = gatewayKey({ host: entry.host, port: entry.port });
+      const existingRecord = registry.find((g) => gatewayKey(g) === key);
+      if (!existingRecord) continue; // discovered, not (yet) connected to -- never recorded speculatively
+      recordGateway({
+        ...existingRecord,
+        lastContactAt: entry.lastContactAt,
+        lastContactResult: entry.lastContactResult,
+        existence: entry.existence,
+      });
+    }
+  } catch (err) {
+    onLog?.(`[mesh] sync/audit failed (${err.message || err}) -- continuing`);
+  }
+}
+
+async function connectRemoteGatewayWithKeyPath(cfg, { onLog, forceTunnel = false } = {}) {
   const sshBin = process.env.CTTC_SSH_BIN || "ssh";
+  // Same key ensureRemoteContainer itself resolves `host` from below --
+  // getOrCreateApiToken always returns the same, already-persisted token
+  // for a given gateway (see lib/api-token.js), so this never changes
+  // between an ordinary reconnect's `docker compose up -d` calls.
+  const apiToken = getOrCreateApiToken(cfg.host || hostFromTarget(cfg.sshTarget));
   const remote = await ensureRemoteContainer(cfg, {
     sshBin,
     resourcesDir: resourcesDirForApp(),
     source: cfg.imageSource || undefined,
+    apiToken,
     onLog,
   });
 
@@ -895,8 +1179,13 @@ async function connectRemoteGateway(cfg, { onLog, forceTunnel = false } = {}) {
 
   if (!forceTunnel) {
     try {
-      const r = await fetch(`http://${remote.host}:${remote.port}/health`, { signal: AbortSignal.timeout(10000) });
+      const r = await fetch(`http://${remote.host}:${remote.port}/health`, {
+        signal: AbortSignal.timeout(10000),
+        headers: { "X-CTTC-Token": apiToken },
+      });
       if (r.ok) {
+        await claimGatewayOwnership({ host: remote.host, port: remote.port, apiToken, sshKey: cfg.sshKey }, onLog);
+        await syncAndAuditGateways({ host: remote.host, port: remote.port, apiToken }, onLog);
         return {
           host: remote.host,
           port: remote.port,
@@ -904,6 +1193,7 @@ async function connectRemoteGateway(cfg, { onLog, forceTunnel = false } = {}) {
           gatewayPort: remote.port,
           connectionType: "remote",
           imageRef: remote.imageRef,
+          apiToken,
         };
       }
     } catch {
@@ -931,6 +1221,8 @@ async function connectRemoteGateway(cfg, { onLog, forceTunnel = false } = {}) {
     }
   );
   setCurrentTunnel(tunnel, remote.port, cfg.sshTarget);
+  await claimGatewayOwnership({ host: "127.0.0.1", port: remote.port, apiToken, sshKey: cfg.sshKey }, onLog);
+  await syncAndAuditGateways({ host: "127.0.0.1", port: remote.port, apiToken }, onLog);
   return {
     host: "127.0.0.1",
     port: remote.port,
@@ -938,11 +1230,26 @@ async function connectRemoteGateway(cfg, { onLog, forceTunnel = false } = {}) {
     gatewayPort: remote.port,
     connectionType: "remote-tunnel",
     imageRef: remote.imageRef,
+    apiToken,
   };
 }
 
+// Vault-aware wrapper around connectRemoteGatewayWithKeyPath: `cfg.gatewayId`
+// (a GUI-managed gateway) is resolved to a real, temporary decrypted key
+// file for the duration of the connect attempt; `cfg.sshKey` (a literal
+// path -- the scripted/env-var deploy case, or no key at all) is passed
+// through unchanged. See withGatewayKeyFile's own comment for why this
+// branch lives in exactly one place.
+async function connectRemoteGateway(cfg, opts = {}) {
+  if (!cfg.gatewayId) return connectRemoteGatewayWithKeyPath(cfg, opts);
+  return withDecryptedGatewayKeyFile(cfg.gatewayId, (keyPath) => connectRemoteGatewayWithKeyPath({ ...cfg, sshKey: keyPath }, opts), {
+    safeStorage,
+    getPassphraseKey: ensureVaultUnlocked,
+  });
+}
+
 let wizardWindow = null;
-function runSetupWizard() {
+function runSetupWizard(dockerDetected) {
   return new Promise((resolve, reject) => {
     let settled = false;
     wizardWindow = new BrowserWindow({
@@ -975,7 +1282,10 @@ function runSetupWizard() {
     });
     wizardWindow.setMenuBarVisibility(false);
     attachEditContextMenu(wizardWindow);
-    wizardWindow.loadFile(path.join(__dirname, "renderer", "gateway-setup.html"), { search: "mode=new" });
+    const showSkip = shouldShowSkipButton({ mode: "new", dockerDetected });
+    wizardWindow.loadFile(path.join(__dirname, "renderer", "gateway-setup.html"), {
+      search: `mode=new&skip=${showSkip ? "1" : "0"}`,
+    });
     wizardWindow.on("closed", () => {
       // The splash was already closed once this window's own 'ready-to-show'
       // fired, so this window closing (successfully submitted, or
@@ -1005,19 +1315,27 @@ function runSetupWizard() {
         serverConnectionType = remote.connectionType;
         activeSshTarget = cfg.sshTarget;
         activeSshPort = cfg.sshPort;
+        currentApiToken = remote.apiToken;
         saveConnectionConfig(cfg);
         recordGateway({
+          id: cfg.gatewayId,
           mode: "remote",
           host: remote.gatewayHost,
           port: remote.gatewayPort,
           label: cfg.sshTarget,
           sshTarget: cfg.sshTarget,
-          sshKey: cfg.sshKey,
+          sshKey: undefined,
+          hasSshKey: true,
           ...(cfg.sshPort ? { sshPort: cfg.sshPort } : {}),
           connectionType: remote.connectionType,
           imageRef: remote.imageRef,
         });
-        await checkServerHostDocker(remote.host, remote.port, (line) => wizardWindow?.webContents.send("setup-log", line));
+        await checkServerHostDocker(
+          remote.host,
+          remote.port,
+          (line) => wizardWindow?.webContents.send("setup-log", line),
+          remote.apiToken
+        );
         settled = true;
         ipcMain.removeHandler("gateway-setup-submit");
         wizardWindow.destroy();
@@ -1045,7 +1363,7 @@ async function reconnectMainWindow() {
   }
   if (mainWindow && !mainWindow.isDestroyed()) {
     await mainWindow.loadFile(path.join(__dirname, "renderer", "index.html"), {
-      search: `host=${serverHost}&port=${serverPort}`,
+      search: `host=${serverHost}&port=${serverPort}&token=${currentApiToken || ""}`,
     });
   } else {
     await createWindow();
@@ -1090,6 +1408,12 @@ ipcMain.handle("set-selected-containers", (_e, hostKey, names) => {
   writeSelectedContainers(hostKey, names);
   return { ok: true };
 });
+// "Remove Docker Daemon" (permanently forgetting a saved daemon, as opposed
+// to Disconnect's "stop for now") deletes its selection file on disk too.
+ipcMain.handle("delete-selected-containers", (_e, hostKey) => {
+  deleteSelectedContainers(hostKey);
+  return { ok: true };
+});
 
 // Backs the status pill's "(tunnel)" suffix and its right-click details
 // popup (see app.js): what kind of connection this actually is right now
@@ -1106,6 +1430,65 @@ ipcMain.handle("get-connection-info", () => ({
   sshTarget: activeSshTarget,
   sshPort: activeSshPort,
 }));
+
+// Developer-only Redis CLI (Help > Developers > Redis CLI…) -- runs a raw
+// command against whichever target's internal Redis is currently active.
+// Deliberately just a plain fetch to the already-resolved serverHost/
+// serverPort, same as claimGatewayOwnership/syncAndAuditGateways below --
+// "the currently active target" is already fully described by those two
+// variables (embedded or remote gateway alike), so no new connection
+// (SSH tunnel, direct Redis TCP) is ever opened for this.
+ipcMain.handle("redis-cli-run", async (_e, argv) => {
+  try {
+    const res = await fetch(`http://${serverHost}:${serverPort}/admin/redis-cli`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(currentApiToken ? { "X-CTTC-Token": currentApiToken } : {}) },
+      body: JSON.stringify({ argv }),
+    });
+    return await res.json();
+  } catch (err) {
+    return { type: "error", value: String(err.message || err) };
+  }
+});
+
+// Records a Docker host under the currently-active gateway's own catalog in
+// gateways.json (see recordDockerHostForGateway) -- called from the
+// renderer right after a Connect/Update Docker Host submission succeeds, so
+// gateways.json ends up holding every Docker host actually created/used
+// through it, not just the renderer's own gateway-agnostic history.
+ipcMain.handle("record-docker-host", (_e, dockerHostEntry) => {
+  // Embedded ("This machine") gateways are otherwise only ever written to
+  // gateways.json lazily, on switch-away (recordCurrentGateway) -- without
+  // this, a session that never switches gateways has no entry here at all
+  // for recordDockerHostForGateway to attach to.
+  recordCurrentGateway();
+  const key = gatewayKey({ host: activeGatewayHost, port: activeGatewayPort });
+  return recordDockerHostForGateway(key, dockerHostEntry);
+});
+
+// gateways.json's dockerHosts[] (for the active gateway) is now the sole
+// source for the Connect/Remove Docker Host dialogs' history/dropdown --
+// see docker-host/state.ts's dockerHostHistory(). Retired entries (see
+// retire-docker-host below) are filtered out here rather than by every
+// caller separately.
+ipcMain.handle("get-docker-hosts", () => {
+  recordCurrentGateway();
+  const key = gatewayKey({ host: activeGatewayHost, port: activeGatewayPort });
+  const gw = readGateways().find((g) => gatewayKey(g) === key);
+  return (gw?.dockerHosts || []).filter((h) => !h.retired);
+});
+
+// Soft-deletes one Docker host from the active gateway's own catalog (see
+// retireDockerHost) -- replaces the renderer's former direct localStorage
+// mutation in remove-dialog.ts, which never touched gateways.json at all
+// (the actual root of "Remove Docker Host" losing track of a host: three
+// independent, unreconciled stores, only one of which this ever wrote to).
+ipcMain.handle("retire-docker-host", (_e, hostIdOrKey) => {
+  const key = gatewayKey({ host: activeGatewayHost, port: activeGatewayPort });
+  const list = retireDockerHost(key, hostIdOrKey);
+  const gw = list.find((g) => gatewayKey(g) === key);
+  return (gw?.dockerHosts || []).filter((h) => !h.retired);
+});
 
 // Read-only: lets the dropdown flag a gateway as unreachable without
 // switching to it or changing anything -- purely informational, including
@@ -1142,7 +1525,7 @@ ipcMain.handle("switch-gateway", async (_e, entry) => {
 
   if (entry.mode === "embedded") {
     if (!isUnprovisionedLocal && !(await checkGatewayReachable(entry))) {
-      const current = listGatewaysWithActiveFlag().find((g) => g.active);
+      const current = (await listGatewaysWithActiveFlag()).find((g) => g.active);
       const currentLabel = current?.label || (activeGatewayHost === "127.0.0.1" ? "This machine" : activeGatewayHost);
       return {
         ok: false,
@@ -1165,6 +1548,9 @@ ipcMain.handle("switch-gateway", async (_e, entry) => {
       serverConnectionType = "local";
       activeSshTarget = null;
       activeSshPort = undefined;
+      // Already provisioned (not re-running ensureLocalContainer here) --
+      // just retrieves the same token generated back then.
+      currentApiToken = getOrCreateApiToken("embedded");
     }
     await reconnectMainWindow();
     return { ok: true };
@@ -1174,7 +1560,10 @@ ipcMain.handle("switch-gateway", async (_e, entry) => {
   const alreadyKnown = readGateways().some((g) => gatewayKey(g) === gatewayKey({ host: entry.host, port: entry.port }));
   const cfg = {
     sshTarget: entry.sshTarget,
-    sshKey: entry.sshKey,
+    // entry.sshKey (a literal path, the scripted/env-var deploy case) and
+    // entry.id/gatewayId (a GUI-managed gateway, resolved via the vault) are
+    // mutually exclusive -- see withGatewayKeyFile's own comment.
+    ...(entry.sshKey ? { sshKey: entry.sshKey } : { gatewayId: entry.id }),
     sshPort: entry.sshPort,
     remotePort: entry.port,
   };
@@ -1199,13 +1588,15 @@ ipcMain.handle("switch-gateway", async (_e, entry) => {
     serverConnectionType = result.connectionType;
     activeSshTarget = cfg.sshTarget;
     activeSshPort = cfg.sshPort;
+    currentApiToken = result.apiToken;
     recordGateway({
+      ...(cfg.gatewayId ? { id: cfg.gatewayId } : {}),
       mode: "remote",
       host: result.gatewayHost,
       port: result.gatewayPort,
       label: entry.label || cfg.sshTarget,
       sshTarget: cfg.sshTarget,
-      sshKey: cfg.sshKey,
+      ...(cfg.gatewayId ? { sshKey: undefined, hasSshKey: true } : { sshKey: cfg.sshKey }),
       ...(cfg.sshPort ? { sshPort: cfg.sshPort } : {}),
       connectionType: result.connectionType,
       imageRef: result.imageRef,
@@ -1239,19 +1630,27 @@ ipcMain.handle("gateway-add-submit", async (_e, payload) => {
     serverConnectionType = remote.connectionType;
     activeSshTarget = cfg.sshTarget;
     activeSshPort = cfg.sshPort;
+    currentApiToken = remote.apiToken;
     saveConnectionConfig(cfg);
     recordGateway({
+      id: cfg.gatewayId,
       mode: "remote",
       host: remote.gatewayHost,
       port: remote.gatewayPort,
       label: cfg.sshTarget,
       sshTarget: cfg.sshTarget,
-      sshKey: cfg.sshKey,
+      sshKey: undefined,
+      hasSshKey: true,
       ...(cfg.sshPort ? { sshPort: cfg.sshPort } : {}),
       connectionType: remote.connectionType,
       imageRef: remote.imageRef,
     });
-    await checkServerHostDocker(remote.host, remote.port, (line) => mainWindow?.webContents.send("setup-log", line));
+    await checkServerHostDocker(
+      remote.host,
+      remote.port,
+      (line) => mainWindow?.webContents.send("setup-log", line),
+      remote.apiToken
+    );
   } catch (err) {
     return { ok: false, error: err.message || String(err) };
   }
@@ -1317,6 +1716,122 @@ ipcMain.on("action-bar-poll-interval", (_e, secs) => {
   mainWindow?.webContents.send("set-poll-interval", secs);
 });
 
+// Passphrase-protected fallback for the gateway-key vault (lib/key-vault.js)
+// when safeStorage.isEncryptionAvailable() is false -- e.g. Linux without a
+// keyring backend. On the common case (macOS Keychain, Windows DPAPI, Linux
+// with a keyring) none of this is ever shown: safeStorage handles gateway
+// keys transparently and ensureVaultUnlocked's getPassphraseKey callback is
+// never invoked. Session-scoped: the derived key lives in memory only,
+// cleared on quit (see the before-quit handler below), never persisted.
+let sessionPassphraseKey = null;
+let vaultWindow = null;
+let vaultUnlockWaiters = [];
+
+function vaultIsInitialized() {
+  return keyVault.readVaultMeta() != null;
+}
+function resolveVaultWaiters(key) {
+  const waiters = vaultUnlockWaiters;
+  vaultUnlockWaiters = [];
+  for (const w of waiters) w.resolve(key);
+}
+function rejectVaultWaiters(err) {
+  const waiters = vaultUnlockWaiters;
+  vaultUnlockWaiters = [];
+  for (const w of waiters) w.reject(err);
+}
+function openVaultWindow(mode) {
+  if (vaultWindow && !vaultWindow.isDestroyed()) {
+    vaultWindow.focus();
+    return;
+  }
+  vaultWindow = new BrowserWindow({
+    width: 380,
+    height: 260,
+    minWidth: 320,
+    minHeight: 220,
+    icon: APP_ICON,
+    show: false,
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+  vaultWindow.once("ready-to-show", () => vaultWindow.show());
+  vaultWindow.setMenuBarVisibility(false);
+  vaultWindow.loadFile(path.join(__dirname, "renderer", "vault.html"), { search: `mode=${mode}` });
+  // Closing by any means (OS close control, Cancel button, Escape) without
+  // having unlocked/set up must reject every pending waiter -- otherwise
+  // whatever key operation asked for this (a gateway connect/save/uninstall)
+  // would hang forever instead of failing cleanly.
+  vaultWindow.on("closed", () => {
+    vaultWindow = null;
+    rejectVaultWaiters(new Error("Secure Storage was closed before it was unlocked."));
+  });
+}
+function closeVaultWindow() {
+  if (vaultWindow && !vaultWindow.isDestroyed()) vaultWindow.close();
+}
+
+/**
+ * Resolves to the passphrase-derived key for the vault's fallback scheme,
+ * unlocking it first (opening the prompt window and waiting on the user) if
+ * it isn't already unlocked this session. Only ever called for the fallback
+ * scheme (see key-vault.js's readEntry/writeEntry) -- a machine with a
+ * working safeStorage never invokes this at all.
+ */
+function ensureVaultUnlocked() {
+  if (sessionPassphraseKey) return Promise.resolve(sessionPassphraseKey);
+  return new Promise((resolve, reject) => {
+    vaultUnlockWaiters.push({ resolve, reject });
+    openVaultWindow(vaultIsInitialized() ? "unlock" : "setup");
+  });
+}
+
+// The single choke point for "give me a real file for this gateway's key" --
+// resolves the one real ambiguity in gateway key storage: `entry.sshKey` is
+// a literal filesystem path for a gateway recorded from a scripted/env-var
+// deploy (CTTC_SSH_KEY/connection.json's ssh_key, see lib/connection-
+// config.js) and must never be routed through the vault; `entry.id` (a
+// GUI-managed gateway) is the vault lookup key otherwise. Every caller that
+// used to read `.sshKey` directly goes through this now, so that branch
+// can't be silently reintroduced at just one call site.
+async function withGatewayKeyFile(entry, fn) {
+  if (entry.sshKey) return fn(entry.sshKey);
+  if (!entry.id) return fn(null);
+  return withDecryptedGatewayKeyFile(entry.id, fn, { safeStorage, getPassphraseKey: ensureVaultUnlocked });
+}
+
+ipcMain.handle("vault-status", () => ({
+  safeStorageAvailable: safeStorage.isEncryptionAvailable(),
+  needsSetup: !vaultIsInitialized(),
+  locked: !safeStorage.isEncryptionAvailable() && !sessionPassphraseKey,
+}));
+ipcMain.handle("vault-setup", (_e, { passphrase, confirm }) => {
+  if (!passphrase || passphrase.length < 8) {
+    return { ok: false, error: "Choose a passphrase at least 8 characters long." };
+  }
+  if (passphrase !== confirm) return { ok: false, error: "Passphrases don't match." };
+  sessionPassphraseKey = keyVault.setupPassphrase(passphrase);
+  resolveVaultWaiters(sessionPassphraseKey);
+  closeVaultWindow();
+  return { ok: true };
+});
+ipcMain.handle("vault-unlock", (_e, { passphrase }) => {
+  const key = keyVault.verifyPassphrase(passphrase);
+  if (!key) return { ok: false, error: "Wrong passphrase." };
+  sessionPassphraseKey = key;
+  resolveVaultWaiters(sessionPassphraseKey);
+  closeVaultWindow();
+  return { ok: true };
+});
+ipcMain.handle("vault-cancel", () => {
+  rejectVaultWaiters(new Error("Secure Storage unlock was cancelled."));
+  closeVaultWindow();
+});
+ipcMain.handle("open-vault-window", () => openVaultWindow(vaultIsInitialized() ? "unlock" : "setup"));
+
 // nativeTheme.themeSource is process-wide (affects every window's
 // prefers-color-scheme match, plus native dialogs/menus), so this doesn't
 // need per-window plumbing the way the other renderer-owned settings do --
@@ -1373,7 +1888,10 @@ ipcMain.handle("ship-logs", async () => {
   const entries = localFiles.map((p) => ({ name: path.basename(p), data: fs.readFileSync(p) }));
 
   try {
-    const res = await fetch(`http://${serverHost}:${serverPort}/mlog`, { signal: AbortSignal.timeout(20000) });
+    const res = await fetch(`http://${serverHost}:${serverPort}/mlog`, {
+      signal: AbortSignal.timeout(20000),
+      ...(currentApiToken ? { headers: { "X-CTTC-Token": currentApiToken } } : {}),
+    });
     const gatewayName = res.headers.get("X-CTTC-Gateway-Name") || "gateway";
     const bytes = Buffer.from(await res.arrayBuffer());
     entries.push({ name: `${gatewayName}.log`, data: bytes });
@@ -1428,15 +1946,28 @@ ipcMain.handle("gateway-manage-save", async (_e, payload) => {
     // rather than a registry lookup, since the never-provisioned "This
     // machine" placeholder (see get-gateways) was never actually recorded.
     if (payload.mode === "embedded") {
+      const apiToken = getOrCreateApiToken("embedded");
       const { port } = await ensureLocalContainer({
         source: payload.imageSource || undefined,
         resourcesDir: resourcesDirForApp(),
+        apiToken,
         onLog: mainLog,
       });
-      recordGateway({ mode: "embedded", host: "127.0.0.1", port, label: "This machine", connectionType: "local" });
+      recordGateway({
+        mode: "embedded",
+        host: "127.0.0.1",
+        port,
+        label: "This machine",
+        connectionType: "local",
+        // br-PROV-007: remembered so a later Uninstall resolves the same
+        // compose file this was actually provisioned with, instead of always
+        // falling back to the bundled/default one -- see uninstallLocalContainer.
+        ...(payload.imageSource ? { imageSource: payload.imageSource } : {}),
+      });
       if (activeGatewayHost === "127.0.0.1" && serverConnectionType === "local") {
         serverPort = port;
         activeGatewayPort = port;
+        currentApiToken = apiToken;
         await offerRestart("Reconnect CTTC to apply the updated image?");
       }
       return { ok: true };
@@ -1445,11 +1976,20 @@ ipcMain.handle("gateway-manage-save", async (_e, payload) => {
     const existing = readGateways().find((g) => gatewayKey(g) === payload.key);
     if (!existing) return { ok: false, error: "That gateway no longer exists -- refresh the list." };
 
-    const sshKey =
-      payload.keyMode === "paste" ? writeKeyFile(payload.keyContents) : copyKeyFile(payload.keyPath);
+    // "keep" (see renderer's gwFillFormForEdit): editing this gateway's
+    // host/port/image without touching its key -- reuses whatever key it
+    // already has (vault-managed via its id, or a literal scripted path)
+    // rather than requiring one be re-entered on every unrelated edit.
+    const keyOpts = { safeStorage, getPassphraseKey: ensureVaultUnlocked };
+    if (payload.keyMode === "paste") await writeGatewayKey(existing.id, payload.keyContents, keyOpts);
+    else if (payload.keyMode === "path") await copyGatewayKey(existing.id, payload.keyPath, keyOpts);
     const cfg = {
       sshTarget: `${payload.sshUser}@${payload.sshHost}`,
-      sshKey,
+      ...(payload.keyMode === "keep"
+        ? existing.sshKey
+          ? { sshKey: existing.sshKey }
+          : { gatewayId: existing.id }
+        : { gatewayId: existing.id }),
       sshPort: payload.sshPort,
       remotePort: 8765,
       imageSource: payload.imageSource || undefined,
@@ -1457,28 +1997,42 @@ ipcMain.handle("gateway-manage-save", async (_e, payload) => {
     const wasActive = payload.key === gatewayKey({ host: activeGatewayHost, port: activeGatewayPort });
     // Only reconnects the transport (direct vs tunnel) if this is the
     // *active* gateway -- otherwise it's just re-provisioned in place,
-    // same as before, with nothing to reconnect.
+    // same as before, with nothing to reconnect. Either way it's the same
+    // persisted token (br-NET-004, see lib/api-token.js) -- connectRemoteGateway
+    // resolves its own copy internally for the wasActive path below.
+    const apiToken = getOrCreateApiToken(hostFromTarget(cfg.sshTarget));
     const result = wasActive
       ? await connectRemoteGateway(cfg, { onLog: (line) => mainWindow?.webContents.send("setup-log", line) })
-      : await ensureRemoteContainer(cfg, {
-          sshBin: process.env.CTTC_SSH_BIN || "ssh",
-          source: cfg.imageSource,
-          onLog: (line) => mainWindow?.webContents.send("setup-log", line),
-        });
+      : // Bypasses connectRemoteGateway's own vault-aware dispatcher (it
+        // only ever re-provisions here, no health-check/tunnel decision to
+        // make), so the vault resolution has to happen by hand -- easy to
+        // miss since this looks like a peer of the wasActive branch above.
+        await withGatewayKeyFile({ sshKey: cfg.sshKey, id: cfg.gatewayId }, (keyPath) =>
+          ensureRemoteContainer(
+            { ...cfg, sshKey: keyPath },
+            {
+              sshBin: process.env.CTTC_SSH_BIN || "ssh",
+              source: cfg.imageSource,
+              apiToken,
+              onLog: (line) => mainWindow?.webContents.send("setup-log", line),
+            }
+          )
+        );
     const gatewayHost = result.gatewayHost || result.host;
     const gatewayPort = result.gatewayPort || result.port;
     recordGateway({
+      ...(cfg.gatewayId ? { id: cfg.gatewayId } : {}),
       mode: "remote",
       host: gatewayHost,
       port: gatewayPort,
       label: cfg.sshTarget,
       sshTarget: cfg.sshTarget,
-      sshKey: cfg.sshKey,
+      ...(cfg.gatewayId ? { sshKey: undefined, hasSshKey: true } : { sshKey: cfg.sshKey }),
       ...(cfg.sshPort ? { sshPort: cfg.sshPort } : {}),
       connectionType: result.connectionType || existing.connectionType || "remote",
       imageRef: result.imageRef,
     });
-    if (gatewayKey({ host: gatewayHost, port: gatewayPort }) !== payload.key) removeGateway(payload.key);
+    if (gatewayKey({ host: gatewayHost, port: gatewayPort }) !== payload.key) retireGateway(payload.key);
     if (wasActive) {
       saveConnectionConfig(cfg);
       serverHost = result.host;
@@ -1488,6 +2042,7 @@ ipcMain.handle("gateway-manage-save", async (_e, payload) => {
       serverConnectionType = result.connectionType;
       activeSshTarget = cfg.sshTarget;
       activeSshPort = cfg.sshPort;
+      currentApiToken = result.apiToken;
       await offerRestart("Reconnect CTTC to apply the updated gateway settings?");
     }
     return { ok: true };
@@ -1509,14 +2064,25 @@ ipcMain.handle("gateway-manage-uninstall", async (_e, entry) => {
   const onLog = (line) => mainWindow?.webContents.send("setup-log", line);
   try {
     if (entry.mode === "embedded") {
-      await uninstallLocalContainer({ resourcesDir: resourcesDirForApp(), onLog });
+      // br-PROV-007: pass back whatever source this entry was actually
+      // provisioned with (see recordGateway above in gateway-manage-save),
+      // so uninstall resolves the same compose file instead of the default.
+      await uninstallLocalContainer({ source: entry.imageSource, resourcesDir: resourcesDirForApp(), onLog });
     } else {
-      await uninstallRemoteContainer(
-        { sshTarget: entry.sshTarget, sshKey: entry.sshKey, sshPort: entry.sshPort },
-        { sshBin: process.env.CTTC_SSH_BIN || "ssh", onLog }
+      await withGatewayKeyFile(entry, (keyPath) =>
+        uninstallRemoteContainer(
+          { sshTarget: entry.sshTarget, sshKey: keyPath, sshPort: entry.sshPort },
+          { sshBin: process.env.CTTC_SSH_BIN || "ssh", onLog }
+        )
       );
     }
-    removeGateway(gatewayKey(entry));
+    retireGateway(entry.id || gatewayKey(entry));
+    // A retired gateway's admin key no longer needs to exist -- best-effort,
+    // never blocks the uninstall itself on a vault hiccup.
+    if (entry.id) await deleteGatewayKey(entry.id, {}).catch(() => {});
+    // So a stale token isn't silently reused if this same host is ever
+    // re-provisioned as a fresh gateway later (br-NET-004).
+    forgetApiToken(entry.mode === "embedded" ? "embedded" : hostFromTarget(entry.sshTarget));
     const wasActive = isActiveGateway(entry);
     if (wasActive) {
       // stopServer() (not just clearCurrentTunnel()) so a bare `uv run
@@ -1546,11 +2112,18 @@ ipcMain.handle("gateway-manage-uninstall", async (_e, entry) => {
     }
     return { ok: true };
   } catch (err) {
-    await checkStillInstalled(entry, {
-      resourcesDir: resourcesDirForApp(),
-      sshBin: process.env.CTTC_SSH_BIN || "ssh",
-      onLog,
-    });
+    // Best-effort diagnostics only -- a failure here (e.g. a cancelled
+    // vault unlock) must never mask the real uninstall error below.
+    try {
+      await withGatewayKeyFile(entry, (keyPath) =>
+        checkStillInstalled(
+          { ...entry, sshKey: keyPath },
+          { resourcesDir: resourcesDirForApp(), sshBin: process.env.CTTC_SSH_BIN || "ssh", onLog }
+        )
+      );
+    } catch {
+      /* diagnostics only -- see comment above */
+    }
     return { ok: false, error: err.message || String(err) };
   }
 });
@@ -1594,6 +2167,40 @@ app.whenReady().then(async () => {
       startLogCollector(logSettings.dir);
     }
   }
+  // One-time (per launch), idempotent migration of the old, single, shared
+  // plaintext ~/.cttc/keys/cttc_ssh_key into the new per-gateway encrypted
+  // vault (see lib/key-vault.js/lib/ssh-key-file.js) -- must run after
+  // safeStorage is actually usable (app.whenReady() has fired) but before
+  // anything else consumes gateways.json's sshKey field. Never blocks
+  // startup or prompts for a passphrase (migrateLegacyGatewayKeys' own
+  // contract): a failure, or a not-yet-set-up vault, just leaves the legacy
+  // file in place for the next launch to retry.
+  try {
+    const migration = await migrateLegacyGatewayKeys({
+      gateways: readGateways(),
+      safeStorage,
+      getPassphraseKey: ensureVaultUnlocked,
+      onLog: mainLog,
+    });
+    if (migration) {
+      for (const g of migration.migrated) recordGateway({ id: g.id, ...g, sshKey: undefined, hasSshKey: true });
+      if (migration.failed.length === 0 && migration.migrated.length > 0) {
+        fs.rmSync(migration.legacyPath, { force: true });
+        mainLog(`[vault] removed the old shared plaintext key file (${migration.legacyPath})`);
+        // connection.json may also still reference the same legacy path (a
+        // GUI-managed remote connection that predates the vault) -- point it
+        // at the matching gateway's id instead, same as the gateways.json
+        // records above.
+        const connCfg = loadConnectionConfig();
+        if (connCfg.mode === "remote" && connCfg.sshKey === migration.legacyPath) {
+          const matched = migration.migrated.find((g) => g.sshTarget === connCfg.sshTarget);
+          if (matched) saveConnectionConfig({ ...connCfg, gatewayId: matched.id, sshKey: undefined });
+        }
+      }
+    }
+  } catch (err) {
+    mainError(`[vault] gateway key migration failed (${err.message || err}) -- will retry next launch`);
+  }
   try {
     // files passed on the command line open at startup: npm start -- file1 file2
     const fileArgs = process.argv.slice(app.isPackaged ? 1 : 2).filter((a) => !a.startsWith("-"));
@@ -1601,7 +2208,12 @@ app.whenReady().then(async () => {
     narrate("checking for a local Docker installation...");
     if (cfg.mode === "embedded" && !(await canBeServerLocally())) {
       try {
-        await runSetupWizard();
+        // A separate, more granular probe than canBeServerLocally() (which
+        // also requires ssh, needed for reaching *other* Docker hosts, not
+        // just running the gateway locally) -- "Skip -- use this machine"
+        // inside the wizard only makes sense to offer when Docker itself is
+        // actually present to fall back to.
+        await runSetupWizard(await hasLocalDocker());
       } catch {
         // declined (Skip, or just closed the window) -- give local docker a
         // genuine try (docker compose up) rather than trusting the earlier
@@ -1610,7 +2222,8 @@ app.whenReady().then(async () => {
         // embedded server if that attempt itself fails.
         try {
           narrate("starting the local gateway container...");
-          const { port } = await ensureLocalContainer({ resourcesDir: resourcesDirForApp(), onLog: mainLog });
+          const apiToken = getOrCreateApiToken("embedded");
+          const { port } = await ensureLocalContainer({ resourcesDir: resourcesDirForApp(), apiToken, onLog: mainLog });
           serverHost = "127.0.0.1";
           serverPort = port;
           activeGatewayHost = "127.0.0.1";
@@ -1618,13 +2231,37 @@ app.whenReady().then(async () => {
           serverConnectionType = "local";
           activeSshTarget = null;
           activeSshPort = undefined;
+          currentApiToken = apiToken;
           mainLog(`[docker] server container running locally — port ${serverPort}`);
         } catch {
           narrate("starting the server...");
+          currentApiToken = null; // bare/native, 127.0.0.1-only -- never needed one (br-NET-004)
           await startServer(fileArgs);
         }
       }
     } else {
+      // Both a local Docker container and a bare native process are viable
+      // here (that's what canBeServerLocally() just confirmed) -- ask the
+      // user once, the first time this machine ever reaches this point, and
+      // remember the answer (connectToServer() reads cfg.runMode from here
+      // on, so this never re-prompts).
+      if (app.isPackaged && cfg.mode === "embedded" && cfg.runMode === undefined && (await hasLocalDocker())) {
+        const { response } = await dialog.showMessageBox({
+          type: "question",
+          icon: APP_ICON,
+          title: "Run CTTC Timeline locally",
+          message: "How should the local gateway run?",
+          detail:
+            "Docker is available on this machine, so there are two ways to run the gateway that collects and stores your logs/telemetry:\n\n" +
+            "• As a container (recommended) -- self-contained, bundles everything it needs (including its Redis data store), matches how CTTC runs in production.\n\n" +
+            "• Natively -- runs directly as a process on this machine instead, no Docker involved after this point. Requires `redis-server` to already be installed and on this machine's PATH.\n\n" +
+            "This is remembered for next time; you won't be asked again.",
+          buttons: ["Run as a container", "Run natively"],
+          defaultId: 0,
+          cancelId: 0,
+        });
+        saveRunMode(response === 1 ? "native" : "container");
+      }
       await connectToServer(fileArgs);
     }
   } catch (err) {
@@ -1656,21 +2293,50 @@ function stopServer() {
   // process's own child: there's nothing local to tear down, and this
   // process must never POST /shutdown to it. Only a bare `uv run server.py`
   // (serverProc) is actually owned by this process.
-  if (serverProc) {
-    try {
-      // graceful: lets the server stop docker collectors and ssh sessions
-      fetch(`http://${serverHost}:${serverPort}/shutdown`, { method: "POST" }).catch(() => {});
-      setTimeout(() => serverProc && serverProc.kill(), 1500);
-    } catch {
-      serverProc.kill();
-    }
-  }
+  //
+  // Returns a promise that resolves once serverProc has actually exited
+  // (gracefully, or via gracefulStop's own fallback kill) -- see
+  // lib/graceful-stop.js and the before-quit handler below (br-EMBED-002).
+  return gracefulStop(serverProc, {
+    stopUrl: `http://${serverHost}:${serverPort}/shutdown`,
+    onLog: mainLog,
+  });
 }
 
 app.on("window-all-closed", () => {
-  stopServer();
-  stopLogCollector();
+  // Just triggers the real teardown below -- app.quit() always fires
+  // before-quit first, which is the one place stopServer()/stopLogCollector()
+  // now run (br-EMBED-002: having two independent call sites racing to stop
+  // the same process is exactly what made the fallback-kill timing bug hard
+  // to reason about in the first place).
   app.quit();
 });
-app.on("before-quit", stopServer);
-app.on("before-quit", stopLogCollector);
+// Every quit path (Quit menu/button, Cmd+Q, Dock > Quit, a window's own
+// close triggering window-all-closed above, or the app.quit() at the end of
+// this same handler on its second pass) funnels through this event -- the
+// one place to tell every still-open window's status bar a shutdown is
+// underway, then actually stop the server, before the process really exits.
+// Guarded against re-entrancy since the deferred app.quit() below re-fires
+// before-quit -- stopServer/stopLogCollector are idempotent and safely run
+// twice, but shuttingDownNotified being true means this branch is skipped
+// on that second pass, letting the quit actually proceed.
+let shuttingDownNotified = false;
+app.on("before-quit", (e) => {
+  if (shuttingDownNotified) return;
+  shuttingDownNotified = true;
+  e.preventDefault();
+  for (const w of BrowserWindow.getAllWindows()) {
+    if (!w.isDestroyed()) w.webContents.send("app-shutting-down");
+  }
+  stopLogCollector();
+  sessionPassphraseKey = null; // the vault's fallback-scheme key is session-only, never persisted
+  // br-EMBED-002: the re-quit below must wait for stopServer()'s own
+  // graceful-shutdown/fallback-kill sequence to actually finish, not fire on
+  // a fixed timer that races past it -- otherwise a wedged (or silently
+  // failed-to-POST) embedded server was never actually killed, because the
+  // app had already force-quit by the time gracefulStop's 1500ms fallback
+  // timer would have run. The 200ms floor alongside it is kept only so the
+  // "shutting down" broadcast above still gets at least one paint even when
+  // stopServer() resolves almost instantly (no serverProc to stop at all).
+  Promise.all([stopServer(), new Promise((resolve) => setTimeout(resolve, 200))]).then(() => app.quit());
+});

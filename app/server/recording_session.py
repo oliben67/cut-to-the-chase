@@ -1,11 +1,11 @@
 """Recording sessions: on-demand or scheduler-triggered captures that
 accumulate server-side and are collected by the client afterward.
 
-Like rolling_buffer.py, a session doesn't duplicate any data -- Source.rows/
-Source.series already retain unbounded in-memory history, so start() just
-snapshots {source_ids, start_ts} and the actual [start, end] window is
-sliced lazily out of that already-resident data once the session ends,
-via State.build_sample_bytes(). Unlike the rolling buffer (which hands the
+Like rolling_buffer.py, a session doesn't duplicate any data -- Redis
+already retains bounded history for every source (see redis_log.py), so
+start() just snapshots {source_ids, start_ts} and the actual [start, end]
+window is sliced lazily out of Redis once the session ends, via
+State.build_sample_bytes(). Unlike the rolling buffer (which hands the
 slice straight back to the caller of stop()), a session's result is a
 .cttc-record file written to `sessions_dir` and left there for the client
 to collect at its own pace -- start() returns a session_id immediately,
@@ -27,6 +27,7 @@ gateway could erase it before the client has even finished recording it.
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,6 +37,8 @@ from cttc_format import METRIC_EXT, RECORD_EXT
 
 if TYPE_CHECKING:
     from server import State
+
+logger = logging.getLogger("cttc")
 
 DEFAULT_TTL_SECONDS = 24 * 3600.0
 
@@ -67,6 +70,56 @@ class RecordingSessionManager:
         self._sessions: dict[str, RecordingSession] = {}
         self._next_id = 1
         self.default_ttl_seconds = DEFAULT_TTL_SECONDS
+        self._reclaim_orphaned_archives()
+
+    def _reclaim_orphaned_archives(self) -> None:
+        """br-RECS-013: `_sessions` is in-memory only, but _finish()/
+        store_precomputed() write real archive files to `sessions_dir` --
+        on a gateway restart this dict starts empty while any files from
+        the previous lifetime remain on disk. Left alone, that broke two
+        things: those files were never reclaimed by the TTL sweep (which
+        only ever walks `_sessions`), leaking disk space forever; and
+        `_next_id` restarting at 1 meant the very next new session could
+        silently overwrite an old, possibly not-yet-downloaded archive
+        under the exact same filename.
+
+        Re-registering each found file here as an already-`"completed"`
+        session (`stored_ts` backdated to the file's own mtime) fixes
+        both: the ordinary TTL sweep now naturally reclaims it once its
+        usual retention window has passed, it stays downloadable via its
+        original session_id until then, and `_next_id` is advanced past
+        every id found so a fresh session can never collide with one of
+        these again."""
+        highest = 0
+        for ext in (RECORD_EXT, METRIC_EXT):
+            for path in sorted(self._dir.glob(f"rec*{ext}")):
+                stem = path.name[: -len(ext)]
+                suffix = stem[3:]
+                if not stem.startswith("rec") or not suffix.isdigit():
+                    continue  # not one of ours -- leave whatever it is alone
+                highest = max(highest, int(suffix))
+                if stem in self._sessions:
+                    continue  # a same-id file under the other extension was already found
+                try:
+                    mtime = path.stat().st_mtime * 1000.0
+                except OSError:
+                    continue
+                self._sessions[stem] = RecordingSession(
+                    id=stem,
+                    source_ids=set(),
+                    start_ts=mtime,
+                    duration_minutes=None,
+                    status="completed",
+                    end_ts=mtime,
+                    path=path,
+                    stored_ts=mtime,
+                )
+        self._next_id = highest + 1
+        if self._sessions:
+            logger.info(
+                "recording_session: reclaimed %d orphaned archive(s) from a previous restart",
+                len(self._sessions),
+            )
 
     def set_default_ttl(self, seconds: float) -> None:
         self.default_ttl_seconds = seconds
@@ -135,13 +188,13 @@ class RecordingSessionManager:
         sess.safe = True
         sess.max_keep_seconds = max_keep_seconds
 
-    def stop(self, session_id: str) -> None:
+    async def stop(self, session_id: str) -> None:
         """End a running session now. A no-op if it's already completed."""
         sess = self._require(session_id)
         if sess.status == "running":
-            self._finish(sess, time.time() * 1000.0)
+            await self._finish(sess, time.time() * 1000.0)
 
-    def tick(self, now: float | None = None) -> None:
+    async def tick(self, now: float | None = None) -> None:
         """Finish any running session whose planned duration has elapsed,
         then sweep expired completed sessions off disk. Called periodically
         from server.py's background loop."""
@@ -152,7 +205,10 @@ class RecordingSessionManager:
                 and sess.duration_minutes is not None
                 and now - sess.start_ts >= sess.duration_minutes * 60_000.0
             ):
-                self._finish(sess, sess.start_ts + sess.duration_minutes * 60_000.0)
+                try:
+                    await self._finish(sess, sess.start_ts + sess.duration_minutes * 60_000.0)
+                except Exception:
+                    logger.exception("recording_session: failed to finish session %s", sess.id)
         self._sweep(now)
 
     def status_of(self, session_id: str) -> dict:
@@ -170,8 +226,8 @@ class RecordingSessionManager:
             raise UnknownSession(session_id)
         return sess.path.read_bytes()
 
-    def _finish(self, sess: RecordingSession, end_ts: float) -> None:
-        data, _meta = self._state.build_sample_bytes(
+    async def _finish(self, sess: RecordingSession, end_ts: float) -> None:
+        data, _ = await self._state.build_sample_bytes(
             sess.start_ts, end_ts, source_ids=sess.source_ids
         )
         path = self._dir / f"{sess.id}{RECORD_EXT}"

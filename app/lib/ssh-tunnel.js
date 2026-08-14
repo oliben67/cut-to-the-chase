@@ -36,7 +36,10 @@ function sshTunnelArgs({ sshTarget, sshKey, sshPort, containerPort }) {
  * @param {{sshTarget: string, sshKey: string|null, sshPort?: number, containerPort: number}} cfg
  * @returns {Promise<{proc: import("child_process").ChildProcess}>}
  */
-async function openSshTunnel(cfg, { spawnFn = spawn, sshBin = "ssh", onLog, onUnexpectedExit } = {}) {
+async function openSshTunnel(
+  cfg,
+  { spawnFn = spawn, sshBin = "ssh", onLog, onUnexpectedExit, readyTimeoutMs = 15000 } = {}
+) {
   // Refuse to shadow whatever's already using this port locally: the
   // readiness check below is just "is *something* listening on
   // 127.0.0.1:containerPort", which a leftover local "This machine"
@@ -84,7 +87,7 @@ async function openSshTunnel(cfg, { spawnFn = spawn, sshBin = "ssh", onLog, onUn
     });
   });
 
-  const readyPromise = waitForPortOpen("127.0.0.1", cfg.containerPort, { timeoutMs: 15000 }).then(() => {
+  const readyPromise = waitForPortOpen("127.0.0.1", cfg.containerPort, { timeoutMs: readyTimeoutMs }).then(() => {
     if (exited) throw new Error("ssh tunnel exited before the forwarded port opened");
     onLog?.(`ssh tunnel established (pid ${proc.pid}): 127.0.0.1:${cfg.containerPort} -> ${cfg.sshTarget}:${cfg.containerPort}`);
     // Once we're past the race above, nothing else is watching this process
@@ -101,7 +104,30 @@ async function openSshTunnel(cfg, { spawnFn = spawn, sshBin = "ssh", onLog, onUn
     return { proc };
   });
 
-  return Promise.race([readyPromise, exitPromise]);
+  try {
+    return await Promise.race([readyPromise, exitPromise]);
+  } catch (err) {
+    // br-TUNL-007: whichever branch lost the race, the spawned process must
+    // not be left running. If `exited` is already true (the exitPromise
+    // branch), the process is dead and this is a no-op. But if `readyPromise`
+    // lost by timing out while ssh was still mid-handshake (slow link,
+    // suppressed MFA prompt), ssh keeps running in the background and can
+    // still bind the forwarded port *after* we've already reported this
+    // connection attempt as failed -- an orphan the port-occupancy guard
+    // above can never get past on the next connect attempt, and one
+    // killOrphanedTunnels can never find either, since recordTunnel() is
+    // only ever reached on success. Killing it here, synchronously, means
+    // there's nothing left to leak: no live process, so nothing to record.
+    if (!exited && !proc.killed) {
+      onLog?.(`ssh tunnel (pid ${proc.pid}) failed to establish -- killing it`);
+      try {
+        proc.kill();
+      } catch (killErr) {
+        onLog?.(`could not kill ssh tunnel (pid ${proc.pid}) after failed establish: ${killErr.message}`);
+      }
+    }
+    throw err;
+  }
 }
 
 /** Kills a tunnel opened by openSshTunnel(). Safe to call with null/already-dead. */
