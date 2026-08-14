@@ -19,3 +19,12 @@ export function fmtClock(ms: number, withMs?: boolean): string {
   if (withMs) s += "." + p(d.getMilliseconds(), 3);
   return s;
 }
+
+// Server-side transform ids (see server/transforms/*.py) as they should
+// read anywhere in the UI -- the bare snake_case id (json_message,
+// parse_level) must never be displayed literally. "JSON" is a proper
+// acronym (special-cased); everything else just loses its underscores.
+export function formatTransformName(name: string): string {
+  if (name === "json_message") return "JSON message";
+  return name.replace(/_/g, " ");
+}

@@ -549,6 +549,60 @@ async def test_forget_daemon_on_an_unknown_host_is_a_safe_noop(redis_log_instanc
     assert {"host": "ssh://user@host"} in known
 
 
+async def test_write_ownership_writes_once_first_claim_wins(redis_log_instance):
+    rl = redis_log_instance
+    wrote_first = await rl.write_ownership({"ownerLabel": "alice"})
+    wrote_second = await rl.write_ownership({"ownerLabel": "mallory"})
+    assert wrote_first is True
+    assert wrote_second is False  # SET NX -- second call left the record untouched
+    assert await rl.read_ownership() == {"ownerLabel": "alice"}
+
+
+async def test_read_ownership_is_none_before_any_claim(redis_log_instance):
+    rl = redis_log_instance
+    assert await rl.read_ownership() is None
+
+
+async def test_overwrite_ownership_replaces_an_existing_record(redis_log_instance):
+    rl = redis_log_instance
+    await rl.write_ownership({"ownerLabel": "alice"})
+    await rl.overwrite_ownership({"ownerLabel": "bob"})
+    assert await rl.read_ownership() == {"ownerLabel": "bob"}
+
+
+async def test_remember_and_consume_nonce_is_single_use(redis_log_instance):
+    rl = redis_log_instance
+    await rl.remember_nonce("abc123", ttl_seconds=60)
+    assert await rl.consume_nonce("abc123") is True
+    assert await rl.consume_nonce("abc123") is False  # GETDEL -- already gone
+
+
+async def test_consume_nonce_never_remembered_is_a_safe_false(redis_log_instance):
+    rl = redis_log_instance
+    assert await rl.consume_nonce("never-issued") is False
+
+
+async def test_nonce_expires_on_its_own(redis_log_instance):
+    # remember_nonce's SET EX truncates ttl_seconds to an int (Redis rejects
+    # EX 0 as invalid) -- 1s is the smallest usable TTL, hence the 1.2s wait.
+    rl = redis_log_instance
+    await rl.remember_nonce("short-lived", ttl_seconds=1)
+    await asyncio.sleep(1.2)
+    assert await rl.consume_nonce("short-lived") is False
+
+
+async def test_load_gateway_list_is_empty_before_any_save(redis_log_instance):
+    rl = redis_log_instance
+    assert await rl.load_gateway_list() == {}
+
+
+async def test_save_and_load_gateway_list_round_trips(redis_log_instance):
+    rl = redis_log_instance
+    entries = {"10.0.0.5:8765": {"host": "10.0.0.5", "port": 8765, "existence": "existing"}}
+    await rl.save_gateway_list(entries)
+    assert await rl.load_gateway_list() == entries
+
+
 async def test_buffer_full_drops_and_logs_a_warning(redis_log_instance, caplog, monkeypatch):
     rl = redis_log_instance
     monkeypatch.setattr(redis_log, "MAX_BUFFERED_RECORDS", 1)

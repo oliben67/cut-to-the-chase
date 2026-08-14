@@ -5,7 +5,13 @@ const assert = require("node:assert/strict");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { loadConnectionConfig, saveRunMode, defaultConfigPath, hostFromTarget } = require("../../lib/connection-config");
+const {
+  loadConnectionConfig,
+  saveConnectionConfig,
+  saveRunMode,
+  defaultConfigPath,
+  hostFromTarget,
+} = require("../../lib/connection-config");
 
 function tmpConfigPath() {
   return path.join(fs.mkdtempSync(path.join(os.tmpdir(), "cttc-cfg-")), "connection.json");
@@ -153,4 +159,37 @@ test("saveRunMode overwrites a previous choice", () => {
   saveRunMode("container", { configPath: p });
   saveRunMode("native", { configPath: p });
   assert.deepEqual(loadConnectionConfig({ env: {}, configPath: p }), { mode: "embedded", runMode: "native" });
+});
+
+test("gateway_id in the file round-trips into loadConnectionConfig's gatewayId", () => {
+  const p = tmpConfigPath();
+  writeConfig(p, { mode: "remote", ssh_target: "deploy@host", remote_port: 8765, gateway_id: "abc-123" });
+  const got = loadConnectionConfig({ env: {}, configPath: p });
+  assert.equal(got.gatewayId, "abc-123");
+});
+
+test("gatewayId is omitted (not just falsy) when absent from the file", () => {
+  const p = tmpConfigPath();
+  writeConfig(p, { mode: "remote", ssh_target: "deploy@host", remote_port: 8765 });
+  const got = loadConnectionConfig({ env: {}, configPath: p });
+  assert.equal("gatewayId" in got, false);
+});
+
+test("saveConnectionConfig writes gateway_id and omits ssh_key when cfg.gatewayId is set", () => {
+  const p = tmpConfigPath();
+  saveConnectionConfig({ sshTarget: "deploy@host", gatewayId: "abc-123", remotePort: 8765 }, { configPath: p });
+  const onDisk = JSON.parse(fs.readFileSync(p, "utf8"));
+  assert.equal(onDisk.gateway_id, "abc-123");
+  assert.equal("ssh_key" in onDisk, false);
+  assert.deepEqual(loadConnectionConfig({ env: {}, configPath: p }), {
+    mode: "remote", host: "host", sshTarget: "deploy@host", sshKey: null, remotePort: 8765, gatewayId: "abc-123",
+  });
+});
+
+test("saveConnectionConfig writes ssh_key and omits gateway_id when cfg.gatewayId is not set", () => {
+  const p = tmpConfigPath();
+  saveConnectionConfig({ sshTarget: "deploy@host", sshKey: "/path/to/key", remotePort: 8765 }, { configPath: p });
+  const onDisk = JSON.parse(fs.readFileSync(p, "utf8"));
+  assert.equal(onDisk.ssh_key, "/path/to/key");
+  assert.equal("gateway_id" in onDisk, false);
 });

@@ -1,6 +1,6 @@
 "use strict";
 
-const { app, BrowserWindow, dialog, ipcMain, Menu, shell, nativeTheme } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain, Menu, shell, nativeTheme, safeStorage } = require("electron");
 // app.name otherwise falls back to package.json's "name" ("cttc-timeline"),
 // which is what an unpackaged dev run's Dock/taskbar hover tooltip and the
 // About dialog's title would show -- userData's default location is
@@ -12,7 +12,9 @@ const defaultUserDataDir = app.getPath("userData");
 app.setName(`CTTC v${app.getVersion()}`);
 app.setPath("userData", defaultUserDataDir);
 const { spawn } = require("child_process");
+const { randomUUID } = require("crypto");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const readline = require("readline");
 const {
@@ -24,7 +26,16 @@ const {
 } = require("./lib/connection-config");
 const { hasLocalDocker, canBeServerLocally } = require("./lib/docker-check");
 const { shouldShowSkipButton } = require("./lib/gateway-setup-visibility");
-const { writeKeyFile, copyKeyFile } = require("./lib/ssh-key-file");
+const {
+  getPublicKey,
+  writeGatewayKey,
+  copyGatewayKey,
+  withDecryptedGatewayKeyFile,
+  deleteGatewayKey,
+  migrateLegacyGatewayKeys,
+} = require("./lib/ssh-key-file");
+const keyVault = require("./lib/key-vault");
+const { auditGatewayList } = require("./lib/gateway-audit");
 const {
   ensureLocalContainer,
   ensureRemoteContainer,
@@ -32,7 +43,14 @@ const {
   uninstallRemoteContainer,
   checkStillInstalled,
 } = require("./lib/server-provision");
-const { readGateways, recordGateway, removeGateway, gatewayKey, recordDockerHostForGateway } = require("./lib/gateway-registry");
+const {
+  readGateways,
+  recordGateway,
+  retireGateway,
+  gatewayKey,
+  recordDockerHostForGateway,
+  retireDockerHost,
+} = require("./lib/gateway-registry");
 const { readSelectedContainers, writeSelectedContainers, deleteSelectedContainers } = require("./lib/container-selection");
 const { openSshTunnel, closeSshTunnel } = require("./lib/ssh-tunnel");
 const { recordTunnel, removeTunnel, killOrphanedTunnels } = require("./lib/tunnel-registry");
@@ -382,6 +400,7 @@ async function showAboutDialog() {
     "Python >=3.11 (via uv)",
     "orjson >=3.10",
     "psutil >=5.9",
+    "Redis >=5.0.0",
   ];
   const { response } = await dialog.showMessageBox({
     type: "info",
@@ -474,8 +493,8 @@ let splashWindow = null;
 function showSplash() {
   if (splashWindow && !splashWindow.isDestroyed()) return splashWindow;
   splashWindow = new BrowserWindow({
-    width: 280,
-    height: 220,
+    width: 300,
+    height: 320,
     frame: false,
     resizable: false,
     alwaysOnTop: true,
@@ -720,6 +739,22 @@ ipcMain.handle("write-binary-file", async (_e, filePath, bytes) => {
   await require("fs").promises.writeFile(filePath, Buffer.from(bytes));
 });
 
+/* ── log panel export (per-panel "Export .log" button, app.js) ────────────
+   Same dialog-first, write-later split as pick-recording-path/
+   write-binary-file above -- and for the same reason: exporting means
+   paginating through potentially every row a source has, which the
+   renderer must only do once the user has actually confirmed Save, not
+   before (the whole point of asking for the path here without touching
+   the log data at all). */
+ipcMain.handle("pick-log-export-path", async (_e, defaultName) => {
+  const r = await dialog.showSaveDialog({
+    title: "Export log",
+    defaultPath: defaultName,
+    filters: [{ name: "Log file", extensions: ["log"] }],
+  });
+  return r.canceled || !r.filePath ? null : r.filePath;
+});
+
 /* ── Events (renderer/app.js's UI-hosted event engine) ────────────────────
    A UI-hosted event's triggered snapshot/recording is saved silently (no
    save dialog -- nobody's necessarily watching when a background event
@@ -922,12 +957,16 @@ async function connectToServer(fileArgs) {
     `[remote] connected to ${cfg.sshTarget} via ${result.connectionType} — http://${serverHost}:${serverPort}`
   );
   recordGateway({
+    // cfg.gatewayId (a GUI-managed gateway remembered via connection.json)
+    // and cfg.sshKey (a literal, scripted/env-var path) are mutually
+    // exclusive -- see lib/connection-config.js's loadConnectionConfig.
+    ...(cfg.gatewayId ? { id: cfg.gatewayId } : {}),
     mode: "remote",
     host: activeGatewayHost,
     port: activeGatewayPort,
     label: cfg.sshTarget,
     sshTarget: cfg.sshTarget,
-    sshKey: cfg.sshKey,
+    ...(cfg.gatewayId ? { sshKey: undefined, hasSshKey: true } : { sshKey: cfg.sshKey }),
     ...(cfg.sshPort ? { sshPort: cfg.sshPort } : {}),
     connectionType: result.connectionType,
     imageRef: result.imageRef,
@@ -985,17 +1024,33 @@ async function provisionRemoteGateway(payload, onLog) {
       `A gateway already exists at ${host} (${existing.label}) -- use File > Gateways > Edit Gateways to modify it instead.`
     );
   }
-  const sshKey = payload.keyMode === "paste" ? writeKeyFile(payload.keyContents) : copyKeyFile(payload.keyPath);
+  // Generated up front, before any gateway record exists -- this becomes
+  // the real, permanent id once recordGateway() below runs (it prefers a
+  // caller-supplied entry.id over minting its own), and is what the key
+  // just written gets stored under. Needed now, not lazily: the key has to
+  // be keyed on *something* stable before the very first connect attempt.
+  const gatewayId = randomUUID();
+  const keyOpts = { safeStorage, getPassphraseKey: ensureVaultUnlocked };
+  if (payload.keyMode === "paste") await writeGatewayKey(gatewayId, payload.keyContents, keyOpts);
+  else await copyGatewayKey(gatewayId, payload.keyPath, keyOpts);
   const cfg = {
     sshTarget: `${payload.sshUser}@${payload.sshHost}`,
-    sshKey,
+    gatewayId,
     sshPort: payload.sshPort,
     remotePort: 8765, // the CTTC server's fixed container port; see docker-compose.yml
   };
-  // First-time connect to this gateway -- direct HTTP first, ssh tunnel
-  // fallback if that times out/fails (see connectRemoteGateway).
-  const result = await connectRemoteGateway({ ...cfg, imageSource: payload.imageSource || undefined }, { onLog });
-  return { remote: result, cfg };
+  try {
+    // First-time connect to this gateway -- direct HTTP first, ssh tunnel
+    // fallback if that times out/fails (see connectRemoteGateway).
+    const result = await connectRemoteGateway({ ...cfg, imageSource: payload.imageSource || undefined }, { onLog });
+    return { remote: result, cfg };
+  } catch (err) {
+    // Nothing will ever reference this id (no gateway record was ever
+    // created for it) -- without this, a failed first connect leaves an
+    // orphaned vault entry behind forever.
+    await deleteGatewayKey(gatewayId, {}).catch(() => {});
+    throw err;
+  }
 }
 
 // Connects to a remote gateway, choosing plain direct HTTP or an ssh -L
@@ -1021,7 +1076,91 @@ async function provisionRemoteGateway(payload, onLog) {
 // identity (gatewayHost/gatewayPort -- always its real address, tunneled or
 // not), plus imageRef for the registry and apiToken for every later request
 // (br-NET-004) -- callers must set currentApiToken from the result.
-async function connectRemoteGateway(cfg, { onLog, forceTunnel = false } = {}) {
+// br-OWNER-001 (REQ-0069): claim ownership of a *remote* gateway once it's
+// confirmed reachable -- idempotent server-side (SET NX), so reconnecting
+// to an already-owned gateway is a harmless no-op there, never a rewrite.
+// Only called for remote gateways: the embedded/local ("This machine")
+// gateway is loopback-only (br-NET-001/003), already outside br-NET-004's
+// token requirement, and has no ssh keypair to claim with in the first
+// place. Best-effort -- a failure here (older gateway image with no
+// /gateway/ownership/claim route yet, network hiccup, etc.) must never
+// break an otherwise-successful connect.
+async function claimGatewayOwnership({ host, port, apiToken, sshKey }, onLog) {
+  if (!sshKey) return;
+  try {
+    const ownerPublicKey = getPublicKey(sshKey);
+    const r = await fetch(`http://${host}:${port}/gateway/ownership/claim`, {
+      method: "POST",
+      signal: AbortSignal.timeout(10000),
+      headers: {
+        "Content-Type": "application/json",
+        ...(apiToken ? { "X-CTTC-Token": apiToken } : {}),
+      },
+      body: JSON.stringify({ ownerLabel: os.hostname(), ownerPublicKey }),
+    });
+    if (!r.ok) {
+      onLog?.(`[ownership] claim request rejected (${r.status}) -- continuing unowned`);
+    }
+  } catch (err) {
+    onLog?.(`[ownership] could not claim ownership (${err.message || err}) -- continuing unowned`);
+  }
+}
+
+// br-MESH-003 / br-AUDIT-001/004 (REQ-0070/REQ-0071): posts this client's
+// known gateway list to the one just connected to, adopts the merged
+// list back, audits every entry (bounded concurrency, per-check
+// timeout), and persists the results locally to seed the next connect.
+// Entirely informational (REQ-0010's principle, reaffirmed by
+// br-AUDIT-004) -- never triggers a reconnect or switch, and never
+// speculatively adds a merely-*discovered* peer to the persistent
+// "recent gateways" history: recordGateway's own contract is "called
+// right after a connect actually succeeds -- never speculatively", so a
+// peer this client has never itself actually reached only ever gets
+// audited here, not written to disk, until/unless the user connects to
+// it for real. Best-effort, same as claimGatewayOwnership -- a failure
+// here must never break an otherwise-successful connect.
+async function syncAndAuditGateways({ host, port, apiToken }, onLog) {
+  try {
+    const registry = readGateways().filter((g) => g.mode !== "embedded");
+    const known = registry.map((g) => ({
+      host: g.host,
+      port: g.port,
+      lastContactAt: g.lastContactAt,
+      lastContactResult: g.lastContactResult,
+      existence: g.existence,
+    }));
+    const r = await fetch(`http://${host}:${port}/gateways/sync`, {
+      method: "POST",
+      signal: AbortSignal.timeout(10000),
+      headers: {
+        "Content-Type": "application/json",
+        ...(apiToken ? { "X-CTTC-Token": apiToken } : {}),
+      },
+      body: JSON.stringify({ entries: known }),
+    });
+    if (!r.ok) {
+      onLog?.(`[mesh] gateways/sync rejected (${r.status}) -- skipping this pass`);
+      return;
+    }
+    const { entries } = await r.json();
+    const audited = await auditGatewayList(entries || [], { onLog });
+    for (const entry of audited) {
+      const key = gatewayKey({ host: entry.host, port: entry.port });
+      const existingRecord = registry.find((g) => gatewayKey(g) === key);
+      if (!existingRecord) continue; // discovered, not (yet) connected to -- never recorded speculatively
+      recordGateway({
+        ...existingRecord,
+        lastContactAt: entry.lastContactAt,
+        lastContactResult: entry.lastContactResult,
+        existence: entry.existence,
+      });
+    }
+  } catch (err) {
+    onLog?.(`[mesh] sync/audit failed (${err.message || err}) -- continuing`);
+  }
+}
+
+async function connectRemoteGatewayWithKeyPath(cfg, { onLog, forceTunnel = false } = {}) {
   const sshBin = process.env.CTTC_SSH_BIN || "ssh";
   // Same key ensureRemoteContainer itself resolves `host` from below --
   // getOrCreateApiToken always returns the same, already-persisted token
@@ -1045,6 +1184,8 @@ async function connectRemoteGateway(cfg, { onLog, forceTunnel = false } = {}) {
         headers: { "X-CTTC-Token": apiToken },
       });
       if (r.ok) {
+        await claimGatewayOwnership({ host: remote.host, port: remote.port, apiToken, sshKey: cfg.sshKey }, onLog);
+        await syncAndAuditGateways({ host: remote.host, port: remote.port, apiToken }, onLog);
         return {
           host: remote.host,
           port: remote.port,
@@ -1080,6 +1221,8 @@ async function connectRemoteGateway(cfg, { onLog, forceTunnel = false } = {}) {
     }
   );
   setCurrentTunnel(tunnel, remote.port, cfg.sshTarget);
+  await claimGatewayOwnership({ host: "127.0.0.1", port: remote.port, apiToken, sshKey: cfg.sshKey }, onLog);
+  await syncAndAuditGateways({ host: "127.0.0.1", port: remote.port, apiToken }, onLog);
   return {
     host: "127.0.0.1",
     port: remote.port,
@@ -1089,6 +1232,20 @@ async function connectRemoteGateway(cfg, { onLog, forceTunnel = false } = {}) {
     imageRef: remote.imageRef,
     apiToken,
   };
+}
+
+// Vault-aware wrapper around connectRemoteGatewayWithKeyPath: `cfg.gatewayId`
+// (a GUI-managed gateway) is resolved to a real, temporary decrypted key
+// file for the duration of the connect attempt; `cfg.sshKey` (a literal
+// path -- the scripted/env-var deploy case, or no key at all) is passed
+// through unchanged. See withGatewayKeyFile's own comment for why this
+// branch lives in exactly one place.
+async function connectRemoteGateway(cfg, opts = {}) {
+  if (!cfg.gatewayId) return connectRemoteGatewayWithKeyPath(cfg, opts);
+  return withDecryptedGatewayKeyFile(cfg.gatewayId, (keyPath) => connectRemoteGatewayWithKeyPath({ ...cfg, sshKey: keyPath }, opts), {
+    safeStorage,
+    getPassphraseKey: ensureVaultUnlocked,
+  });
 }
 
 let wizardWindow = null;
@@ -1161,12 +1318,14 @@ function runSetupWizard(dockerDetected) {
         currentApiToken = remote.apiToken;
         saveConnectionConfig(cfg);
         recordGateway({
+          id: cfg.gatewayId,
           mode: "remote",
           host: remote.gatewayHost,
           port: remote.gatewayPort,
           label: cfg.sshTarget,
           sshTarget: cfg.sshTarget,
-          sshKey: cfg.sshKey,
+          sshKey: undefined,
+          hasSshKey: true,
           ...(cfg.sshPort ? { sshPort: cfg.sshPort } : {}),
           connectionType: remote.connectionType,
           imageRef: remote.imageRef,
@@ -1272,6 +1431,26 @@ ipcMain.handle("get-connection-info", () => ({
   sshPort: activeSshPort,
 }));
 
+// Developer-only Redis CLI (Help > Developers > Redis CLI…) -- runs a raw
+// command against whichever target's internal Redis is currently active.
+// Deliberately just a plain fetch to the already-resolved serverHost/
+// serverPort, same as claimGatewayOwnership/syncAndAuditGateways below --
+// "the currently active target" is already fully described by those two
+// variables (embedded or remote gateway alike), so no new connection
+// (SSH tunnel, direct Redis TCP) is ever opened for this.
+ipcMain.handle("redis-cli-run", async (_e, argv) => {
+  try {
+    const res = await fetch(`http://${serverHost}:${serverPort}/admin/redis-cli`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(currentApiToken ? { "X-CTTC-Token": currentApiToken } : {}) },
+      body: JSON.stringify({ argv }),
+    });
+    return await res.json();
+  } catch (err) {
+    return { type: "error", value: String(err.message || err) };
+  }
+});
+
 // Records a Docker host under the currently-active gateway's own catalog in
 // gateways.json (see recordDockerHostForGateway) -- called from the
 // renderer right after a Connect/Update Docker Host submission succeeds, so
@@ -1285,6 +1464,30 @@ ipcMain.handle("record-docker-host", (_e, dockerHostEntry) => {
   recordCurrentGateway();
   const key = gatewayKey({ host: activeGatewayHost, port: activeGatewayPort });
   return recordDockerHostForGateway(key, dockerHostEntry);
+});
+
+// gateways.json's dockerHosts[] (for the active gateway) is now the sole
+// source for the Connect/Remove Docker Host dialogs' history/dropdown --
+// see docker-host/state.ts's dockerHostHistory(). Retired entries (see
+// retire-docker-host below) are filtered out here rather than by every
+// caller separately.
+ipcMain.handle("get-docker-hosts", () => {
+  recordCurrentGateway();
+  const key = gatewayKey({ host: activeGatewayHost, port: activeGatewayPort });
+  const gw = readGateways().find((g) => gatewayKey(g) === key);
+  return (gw?.dockerHosts || []).filter((h) => !h.retired);
+});
+
+// Soft-deletes one Docker host from the active gateway's own catalog (see
+// retireDockerHost) -- replaces the renderer's former direct localStorage
+// mutation in remove-dialog.ts, which never touched gateways.json at all
+// (the actual root of "Remove Docker Host" losing track of a host: three
+// independent, unreconciled stores, only one of which this ever wrote to).
+ipcMain.handle("retire-docker-host", (_e, hostIdOrKey) => {
+  const key = gatewayKey({ host: activeGatewayHost, port: activeGatewayPort });
+  const list = retireDockerHost(key, hostIdOrKey);
+  const gw = list.find((g) => gatewayKey(g) === key);
+  return (gw?.dockerHosts || []).filter((h) => !h.retired);
 });
 
 // Read-only: lets the dropdown flag a gateway as unreachable without
@@ -1357,7 +1560,10 @@ ipcMain.handle("switch-gateway", async (_e, entry) => {
   const alreadyKnown = readGateways().some((g) => gatewayKey(g) === gatewayKey({ host: entry.host, port: entry.port }));
   const cfg = {
     sshTarget: entry.sshTarget,
-    sshKey: entry.sshKey,
+    // entry.sshKey (a literal path, the scripted/env-var deploy case) and
+    // entry.id/gatewayId (a GUI-managed gateway, resolved via the vault) are
+    // mutually exclusive -- see withGatewayKeyFile's own comment.
+    ...(entry.sshKey ? { sshKey: entry.sshKey } : { gatewayId: entry.id }),
     sshPort: entry.sshPort,
     remotePort: entry.port,
   };
@@ -1384,12 +1590,13 @@ ipcMain.handle("switch-gateway", async (_e, entry) => {
     activeSshPort = cfg.sshPort;
     currentApiToken = result.apiToken;
     recordGateway({
+      ...(cfg.gatewayId ? { id: cfg.gatewayId } : {}),
       mode: "remote",
       host: result.gatewayHost,
       port: result.gatewayPort,
       label: entry.label || cfg.sshTarget,
       sshTarget: cfg.sshTarget,
-      sshKey: cfg.sshKey,
+      ...(cfg.gatewayId ? { sshKey: undefined, hasSshKey: true } : { sshKey: cfg.sshKey }),
       ...(cfg.sshPort ? { sshPort: cfg.sshPort } : {}),
       connectionType: result.connectionType,
       imageRef: result.imageRef,
@@ -1426,12 +1633,14 @@ ipcMain.handle("gateway-add-submit", async (_e, payload) => {
     currentApiToken = remote.apiToken;
     saveConnectionConfig(cfg);
     recordGateway({
+      id: cfg.gatewayId,
       mode: "remote",
       host: remote.gatewayHost,
       port: remote.gatewayPort,
       label: cfg.sshTarget,
       sshTarget: cfg.sshTarget,
-      sshKey: cfg.sshKey,
+      sshKey: undefined,
+      hasSshKey: true,
       ...(cfg.sshPort ? { sshPort: cfg.sshPort } : {}),
       connectionType: remote.connectionType,
       imageRef: remote.imageRef,
@@ -1506,6 +1715,122 @@ ipcMain.on("action-bar-redock", () => {
 ipcMain.on("action-bar-poll-interval", (_e, secs) => {
   mainWindow?.webContents.send("set-poll-interval", secs);
 });
+
+// Passphrase-protected fallback for the gateway-key vault (lib/key-vault.js)
+// when safeStorage.isEncryptionAvailable() is false -- e.g. Linux without a
+// keyring backend. On the common case (macOS Keychain, Windows DPAPI, Linux
+// with a keyring) none of this is ever shown: safeStorage handles gateway
+// keys transparently and ensureVaultUnlocked's getPassphraseKey callback is
+// never invoked. Session-scoped: the derived key lives in memory only,
+// cleared on quit (see the before-quit handler below), never persisted.
+let sessionPassphraseKey = null;
+let vaultWindow = null;
+let vaultUnlockWaiters = [];
+
+function vaultIsInitialized() {
+  return keyVault.readVaultMeta() != null;
+}
+function resolveVaultWaiters(key) {
+  const waiters = vaultUnlockWaiters;
+  vaultUnlockWaiters = [];
+  for (const w of waiters) w.resolve(key);
+}
+function rejectVaultWaiters(err) {
+  const waiters = vaultUnlockWaiters;
+  vaultUnlockWaiters = [];
+  for (const w of waiters) w.reject(err);
+}
+function openVaultWindow(mode) {
+  if (vaultWindow && !vaultWindow.isDestroyed()) {
+    vaultWindow.focus();
+    return;
+  }
+  vaultWindow = new BrowserWindow({
+    width: 380,
+    height: 260,
+    minWidth: 320,
+    minHeight: 220,
+    icon: APP_ICON,
+    show: false,
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+  vaultWindow.once("ready-to-show", () => vaultWindow.show());
+  vaultWindow.setMenuBarVisibility(false);
+  vaultWindow.loadFile(path.join(__dirname, "renderer", "vault.html"), { search: `mode=${mode}` });
+  // Closing by any means (OS close control, Cancel button, Escape) without
+  // having unlocked/set up must reject every pending waiter -- otherwise
+  // whatever key operation asked for this (a gateway connect/save/uninstall)
+  // would hang forever instead of failing cleanly.
+  vaultWindow.on("closed", () => {
+    vaultWindow = null;
+    rejectVaultWaiters(new Error("Secure Storage was closed before it was unlocked."));
+  });
+}
+function closeVaultWindow() {
+  if (vaultWindow && !vaultWindow.isDestroyed()) vaultWindow.close();
+}
+
+/**
+ * Resolves to the passphrase-derived key for the vault's fallback scheme,
+ * unlocking it first (opening the prompt window and waiting on the user) if
+ * it isn't already unlocked this session. Only ever called for the fallback
+ * scheme (see key-vault.js's readEntry/writeEntry) -- a machine with a
+ * working safeStorage never invokes this at all.
+ */
+function ensureVaultUnlocked() {
+  if (sessionPassphraseKey) return Promise.resolve(sessionPassphraseKey);
+  return new Promise((resolve, reject) => {
+    vaultUnlockWaiters.push({ resolve, reject });
+    openVaultWindow(vaultIsInitialized() ? "unlock" : "setup");
+  });
+}
+
+// The single choke point for "give me a real file for this gateway's key" --
+// resolves the one real ambiguity in gateway key storage: `entry.sshKey` is
+// a literal filesystem path for a gateway recorded from a scripted/env-var
+// deploy (CTTC_SSH_KEY/connection.json's ssh_key, see lib/connection-
+// config.js) and must never be routed through the vault; `entry.id` (a
+// GUI-managed gateway) is the vault lookup key otherwise. Every caller that
+// used to read `.sshKey` directly goes through this now, so that branch
+// can't be silently reintroduced at just one call site.
+async function withGatewayKeyFile(entry, fn) {
+  if (entry.sshKey) return fn(entry.sshKey);
+  if (!entry.id) return fn(null);
+  return withDecryptedGatewayKeyFile(entry.id, fn, { safeStorage, getPassphraseKey: ensureVaultUnlocked });
+}
+
+ipcMain.handle("vault-status", () => ({
+  safeStorageAvailable: safeStorage.isEncryptionAvailable(),
+  needsSetup: !vaultIsInitialized(),
+  locked: !safeStorage.isEncryptionAvailable() && !sessionPassphraseKey,
+}));
+ipcMain.handle("vault-setup", (_e, { passphrase, confirm }) => {
+  if (!passphrase || passphrase.length < 8) {
+    return { ok: false, error: "Choose a passphrase at least 8 characters long." };
+  }
+  if (passphrase !== confirm) return { ok: false, error: "Passphrases don't match." };
+  sessionPassphraseKey = keyVault.setupPassphrase(passphrase);
+  resolveVaultWaiters(sessionPassphraseKey);
+  closeVaultWindow();
+  return { ok: true };
+});
+ipcMain.handle("vault-unlock", (_e, { passphrase }) => {
+  const key = keyVault.verifyPassphrase(passphrase);
+  if (!key) return { ok: false, error: "Wrong passphrase." };
+  sessionPassphraseKey = key;
+  resolveVaultWaiters(sessionPassphraseKey);
+  closeVaultWindow();
+  return { ok: true };
+});
+ipcMain.handle("vault-cancel", () => {
+  rejectVaultWaiters(new Error("Secure Storage unlock was cancelled."));
+  closeVaultWindow();
+});
+ipcMain.handle("open-vault-window", () => openVaultWindow(vaultIsInitialized() ? "unlock" : "setup"));
 
 // nativeTheme.themeSource is process-wide (affects every window's
 // prefers-color-scheme match, plus native dialogs/menus), so this doesn't
@@ -1651,11 +1976,20 @@ ipcMain.handle("gateway-manage-save", async (_e, payload) => {
     const existing = readGateways().find((g) => gatewayKey(g) === payload.key);
     if (!existing) return { ok: false, error: "That gateway no longer exists -- refresh the list." };
 
-    const sshKey =
-      payload.keyMode === "paste" ? writeKeyFile(payload.keyContents) : copyKeyFile(payload.keyPath);
+    // "keep" (see renderer's gwFillFormForEdit): editing this gateway's
+    // host/port/image without touching its key -- reuses whatever key it
+    // already has (vault-managed via its id, or a literal scripted path)
+    // rather than requiring one be re-entered on every unrelated edit.
+    const keyOpts = { safeStorage, getPassphraseKey: ensureVaultUnlocked };
+    if (payload.keyMode === "paste") await writeGatewayKey(existing.id, payload.keyContents, keyOpts);
+    else if (payload.keyMode === "path") await copyGatewayKey(existing.id, payload.keyPath, keyOpts);
     const cfg = {
       sshTarget: `${payload.sshUser}@${payload.sshHost}`,
-      sshKey,
+      ...(payload.keyMode === "keep"
+        ? existing.sshKey
+          ? { sshKey: existing.sshKey }
+          : { gatewayId: existing.id }
+        : { gatewayId: existing.id }),
       sshPort: payload.sshPort,
       remotePort: 8765,
       imageSource: payload.imageSource || undefined,
@@ -1669,26 +2003,36 @@ ipcMain.handle("gateway-manage-save", async (_e, payload) => {
     const apiToken = getOrCreateApiToken(hostFromTarget(cfg.sshTarget));
     const result = wasActive
       ? await connectRemoteGateway(cfg, { onLog: (line) => mainWindow?.webContents.send("setup-log", line) })
-      : await ensureRemoteContainer(cfg, {
-          sshBin: process.env.CTTC_SSH_BIN || "ssh",
-          source: cfg.imageSource,
-          apiToken,
-          onLog: (line) => mainWindow?.webContents.send("setup-log", line),
-        });
+      : // Bypasses connectRemoteGateway's own vault-aware dispatcher (it
+        // only ever re-provisions here, no health-check/tunnel decision to
+        // make), so the vault resolution has to happen by hand -- easy to
+        // miss since this looks like a peer of the wasActive branch above.
+        await withGatewayKeyFile({ sshKey: cfg.sshKey, id: cfg.gatewayId }, (keyPath) =>
+          ensureRemoteContainer(
+            { ...cfg, sshKey: keyPath },
+            {
+              sshBin: process.env.CTTC_SSH_BIN || "ssh",
+              source: cfg.imageSource,
+              apiToken,
+              onLog: (line) => mainWindow?.webContents.send("setup-log", line),
+            }
+          )
+        );
     const gatewayHost = result.gatewayHost || result.host;
     const gatewayPort = result.gatewayPort || result.port;
     recordGateway({
+      ...(cfg.gatewayId ? { id: cfg.gatewayId } : {}),
       mode: "remote",
       host: gatewayHost,
       port: gatewayPort,
       label: cfg.sshTarget,
       sshTarget: cfg.sshTarget,
-      sshKey: cfg.sshKey,
+      ...(cfg.gatewayId ? { sshKey: undefined, hasSshKey: true } : { sshKey: cfg.sshKey }),
       ...(cfg.sshPort ? { sshPort: cfg.sshPort } : {}),
       connectionType: result.connectionType || existing.connectionType || "remote",
       imageRef: result.imageRef,
     });
-    if (gatewayKey({ host: gatewayHost, port: gatewayPort }) !== payload.key) removeGateway(payload.key);
+    if (gatewayKey({ host: gatewayHost, port: gatewayPort }) !== payload.key) retireGateway(payload.key);
     if (wasActive) {
       saveConnectionConfig(cfg);
       serverHost = result.host;
@@ -1725,12 +2069,17 @@ ipcMain.handle("gateway-manage-uninstall", async (_e, entry) => {
       // so uninstall resolves the same compose file instead of the default.
       await uninstallLocalContainer({ source: entry.imageSource, resourcesDir: resourcesDirForApp(), onLog });
     } else {
-      await uninstallRemoteContainer(
-        { sshTarget: entry.sshTarget, sshKey: entry.sshKey, sshPort: entry.sshPort },
-        { sshBin: process.env.CTTC_SSH_BIN || "ssh", onLog }
+      await withGatewayKeyFile(entry, (keyPath) =>
+        uninstallRemoteContainer(
+          { sshTarget: entry.sshTarget, sshKey: keyPath, sshPort: entry.sshPort },
+          { sshBin: process.env.CTTC_SSH_BIN || "ssh", onLog }
+        )
       );
     }
-    removeGateway(gatewayKey(entry));
+    retireGateway(entry.id || gatewayKey(entry));
+    // A retired gateway's admin key no longer needs to exist -- best-effort,
+    // never blocks the uninstall itself on a vault hiccup.
+    if (entry.id) await deleteGatewayKey(entry.id, {}).catch(() => {});
     // So a stale token isn't silently reused if this same host is ever
     // re-provisioned as a fresh gateway later (br-NET-004).
     forgetApiToken(entry.mode === "embedded" ? "embedded" : hostFromTarget(entry.sshTarget));
@@ -1763,11 +2112,18 @@ ipcMain.handle("gateway-manage-uninstall", async (_e, entry) => {
     }
     return { ok: true };
   } catch (err) {
-    await checkStillInstalled(entry, {
-      resourcesDir: resourcesDirForApp(),
-      sshBin: process.env.CTTC_SSH_BIN || "ssh",
-      onLog,
-    });
+    // Best-effort diagnostics only -- a failure here (e.g. a cancelled
+    // vault unlock) must never mask the real uninstall error below.
+    try {
+      await withGatewayKeyFile(entry, (keyPath) =>
+        checkStillInstalled(
+          { ...entry, sshKey: keyPath },
+          { resourcesDir: resourcesDirForApp(), sshBin: process.env.CTTC_SSH_BIN || "ssh", onLog }
+        )
+      );
+    } catch {
+      /* diagnostics only -- see comment above */
+    }
     return { ok: false, error: err.message || String(err) };
   }
 });
@@ -1810,6 +2166,40 @@ app.whenReady().then(async () => {
     } else if (logSettings.enabled && logSettings.dir) {
       startLogCollector(logSettings.dir);
     }
+  }
+  // One-time (per launch), idempotent migration of the old, single, shared
+  // plaintext ~/.cttc/keys/cttc_ssh_key into the new per-gateway encrypted
+  // vault (see lib/key-vault.js/lib/ssh-key-file.js) -- must run after
+  // safeStorage is actually usable (app.whenReady() has fired) but before
+  // anything else consumes gateways.json's sshKey field. Never blocks
+  // startup or prompts for a passphrase (migrateLegacyGatewayKeys' own
+  // contract): a failure, or a not-yet-set-up vault, just leaves the legacy
+  // file in place for the next launch to retry.
+  try {
+    const migration = await migrateLegacyGatewayKeys({
+      gateways: readGateways(),
+      safeStorage,
+      getPassphraseKey: ensureVaultUnlocked,
+      onLog: mainLog,
+    });
+    if (migration) {
+      for (const g of migration.migrated) recordGateway({ id: g.id, ...g, sshKey: undefined, hasSshKey: true });
+      if (migration.failed.length === 0 && migration.migrated.length > 0) {
+        fs.rmSync(migration.legacyPath, { force: true });
+        mainLog(`[vault] removed the old shared plaintext key file (${migration.legacyPath})`);
+        // connection.json may also still reference the same legacy path (a
+        // GUI-managed remote connection that predates the vault) -- point it
+        // at the matching gateway's id instead, same as the gateways.json
+        // records above.
+        const connCfg = loadConnectionConfig();
+        if (connCfg.mode === "remote" && connCfg.sshKey === migration.legacyPath) {
+          const matched = migration.migrated.find((g) => g.sshTarget === connCfg.sshTarget);
+          if (matched) saveConnectionConfig({ ...connCfg, gatewayId: matched.id, sshKey: undefined });
+        }
+      }
+    }
+  } catch (err) {
+    mainError(`[vault] gateway key migration failed (${err.message || err}) -- will retry next launch`);
   }
   try {
     // files passed on the command line open at startup: npm start -- file1 file2
@@ -1939,6 +2329,7 @@ app.on("before-quit", (e) => {
     if (!w.isDestroyed()) w.webContents.send("app-shutting-down");
   }
   stopLogCollector();
+  sessionPassphraseKey = null; // the vault's fallback-scheme key is session-only, never persisted
   // br-EMBED-002: the re-quit below must wait for stopServer()'s own
   // graceful-shutdown/fallback-kill sequence to actually finish, not fire on
   // a fixed timer that races past it -- otherwise a wedged (or silently

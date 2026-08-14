@@ -64,7 +64,10 @@
       <button class="menu-label" type="button">Help</button>
       <div class="menu-list" role="menu">
         <button data-action="about">About CTTC</button>
-        <button data-action="toggle-devtools">Toggle Developer Tools <span class="acc">F12</span></button>
+        <div class="menu-sep"></div>
+        <div class="menu-sub-label">Developers</div>
+        <button class="menu-indent" data-action="redis-cli">Redis CLI…</button>
+        <button class="menu-indent" data-action="toggle-devtools">Toggle Developer Tools <span class="acc">F12</span></button>
       </div>
     </div>
   </nav>
@@ -87,6 +90,7 @@
           <button data-action="new-gateway"><span class="ab-icon"><svg fill="currentColor" viewBox="0 0 511.997 511.997" aria-hidden="true"><path d="M456.584,106.493l-171.17-98.65c-18.145-10.457-40.687-10.457-58.83,0l-171.171,98.65c-18.143,10.456-29.414,29.943-29.414,50.856v197.3c0,20.913,11.271,40.4,29.415,50.855l171.17,98.65c18.145,10.457,40.683,10.459,58.83,0l171.171-98.65c18.143-10.456,29.414-29.943,29.414-50.856v-197.3C485.999,136.435,474.728,116.948,456.584,106.493z M445.924,354.648c0,6.666-3.593,12.879-9.377,16.212l-171.172,98.65c-5.782,3.334-12.969,3.334-18.753,0L75.451,370.86c-5.784-3.333-9.377-9.545-9.377-16.212v-197.3c0-6.667,3.593-12.88,9.377-16.213l171.172-98.65c5.78-3.333,12.969-3.334,18.753,0l171.171,98.65c5.784,3.334,9.377,9.546,9.377,16.213V354.648z"/><path d="M336.151,235.997h-60.113v-60.006c0-11.047-8.971-20.002-20.038-20.002c-11.067,0-20.038,8.955-20.038,20.002v60.006h-60.113c-11.067,0-20.038,8.955-20.038,20.002c0,11.047,8.971,20.002,20.038,20.002h60.111v60.006c0,11.047,8.971,20.002,20.038,20.002c11.067,0,20.038-8.955,20.038-20.002v-60.006h60.113c11.067,0,20.038-8.955,20.038-20.002C356.187,244.952,347.216,235.997,336.151,235.997z"/></svg></span>New Gateway…</button>
           <button data-action="edit-gateways"><span class="ab-icon"><svg fill="currentColor" viewBox="0 0 512.001 512.001" aria-hidden="true"><path d="m511.403 487.149-40-160c-.881-3.526-2.738-6.768-5.261-9.291-3.399-3.399-304.052-304.052-312-312-7.811-7.81-20.474-7.81-28.284 0l-120 120c-7.811 7.811-7.811 20.474 0 28.284l312 312c2.623 2.623 5.931 4.421 9.292 5.261l160 40c6.896 1.724 14.085-.352 18.993-5.261 4.967-4.968 6.964-12.177 5.26-18.993zm-118.906-123.93-200.199-207.233 27.702-27.702 203.716 203.716zm-252.497-314.935 51.716 51.716-91.716 91.716-51.716-51.716zm24.009 135.991 200.199 207.233-32.208 32.208-203.716-203.716zm207.111 256.889c4.706-4.706 65.283-65.283 70.045-70.044l23.348 93.393z"/></svg></span>Edit Gateway</button>
           <button data-action="uninstall-gateway"><span class="ab-icon"><svg fill="currentColor" viewBox="0 0 512 512" aria-hidden="true"><path d="m444.654 180.293-90.449-37.489 22.962-55.447c4.224-10.197-.621-21.905-10.822-26.131l-144.095-59.698c-10.199-4.227-21.899.619-26.125 10.824l-22.95 55.418-90.445-37.488c-10.197-4.227-21.899.615-26.127 10.82-4.228 10.204.616 21.904 10.818 26.133 1.249.518 220.374 91.341 223.819 92.769h-216.244c-11.044 0-19.996 8.954-19.996 20v311.996c0 11.046 8.952 20 19.996 20h311.934c11.044 0 19.996-8.954 19.996-20v-284.047l22.419 9.292c10.222 4.236 21.908-.637 26.127-10.82 4.227-10.204-.616-21.904-10.818-26.132zm-234.535-97.211 15.301-36.947 107.148 44.391-15.305 36.956c-.659-.272-106.062-43.951-107.144-44.4zm156.815 388.918h-271.942v-271.997h271.942zm-207.977-55.997v-160c0-11.046 8.954-20 20-20s20 8.954 20 20v160c0 11.046-8.954 20-20 20s-20-8.954-20-20zm104 0v-160c0-11.046 8.954-20 20-20s20 8.954 20 20v160c0 11.046-8.954 20-20 20s-20-8.954-20-20z"/></svg></span>Uninstall Gateway…</button>
+          <button data-action="secure-storage" title="Set up or unlock passphrase-protected storage for gateway keys (only needed when this system's own secure storage isn't available)"><span class="ab-icon"><svg fill="currentColor" viewBox="0 0 448 512" aria-hidden="true"><path d="M400 224h-24v-72C376 68.2 307.8 0 224 0S72 68.2 72 152v72H48c-26.5 0-48 21.5-48 48v192c0 26.5 21.5 48 48 48h352c26.5 0 48-21.5 48-48V272c0-26.5-21.5-48-48-48zM224 400c-22.1 0-40-17.9-40-40s17.9-40 40-40 40 17.9 40 40-17.9 40-40 40zm88-176H136v-72c0-48.5 39.5-88 88-88s88 39.5 88 88v72z"/></svg></span>Secure Storage…</button>
           <div class="ab-sep"></div>
         </div>
       </div>
@@ -132,10 +136,11 @@
         <!-- Was a foldout group with two sub-buttons (Settings…/Appearance…,
              each opening what's now just a different pane of the same
              dlg-preferences dialog) -- now one flat entry, no chevron/
-             foldout body, straight into that dialog (defaulting to its
-             Preferences pane, i.e. the same target the old Appearance…
-             button opened -- see app.js's "open-theme" action). -->
-        <button data-action="open-theme"><span class="ab-icon"><svg fill="currentColor" height="512pt" viewBox="-12 0 512 512" width="512pt" xmlns="http://www.w3.org/2000/svg"><path d="m450.144531 279.988281v-47.976562l34.414063-48.15625c4.5625-6.378907 4.972656-14.835938 1.046875-21.628907l-39.519531-68.453124c-3.921876-6.792969-11.449219-10.667969-19.257813-9.90625l-58.910156 5.726562-41.550781-23.988281-24.492188-53.882813c-3.25-7.140625-10.367188-11.722656-18.210938-11.722656h-79.042968c-7.84375 0-14.960938 4.582031-18.207032 11.722656l-24.496093 53.882813-41.550781 23.988281-58.910157-5.726562c-7.800781-.757813-15.332031 3.113281-19.253906 9.90625l-39.523437 68.453124c-3.921876 6.792969-3.511719 15.25 1.050781 21.628907l34.414062 48.15625v47.976562l-34.417969 48.15625c-4.558593 6.378907-4.96875 14.835938-1.046874 21.628907l39.523437 68.453124c3.917969 6.792969 11.453125 10.667969 19.253906 9.90625l58.910157-5.726562 41.550781 23.988281 24.496093 53.882813c3.246094 7.136718 10.363282 11.722656 18.207032 11.722656h79.042968c7.84375 0 14.960938-4.582031 18.207032-11.722656l24.496094-53.882813 41.550781-23.988281 58.910156 5.726562c7.820313.765626 15.335937-3.113281 19.253906-9.90625l39.523438-68.453124c3.921875-6.792969 3.511719-15.25-1.050781-21.628907zm-406.386719 60.9375 17.359376-24.289062 75.007812-43.308594c6.183594-3.566406 9.996094-10.164063 10-17.300781.0625-69.6875 71.054688-117.503906 135.902344-90.414063l-67.550782 39.003907c-9.558593 5.519531-12.84375 17.753906-7.320312 27.320312l39.332031 68.125c5.523438 9.566406 17.753907 12.84375 27.320313 7.320312l67.554687-39c-8.960937 69.679688-85.835937 107.296876-146.25 72.488282-6.1875-3.5625-13.804687-3.558594-19.988281.011718l-75.007812 43.304688-29.710938 2.886719zm370.113282-42.894531 30.65625 42.894531-26.644532 46.148438-52.476562-5.101563c-4.148438-.402344-8.324219.5-11.9375 2.585938l-52.65625 30.402344c-3.609375 2.085937-6.480469 5.246093-8.207031 9.042968l-21.816407 47.996094h-53.292968l-21.816406-47.996094c-1.726563-3.796875-4.597657-6.957031-8.207032-9.042968l-30.328125-17.511719 28.503907-16.457031c102.195312 47.667968 214.574218-40.59375 194.191406-150.222657-2.515625-13.542969-17.703125-20.566406-29.664063-13.664062l-79.046875 45.636719-19.332031-33.484376 79.046875-45.636718c11.929688-6.886719 13.492188-23.546875 2.996094-32.523438-84.78125-72.492187-217.375-19.238281-227.191406 93.066406l-28.503907 16.453126v-35.019532c0-4.167968-1.304687-8.234375-3.730469-11.628906l-30.65625-42.894531 26.648438-46.148438 52.472656 5.101563c4.152344.402344 8.324219-.5 11.933594-2.585938l52.660156-30.402344c3.609375-2.085937 6.480469-5.246093 8.207032-9.042968l21.820312-47.996094h53.289062l21.820313 47.996094c1.726563 3.796875 4.59375 6.957031 8.207031 9.042968l52.65625 30.402344c3.609375 2.082032 7.777344 2.988282 11.933594 2.585938l52.476562-5.101563 26.648438 46.148438-30.65625 42.894531c-2.425781 3.394531-3.730469 7.457031-3.730469 11.628906v60.804688c0 4.167968 1.300781 8.234375 3.726563 11.628906zm0 0"/></svg></span><span class="ab-group-title">Preferences</span></button>
+             foldout body, straight into that dialog, defaulting to its
+             Settings pane (the same target the old Settings… button
+             opened -- see app.js's "open-settings" action; the dialog's
+             own left-hand pane list still reaches Appearance from here). -->
+        <button data-action="open-settings"><span class="ab-icon"><svg fill="currentColor" height="512pt" viewBox="-12 0 512 512" width="512pt" xmlns="http://www.w3.org/2000/svg"><path d="m450.144531 279.988281v-47.976562l34.414063-48.15625c4.5625-6.378907 4.972656-14.835938 1.046875-21.628907l-39.519531-68.453124c-3.921876-6.792969-11.449219-10.667969-19.257813-9.90625l-58.910156 5.726562-41.550781-23.988281-24.492188-53.882813c-3.25-7.140625-10.367188-11.722656-18.210938-11.722656h-79.042968c-7.84375 0-14.960938 4.582031-18.207032 11.722656l-24.496093 53.882813-41.550781 23.988281-58.910157-5.726562c-7.800781-.757813-15.332031 3.113281-19.253906 9.90625l-39.523437 68.453124c-3.921876 6.792969-3.511719 15.25 1.050781 21.628907l34.414062 48.15625v47.976562l-34.417969 48.15625c-4.558593 6.378907-4.96875 14.835938-1.046874 21.628907l39.523437 68.453124c3.917969 6.792969 11.453125 10.667969 19.253906 9.90625l58.910157-5.726562 41.550781 23.988281 24.496093 53.882813c3.246094 7.136718 10.363282 11.722656 18.207032 11.722656h79.042968c7.84375 0 14.960938-4.582031 18.207032-11.722656l24.496094-53.882813 41.550781-23.988281 58.910156 5.726562c7.820313.765626 15.335937-3.113281 19.253906-9.90625l39.523438-68.453124c3.921875-6.792969 3.511719-15.25-1.050781-21.628907zm-406.386719 60.9375 17.359376-24.289062 75.007812-43.308594c6.183594-3.566406 9.996094-10.164063 10-17.300781.0625-69.6875 71.054688-117.503906 135.902344-90.414063l-67.550782 39.003907c-9.558593 5.519531-12.84375 17.753906-7.320312 27.320312l39.332031 68.125c5.523438 9.566406 17.753907 12.84375 27.320313 7.320312l67.554687-39c-8.960937 69.679688-85.835937 107.296876-146.25 72.488282-6.1875-3.5625-13.804687-3.558594-19.988281.011718l-75.007812 43.304688-29.710938 2.886719zm370.113282-42.894531 30.65625 42.894531-26.644532 46.148438-52.476562-5.101563c-4.148438-.402344-8.324219.5-11.9375 2.585938l-52.65625 30.402344c-3.609375 2.085937-6.480469 5.246093-8.207031 9.042968l-21.816407 47.996094h-53.292968l-21.816406-47.996094c-1.726563-3.796875-4.597657-6.957031-8.207032-9.042968l-30.328125-17.511719 28.503907-16.457031c102.195312 47.667968 214.574218-40.59375 194.191406-150.222657-2.515625-13.542969-17.703125-20.566406-29.664063-13.664062l-79.046875 45.636719-19.332031-33.484376 79.046875-45.636718c11.929688-6.886719 13.492188-23.546875 2.996094-32.523438-84.78125-72.492187-217.375-19.238281-227.191406 93.066406l-28.503907 16.453126v-35.019532c0-4.167968-1.304687-8.234375-3.730469-11.628906l-30.65625-42.894531 26.648438-46.148438 52.472656 5.101563c4.152344.402344 8.324219-.5 11.933594-2.585938l52.660156-30.402344c3.609375-2.085937 6.480469-5.246093 8.207032-9.042968l21.820312-47.996094h53.289062l21.820313 47.996094c1.726563 3.796875 4.59375 6.957031 8.207031 9.042968l52.65625 30.402344c3.609375 2.082032 7.777344 2.988282 11.933594 2.585938l52.476562-5.101563 26.648438 46.148438-30.65625 42.894531c-2.425781 3.394531-3.730469 7.457031-3.730469 11.628906v60.804688c0 4.167968 1.300781 8.234375 3.726563 11.628906zm0 0"/></svg></span><span class="ab-group-title">Preferences</span></button>
       </div>
       <div class="ab-group ab-group-flat ab-group-bottom">
         <button data-action="about"><span class="ab-icon">ⓘ</span>About CTTC</button>
@@ -211,13 +216,14 @@
     <section id="chart-block">
       <div id="svc-graph" class="graph-block">
         <div id="chart-head">
-          <span>Telemetry</span>
+          <span class="panel-head-title">Telemetry</span>
           <div class="panel-head-right">
             <button id="btn-style-toggle-svc" class="icon-btn" data-group="svc" title="Switch between line plot and histogram"></button>
             <button id="btn-popout-telemetry" class="icon-btn" title="Open the telemetry charts in their own window">⧉</button>
             <button id="btn-popback-telemetry" class="popback btn-flat" title="Bring back into the main window" hidden><svg class="btn-flat-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="m12 2a9.95 9.95 0 0 0 -7 2.88v-1.88a1 1 0 0 0 -2 0v5a1 1 0 0 0 1 1h5a1 1 0 0 0 0-2h-3.2242a7.9872 7.9872 0 1 1 .2613 10.3335 1 1 0 1 0 -1.49 1.334 10 10 0 1 0 7.4529-16.6675z"/></svg>Bring Back</button>
           </div>
         </div>
+        <div class="panel-head-divider"></div>
         <div id="legend"></div>
         <div id="charts"></div>
         <div id="chart-nav" class="timeline-nav" title="Drag the thumb or click the track to pan · click “now” to jump to the present and resume following it">
@@ -234,7 +240,7 @@
       <div id="lanes" hidden></div>
       <div id="host-block" class="graph-block" hidden>
         <div id="host-head">
-          <span id="host-title">Host telemetry</span>
+          <span id="host-title" class="panel-head-title">Host telemetry</span>
           <div class="panel-head-right">
             <button id="btn-host-toggle" class="icon-btn"></button>
             <button id="btn-style-toggle-host" class="icon-btn" data-group="host" title="Switch between line plot and histogram"></button>
@@ -242,6 +248,7 @@
             <button id="btn-popback-host" class="popback btn-flat" title="Bring back into the main window" hidden><svg class="btn-flat-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="m12 2a9.95 9.95 0 0 0 -7 2.88v-1.88a1 1 0 0 0 -2 0v5a1 1 0 0 0 1 1h5a1 1 0 0 0 0-2h-3.2242a7.9872 7.9872 0 1 1 .2613 10.3335 1 1 0 1 0 -1.49 1.334 10 10 0 1 0 7.4529-16.6675z"/></svg>Bring Back</button>
           </div>
         </div>
+        <div class="panel-head-divider"></div>
         <div id="host-charts"></div>
         <div id="host-loading" class="muted" hidden><span class="hourglass">⏳</span> Loading host telemetry…</div>
         <div id="host-nav" class="timeline-nav" title="Drag the thumb or click the track to pan · click “now” to jump to the present and resume following it">
@@ -271,7 +278,7 @@
     <span class="status-bar-divider"></span>
 
     <div id="server-status" class="server-status" title="">
-      <button id="server-status-btn" type="button" class="server-status-btn" title="Switch gateway…">
+      <button id="server-status-btn" type="button" class="server-status-btn">
         <span class="server-status-dot"></span>
         <svg class="server-status-icon" viewBox="0 0 512 512" fill="currentColor" aria-hidden="true"><g><circle cx="356" cy="412" r="20"/><path d="m436 0h-160c-33.084 0-60 26.916-60 60v71.716l-40-40v-71.716c0-11.046-8.954-20-20-20h-80c-11.046 0-20 8.954-20 20v80c0 11.046 8.954 20 20 20h71.716l68.284 68.284v47.716h-80v-20c0-11.046-8.954-20-20-20h-80c-11.046 0-20 8.954-20 20v80c0 11.046 8.954 20 20 20h80c11.046 0 20-8.954 20-20v-20h80v47.716l-68.284 68.284h-71.716c-11.046 0-20 8.954-20 20v80c0 11.046 8.954 20 20 20h80c11.046 0 20-8.954 20-20v-71.716l40-40v71.716c0 33.084 26.916 60 60 60h160c33.084 0 60-26.916 60-60v-392c0-33.084-26.916-60-60-60zm-340 40h40v40h-40zm0 236h-40v-40h40zm40 196h-40v-40h40zm140-432h160c11.028 0 20 8.972 20 20v20h-200v-20c0-11.028 8.972-20 20-20zm160 432h-160c-11.028 0-20-8.972-20-20v-332h200v332c0 11.028-8.972 20-20 20z"/><path d="m396 160h-80c-11.046 0-20 8.954-20 20s8.954 20 20 20h80c11.046 0 20-8.954 20-20s-8.954-20-20-20z"/></g></svg>
       </button>
@@ -280,7 +287,7 @@
     </div>
 
     <div id="docker-host-status" class="server-status">
-      <button id="docker-host-status-btn" type="button" class="server-status-btn" title="Manage Docker hosts…">
+      <button id="docker-host-status-btn" type="button" class="server-status-btn">
         <span class="server-status-dot"></span>
         <svg class="server-status-icon" fill="currentColor" viewBox="0 0 512 512" aria-hidden="true"><g><path d="m260 0h-240c-11.046 0-20 8.954-20 20v472c0 11.046 8.954 20 20 20h240c11.046 0 20-8.954 20-20v-472c0-11.046-8.954-20-20-20zm-20 40v40h-200v-40zm-200 432v-352h200v352z"/><path d="m140 316c-33.084 0-60 26.916-60 60s26.916 60 60 60 60-26.916 60-60-26.916-60-60-60zm0 80c-11.028 0-20-8.972-20-20s8.972-20 20-20 20 8.972 20 20-8.972 20-20 20z"/><path d="m180 156h-80c-11.046 0-20 8.954-20 20s8.954 20 20 20h80c11.046 0 20-8.954 20-20s-8.954-20-20-20z"/><path d="m180 236h-80c-11.046 0-20 8.954-20 20s8.954 20 20 20h80c11.046 0 20-8.954 20-20s-8.954-20-20-20z"/><path d="m492 160h-100v-20c0-11.046-8.954-20-20-20s-20 8.954-20 20v20h-20c-11.046 0-20 8.954-20 20s8.954 20 20 20h20v20c0 11.046 8.954 20 20 20s20-8.954 20-20v-20h100c11.046 0 20-8.954 20-20s-8.954-20-20-20z"/><path d="m332 80h100v20c0 11.046 8.954 20 20 20s20-8.954 20-20v-20h20c11.046 0 20-8.954 20-20s-8.954-20-20-20h-20v-20c0-11.046-8.954-20-20-20s-20 8.954-20 20v20h-100c-11.046 0-20 8.954-20 20s8.954 20 20 20z"/></g></svg>
       </button>
@@ -315,13 +322,6 @@
       </label>
       <label class="ctl block">Docker host ssh connection string
         <input id="docker-host" type="text" placeholder="empty = gateway Docker host, or user@host (ssh:// optional)" />
-      </label>
-      <label class="ctl block ssh-key-row">SSH key
-        <span class="ctl">
-          <input id="docker-ssh-key" type="text" readonly placeholder="No file selected" />
-          <button id="docker-ssh-key-browse" type="button">Browse…</button>
-        </span>
-        <span class="tdoc ssh-key-hint">(optional — leave empty to use the gateway host's ssh-agent/default identity)</span>
       </label>
       <div class="ctl fetch-row">
         <button id="btn-ps-refresh" class="btn-fetch" title="Lists containers/services running on this target's docker daemon right now"><svg class="btn-fetch-icon" viewBox="0 0 512 512" fill="currentColor" aria-hidden="true"><circle cx="346" cy="407" r="15"/><circle cx="286" cy="407" r="15"/><circle cx="226" cy="407" r="15"/><circle cx="166" cy="407" r="15"/><path d="m497 332h-377v-121h15c8.284 0 15-6.716 15-15s-6.716-15-15-15h-45v-45c0-8.284-6.716-15-15-15s-15 6.716-15 15v45h-30v-45c0-8.284-6.716-15-15-15s-15 6.716-15 15v331c0 8.284 6.716 15 15 15h60c8.271 0 15 6.729 15 15 0 8.284 6.716 15 15 15h302c3.979 0 7.794-1.581 10.606-4.394 2.814-2.813 4.394-6.628 4.394-10.606 0-18.187 11.685-28.685 32.338-45.672 25.689-21.132 57.662-47.431 57.662-104.328 0-8.284-6.716-15-15-15zm-467 0v-121h60v121zm405.279 96.159c-17.837 14.672-36.183 29.761-41.649 53.841h-276.2c-6.19-17.461-22.873-30-42.43-30h-45v-90h450.97c-4.687 32.432-24.679 48.875-45.691 66.159z"/><path d="m497 90h-55.458l-79.542-53.028v-21.972c0-8.284-6.716-15-15-15s-15 6.716-15 15v21.972l-79.542 53.028h-55.458c-8.284 0-15 6.716-15 15v180c0 8.284 6.716 15 15 15h300c8.284 0 15-6.716 15-15v-180c0-8.284-6.716-15-15-15zm-150-26.972 40.458 26.972h-80.917zm135 206.972h-270v-150h270z"/><path d="m257 150c-8.284 0-15 6.716-15 15v60c0 8.284 6.716 15 15 15s15-6.716 15-15v-60c0-8.284-6.716-15-15-15z"/><path d="m317 150c-8.284 0-15 6.716-15 15v60c0 8.284 6.716 15 15 15s15-6.716 15-15v-60c0-8.284-6.716-15-15-15z"/><path d="m377 150c-8.284 0-15 6.716-15 15v60c0 8.284 6.716 15 15 15s15-6.716 15-15v-60c0-8.284-6.716-15-15-15z"/><path d="m437 150c-8.284 0-15 6.716-15 15v60c0 8.284 6.716 15 15 15s15-6.716 15-15v-60c0-8.284-6.716-15-15-15z"/></svg><span id="btn-ps-refresh-label">Fetch</span></button>
@@ -640,6 +640,7 @@
 
       <fieldset class="keys-box">
         <legend>SSH private key</legend>
+        <label id="gw-key-mode-keep-row" class="radio-row" hidden><input type="radio" name="gw-key-mode" value="keep" /> Keep the current key</label>
         <label class="radio-row"><input type="radio" name="gw-key-mode" value="path" checked /> Use a key file already on this machine</label>
         <div id="gw-key-path-row" class="ctl">
           <input id="gw-key-path" type="text" readonly placeholder="No file selected" />
@@ -677,8 +678,8 @@
     </div>
 
     <div id="gw-activity" hidden>
-      <button type="button" id="gw-btn-activity-toggle" class="linklike">Show activity</button>
-      <pre id="gw-activity-log" class="activity-log" hidden></pre>
+      <button type="button" id="gw-btn-activity-toggle" class="linklike">Hide activity</button>
+      <pre id="gw-activity-log" class="activity-log"></pre>
     </div>
   </dialog>
 
@@ -724,6 +725,22 @@
     <div id="opened-data-list" class="opened-data-list" role="listbox"></div>
     <div class="dlg-actions">
       <button id="dlg-opened-data-cancel" title="Close without switching">Cancel</button>
+    </div>
+  </dialog>
+
+  <!-- Developer-only: send raw commands to the internal Redis of whichever
+       target (local or the active gateway) is currently connected -- see
+       Help > Developers > Redis CLI…. -->
+  <dialog id="dlg-redis-cli">
+    <h2>Redis CLI <span id="redis-cli-target" class="muted"></span></h2>
+    <div id="redis-cli-output" class="redis-cli-output" role="log"></div>
+    <div class="redis-cli-input-row">
+      <input id="redis-cli-input" type="text" placeholder="Enter a Redis command…" autocomplete="off" spellcheck="false" />
+      <button id="redis-cli-run">Run</button>
+    </div>
+    <div class="dlg-actions">
+      <button id="redis-cli-clear" title="Clear the output pane">Clear</button>
+      <button id="dlg-redis-cli-close">Close</button>
     </div>
   </dialog>
 

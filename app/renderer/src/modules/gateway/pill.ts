@@ -236,7 +236,9 @@ function mountGatewayDropdown(): void {
     if (infoPopup) infoPopup.hidden = true; // don't show both at once
     wrap.classList.add("open");
     dropdown.hidden = false;
-    render(await window.cttc!.getGateways());
+    // retired entries (soft-deleted, see lib/gateway-registry.js) stay in
+    // gateways.json for history/audit but never show as available here.
+    render((await window.cttc!.getGateways()).filter((g: { retired?: boolean }) => !g.retired));
     syncPillPeerVisibility("gateway");
   };
   document.addEventListener("click", (e) => {

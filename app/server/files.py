@@ -25,10 +25,14 @@ from cttc_format import METRIC_EXT, is_cttc_archive
 logger = logging.getLogger("cttc")
 
 
-async def download_sample(state, t0: float, t1: float, include_host: bool):
+async def download_sample(
+    state, t0: float, t1: float, include_host: bool, source_ids: set[str] | None = None
+):
     """-> (data, filename, source_count) for the .cttc-metric sample covering
-    [t0, t1] -- the byte-returning counterpart to State.export_sample()."""
-    data, meta = await state.build_sample_bytes(t0, t1, include_host)
+    [t0, t1] -- the byte-returning counterpart to State.export_sample().
+    `source_ids`, if given, restricts the archive to that subset of sources
+    (see State.build_sample_bytes, which this passes straight through to)."""
+    data, meta = await state.build_sample_bytes(t0, t1, include_host, source_ids)
     ts = datetime.fromtimestamp(t0 / 1000, tz=UTC).strftime("%Y-%m-%d-%H-%M-%S")
     filename = f"sample-{ts}{METRIC_EXT}"
     return data, filename, len(meta)

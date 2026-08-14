@@ -1,11 +1,13 @@
 body {
   margin: 0;
   height: 100vh;
+  box-sizing: border-box;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
   gap: 12px;
+  padding: 16px 0 12px;
   font-family: -apple-system, "Segoe UI", sans-serif;
   background: #1e1e1e;
   color: #ccc;
@@ -14,7 +16,7 @@ body {
 }
 p { margin: 0; font-size: 13px; }
 #status {
-  max-width: 240px;
+  max-width: 260px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -24,5 +26,26 @@ p { margin: 0; font-size: 13px; }
   border: 3px solid #444; border-top-color: #3a7bd5;
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
+  flex: 0 0 auto;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
+/* More-detailed progress under the simple status line above -- every
+   narrate() call so far (see main.js), not just the latest one, so the
+   history of what's already happened stays visible instead of being
+   overwritten each time. Empty (and takes no space) until the first line
+   arrives. */
+.details {
+  margin: 0;
+  width: 260px;
+  max-height: 120px;
+  overflow-y: auto;
+  padding: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  line-height: 1.5;
+  color: #888;
+  white-space: pre-wrap;
+  word-break: break-word;
+  flex: 0 1 auto;
+}
+.details:empty { display: none; }

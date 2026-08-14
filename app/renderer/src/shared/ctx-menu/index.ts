@@ -15,24 +15,38 @@ import { computePosition, flip, shift, offset, type VirtualElement } from "@floa
 // "<svg ...>...</svg>" string for an entry with no corresponding button to
 // clone from. The literal string "separator" in place of an entry renders
 // a thin divider instead. A selector-sourced entry also mirrors that
-// button's own .disabled -- same reasoning as the icon.
+// button's own .disabled -- same reasoning as the icon. An optional 4th
+// element marks the entry "active" (data-active="true"), for mutually
+// exclusive choices like a sort direction.
 //
 // ownerId: opaque tag identifying which caller opened this menu (only the
 // Gateway/Docker Host pills pass one, see shared/toolbar-pills) -- left
 // off entirely by the legend/chart-time menus, which don't care.
-export type CtxMenuEntry = [string, () => void, string?] | "separator";
+export type CtxMenuEntry = [string, () => void, string?, boolean?] | "separator";
 
 let ctxEl: HTMLElement | null = null;
+// Whatever had focus when the menu was opened (the trigger button, for a
+// mouse click or a keyboard Enter/Space) -- refocused on close, and its
+// aria-expanded (if any) kept in sync, so a hamburger-style trigger stays
+// keyboard-accessible with no per-caller wiring.
+let ctxOpener: HTMLElement | null = null;
 
 export function closeCtxMenu(): void {
   ctxEl?.remove();
   ctxEl = null;
+  if (ctxOpener) {
+    if (ctxOpener.hasAttribute("aria-expanded")) ctxOpener.setAttribute("aria-expanded", "false");
+    ctxOpener.focus();
+    ctxOpener = null;
+  }
 }
 
 export function ctxMenu(e: MouseEvent, entries: CtxMenuEntry[], ownerId?: string): void {
   e.preventDefault();
   e.stopPropagation();
   closeCtxMenu();
+  ctxOpener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  if (ctxOpener?.hasAttribute("aria-expanded")) ctxOpener.setAttribute("aria-expanded", "true");
   const el = document.createElement("div");
   el.id = "ctxmenu";
   if (ownerId) el.dataset.owner = ownerId;
@@ -43,7 +57,7 @@ export function ctxMenu(e: MouseEvent, entries: CtxMenuEntry[], ownerId?: string
       el.appendChild(sep);
       continue;
     }
-    const [label, fn, icon] = entry;
+    const [label, fn, icon, active] = entry;
     const b = document.createElement("button");
     let iconEl: HTMLElement | null = null;
     let sourceBtn: HTMLButtonElement | null = null;
@@ -67,6 +81,7 @@ export function ctxMenu(e: MouseEvent, entries: CtxMenuEntry[], ownerId?: string
     const text = document.createElement("span");
     text.textContent = label;
     b.appendChild(text);
+    if (active) b.dataset.active = "true";
     if (sourceBtn?.disabled) {
       b.disabled = true;
     } else {
@@ -74,6 +89,19 @@ export function ctxMenu(e: MouseEvent, entries: CtxMenuEntry[], ownerId?: string
     }
     el.appendChild(b);
   }
+
+  // Keyboard nav: Up/Down cycles focus among the menu's own buttons,
+  // wrapping around. Enter/Space need no handling here -- native <button>
+  // activation already fires the onclick set above.
+  el.addEventListener("keydown", (ke) => {
+    if (ke.key !== "ArrowDown" && ke.key !== "ArrowUp") return;
+    ke.preventDefault();
+    const items = [...el.querySelectorAll<HTMLButtonElement>("button:not(:disabled)")];
+    if (items.length === 0) return;
+    const idx = items.indexOf(document.activeElement as HTMLButtonElement);
+    const next = ke.key === "ArrowDown" ? (idx + 1) % items.length : (idx - 1 + items.length) % items.length;
+    items[next].focus();
+  });
 
   // Synchronous open at the cursor -- same as the original, so anything
   // checking #ctxmenu exists immediately after the triggering event (no
@@ -83,6 +111,7 @@ export function ctxMenu(e: MouseEvent, entries: CtxMenuEntry[], ownerId?: string
   el.style.top = `${e.clientY}px`;
   document.body.appendChild(el);
   ctxEl = el;
+  el.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus();
 
   // Floating UI then measures the menu's real size against the viewport
   // and refines the position -- necessarily async (computePosition reads

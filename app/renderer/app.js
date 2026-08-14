@@ -38,15 +38,40 @@ window.cttc?.onMainLog?.(({ level, text }) => {
   (level === "error" ? console.error : console.log)(`[main] ${text}`);
 });
 
+// Default ceiling for get()/post() below -- generous enough for a large
+// export/date-range query on localhost or over an ssh tunnel, but finite:
+// without this, a stalled server (e.g. mid-recovery) leaves fetch() pending
+// forever and the caller's UI hangs with no error (see the "Export metrics
+// hangs" regression this default was added to fix).
+const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
+
 // GET path (relative to the CTTC server, never the docker/ssh target -- see
-// normalizeDockerHost below) -> parsed JSON body. Throws on any non-2xx.
-async function get(path) {
-  const r = await fetch(API + path, { headers: authHeaders() });
+// normalizeDockerHost below) -> parsed JSON body. Throws on any non-2xx or
+// if the server never responds within timeoutMs.
+async function get(path, { timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS } = {}) {
+  let r;
+  try {
+    r = await fetch(API + path, { headers: authHeaders(), signal: AbortSignal.timeout(timeoutMs) });
+  } catch (err) {
+    if (err.name === "TimeoutError") throw new Error(`${path}: no response within ${timeoutMs}ms`);
+    throw err;
+  }
   if (!r.ok) throw new Error(`${path}: ${r.status}`);
   return r.json();
 }
-async function post(path, body) {
-  const r = await fetch(API + path, { method: "POST", body: JSON.stringify(body || {}), headers: authHeaders() });
+async function post(path, body, { timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS } = {}) {
+  let r;
+  try {
+    r = await fetch(API + path, {
+      method: "POST",
+      body: JSON.stringify(body || {}),
+      headers: authHeaders(),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (err) {
+    if (err.name === "TimeoutError") throw new Error(`${path}: no response within ${timeoutMs}ms`);
+    throw err;
+  }
   const j = await r.json().catch(() => ({}));
   if (!r.ok) {
     const e = new Error(j.error || `${path}: ${r.status}`);
@@ -143,6 +168,15 @@ const state = {
   // survives the source itself being closed and reopened, same as
   // state.track/state.visible above.
   panelOrder: prefs.get("panelOrder", {}),
+  // Which connected Docker host's telemetry/containers are actually shown
+  // -- multiple hosts can be collected concurrently server-side (New Docker
+  // Host never disconnects a previous one, and lastDockerSessions replays
+  // every remembered host on launch), but the graph/snapshot/exports only
+  // ever show one at a time (see isOtherDockerHostHidden). "local" or a
+  // full "ssh://user@host[:port]" string -- set whenever a host is
+  // connected/edited (Set/Edit Docker Host's dlg-ok), self-healed in
+  // refreshAll() if it stops matching anything currently open.
+  activeDockerHost: prefs.get("activeDockerHost", "local"),
 };
 // Migrates a pre-per-graph "chartStyle" pref (a bare "lines"/"bars" string,
 // applied to every graph at once) to the {svc, host} shape -- carries the
@@ -175,7 +209,16 @@ const STRIPS = [
   { key: "mem", title: "MEM %", fmt: (v) => v.toFixed(1) + "%" },
   { key: "net", title: "NET", fmt: fmtBytes },
 ];
-const MARGIN_L = 46, MARGIN_R = 8, AXIS_H = 20;
+// NET's byte-rate axis labels ("999.9 GB/s") are the widest text any
+// strip ever draws (percentages top out at "100.0%") -- measured here
+// once, rather than guessed, so a wide value can never silently clip off
+// the left edge of the chart the way a too-small fixed constant did.
+const MARGIN_L = (() => {
+  const ctx = document.createElement("canvas").getContext("2d");
+  ctx.font = "10px system-ui, sans-serif";
+  return Math.ceil(ctx.measureText("999.9 GB/s").width) + 8;
+})();
+const MARGIN_R = 8, AXIS_H = 20;
 const STRIP_MIN_H = 44;
 // Per-strip height -- no longer a fixed/dragged value: each group (svc,
 // host) auto-fits its own strips to whatever vertical room its container
@@ -278,12 +321,19 @@ function sampleFileGroups() {
   return [...byPath.values()];
 }
 // true if this source belongs to a loaded .cttc-metric/.cttc-record file
-// that *isn't* the current active view (see setActiveView) -- exactly one
-// loaded file's sources are ever shown at a time now, checked everywhere a
-// sample-sourced series/lane/panel might need hiding.
+// that shouldn't be shown right now: either it isn't the active view's own
+// file (see setActiveView), or we're not even in analysis mode at all.
+// Extremely hard rule: live view and analysis view never share data in
+// either direction -- Back to Live (setLiveHidden(false)) deliberately
+// never clears state.activeSamplePath (loaded samples aren't closed, so
+// Opened Data can still list them), so the `!state.liveHidden` check here
+// is what actually hides a just-left sample's data once back in live view;
+// without it this only ever compared *which* sample, never *whether* one
+// should be showing at all. Checked everywhere a sample-sourced
+// series/lane/panel might need hiding.
 function isSampleHidden(sid) {
   const src = state.sources.find((s) => s.id === sid);
-  return !!(src && src.live === false && src.path !== state.activeSamplePath);
+  return !!(src && src.live === false && (!state.liveHidden || src.path !== state.activeSamplePath));
 }
 // The inverse of isSampleHidden: true for a *live* source while the app is
 // in analysis mode (state.liveHidden) -- checked
@@ -291,6 +341,18 @@ function isSampleHidden(sid) {
 // depending on which one the toolbar is currently focused on.
 function isLiveDataHidden(sid) {
   return state.liveHidden && isLiveSid(sid);
+}
+// true if this source is live docker telemetry/logs from a Docker host
+// other than the currently active one (state.activeDockerHost) -- multiple
+// hosts can be collected concurrently in the background (see New Docker
+// Host's own docstring), but only the active host's data is ever shown.
+// Orthogonal to isSampleHidden/isLiveDataHidden: a loaded/uploaded sample
+// (live === false) is never host-scoped, so this only ever applies to a
+// live docker:// source.
+function isOtherDockerHostHidden(sid) {
+  const src = state.sources.find((s) => s.id === sid);
+  if (!src || src.live !== true || !/^docker:\/\//.test(src.path || "")) return false;
+  return (src.host || "local") !== (state.activeDockerHost || "local");
 }
 /* ── layout references ──────────────────────────────────────────────────── */
 
@@ -359,6 +421,14 @@ if (POPOUT_KIND === "series") {
   document.querySelector("#chart-head span").textContent = POPOUT_ID;
 }
 
+// True platform distinction (Cmd vs Ctrl, menu label glyphs) -- NOT the
+// same question as which side the OS's window-control buttons are on
+// (see controlsSide, defined below panels/Panel since it needs to walk
+// existing panels): macOS traffic lights are always left, an OS
+// constant, but Windows/Linux control-button position genuinely varies
+// by theme/DE and can't be inferred from the platform alone.
+const IS_MAC = navigator.platform.toUpperCase().includes("MAC");
+
 // in the main window, hide whichever panels have been popped out elsewhere.
 function applyPopoutLayout() {
   if (POPOUT_KIND) return; // popout windows have a fixed single-panel layout
@@ -416,7 +486,7 @@ function buildStrips() {
       c.className = "strip";
       c.dataset.strip = i;
       c.dataset.group = group;
-      c.title = "Click: move cursor  ·  Drag: zoom to selection  ·  Right-click: zoom menu";
+      c.title = "Click: move cursor  ·  Drag: zoom to selection  ·  Right-click: capture/snapshot menu";
       parent.appendChild(c);
       arr.push(c);
     });
@@ -447,10 +517,10 @@ function seriesOf(group, respectVisibility = true) {
     if (!!s.host !== (group === "host")) return false;
     if (group === "svc" && POPOUT_KIND === "series") {
       // a series popout shows exactly its one series, whatever its track state
-      return s.name === POPOUT_ID && !isSampleHidden(s.sid) && !isLiveDataHidden(s.sid);
+      return s.name === POPOUT_ID && !isSampleHidden(s.sid) && !isLiveDataHidden(s.sid) && !isOtherDockerHostHidden(s.sid);
     }
     if (group === "svc" && trackStateOf(s) !== "sel") return false;
-    if (isSampleHidden(s.sid) || isLiveDataHidden(s.sid)) return false;
+    if (isSampleHidden(s.sid) || isLiveDataHidden(s.sid) || isOtherDockerHostHidden(s.sid)) return false;
     return !respectVisibility || state.visible.get(s.name) !== false;
   });
 }
@@ -463,7 +533,7 @@ function allSvcSeries() {
 // the host-stats source "host@<hostname>" (bare hostname, no user@, see
 // HostStatsSource) specifically so the client can pull it back out here.
 function hostTelemetryLabel() {
-  const src = state.sources.find((s) => s.kind === "stats" && s.is_host);
+  const src = state.sources.find((s) => s.kind === "stats" && s.is_host && !isOtherDockerHostHidden(s.id));
   const name = String(src?.name || "");
   const host = name.startsWith("host@") ? name.slice("host@".length) : "";
   if (!host || host === "local") return "Host telemetry — localhost";
@@ -794,7 +864,7 @@ function drawVerticals(ctx, h) {
 /* ── density lanes (one per log source) ─────────────────────────────────── */
 
 function drawLanes() {
-  let logs = state.sources.filter((s) => s.kind === "log" && !isSampleHidden(s.id) && !isLiveDataHidden(s.id));
+  let logs = state.sources.filter((s) => s.kind === "log" && !isSampleHidden(s.id) && !isLiveDataHidden(s.id) && !isOtherDockerHostHidden(s.id));
   // a series popout keeps only the lanes of the same-named log source(s)
   if (POPOUT_KIND === "series") logs = logs.filter((s) => s.name === POPOUT_ID);
   // rebuild DOM if the set changed
@@ -901,7 +971,6 @@ async function startTracking(s) {
           host: host === "local" ? null : host,
           stats: false, host_stats: false, transforms: [],
           logs: [{ name: s.name, type: ttype }],
-          ssh_key: dockerHostKeys.get(host) ?? null,
           interval: dockerPollIntervalSecs,
         });
       } catch (err) {
@@ -994,7 +1063,7 @@ function renderLegend() {
   // loaded file's own series, must never appear alongside the active
   // one's (BUG-0082 -- this filter was missing here, so every container
   // ever tracked across every load kept piling up in the legend forever).
-  let all = allSvcSeries().filter((s) => !isSampleHidden(s.sid) && !isLiveDataHidden(s.sid));
+  let all = allSvcSeries().filter((s) => !isSampleHidden(s.sid) && !isLiveDataHidden(s.sid) && !isOtherDockerHostHidden(s.sid));
   // a series popout's legend shows just its one series, always as selected
   if (POPOUT_KIND === "series") all = all.filter((s) => s.name === POPOUT_ID);
   const sel = all.filter((s) => POPOUT_KIND === "series" || trackStateOf(s) === "sel")
@@ -1131,20 +1200,19 @@ function timelineUp(c, e) {
 // opposed to any individual container) is currently being collected --
 // drives the export dialog's default "include host telemetry" checkbox.
 function hasHostSeries() {
-  return (state.series?.services || []).some((s) => s.host);
+  return (state.series?.services || []).some((s) => s.host && !isOtherDockerHostHidden(s.sid));
 }
 
-// any currently open docker:// source tells us which host (and ssh key) to
-// use if we need to start host-telemetry collection from the export dialog
+// The active Docker host (see state.activeDockerHost), in the "null means
+// local" shape every existing caller already expects (form pre-fill, Edit
+// Docker Host's target, the export dialog's host-telemetry POST). Multiple
+// hosts can be connected at once, so this deliberately does NOT scan
+// state.sources for "the first docker:// source found" anymore (ambiguous,
+// and arbitrary once a second host is open) -- state.activeDockerHost is
+// the single source of truth, set on connect/edit and self-healed in
+// refreshAll().
 function currentDockerHost() {
-  for (const s of state.sources) {
-    // hostkey itself is "local" or a full "ssh://user@host[:port]" (which
-    // has its own slashes) -- a plain "up to the first slash" match would
-    // truncate that down to just "ssh:".
-    const m = /^docker:\/\/(local|ssh:\/\/[^/]+)\//.exec(s.path || "");
-    if (m) return m[1] === "local" ? null : m[1];
-  }
-  return null;
+  return state.activeDockerHost === "local" ? null : state.activeDockerHost;
 }
 
 // Whether *any* docker:// source (stats/host/container/service, local or
@@ -1167,8 +1235,14 @@ function syncDockerDaemonButtons() {
   $("btn-edit-docker-host").disabled = !hasDockerDaemon();
   // Remove Docker Host (permanently forgetting a saved one) is independent
   // of whether anything is currently connected -- it operates on the saved
-  // catalog (savedDockerDaemons), not on state.sources.
-  $("btn-remove-docker-daemon").disabled = Object.keys(prefs.get("savedDockerDaemons", {})).length === 0;
+  // catalog (gateways.json's dockerHosts[], see dockerHostHistory()), not
+  // on state.sources. dockerHostHistory() is async (an IPC round-trip) --
+  // fire-and-forget rather than blocking this otherwise-synchronous
+  // function (called on every state.sources refresh); the button briefly
+  // keeps its previous disabled state until this resolves.
+  dockerHostHistory().then((history) => {
+    $("btn-remove-docker-daemon").disabled = history.length === 0;
+  });
   refreshDockerHostPill();
 }
 
@@ -1237,7 +1311,6 @@ async function exportSample(t0, t1) {
       const host = currentDockerHost();
       await post("/docker/collect", {
         host, stats: false, host_stats: true, logs: [], transforms: [],
-        ssh_key: dockerHostKeys.get(host || "local") ?? null,
         interval: dockerPollIntervalSecs,
       });
     } catch (err) {
@@ -1251,7 +1324,14 @@ async function exportSample(t0, t1) {
     // remote one reached directly over HTTP -- see docs/architecture/
     // remote-server.md phase 3) rather than asking it to write to a path
     // that might not exist on whichever machine actually ran it
-    const params = new URLSearchParams({ from: t0, to: t1, include_host: opts.includeHost ? "1" : "0" });
+    // Scoped to the active Docker host server-side too (not just this
+    // client's own display filtering) -- see isOtherDockerHostHidden and
+    // /files/download's `host` param. state.activeDockerHost itself (not
+    // currentDockerHost(), which maps local to null for form pre-fill).
+    const params = new URLSearchParams({
+      from: t0, to: t1, include_host: opts.includeHost ? "1" : "0",
+      host: state.activeDockerHost || "local",
+    });
     const res = await fetch(`${API}/files/download?${params}`, { headers: authHeaders() });
     if (!res.ok) throw new Error((await res.json().catch(() => null))?.error || `download failed: ${res.status}`);
     const sourceCount = Number(res.headers.get("X-CTTC-Source-Count") || 0);
@@ -1306,12 +1386,12 @@ async function computeSlice(t, { includeLogs, ctxLines }) {
   const r = await get(`/point?t=${t}`);
   let services = Object.entries(r.services || {}).map(([name, v]) => ({ name, ...v }));
   const selected = new Set(allSvcSeries().filter((s) => trackStateOf(s) === "sel").map((s) => s.name));
-  services = services.filter((s) => s.host || selected.has(s.name));
+  services = services.filter((s) => (s.host || selected.has(s.name)) && !isOtherDockerHostHidden(s.sid));
   services.sort((a, b) => (b.host - a.host) || a.name.localeCompare(b.name));
 
   let logs = [];
   if (includeLogs) {
-    const logSources = state.sources.filter((s) => s.kind === "log" && !isSampleHidden(s.id) && !isLiveDataHidden(s.id));
+    const logSources = state.sources.filter((s) => s.kind === "log" && !isSampleHidden(s.id) && !isLiveDataHidden(s.id) && !isOtherDockerHostHidden(s.id));
     logs = await Promise.all(logSources.map(async (s) => {
       try {
         const idx = await get(`/index_at?source=${s.id}&t=${t}`);
@@ -1594,6 +1674,36 @@ async function fetchLogRowsInRange(sourceId, t0, t1) {
   }
 }
 
+// Every row a source has, start to end -- the counterpart to
+// fetchLogRowsInRange above but with no time bound at all (used by the log
+// panel's own "Export .log" button, which always exports everything
+// currently in that viewer, not just what's in the chart's current time
+// window).
+async function fetchAllLogRows(sourceId) {
+  const rows = [];
+  let start = 0;
+  for (;;) {
+    const page = await get(`/logs?source=${sourceId}&start=${start}&count=2000`);
+    rows.push(...page.rows);
+    start += page.rows.length;
+    if (page.rows.length < 2000 || start >= page.total) return rows;
+  }
+}
+
+// Thin, individually reassignable wrappers -- same pattern as
+// pickRecordingSavePath/writeRecordingBytes, so tests can substitute an
+// in-memory store instead of driving a real native save dialog (which
+// can't run headlessly). Dialog and write are deliberately two separate
+// calls (see main.js's pick-log-export-path docstring): the log panel's
+// export button asks where to save *before* fetching a single row, so
+// cancelling out of the dialog costs nothing.
+async function pickLogExportPath(defaultName) {
+  return window.cttc?.pickLogExportPath ? window.cttc.pickLogExportPath(defaultName) : null;
+}
+async function writeLogExportFile(path, bytes) {
+  return window.cttc.writeBinaryFile(path, bytes);
+}
+
 // stats_export's response, like /series's own, spans every open stats
 // source -- filtered down to just the active sample's own (isSampleHidden/
 // isLiveDataHidden, via each service's "sid") so an export doesn't pile up
@@ -1606,11 +1716,11 @@ async function gatherExportMetricsData(includeStats, includeLogs) {
     const r = await get(`/stats_export?from=${range.min_ts}&to=${range.max_ts}&granularity=${exportMetricsGranularity}`);
     data.stats = {
       granularity: exportMetricsGranularity,
-      services: r.services.filter((s) => !isSampleHidden(s.sid) && !isLiveDataHidden(s.sid)),
+      services: r.services.filter((s) => !isSampleHidden(s.sid) && !isLiveDataHidden(s.sid) && !isOtherDockerHostHidden(s.sid)),
     };
   }
   if (includeLogs) {
-    const logSources = state.sources.filter((s) => s.kind === "log" && !isSampleHidden(s.id) && !isLiveDataHidden(s.id));
+    const logSources = state.sources.filter((s) => s.kind === "log" && !isSampleHidden(s.id) && !isLiveDataHidden(s.id) && !isOtherDockerHostHidden(s.id));
     data.logs = await Promise.all(logSources.map(async (s) => ({
       source: s.name,
       path: s.path,
@@ -1681,19 +1791,22 @@ $("dlg-export-metrics-export").onclick = async () => {
   }
 };
 
-// Shared "time" context menu: capture metrics / take snapshot / zoom / reset,
-// anchored on time `t`. Used both by right-clicking a chart (t = the point
-// under the cursor) and by right-clicking selected log entries (t = the
-// center of their timestamps). `onDone`, if given, runs once whichever
-// action was picked (used to clear a log panel's selection afterwards).
+// Shared "time" context menu: capture metrics / take snapshot, anchored on
+// time `t`. Used both by right-clicking a chart (t = the point under the
+// cursor) and by right-clicking selected log entries (t = the center of
+// their timestamps). `onDone`, if given, runs once whichever action was
+// picked (used to clear a log panel's selection afterwards).
+//
+// Zoom in/out/reset used to be menu items here too -- removed from this
+// menu on request, but zoomAt()/resetZoom() themselves are untouched and
+// still very much live: plain drag-to-zoom (timelineUp) and the
+// View > Actual Size / Ctrl+0 menubar action (see menubarActions'
+// "zoom-reset") still work exactly as before.
 function timeContextMenu(e, t, onDone) {
   const wrap = (fn) => () => { onDone?.(); fn(); };
   ctxMenu(e, [
     ["✂ Capture metrics", wrap(armSampleCapture)],
     ["📸 Take snapshot at this time", wrap(() => takeSnapshot(t))],
-    ["🔍+ Zoom in here", wrap(() => zoomAt(t, 0.5))],
-    ["🔍− Zoom out here", wrap(() => zoomAt(t, 2))],
-    ["↺ Reset zoom", wrap(resetZoom)],
   ]);
 }
 
@@ -1851,9 +1964,16 @@ function followNow() {
 
 // The nav's "now" label: explicitly resumes live-following (unlike a plain
 // click elsewhere, which only recenters once and leaves live off).
-function goLive() {
+// opts.resetSpan (only ever passed by the "now" label's own click handler
+// below) additionally drops whatever span the user had zoomed/panned to,
+// restoring the graphs to their original DEFAULT_SPAN window -- every
+// other caller (auto-resume after a double-click pause, the Live-track
+// toggle, boot, leaving analysis mode) deliberately keeps the current
+// span, since those aren't the user explicitly asking to start over.
+function goLive(opts = {}) {
   state.live = true;
   state.liveResumeAt = null;
+  if (opts.resetSpan) state.view = null;
   followNow();
   setCursor(Date.now());
 }
@@ -1874,6 +1994,12 @@ function goLive() {
 setInterval(() => {
   liveTrackTick();
   if (!state.view) return;
+  // Analysis mode's view is static (see setLiveHidden's own centering) --
+  // nothing here may move it, resume live-follow out from under it, or
+  // even redraw on its behalf. Collection may still be running server-side
+  // for other open sources, but the displayed view must not react to real
+  // time at all while a sample/recording is what's shown.
+  if (state.liveHidden) return;
   if (state.live) followNow();
   else {
     if (state.liveResumeAt && Date.now() >= state.liveResumeAt) goLive();
@@ -2003,7 +2129,7 @@ function attachTimelineNav(navEl) {
 
   nowLabel.addEventListener("click", (e) => {
     e.stopPropagation();
-    goLive();
+    goLive({ resetSpan: true });
   });
 
   thumb.addEventListener("mousedown", (e) => {
@@ -2141,6 +2267,47 @@ function formatLogEntryText(text) {
 
 const panels = new Map(); // source id -> Panel
 
+// Which side the OS's own window-control buttons are on. Ideally this
+// would ask the OS directly (Windows/Linux themes and DEs can move
+// those buttons, unlike macOS's fixed-left traffic lights) -- an earlier
+// version of this did exactly that via Electron's titleBarOverlay +
+// navigator.windowControlsOverlay, but that requires frame:false, and
+// frame:false silently dropped the window's control buttons entirely on
+// Windows (never actually verified there before landing) -- a broken
+// window is worse than an imperfect guess, so that's reverted and this
+// is back to a platform-only default until a way to detect the real
+// side is found that doesn't risk the window chrome itself. Log panel
+// headers mirror this: the hamburger sits opposite the OS's own
+// controls, the two right-side icons sit alongside them (see Panel's
+// syncControlsSide and the body.controls-left CSS overrides).
+let controlsSide = IS_MAC ? "left" : "right";
+
+// A button cluster's outside-in reading order (the order you'd encounter
+// its buttons moving from the window's edge toward the center) has to
+// stay the same regardless of which side it's actually pinned to -- e.g.
+// the detach/popout button always closest to the edge, a "hide"-style
+// toggle always closest to center. canonicalOutsideIn is that fixed
+// reading order; reversing it is only ever needed once the cluster
+// itself is on the right (so left-to-right DOM order still reads as
+// outside-in from that side).
+function orderForSide(canonicalOutsideIn, side) {
+  return side === "left" ? canonicalOutsideIn : [...canonicalOutsideIn].reverse();
+}
+
+function applyControlsSide(side) {
+  controlsSide = side;
+  document.body.classList.toggle("controls-left", side === "left");
+  document.body.classList.toggle("controls-right", side === "right");
+  $("chart-head").querySelector(".panel-head-right").append(
+    ...orderForSide([$("btn-popout-telemetry"), $("btn-popback-telemetry"), $("btn-style-toggle-svc")], side)
+  );
+  $("host-head").querySelector(".panel-head-right").append(
+    ...orderForSide([$("btn-popout-host"), $("btn-popback-host"), $("btn-style-toggle-host"), $("btn-host-toggle")], side)
+  );
+  for (const p of panels.values()) p.syncControlsSide();
+}
+applyControlsSide(controlsSide);
+
 // One log source's virtual-scrolled panel: renders only the rows currently
 // in (or just outside) the visible scroll viewport, fetching them from the
 // server a PAGE (200 rows) at a time and caching pages by index for as long
@@ -2148,6 +2315,18 @@ const panels = new Map(); // source id -> Panel
 // oldest-first; `reversed` only affects display order (see dataIndexAt/
 // visualIndexOf) so index-based operations (cursor sync, search) never need
 // to care which way the panel is currently sorted.
+// Log panel header menu icons -- inlined the same way the Export entry's
+// own SVG is (see below, in the constructor), sourced from
+// ~/sources/icons/{search,sort-up,sort-down,hamburger}.svg, stripped down
+// to just viewBox plus fill="currentColor" so they inherit .icon-btn's
+// color like every other
+// header icon. Search's markup is identical (same path data) to the
+// magnifier already inlined at index.html's .mac-settings-search button.
+const LOG_MENU_SEARCH_SVG = '<svg viewBox="0 0 512 512" fill="currentColor" aria-hidden="true"><path d="m292 80c-77.196 0-140 62.804-140 140s62.804 140 140 140 140-62.804 140-140-62.804-140-140-140zm97.989 120h-38.507c-1.262-24.255-4.859-47.745-10.975-67.42 25.09 13.978 43.576 38.437 49.482 67.42zm-117.414 40h38.849c-2.545 43.399-12.971 69.987-19.425 78.185-6.453-8.198-16.879-34.786-19.424-78.185zm0-40c2.545-43.399 12.971-69.987 19.425-78.185 6.454 8.198 16.88 34.786 19.425 78.185zm-29.082-67.42c-6.116 19.675-9.714 43.165-10.975 67.42h-38.507c5.906-28.983 24.392-53.442 49.482-67.42zm-49.482 107.42h38.507c1.262 24.255 4.859 47.745 10.975 67.42-25.09-13.978-43.576-38.437-49.482-67.42zm146.496 67.42c6.116-19.675 9.714-43.165 10.975-67.42h38.507c-5.906 28.983-24.392 53.442-49.482 67.42z"/><path d="m292 0c-121.588 0-220 98.396-220 220 0 52.045 17.963 101.324 50.935 140.781l-117.077 117.077c-7.811 7.811-7.811 20.474 0 28.284 7.81 7.81 20.473 7.811 28.284 0l117.077-117.077c39.457 32.972 88.736 50.935 140.781 50.935 121.588 0 220-98.396 220-220 0-121.588-98.396-220-220-220zm0 400c-99.252 0-180-80.748-180-180s80.748-180 180-180 180 80.748 180 180-80.748 180-180 180z"/></svg>';
+const LOG_MENU_SORT_UP_SVG = '<svg viewBox="0 0 32 32" fill="currentColor" aria-hidden="true"><path d="M9.707,7.293A1,1,0,1,1,8.293,8.707L7,7.414V27a1,1,0,0,1-2,0V7.414L3.707,8.707A1,1,0,0,1,2.293,7.293l3-3a1,1,0,0,1,1.414,0ZM29,5H13a1,1,0,0,0,0,2H29a1,1,0,0,0,0-2Zm-4,7H13a1,1,0,0,0,0,2H25a1,1,0,0,0,0-2Zm-4,7H13a1,1,0,0,0,0,2h8a1,1,0,0,0,0-2Zm-4,7H13a1,1,0,0,0,0,2h4a1,1,0,0,0,0-2Z"/></svg>';
+const LOG_MENU_SORT_DOWN_SVG = '<svg viewBox="0 0 32 32" fill="currentColor" aria-hidden="true"><path d="m9.707 23.293a1 1 0 0 1 0 1.414l-3 3a1 1 0 0 1 -1.414 0l-3-3a1 1 0 0 1 1.414-1.414l1.293 1.293v-19.586a1 1 0 0 1 2 0v19.586l1.293-1.293a1 1 0 0 1 1.414 0zm19.293-18.293h-16a1 1 0 0 0 0 2h16a1 1 0 0 0 0-2zm-4 7h-12a1 1 0 0 0 0 2h12a1 1 0 0 0 0-2zm-4 7h-8a1 1 0 0 0 0 2h8a1 1 0 0 0 0-2zm-4 7h-4a1 1 0 0 0 0 2h4a1 1 0 0 0 0-2z"/></svg>';
+const LOG_MENU_HAMBURGER_SVG = '<svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path d="m19 11h-18c-.265216 0-.51957-.1054-.707107-.2929-.187536-.1875-.292893-.4419-.292893-.7071 0-.26522.105357-.51957.292893-.70711.187537-.18753.441891-.29289.707107-.29289h18c.2652 0 .5196.10536.7071.29289.1875.18754.2929.44189.2929.70711 0 .2652-.1054.5196-.2929.7071s-.4419.2929-.7071.2929zm0-7h-18c-.265216 0-.51957-.10536-.707107-.29289-.187536-.18754-.292893-.44189-.292893-.70711s.105357-.51957.292893-.70711c.187537-.18753.441891-.29289.707107-.29289h18c.2652 0 .5196.10536.7071.29289.1875.18754.2929.44189.2929.70711s-.1054.51957-.2929.70711c-.1875.18753-.4419.29289-.7071.29289zm0 14h-18c-.265216 0-.51957-.1054-.707107-.2929-.187536-.1875-.292893-.4419-.292893-.7071s.105357-.5196.292893-.7071c.187537-.1875.441891-.2929.707107-.2929h18c.2652 0 .5196.1054.7071.2929s.2929.4419.2929.7071-.1054.5196-.2929.7071-.4419.2929-.7071.2929z"/></svg>';
+
 class Panel {
   constructor(src) {
     this.src = src;
@@ -2176,29 +2355,36 @@ class Panel {
     this.sampleBadge.hidden = true;
     this.countEl = document.createElement("span");
     this.countEl.className = "muted";
-    const orderToggle = document.createElement("button");
-    orderToggle.className = "icon-btn";
-    const syncOrderToggle = () => {
-      orderToggle.textContent = this.reversed ? "⬆" : "⬇";
-      orderToggle.title = this.reversed
-        ? "Showing newest entries first — click to show oldest first"
-        : "Showing oldest entries first — click to show newest first";
-    };
-    syncOrderToggle();
-    orderToggle.onclick = () => {
-      this.reversed = !this.reversed;
+    // Search/Sort up/Sort down/Export all live in the hamburger menu below
+    // instead of as standalone buttons -- setSortDir is shared by the Sort
+    // up/down entries (mutually exclusive; the active one is marked fresh
+    // on every menu open, since entries are rebuilt per click).
+    const setSortDir = (reversed) => {
+      this.reversed = reversed;
       prefs.set("logNewestFirst", this.reversed);
-      syncOrderToggle();
       this.body.scrollTop = 0;
       this.render();
     };
-    const searchToggle = document.createElement("button");
-    searchToggle.className = "icon-btn";
-    searchToggle.textContent = "🔍";
-    searchToggle.title = "Search this log";
-    searchToggle.onclick = () => {
-      this.searchBar.hidden = !this.searchBar.hidden;
-      if (!this.searchBar.hidden) this.searchInput.focus();
+    const menuBtn = document.createElement("button");
+    menuBtn.className = "icon-btn panel-menu-btn";
+    menuBtn.innerHTML = LOG_MENU_HAMBURGER_SVG;
+    menuBtn.title = "Menu";
+    menuBtn.setAttribute("aria-label", "Menu");
+    menuBtn.setAttribute("aria-haspopup", "true");
+    menuBtn.setAttribute("aria-expanded", "false");
+    menuBtn.onclick = (e) => {
+      ctxMenu(e, [
+        ["Search", () => {
+          this.searchBar.hidden = !this.searchBar.hidden;
+          if (!this.searchBar.hidden) this.searchInput.focus();
+        }, LOG_MENU_SEARCH_SVG],
+        ["Sort up", () => setSortDir(false), LOG_MENU_SORT_UP_SVG, !this.reversed],
+        ["Sort down", () => setSortDir(true), LOG_MENU_SORT_DOWN_SVG, this.reversed],
+        // Same export glyph as #btn-export-metrics, next to the metric(s)
+        // dropdown in analysis mode -- this is that same action's
+        // log-viewer counterpart, one panel at a time.
+        ["Export", () => this.exportLog(), '<svg viewBox="0 0 512 512" fill="currentColor" aria-hidden="true"><path d="m256.008 383.451c-26.012 0-47.149-21.137-47.149-47.117v-181.017c-16.889 6.563-36.829 3.037-50.442-10.576-.117-.117-.232-.236-.345-.356-18.066-18.418-18.005-47.98.341-66.313l64.263-64.263c8.889-8.902 20.726-13.809 33.324-13.809s24.435 4.907 33.332 13.816l64.259 64.259c18.286 18.273 18.46 47.834.337 66.309-.113.121-.228.24-.345.356-13.617 13.618-33.563 17.142-50.458 10.571v181.022c0 25.981-21.136 47.118-47.117 47.118zm-26.409-272.59c5.605 2.321 9.26 7.791 9.26 13.858v211.614c0 9.438 7.679 17.117 17.117 17.117 9.47 0 17.149-7.679 17.149-17.117v-211.63c0-6.067 3.655-11.537 9.26-13.858s12.057-1.038 16.347 3.252l9.431 9.431c6.604 6.604 17.306 6.674 23.995.208.074-.076.148-.152.224-.228 6.696-6.692 6.701-17.52 0-24.216l-64.27-64.271c-3.237-3.24-7.535-5.021-12.112-5.021s-8.875 1.781-12.104 5.014l-64.274 64.274c-6.698 6.694-6.707 17.52-.003 24.22.075.075.15.151.223.228 6.689 6.465 17.391 6.396 23.996-.208l9.415-9.415c4.605-4.607 11.159-5.401 16.346-3.252z"/><path d="m432.733 512h-353.466c-43.781 0-79.267-35.415-79.267-79.267v-160.666c0-43.78 35.415-79.267 79.267-79.267h48.2c25.808 0 47.133 20.856 47.133 47.133 0 25.744-20.796 47.134-47.133 47.134h-33.2v130.667h323.467v-130.667h-33.2c-25.743 0-47.133-20.797-47.133-47.134 0-25.743 20.796-47.133 47.133-47.133h48.2c43.78 0 79.267 35.415 79.267 79.267v160.667c-.001 43.781-35.417 79.266-79.268 79.266zm-353.466-289.2c-27.216 0-49.267 22.015-49.267 49.267v160.667c0 27.211 22.011 49.266 49.267 49.266h353.467c27.214 0 49.266-22.012 49.266-49.267v-160.666c0-27.216-22.015-49.267-49.267-49.267h-48.2c-9.596 0-17.133 7.808-17.133 17.133 0 9.578 7.788 17.134 17.133 17.134h48.2c8.284 0 15 6.716 15 15v160.667c0 8.284-6.716 15-15 15h-353.466c-8.284 0-15-6.716-15-15v-160.667c0-8.284 6.716-15 15-15h48.2c9.595 0 17.133-7.807 17.133-17.134 0-9.576-7.786-17.133-17.133-17.133z"/></svg>'],
+      ]);
     };
     const popout = document.createElement("button");
     popout.className = "icon-btn";
@@ -2221,7 +2407,9 @@ class Panel {
     };
     const right = document.createElement("div");
     right.className = "panel-head-right";
-    right.append(popout, close);
+    this.popout = popout;
+    this.close = close;
+    this.popback = null;
     if (POPOUT_KIND === "log") {
       const popback = document.createElement("button");
       popback.className = "popback btn-flat";
@@ -2231,10 +2419,25 @@ class Panel {
         "Bring Back";
       popback.title = "Bring back into the main window";
       popback.onclick = () => window.close();
-      right.append(popback);
+      this.popback = popback;
     }
-    headTop.append(name, this.sampleBadge);
-    headControls.append(this.countEl, orderToggle, searchToggle, right);
+    const center = document.createElement("div");
+    center.className = "panel-head-center";
+    center.append(name, this.sampleBadge);
+    // Row 1: hamburger menu, centered name+badge, and the right-side icons
+    // -- a 3-column grid (see .panel-head-top) so the center stays
+    // centered regardless of how wide either side is, with the hamburger
+    // and icon cluster swapping which column they occupy to mirror the
+    // OS's own window-control side (see syncControlsSide). Row 2
+    // (headControls) is the entries/transforms count, flushed right on
+    // its own -- this.countEl (set in update()) is the only thing on the
+    // row below.
+    this.headTop = headTop;
+    this.menuBtn = menuBtn;
+    this.headCenter = center;
+    this.headRight = right;
+    this.syncControlsSide();
+    headControls.append(this.countEl);
     head.append(headTop, headControls);
     // Drag the header to reorder this panel (and its matching legend entry
     // moves to match), or drag it out past the window's edge to pop it out
@@ -2250,7 +2453,14 @@ class Panel {
     this.searchInput.type = "text";
     this.searchInput.placeholder = "search…";
     this.searchInput.onkeydown = (e) => {
+      // Enter/Shift+Enter and Up/Down all drive the same find() -- focus
+      // stays on the input the whole time (find() itself re-focuses after
+      // jumping to a match), so once a search is underway the user can
+      // keep stepping through matches with the keyboard alone, without
+      // ever needing to click ▲/▼.
       if (e.key === "Enter") { e.preventDefault(); this.find(!e.shiftKey); }
+      else if (e.key === "ArrowDown") { e.preventDefault(); this.find(true); }
+      else if (e.key === "ArrowUp") { e.preventDefault(); this.find(false); }
       else if (e.key === "Escape") { this.searchBar.hidden = true; }
     };
     const prevBtn = document.createElement("button");
@@ -2288,6 +2498,20 @@ class Panel {
     this.update(src);
   }
 
+  // Places the hamburger and icon-cluster zones into headTop, and orders
+  // the icon cluster's own buttons (detach closest to the window edge,
+  // close closest to center -- see orderForSide), according to the
+  // current controlsSide. Called once from the constructor, and again
+  // for every existing panel if controlsSide ever changes live (a
+  // geometrychange from the Window Controls Overlay API, see the
+  // controlsSide/applyControlsSide definitions above).
+  syncControlsSide() {
+    const start = controlsSide === "left" ? this.headRight : this.menuBtn;
+    const end = controlsSide === "left" ? this.menuBtn : this.headRight;
+    this.headTop.append(start, this.headCenter, end);
+    this.headRight.append(...orderForSide([this.popout, this.popback, this.close].filter(Boolean), controlsSide));
+  }
+
   // Called on every refreshAll() with this source's latest /sources entry
   // (row count, error, transforms). Refreshes the header/spacer and, if the
   // row count grew, invalidates the last cached page so newly-tailed rows
@@ -2303,7 +2527,7 @@ class Panel {
       this.total = src.total;
     }
     this.countEl.textContent = `${this.total.toLocaleString()} entries` +
-      (src.transforms?.length ? ` · ${src.transforms.join("+")}` : "");
+      (src.transforms?.length ? ` · ${src.transforms.map(formatTransformName).join("+")}` : "");
     const broken = this.total === 0 && !!src.error;
     this.emptyState.hidden = !broken;
     this.emptyState.textContent = broken ? src.error : "";
@@ -2459,6 +2683,32 @@ class Panel {
       await this.jumpToIndex(r.index);
     } catch (err) {
       this.searchStatus.textContent = String(err.message || err);
+    } finally {
+      // Whether this find succeeded, found nothing, or errored, focus
+      // stays on the input -- jumpToIndex()'s own render()/setCursor()
+      // touch every panel's DOM but never this one's search box, so this
+      // is only ever needed after a click on ▲/▼ (which, unlike Enter/
+      // Up/Down on the input itself, steals focus to the button).
+      this.searchInput.focus();
+    }
+  }
+
+  // "Export .log": writes every entry this log viewer currently has to a
+  // plain .log file, one line per entry. Asks where to save *first* (see
+  // main.js's pick-log-export-path docstring) -- fetchAllLogRows only
+  // runs, and nothing gets written, once the user actually confirms Save
+  // in the native dialog; cancelling costs nothing.
+  async exportLog() {
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, "-");
+    const path = await pickLogExportPath(`${this.src.name}-${stamp}.log`);
+    if (!path) return;
+    try {
+      const rows = await fetchAllLogRows(this.src.id);
+      const text = rows.map((r) => r.text).join("\n") + (rows.length ? "\n" : "");
+      await writeLogExportFile(path, new TextEncoder().encode(text));
+      notifyEvent(`Log exported: ${path}`);
+    } catch (err) {
+      notifyEvent(`Could not export log: ${err.message || err}`);
     }
   }
 
@@ -2555,7 +2805,7 @@ function syncPanels() {
     // via the legend or the panel's own close button (see Panel's close
     // handler) -- collection keeps running server-side either way, so it's
     // still right here, at the exact same spot, whenever it's switched back on.
-    p.el.hidden = isSampleHidden(s.id) || isLiveDataHidden(s.id) || state.visible.get(s.name) === false;
+    p.el.hidden = isSampleHidden(s.id) || isLiveDataHidden(s.id) || isOtherDockerHostHidden(s.id) || state.visible.get(s.name) === false;
   }
   // Reorders the DOM to match panelOrder every sync -- appendChild on an
   // already-attached node just moves it, so this is cheap and keeps a
@@ -2630,7 +2880,46 @@ async function refreshAll() {
       // rather than leaving every sample hidden with nothing selected.
       state.activeSamplePath = sampleGroups.length ? sampleGroups[0].path : null;
     }
-    if (hasSample !== state.liveHidden) setLiveHidden(hasSample);
+    // Self-heals state.activeDockerHost the same way: if it no longer
+    // matches any currently-open live docker source (that host was
+    // disconnected/removed some other way), fall back to whichever live
+    // docker source is still open rather than leaving the graph/exports
+    // scoped to a host with nothing left collecting. Left as-is (not
+    // reset to "local") when nothing docker-related is open at all, so
+    // reconnecting the same remote host later restores it.
+    const liveDockerHosts = state.sources
+      .filter((s) => s.live === true && /^docker:\/\//.test(s.path || ""))
+      .map((s) => s.host || "local");
+    if (liveDockerHosts.length && !liveDockerHosts.includes(state.activeDockerHost)) {
+      state.activeDockerHost = liveDockerHosts[0];
+      prefs.set("activeDockerHost", state.activeDockerHost);
+    }
+    // Regression fix: this self-heal used to fire unconditionally, which
+    // predates ui-LIVE-016 (Back to Live deliberately never closes loaded
+    // samples). Once that shipped, hasSample=true + liveHidden=false
+    // became a perfectly legitimate state -- exactly what clicking Back
+    // to Live with an old sample still parked open leaves you in -- but
+    // this line still treated it as "stale, force analysis mode back on",
+    // so the view rubber-banded: briefly live, then straight back to the
+    // sample. liveChosenWithSamplesStillOpen (set by setActiveView) is
+    // the fix: skip re-forcing analysis mode on only while that explicit
+    // choice still stands. The other direction (last sample just closed,
+    // nothing left to show) is unaffected and stays unconditional -- and
+    // any *explicit* switch into a file, including a no-op reupload's own
+    // setActiveView call (btn-load-sample/openRecording), already clears
+    // the flag itself, so a genuinely new/returning sample still correctly
+    // trips analysis mode exactly as this self-heal originally intended.
+    // Also self-clears here once every sample is actually gone (closed via
+    // Opened Metrics, a panel's own close button, etc. -- any route that
+    // doesn't go through setActiveView either): with nothing left open,
+    // "stay Live despite an old sample" is moot, and the *next* sample to
+    // appear is unambiguously new, so it must correctly trip analysis mode
+    // again rather than staying suppressed by a stale choice about a file
+    // that isn't even open anymore.
+    if (!hasSample) liveChosenWithSamplesStillOpen = false;
+    if (hasSample !== state.liveHidden && !(hasSample && liveChosenWithSamplesStillOpen)) {
+      setLiveHidden(hasSample);
+    }
     assignColorSlots(); // before anything draws, so slots don't depend on draw order
     const hadView = !!state.view;
     state.range = range;
@@ -2662,7 +2951,7 @@ async function refreshAll() {
 // (not "always"): a user who's panned away to look at history shouldn't
 // have their cursor yanked back to the live edge by a background refresh.
 function liveTrackTick() {
-  if (!state.live || !liveTrackEnabled) return;
+  if (!state.live || !liveTrackEnabled || state.liveHidden) return;
   setCursor(Date.now() + liveTrackSecs * 1000, { liveTrack: true });
 }
 
@@ -2803,7 +3092,7 @@ $("record-sections").onchange = async () => {
   // segment recorded at a different point in time left its data outside
   // the visible window entirely: it looked empty even though it loaded
   // correctly (BUG-0077).
-  centerViewOnLoadedStart(res.opened || []);
+  centerViewOnLoadedRange(res.opened || []);
   // Flip activeIndex (and the dropdown) only now that the view is actually
   // centered on the new segment -- this is the signal anything watching
   // activeRecordSections uses to know the switch is done, so it must not
@@ -2826,22 +3115,34 @@ async function pickAnalysisFiles() {
   ]);
 }
 
-// Centers the view on the earliest min_ts among just-opened sources,
-// instead of resetZoom()'s "fit the combined range" -- recording keeps
-// ingesting live data in the background regardless of what's shown (see
-// ui-REC-013), so the combined /range can span from the loaded file's own
-// history all the way to "now", making the file itself look like a sliver
-// (or vice versa) rather than showing what was actually just loaded.
-// Reads from state.sources (already refreshed by the caller's own
-// refreshAll(), which is /sources-backed and so already carries min_ts).
-function centerViewOnLoadedStart(openedIds) {
+// Centers the view on the midpoint of just-opened sources' own combined
+// span, zoomed so that span occupies 75% of the visible width (explicit
+// user direction, 2026-08-12) -- instead of resetZoom()'s "fit the
+// combined /range". Recording keeps ingesting live data in the background
+// regardless of what's shown (see ui-REC-013), so the combined /range can
+// span from the loaded file's own history all the way to "now", making
+// the file itself look like a sliver (or vice versa) rather than showing
+// what was actually just loaded. Reads from state.sources (already
+// refreshed by the caller's own refreshAll(), which is /sources-backed
+// and so already carries min_ts/max_ts).
+function centerViewOnLoadedRange(openedIds) {
   const opened = new Set(openedIds);
-  const starts = state.sources
-    .filter((s) => opened.has(s.id) && s.min_ts != null)
-    .map((s) => s.min_ts);
+  const starts = [], ends = [];
+  for (const s of state.sources) {
+    if (opened.has(s.id) && s.min_ts != null) {
+      starts.push(s.min_ts);
+      ends.push(s.max_ts);
+    }
+  }
   if (!starts.length) return;
   const start = Math.min(...starts);
-  setView(start - DEFAULT_SPAN / 2, start + DEFAULT_SPAN / 2);
+  const end = Math.max(...ends);
+  // pad chosen so (span + 2*pad) * 0.75 === span, i.e. the loaded data
+  // occupies exactly 75% of the resulting view; floored so a near-
+  // instantaneous recording still gets a sensible, non-degenerate zoom.
+  const span = Math.max(end - start, 1500);
+  const pad = span / 6;
+  setView(start - pad, end + pad);
 }
 
 $("btn-load-sample").onclick = async () => {
@@ -2882,7 +3183,7 @@ $("btn-load-sample").onclick = async () => {
     }
     await refreshAll(); // also switches into analysis mode -- see setLiveHidden
     setActiveView(`upload://${basename(files[files.length - 1])}`);
-    centerViewOnLoadedStart(openedIds);
+    centerViewOnLoadedRange(openedIds);
   } catch (err) {
     alert(String(err.message || err));
   }
@@ -3295,7 +3596,7 @@ async function openRecording() {
     }
     await refreshAll(); // also switches into analysis mode -- see setLiveHidden
     setActiveView(`upload://${basename(files[files.length - 1])}`);
-    centerViewOnLoadedStart(openedIds);
+    centerViewOnLoadedRange(openedIds);
   } catch (err) {
     alert(String(err.message || err));
   }
@@ -3608,6 +3909,20 @@ function setLiveTrackEnabled(enabled) {
   $("live-track-toggle-sidebar").checked = enabled;
   $("live-track-secs").disabled = !enabled;
   $("live-track-secs-sidebar").disabled = !enabled;
+  // Turning tracking off must interrupt its own highlight, not just stop
+  // moving it -- liveTrackTick() becoming a no-op above only freezes
+  // state.cursorT/liveTrackCursor wherever they last were, so the "live"
+  // highlight (log rows in hl-live, the chart's own live-track bar --
+  // both driven off this same shared cursor) would otherwise linger
+  // indefinitely. Only clears it when the highlight actually is the
+  // live-tracking one (liveTrackCursor true) -- a manually-placed cursor
+  // is left alone.
+  if (!enabled && state.liveTrackCursor) {
+    state.liveTrackCursor = false;
+    state.cursorT = null;
+    drawAll();
+    for (const p of panels.values()) p.render();
+  }
 }
 setLiveTrackEnabled(liveTrackEnabled); // apply the persisted value to both fields on load
 
@@ -3658,7 +3973,7 @@ $("dlg-settings-close").onclick = () => dlgPreferences.close();
 // Settings > Danger > Hard Reset: closes every open source (stopping
 // collection server-side, same as Remove Docker Host) and wipes every
 // persisted UI preference (prefs' entire localStorage namespace -- track
-// states, panelOrder, dockerHostKeys, sidebar dock/size, theme, the "now"
+// states, panelOrder, sidebar dock/size, theme, the "now"
 // line style, everything), then reloads to boot exactly like a brand-new
 // install. A real confirm() (not a styled dialog) on purpose -- its
 // blocking, plain-text, native-chrome nature reads as more serious than
@@ -3867,6 +4182,13 @@ function setLiveHidden(hidden) {
     // restores exactly this, rather than whatever analysis mode leaves it
     // panned/zoomed to.
     savedLiveView = state.view ? { t0: state.view.t0, t1: state.view.t1, live: state.live } : null;
+    // Extremely hard rule: analysis mode is a static view centered on the
+    // active sample's own range, not wherever Live happened to be looking
+    // the instant it loaded (state.liveHidden is already true above, so
+    // resetZoom()'s own activeViewRange() picks up the active sample; the
+    // heartbeat's !state.liveHidden guard, above, is what then keeps it
+    // static going forward).
+    resetZoom();
   } else if (!hidden && wasHidden) {
     // Leaving analysis mode: restore the saved view (resuming live-follow
     // too, if it was on) rather than leaving the view stuck wherever
@@ -3897,6 +4219,14 @@ function setLiveHidden(hidden) {
   syncPanels();
 }
 
+// Set by the user's own explicit "Back to Live" click, cleared by any
+// explicit switch back into a file (including a no-op reupload's own
+// setActiveView call) -- tells refreshAll()'s self-heal not to treat a
+// sample still sitting open in the background as a reason to force
+// analysis mode back on. See that self-heal's own comment for why this
+// exists (ui-LIVE-016 regression fix).
+let liveChosenWithSamplesStillOpen = false;
+
 // The one entry point for "show exactly this, and nothing else" -- either
 // "live" or one loaded file's path (sampleFileGroups()'s own g.path, the
 // same value state.activeSamplePath and isSampleHidden compare against).
@@ -3908,6 +4238,7 @@ function setLiveHidden(hidden) {
 // its own side effects when `hidden` doesn't actually change, but still
 // re-renders, so switching between two already-open files still works).
 function setActiveView(view) {
+  liveChosenWithSamplesStillOpen = view === "live";
   if (view === "live") {
     setLiveHidden(false);
     return;
@@ -3985,8 +4316,7 @@ if (!POPOUT_KIND) {
    be styled via CSS on either macOS or Windows) ─────────────────────────── */
 {
   const menubar = $("menubar");
-  const isMac = navigator.platform.toUpperCase().includes("MAC");
-  if (isMac) {
+  if (IS_MAC) {
     for (const acc of menubar.querySelectorAll(".acc")) {
       acc.textContent = acc.textContent
         .replace(/Ctrl\+Shift\+/, "⇧⌘")
@@ -4045,10 +4375,12 @@ if (!POPOUT_KIND) {
     "new-gateway": () => openNewGatewayDialog(),
     "edit-gateways": () => openEditGatewaysDialog(),
     "uninstall-gateway": () => openUninstallGatewayDialog(),
+    "secure-storage": () => window.cttc.openVaultWindow(),
     "event-create": () => $("btn-event-create").click(),
     "event-edit": () => $("btn-event-edit").click(),
     "open-theme": () => openThemeDialog(),
     "open-settings": () => openSettingsDialog(),
+    "redis-cli": () => openRedisCliDialog(),
     // View > Actual Size (Ctrl/Cmd+0) otherwise only resets the browser
     // page's own zoom level (window.cttc.menubarAction, handled in main.js)
     // -- which does nothing to the timeline's pan/zoom. "Reset zoom"
@@ -4248,7 +4580,7 @@ if (!POPOUT_KIND) {
     "mod+q": "quit",
   };
   window.addEventListener("keydown", (e) => {
-    const mod = isMac ? e.metaKey : e.ctrlKey;
+    const mod = IS_MAC ? e.metaKey : e.ctrlKey;
     const key = e.key.toLowerCase();
     if (["control", "meta", "shift", "alt"].includes(key)) return;
     const combo = mod ? `mod+${key}` : key;
@@ -4275,18 +4607,36 @@ function shouldPromptSetSourcesOnBoot() {
   return state.sources.length === 0 && !dlgResumeChoice.open;
 }
 
+// Named (not inlined) so it's independently testable. Reopens whatever
+// containers/services were being collected last time (nothing else has
+// opened anything yet -- see the only caller, below), and sets
+// state.activeDockerHost to match -- the same funnel point as Set/Edit
+// Docker Host's dlg-ok (br-DHOST-030). Without this, activeDockerHost
+// stays whatever it last was (often "local" from a much earlier session),
+// and if that stale local session also gets replayed here alongside a
+// newer remote one (lastDockerSessions is undeduped and append-only, so
+// both can coexist), refreshAll()'s self-heal treats "local" as a
+// perfectly valid match and never corrects it -- silently hiding the
+// remote host's containers/telemetry even though it's the one just
+// (re)connected (regression found 2026-08-12).
+async function autoReconnectLastDockerSessions() {
+  const sessions = prefs.get("lastDockerSessions", []);
+  if (!sessions.length) return;
+  try {
+    await Promise.all(sessions.map((req) => post("/docker/collect", req)));
+    const lastHost = sessions[sessions.length - 1]?.host;
+    state.activeDockerHost = lastHost || "local";
+    prefs.set("activeDockerHost", state.activeDockerHost);
+    await refreshAll();
+  } catch { /* remembered host(s) unreachable; fall through */ }
+}
+
 refreshAll().then(async () => {
   if (POPOUT_KIND) return; // popout windows never restore/set sources on their own
   if (state.sources.length === 0) {
     // nothing open yet (fresh install, or the last session's sources are all
     // closed): try to reopen the containers/services collected last time.
-    const sessions = prefs.get("lastDockerSessions", []);
-    if (sessions.length) {
-      try {
-        await Promise.all(sessions.map((req) => post("/docker/collect", req)));
-        await refreshAll();
-      } catch { /* remembered host(s) unreachable; fall through below */ }
-    }
+    await autoReconnectLastDockerSessions();
   }
   if (shouldPromptSetSourcesOnBoot()) $("btn-set").click();
 });

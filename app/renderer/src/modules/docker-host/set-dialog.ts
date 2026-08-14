@@ -1,8 +1,8 @@
 import "../../shared/legacy-globals";
 import { $ } from "../../shared/dollar";
 import { exposeMutable } from "../../shared/expose-mutable";
+import { formatTransformName } from "../../shared/format";
 import {
-  dockerHostKeys,
   dockerFormFetched,
   setDockerFormFetched,
   dockerFetchAttempted,
@@ -21,11 +21,6 @@ import {
 /* ── set-sources dialog (Docker) ────────────────────────────────────────── */
 
 export const dlg = $("dlg-set");
-
-$("docker-ssh-key-browse").onclick = async () => {
-  const paths = await window.cttc!.pickFiles("Choose your SSH private key");
-  if (paths.length) $("docker-ssh-key").value = paths[0];
-};
 
 // names of the transform checkboxes ticked in Set Sources, in DOM order --
 // sent as-is to /docker/collect, which loads and applies them server-side.
@@ -56,18 +51,17 @@ function syncActivityToggleEnabled(): void {
 $("docker-host").addEventListener("input", syncActivityToggleEnabled);
 
 // Picking a previously-used Docker host here now does what a separate Edit
-// Docker Host button used to, for a *disconnected* one: pre-fills its ssh
-// key and whatever containers/services it last had selected, then
-// immediately re-probes it live. Host/ssh-key stay editable here (unlike
-// enterDockerHostEditMode below) since nothing is actually connected yet --
-// there's no live identity that needs protecting from being changed.
+// Docker Host button used to, for a *disconnected* one: pre-fills whatever
+// containers/services it last had selected, then immediately re-probes it
+// live. Host stays editable here (unlike enterDockerHostEditMode below)
+// since nothing is actually connected yet -- there's no live identity that
+// needs protecting from being changed.
 $("docker-host-history").onchange = async () => {
   const hostKey = $("docker-host-history").value;
   if (!hostKey) return;
-  const entry = dockerHostHistory().find((e) => e.hostKey === hostKey);
+  const entry = (await dockerHostHistory()).find((e) => e.hostKey === hostKey);
   if (!entry) return;
   $("docker-host").value = hostKey === "local" ? "" : hostKey.replace(/^ssh:\/\//, "");
-  $("docker-ssh-key").value = (entry.ssh_key as string) || "";
   // Loading a *different* saved host supersedes whatever the current
   // dialog session already fetched (if anything) -- that answer was for the
   // host just replaced, not this one.
@@ -96,9 +90,6 @@ export function openNewDockerHostDialog(): void {
   setSelectedTargets({ containers: new Set(), services: new Set() });
   $("docker-host").value = "";
   $("docker-host").disabled = false;
-  $("docker-ssh-key").value = "";
-  $("docker-ssh-key").disabled = false;
-  $("docker-ssh-key-browse").disabled = false;
   $("dlg-set-title").textContent = "New Docker Host";
   $("btn-ps-refresh-label").textContent = "Fetch Sources";
   $("dlg-ok").textContent = "Connect Docker Host";
@@ -112,8 +103,15 @@ export function openNewDockerHostDialog(): void {
   // Still populates the underlying <select>'s options (some callers drive
   // it programmatically, see the Docker Host pill's openHost) -- only the
   // row itself stays hidden, since New Docker Host never shows this picker.
-  populateDockerHostHistory();
-  $("docker-host-history-row").hidden = true;
+  // Deliberately not awaited: this function stays synchronous (showModal
+  // fires immediately, same as before dockerHostHistory() became an IPC
+  // round-trip) -- the unconditional hide is chained onto the same promise
+  // instead, so it still always lands after populate's own async
+  // row-visibility write (based on history.length), just without making
+  // every caller wait on an IPC call before the dialog actually opens.
+  populateDockerHostHistory().then(() => {
+    $("docker-host-history-row").hidden = true;
+  });
   dlg.showModal();
 }
 $("btn-set").onclick = openNewDockerHostDialog;
@@ -127,25 +125,21 @@ export async function openEditDockerHostDialog(): Promise<void> {
 }
 $("btn-edit-docker-host").onclick = openEditDockerHostDialog;
 
-// Reopens the dialog pre-pointed at hostKey -- host and ssh key are locked
-// (this is "reconfigure/refresh what's already set", editing which
-// containers/services are followed for an already-identified host, not
-// its connection string itself), and Fetch becomes Refresh, since it's
-// re-probing a known daemon rather than connecting to a new one. Load
-// Docker Host stays visible+enabled here too (unlike before) -- picking a
-// different saved host from it re-targets the checklist to that host, but
-// never unlocks host/ssh-key: still Edit, just editing a different host's
-// checklist now, not its connection string either. Submitting still goes
-// through the same dlg-ok handler as the create flow, disabled inputs'
-// .value reads normally.
+// Reopens the dialog pre-pointed at hostKey -- host is locked (this is
+// "reconfigure/refresh what's already set", editing which containers/
+// services are followed for an already-identified host, not its connection
+// string itself), and Fetch becomes Refresh, since it's re-probing a known
+// daemon rather than connecting to a new one. Load Docker Host stays
+// visible+enabled here too (unlike before) -- picking a different saved
+// host from it re-targets the checklist to that host, but never unlocks
+// host: still Edit, just editing a different host's checklist now, not its
+// connection string either. Submitting still goes through the same dlg-ok
+// handler as the create flow, disabled inputs' .value reads normally.
 export async function enterDockerHostEditMode(hostKey: string): Promise<void> {
   setDockerDaemonEditMode(true);
-  populateDockerHostHistory();
+  await populateDockerHostHistory();
   $("docker-host").value = hostKey === "local" ? "" : hostKey.replace(/^ssh:\/\//, "");
   $("docker-host").disabled = true;
-  $("docker-ssh-key").value = dockerHostKeys.get(hostKey) || "";
-  $("docker-ssh-key").disabled = true;
-  $("docker-ssh-key-browse").disabled = true;
   $("dlg-set-title").textContent = "Edit Docker Host";
   $("btn-ps-refresh-label").textContent = "Refresh Sources";
   $("dlg-ok").textContent = "Update Docker Host";
@@ -204,9 +198,9 @@ function updateDlgOkEnabled(): void {
 // Closes every open source for the currently-connected daemon and drops it
 // from the auto-reconnect-on-launch list (lastDockerSessions), so it
 // doesn't silently come right back next launch -- but keeps its entry in
-// savedDockerDaemons, so it still shows up in Load Docker Host (Connect
-// Docker Host) and Remove Docker Host. "Disconnect", not "forget" -- use
-// Remove Docker Host for that.
+// gateways.json's dockerHosts[] catalog, so it still shows up in Load
+// Docker Host (Connect Docker Host) and Remove Docker Host. "Disconnect",
+// not "forget" -- use Remove Docker Host for that.
 $("btn-clear-sources").onclick = async () => {
   if (!state.sources.length) return; // nothing to clear -- no point asking
   if (!confirm(`Close all ${state.sources.length} open source${state.sources.length === 1 ? "" : "s"}? You can reconnect it later via Load Docker Host.`)) return;
@@ -222,8 +216,8 @@ $("btn-clear-sources").onclick = async () => {
     // #dlg-set is a showModal() dialog -- it's structurally impossible to
     // reach this handler while it's open (the modal blocks the toolbar), so
     // there's nothing to close here. What's real: dockerDaemonEditMode (and
-    // the host/ssh-key/browse .disabled flags it drives) is set by whichever
-    // branch of btn-set the dialog was *last* opened into (create mode or
+    // the host .disabled flag it drives) is set by whichever branch of
+    // btn-set the dialog was *last* opened into (create mode or
     // enterDockerHostEditMode), and only ever reset when *opened*, not when
     // it's closed -- so a Cancel or successful submit out of Edit mode
     // leaves it true. Disconnect is exactly the moment that
@@ -235,8 +229,6 @@ $("btn-clear-sources").onclick = async () => {
     // refreshAll() itself failed (br-DHOST-001/BUG-0067, BUG-0069).
     setDockerDaemonEditMode(false);
     $("docker-host").disabled = false;
-    $("docker-ssh-key").disabled = false;
-    $("docker-ssh-key-browse").disabled = false;
   }
 };
 
@@ -470,8 +462,6 @@ export let listContainers = async (): Promise<void> => {
   $("docker-error").textContent = "";
   renderActivityLog(null);
   const host = normalizeDockerHost($("docker-host").value);
-  const sshKey = $("docker-ssh-key").value.trim() || null;
-  dockerHostKeys.set(host || "local", sshKey!);
   // spelled out explicitly (rather than just "Connecting to <host>…") since
   // that phrasing reads as if *this browser page* opens a connection to
   // <host> -- it never does (fetch() can't even speak ssh://): the CTTC
@@ -499,7 +489,7 @@ export let listContainers = async (): Promise<void> => {
   $("btn-ps-refresh").disabled = true;
   setDockerFormEnabled(false);
   try {
-    const r = await post("/docker/ps", { host, ssh_key: sshKey });
+    const r = await post("/docker/ps", { host });
     clearInterval(tick);
     status.textContent = "";
     renderActivityLog(r.log);
@@ -538,7 +528,7 @@ export let listContainers = async (): Promise<void> => {
       // common case, not an opt-in; anything else (e.g. drop_healthchecks)
       // stays opt-in as before.
       cb.checked = wasChecked.has(tr.name) ? wasChecked.get(tr.name)! : DEFAULT_ON_TRANSFORMS.has(tr.name);
-      label.append(cb, ` ${tr.name} `);
+      label.append(cb, ` ${formatTransformName(tr.name)} `);
       const doc = document.createElement("span");
       doc.className = "tdoc";
       doc.textContent = tr.doc || "";
@@ -566,13 +556,11 @@ export let listContainers = async (): Promise<void> => {
       ? `The CTTC server reached out to ${host || "the local daemon"} and failed: ${String(e.message || err)}`
       : `Could not reach the CTTC server itself at 127.0.0.1:${PORT} (${String(e.message || err)}) — check the connection/tunnel.`;
   } finally {
-    // Edit mode locked host/ssh-key/browse on purpose (see
-    // enterDockerHostEditMode) -- a Refresh re-probing the same daemon must
-    // leave them locked, not spring back open the moment the request ends.
+    // Edit mode locked host on purpose (see enterDockerHostEditMode) -- a
+    // Refresh re-probing the same daemon must leave it locked, not spring
+    // back open the moment the request ends.
     if (!dockerDaemonEditMode) {
       $("docker-host").disabled = false;
-      $("docker-ssh-key").disabled = false;
-      $("docker-ssh-key-browse").disabled = false;
     }
     $("btn-ps-refresh").disabled = false;
     // Success or failure, the attempt is done and its activity log (if any)
@@ -611,9 +599,13 @@ $("dlg-ok").onclick = async () => {
   const transforms = chosenTransforms();
   try {
     const host = normalizeDockerHost($("docker-host").value);
-    const sshKey = $("docker-ssh-key").value.trim() || null;
-    dockerHostKeys.set(host || "local", sshKey!);
     const hostKey = host || "local";
+    // Connecting/editing a host is the one funnel point for "this is what
+    // the graph/snapshot/exports should show now" -- see
+    // isOtherDockerHostHidden in app.js. Multiple hosts can stay collected
+    // concurrently in the background; only the active one is displayed.
+    state.activeDockerHost = hostKey;
+    prefs.set("activeDockerHost", hostKey);
     // :not(:disabled) excludes the "no longer available" entries
     // (renderDockerTargetGroup's `missing`) -- checked=true there only to
     // show "this was selected", never meant to actually be (re-)submitted
@@ -648,7 +640,6 @@ $("dlg-ok").onclick = async () => {
     const collectReq = {
       host, stats: true, logs, transforms,
       host_stats: true,
-      ssh_key: sshKey,
       interval: dockerPollIntervalSecs,
     };
     await post("/docker/collect", collectReq);
@@ -656,22 +647,20 @@ $("dlg-ok").onclick = async () => {
     const sessions = prefs.get("lastDockerSessions", []) as unknown[];
     sessions.push(collectReq);
     prefs.set("lastDockerSessions", sessions);
-    // Separate, durable catalog of every daemon ever configured -- unlike
+    // Durable catalog of every daemon ever configured -- unlike
     // lastDockerSessions (an unde-duped auto-reconnect-on-launch list that
     // Disconnect Docker Host removes entries from), this is keyed by host
     // and never touched by Disconnect, only by Remove Docker Host -- see
     // dockerHostHistory()/populateDockerHostHistory() (Load Docker Host) and
-    // removeDockerDaemon() in remove-dialog.ts.
-    const saved = prefs.get("savedDockerDaemons", {}) as Record<string, unknown>;
-    saved[hostKey] = { ...collectReq, lastUsed: Date.now() };
-    prefs.set("savedDockerDaemons", saved);
-    // gateways.json's own record of "which Docker hosts were created using
-    // this gateway" (see recordDockerHostForGateway) -- additive to
-    // savedDockerDaemons above, not a replacement for it; best-effort since
-    // there's nothing useful to do here if it fails (the connection above
-    // already succeeded, so this is purely bookkeeping).
+    // the retire-docker-host IPC call in remove-dialog.ts. Recorded against
+    // the active gateway's own catalog in gateways.json (see
+    // recordDockerHostForGateway) -- the sole store for this now (the
+    // former renderer-only "savedDockerDaemons" localStorage map is gone,
+    // see docker-host/state.ts); best-effort since there's nothing useful
+    // to do here if it fails (the connection above already succeeded, so
+    // this is purely bookkeeping).
     try {
-      await window.cttc?.recordDockerHost?.({ hostKey, host, sshKey });
+      await window.cttc?.recordDockerHost?.({ hostKey, host, transforms });
     } catch (err) {
       console.error("could not record Docker host against the active gateway:", err);
     }

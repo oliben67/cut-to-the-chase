@@ -1,4 +1,11 @@
 export interface Gateway {
+  // The real, sole identifier once this entry has been recorded at least
+  // once (see lib/gateway-registry.js) -- optional only because a
+  // not-yet-provisioned "This machine" placeholder (see main.js's
+  // listGatewaysWithActiveFlag) has no on-disk record yet to carry one.
+  id?: string;
+  retired?: boolean;
+  retiredAt?: string | null;
   host: string;
   port: number | null;
   label?: string;
@@ -6,5 +13,11 @@ export interface Gateway {
   mode?: string;
   sshTarget?: string;
   sshPort?: number;
+  // A literal filesystem path -- only ever set for a scripted/env-var
+  // deploy (CTTC_SSH_KEY/connection.json's ssh_key, see
+  // lib/connection-config.js). A GUI-managed gateway's key lives encrypted
+  // in the vault instead (see lib/key-vault.js), keyed by this entry's own
+  // `id` -- hasSshKey below just reports whether one exists there.
   sshKey?: string;
+  hasSshKey?: boolean;
 }

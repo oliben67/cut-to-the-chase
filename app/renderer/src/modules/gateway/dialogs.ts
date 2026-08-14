@@ -31,13 +31,18 @@ function gwSelectedGateway(): Gateway | undefined {
   return gwGateways.find((g) => gwKeyOf(g) === $("gw-select").value);
 }
 
+// Reads the currently-checked radio directly rather than each radio's own
+// onchange toggling the others' disabled state relative to itself -- with a
+// third ("keep") mode added, that pairwise approach no longer has anywhere
+// to put "neither field applies" (see gwFillFormForEdit's own use of this).
+function gwSyncKeyModeFields(): void {
+  const checked = (document.querySelector('input[name="gw-key-mode"]:checked') as HTMLInputElement | null)?.value;
+  $("gw-key-path").disabled = checked !== "path";
+  $("gw-btn-browse").disabled = checked !== "path";
+  $("gw-key-paste").disabled = checked !== "paste";
+}
 for (const radio of document.querySelectorAll('input[name="gw-key-mode"]')) {
-  (radio as HTMLInputElement).onchange = () => {
-    const paste = (radio as HTMLInputElement).value === "paste" && (radio as HTMLInputElement).checked;
-    $("gw-key-path").disabled = paste;
-    $("gw-btn-browse").disabled = paste;
-    $("gw-key-paste").disabled = !paste;
-  };
+  (radio as HTMLInputElement).onchange = gwSyncKeyModeFields;
 }
 for (const radio of document.querySelectorAll('input[name="gw-image-source"]')) {
   (radio as HTMLInputElement).onchange = () => {
@@ -91,6 +96,7 @@ function gwFillFormForEdit(g: Gateway | undefined): void {
     $("gw-ssh-user").value = "";
     $("gw-ssh-host").value = "";
     $("gw-key-path").value = "";
+    $("gw-key-mode-keep-row").hidden = true;
     return;
   }
 
@@ -104,13 +110,25 @@ function gwFillFormForEdit(g: Gateway | undefined): void {
     $("gw-ssh-user").value = at === -1 ? "" : g.sshTarget!.slice(0, at);
     $("gw-ssh-host").value = at === -1 ? g.sshTarget : g.sshTarget!.slice(at + 1);
     $("gw-ssh-port").value = g.sshPort || 22;
-    (document.querySelector('input[name="gw-key-mode"][value="path"]') as HTMLInputElement).checked = true;
-    $("gw-key-paste").disabled = true;
-    $("gw-key-path").value = g.sshKey || "";
+    // "Keep the current key" only shows (and only makes sense) when there's
+    // an existing vault-managed key to keep -- a literal g.sshKey (the
+    // scripted/env-var deploy case) still prefills the path field exactly
+    // as before, since there's a real path here to show and re-submit
+    // unchanged without the user re-entering anything.
+    $("gw-key-mode-keep-row").hidden = !g.hasSshKey;
+    if (g.hasSshKey) {
+      (document.querySelector('input[name="gw-key-mode"][value="keep"]') as HTMLInputElement).checked = true;
+      $("gw-key-path").value = "";
+    } else {
+      (document.querySelector('input[name="gw-key-mode"][value="path"]') as HTMLInputElement).checked = true;
+      $("gw-key-path").value = g.sshKey || "";
+    }
+    gwSyncKeyModeFields();
   } else {
     $("gw-ssh-user").value = "";
     $("gw-ssh-host").value = "";
     $("gw-key-path").value = "";
+    $("gw-key-mode-keep-row").hidden = true;
   }
 }
 
@@ -122,7 +140,9 @@ function gwFillFormForEdit(g: Gateway | undefined): void {
 // window.cttc.getGateways() itself, since the toolbar's gateway-switcher
 // dropdown still needs to offer switching *to* it.
 export function editableGateways(gateways: Gateway[]): Gateway[] {
-  return gateways.filter((g) => g.mode !== "embedded");
+  // retired entries (soft-deleted, see lib/gateway-registry.js) stay in
+  // gateways.json for history/audit but are never selectable here.
+  return gateways.filter((g) => g.mode !== "embedded" && !g.retired);
 }
 
 async function gwLoadGatewaysForEdit(): Promise<void> {
@@ -305,6 +325,12 @@ export function openNewGatewayDialog(): void {
   $("gw-activity").hidden = true;
   $("gw-activity-log").textContent = "";
   $("gw-form").reset();
+  // "Keep the current key" never applies here -- a brand-new gateway has no
+  // existing key to keep (gwFillFormForEdit is what shows/hides this row
+  // for an actual edit, and only leftover state from a previous edit-mode
+  // session could otherwise leave it visible/checked here).
+  $("gw-key-mode-keep-row").hidden = true;
+  gwSyncKeyModeFields();
   dlgGatewaySetup.showModal();
 }
 
