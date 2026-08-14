@@ -2,7 +2,8 @@ import { mountDockerHostPill } from "./pill";
 
 export { openNewDockerHostDialog, openEditDockerHostDialog, enterDockerHostEditMode, renderActivityLog, listContainers, dlg } from "./set-dialog";
 export { populateRemoveDaemonSelect, dlgRemoveDaemon } from "./remove-dialog";
-export { dockerDaemonEditMode, loadSelectedTargets, saveSelectedTargets, dockerHostHistory, populateDockerHostHistory } from "./state";
+export { dockerDaemonEditMode, loadSelectedTargets, saveSelectedTargets, dockerHostHistory } from "./state";
+export { populateDockerHostHistory } from "./history-select";
 export { mountDockerHostPill } from "./pill";
 
 // Called back in from app.js's own boot sequence (see entry.ts) -- this

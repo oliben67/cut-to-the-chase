@@ -1,6 +1,8 @@
 import "../../shared/legacy-globals";
 import { $ } from "../../shared/dollar";
 import { dockerHostHistory, setDockerDaemonEditMode } from "./state";
+import { dockerHostLabel } from "./host-label";
+import { renderSelectOptions } from "../../shared/components/SelectOptions";
 
 /* ── Remove Docker Host: permanently forget a saved daemon ─────────────
    Distinct from Disconnect (set-dialog.ts's btn-clear-sources), which only
@@ -15,13 +17,10 @@ export const dlgRemoveDaemon = $("dlg-remove-daemon");
 export async function populateRemoveDaemonSelect(): Promise<void> {
   const history = await dockerHostHistory();
   const select = $("remove-daemon-select");
-  select.innerHTML = '<option value="">— pick a Docker host to remove —</option>';
-  for (const entry of history) {
-    const opt = document.createElement("option");
-    opt.value = entry.hostKey;
-    opt.textContent = entry.hostKey === "local" ? "localhost" : entry.hostKey.replace(/^ssh:\/\//, "");
-    select.appendChild(opt);
-  }
+  renderSelectOptions(select, {
+    placeholder: "— pick a Docker host to remove —",
+    options: history.map((entry) => ({ value: entry.hostKey, label: dockerHostLabel(entry.hostKey) })),
+  });
   select.value = "";
   $("dlg-remove-daemon-delete").disabled = true;
   $("remove-daemon-status").textContent = "";

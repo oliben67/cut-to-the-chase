@@ -1027,9 +1027,8 @@
     try {
       eq($("docker-targets").innerHTML, "", "targets empty");
       eq($("dlg-ok").disabled, true, "Set Docker Host disabled");
-      // only Docker host / SSH key / Fetch stay usable up front
+      // only Docker host / Fetch stay usable up front
       eq($("docker-host").disabled, false, "host stays enabled");
-      eq($("docker-ssh-key").disabled, false, "ssh key stays enabled");
       eq($("btn-ps-refresh").disabled, false, "fetch stays enabled");
     } finally {
       dlg.close();
@@ -1168,7 +1167,7 @@
     }
   });
 
-  await T("Edit Docker Host pre-fills and locks host/ssh-key, relabels buttons", async () => {
+  await T("Edit Docker Host pre-fills and locks host, relabels buttons", async () => {
     const fakeSrc = { id: "__edit_test", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
     state.sources.push(fakeSrc);
     syncDockerDaemonButtons(); // a real app calls this via refreshAll() whenever state.sources changes
@@ -1178,7 +1177,6 @@
     // this itself; simulated directly here since dlg-ok isn't exercised.
     const savedActiveHost = state.activeDockerHost;
     state.activeDockerHost = "ssh://u@h";
-    dockerHostKeys.set("ssh://u@h", "/path/to/key");
     // Edit Docker Host runs an immediate live Refresh on open (see
     // enterDockerHostEditMode) -- mocked here since this test isn't about
     // that probe itself, just the form's fields/labels.
@@ -1198,9 +1196,6 @@
       await $("btn-edit-docker-host").onclick();
       eq($("docker-host").value, "u@h", "host prefilled (scheme stripped for editing)");
       eq($("docker-host").disabled, true, "host locked");
-      eq($("docker-ssh-key").value, "/path/to/key", "ssh key prefilled");
-      eq($("docker-ssh-key").disabled, true, "ssh key locked");
-      eq($("docker-ssh-key-browse").disabled, true, "browse locked");
       eq($("btn-ps-refresh").textContent, "Refresh Sources", "Fetch relabeled Refresh Sources");
       eq($("dlg-ok").textContent, "Update Docker Host", "confirm relabeled");
       eq($("dlg-set-title").textContent, "Edit Docker Host", "dialog titled for editing, not creating");
@@ -1210,7 +1205,6 @@
       state.sources = state.sources.filter((s) => s.id !== "__edit_test");
       state.activeDockerHost = savedActiveHost;
       syncDockerDaemonButtons();
-      dockerHostKeys.delete("ssh://u@h");
       dlg.close();
       $("btn-set").click(); // resets host/ssh-key/labels back to create-mode defaults
       dlg.close();
@@ -1300,7 +1294,6 @@
     await window.cttc.recordDockerHost({ hostKey: "ssh://u@other-daemon", host: "ssh://u@other-daemon", sshKey: null, transforms: [] });
     const fakeSrc = { id: "__abandon_active", path: `docker://${activeKey}/stats`, kind: "stats", live: true };
     state.sources.push(fakeSrc);
-    dockerHostKeys.set(activeKey, "/path/to/key");
     // currentDockerHost() (which remove-dialog.ts's own activeHostKey is
     // built from) now reflects state.activeDockerHost, not state.sources
     // (br-DHOST-030) -- simulated directly here since dlg-ok isn't exercised.
@@ -1347,7 +1340,6 @@
       if (recording.status !== "idle") await discardRecording();
       state.sources = state.sources.filter((s) => s.id !== "__abandon_active");
       state.activeDockerHost = savedActiveHost;
-      dockerHostKeys.delete(activeKey);
       // Both were already retired above via the dialog's own delete handler --
       // this is belt-and-braces in case an assertion threw before either ran.
       await window.cttc.retireDockerHost(activeKey);
@@ -1392,7 +1384,6 @@
     const fakeService = { id: "__prefill_s", path: "docker://ssh://u@h/service/demo-svc", name: "demo-svc", kind: "log", live: true };
     state.sources.push(fakeStats, fakeContainer, fakeService);
     syncDockerDaemonButtons();
-    dockerHostKeys.set("ssh://u@h", "/path/to/key");
     state.activeDockerHost = "ssh://u@h"; // br-DHOST-030: currentDockerHost() now reflects this, not state.sources
     // demo-c is in the persisted [user]@[gateway]-containers.json (actually
     // selected); demo-svc is merely followed (e.g. previously unselected
@@ -1432,7 +1423,6 @@
       loadSelectedTargets = realLoadSelectedTargets;
       state.sources = state.sources.filter((s) => !s.id.startsWith("__prefill_"));
       syncDockerDaemonButtons();
-      dockerHostKeys.delete("ssh://u@h");
       state.activeDockerHost = "local";
       dlg.close();
       $("btn-set").click();
@@ -1440,11 +1430,10 @@
     }
   });
 
-  await T("Refresh in Edit Docker Host re-fetches, leaves checkboxes selectable, and keeps host/ssh-key locked", async () => {
+  await T("Refresh in Edit Docker Host re-fetches, leaves checkboxes selectable, and keeps host locked", async () => {
     const fakeSrc = { id: "__edit_test2", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
     state.sources.push(fakeSrc);
     syncDockerDaemonButtons();
-    dockerHostKeys.set("ssh://u@h", "/path/to/key");
     state.activeDockerHost = "ssh://u@h"; // br-DHOST-030: currentDockerHost() now reflects this, not state.sources
     const realPost = post;
     const realGet = get;
@@ -1460,7 +1449,6 @@
       ok(cb, "checkbox rendered from the automatic Refresh on open");
       eq(cb.disabled, false, "checkbox is selectable, not locked, in edit mode");
       eq($("docker-host").disabled, true, "host stays locked after a Refresh in edit mode");
-      eq($("docker-ssh-key").disabled, true, "ssh key stays locked after a Refresh in edit mode");
       // clicking Refresh again is idempotent
       $("btn-ps-refresh").click();
       await until(() => $("docker-targets").textContent.includes("demo-x"), "checklist still populated after an explicit Refresh");
@@ -1471,7 +1459,6 @@
       get = realGet;
       state.sources = state.sources.filter((s) => s.id !== "__edit_test2");
       syncDockerDaemonButtons();
-      dockerHostKeys.delete("ssh://u@h");
       state.activeDockerHost = "local";
       dlg.close();
       $("btn-set").click();
@@ -1484,7 +1471,6 @@
     const fakeContainerB = { id: "__diff_b", path: "docker://ssh://u@h/container/demo-b", name: "demo-b", kind: "log", live: true };
     state.sources.push(fakeContainerA, fakeContainerB);
     syncDockerDaemonButtons();
-    dockerHostKeys.set("ssh://u@h", "/path/to/key");
     state.activeDockerHost = "ssh://u@h"; // br-DHOST-030: currentDockerHost() now reflects this, not state.sources
     // demo-a is persisted-selected; demo-b was merely followed, never
     // persisted-selected -- per spec, if it's gone and NOT in the file, it
@@ -1519,7 +1505,6 @@
       loadSelectedTargets = realLoadSelectedTargets;
       state.sources = state.sources.filter((s) => !s.id.startsWith("__diff_"));
       syncDockerDaemonButtons();
-      dockerHostKeys.delete("ssh://u@h");
       state.activeDockerHost = "local";
       dlg.close();
       $("btn-set").click();
@@ -1531,7 +1516,6 @@
     const fakeContainerA = { id: "__gone_a", path: "docker://ssh://u@h/container/demo-a", name: "demo-a", kind: "log", live: true };
     state.sources.push(fakeContainerA);
     syncDockerDaemonButtons();
-    dockerHostKeys.set("ssh://u@h", "/path/to/key");
     state.activeDockerHost = "ssh://u@h"; // br-DHOST-030: currentDockerHost() now reflects this, not state.sources
     const realLoadSelectedTargets = loadSelectedTargets;
     loadSelectedTargets = async () => ({ containers: new Set(["demo-a"]), services: new Set() });
@@ -1561,7 +1545,6 @@
       loadSelectedTargets = realLoadSelectedTargets;
       state.sources = state.sources.filter((s) => !s.id.startsWith("__gone_"));
       syncDockerDaemonButtons();
-      dockerHostKeys.delete("ssh://u@h");
       state.activeDockerHost = "local";
       dlg.close();
       $("btn-set").click();
@@ -1575,7 +1558,6 @@
     const nowGone = { id: "__combo_gone", path: "docker://ssh://u@h/container/now-gone", name: "now-gone", kind: "log", live: true };
     state.sources.push(stillSelected, wasUnselected, nowGone);
     syncDockerDaemonButtons();
-    dockerHostKeys.set("ssh://u@h", "/path/to/key");
     state.activeDockerHost = "ssh://u@h"; // br-DHOST-030: currentDockerHost() now reflects this, not state.sources
     // Mirrors the real flow: still-selected and now-gone were persisted
     // (ticked and Set/Updated); was-unselected was followed but never
@@ -1612,20 +1594,10 @@
       loadSelectedTargets = realLoadSelectedTargets;
       state.sources = state.sources.filter((s) => !s.id.startsWith("__combo_"));
       syncDockerDaemonButtons();
-      dockerHostKeys.delete("ssh://u@h");
       state.activeDockerHost = "local";
       dlg.close();
       $("btn-set").click();
       dlg.close();
-    }
-  });
-
-  await T("dockerHostKeys persists across restarts (regression: was in-memory only, lost the ssh key on relaunch)", () => {
-    try {
-      dockerHostKeys.set("ssh://persist-test@h", "/some/key/path");
-      eq(prefs.get("dockerHostKeys", {})["ssh://persist-test@h"], "/some/key/path", "written to prefs, not just kept in memory");
-    } finally {
-      dockerHostKeys.delete("ssh://persist-test@h");
     }
   });
 
@@ -1637,8 +1609,6 @@
     await sleep(20);
     try {
       eq($("docker-host").disabled, false, "host unlocked");
-      eq($("docker-ssh-key").disabled, false, "ssh key unlocked");
-      eq($("docker-ssh-key-browse").disabled, false, "browse unlocked");
       eq($("btn-ps-refresh").textContent, "Fetch Sources", "Fetch Sources label restored");
       eq($("dlg-ok").textContent, "Connect Docker Host", "confirm label restored");
       eq($("dlg-set-title").textContent, "New Docker Host", "dialog re-titled for creating, not editing");
@@ -1670,8 +1640,6 @@
     ok(!dlg.open, "sanity: dialog is not open, matching showModal()'s modal-blocks-toolbar reality");
     dockerDaemonEditMode = true;
     $("docker-host").disabled = true;
-    $("docker-ssh-key").disabled = true;
-    $("docker-ssh-key-browse").disabled = true;
     const fakeSrc = { id: "__disc_test", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
     state.sources.push(fakeSrc);
     const realConfirm = window.confirm;
@@ -1682,8 +1650,6 @@
       await $("btn-clear-sources").onclick();
       eq(dockerDaemonEditMode, false, "edit-mode flag cleared even though the dialog was never open to trigger the old dlg.open-gated reset");
       eq($("docker-host").disabled, false, "host unlocked");
-      eq($("docker-ssh-key").disabled, false, "ssh key unlocked");
-      eq($("docker-ssh-key-browse").disabled, false, "browse unlocked");
     } finally {
       window.confirm = realConfirm;
       post = realPost;
@@ -1734,8 +1700,6 @@
         eq(dockerDaemonEditMode, false, "create mode, not edit mode -- nothing left to edit");
         eq($("docker-host-history-row").hidden, true, "New Docker Host never shows Load Docker Host, history or not");
         eq($("docker-host").disabled, false, "host stays editable");
-        eq($("docker-ssh-key").disabled, false, "ssh key stays editable");
-        eq($("docker-ssh-key-browse").disabled, false, "browse stays enabled");
       } finally {
         dlg.close();
       }
@@ -1744,7 +1708,6 @@
       get = realGet;
       window.confirm = realConfirm;
       await window.cttc.retireDockerHost("ssh://u@h");
-      dockerHostKeys.delete("ssh://u@h");
       state.activeDockerHost = "local";
       state.sources = state.sources.filter((s) => s.id !== "__reconnect_test");
       syncDockerDaemonButtons();
@@ -1762,8 +1725,6 @@
     // ui-DHOST-026's "unconditionally clears" claim.
     dockerDaemonEditMode = true;
     $("docker-host").disabled = true;
-    $("docker-ssh-key").disabled = true;
-    $("docker-ssh-key-browse").disabled = true;
     const srcA = { id: "__partial_a", path: "docker://ssh://u@h/container/a", kind: "log", live: true };
     const srcB = { id: "__partial_b", path: "docker://ssh://u@h/container/b", kind: "log", live: true };
     state.sources.push(srcA, srcB);
@@ -1781,8 +1742,6 @@
       await $("btn-clear-sources").onclick();
       eq(dockerDaemonEditMode, false, "cleared even though one close call rejected");
       eq($("docker-host").disabled, false, "host unlocked even though one close call rejected");
-      eq($("docker-ssh-key").disabled, false, "ssh key unlocked even though one close call rejected");
-      eq($("docker-ssh-key-browse").disabled, false, "browse unlocked even though one close call rejected");
     } finally {
       post = realPost;
       window.confirm = realConfirm;
@@ -1810,7 +1769,6 @@
       get = realGet;
       state.sources = state.sources.filter((s) => s.id !== "__cancel_test");
       syncDockerDaemonButtons();
-      dockerHostKeys.delete("ssh://u@h");
       state.activeDockerHost = "local";
       if (dlg.open) dlg.close();
     }
@@ -1847,7 +1805,6 @@
       // than a successful one.
       eq($("activity-toggle").disabled, false, "unlocked once the attempt completes, success or not");
     } finally {
-      dockerHostKeys.delete("ssh://u@h");
       state.activeDockerHost = "local";
       dlg.close();
     }
@@ -4501,7 +4458,7 @@
     }
   });
 
-  await T("Current Status on the Docker Host pill shows SSH connection/key and which transforms are on", async () => {
+  await T("Current Status on the Docker Host pill shows SSH connection and which transforms are on", async () => {
     await window.cttc.recordDockerHost({ hostKey: "ssh://u@h", host: "ssh://u@h", sshKey: "/path/to/key", transforms: ["json_message"] });
     const fakeSrc = { id: "__hover_test", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
     state.sources.push(fakeSrc);
@@ -4516,7 +4473,6 @@
       await sleep(20);
       const text = $("docker-host-info-popup").textContent;
       ok(text.includes("SSH Connection") && text.includes("u@h"), text);
-      ok(text.includes("SSH Key") && text.includes("/path/to/key"), text);
       ok(text.includes("drop healthchecks") && text.includes("False"), text);
       ok(text.includes("JSON message") && text.includes("True"), text);
       ok(text.includes("parse level") && text.includes("False"), text);
@@ -4526,25 +4482,6 @@
       state.activeDockerHost = savedActiveHost;
       syncDockerDaemonButtons();
       await window.cttc.retireDockerHost("ssh://u@h");
-    }
-  });
-
-  await T("Current Status on the Docker Host pill shows '---' for an unset SSH key", async () => {
-    await window.cttc.recordDockerHost({ hostKey: "local", host: null, sshKey: null, transforms: [] });
-    const fakeSrc = { id: "__hover_local_test", path: "docker://local/stats", kind: "stats", live: true };
-    state.sources.push(fakeSrc);
-    syncDockerDaemonButtons();
-    try {
-      openDockerHostCurrentStatus();
-      await sleep(20); // see the previous test -- showDockerHostStatus is async now
-      const text = $("docker-host-info-popup").textContent;
-      ok(text.includes("SSH Connection") && text.includes("localhost"), text);
-      ok(text.includes("SSH Key") && text.includes("---"), text);
-    } finally {
-      document.body.click();
-      state.sources = state.sources.filter((s) => s.id !== "__hover_local_test");
-      syncDockerDaemonButtons();
-      await window.cttc.retireDockerHost("local");
     }
   });
 
@@ -4727,7 +4664,7 @@
     }
   });
 
-  await T("Edit Docker Host: picking a different saved host from Load Docker Host swaps the checklist but leaves host/ssh-key locked", async () => {
+  await T("Edit Docker Host: picking a different saved host from Load Docker Host swaps the checklist but leaves host locked", async () => {
     // Confirmed behavior: unlike New Docker Host, Edit Docker Host's Load
     // Docker Host stays visible+enabled, but picking a different entry only
     // re-targets which host's checklist is being edited -- it must never
@@ -4740,7 +4677,6 @@
     const fakeSrc = { id: "__editpick_test", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
     state.sources.push(fakeSrc);
     syncDockerDaemonButtons();
-    dockerHostKeys.set("ssh://u@h", "/path/to/key");
     state.activeDockerHost = "ssh://u@h"; // br-DHOST-030: currentDockerHost() now reflects this, not state.sources
     const realPost = post;
     const realGet = get;
@@ -4753,14 +4689,10 @@
       $("docker-host-history").value = "ssh://other@h2";
       await $("docker-host-history").onchange();
       eq($("docker-host").value, "other@h2", "checklist context switched to the picked host");
-      eq($("docker-ssh-key").value, "/other/key", "ssh key field reflects the picked host's own saved key");
       eq($("docker-host").disabled, true, "still locked -- picking a host in Edit mode never unlocks the connection string");
-      eq($("docker-ssh-key").disabled, true, "ssh key still locked too");
-      eq($("docker-ssh-key-browse").disabled, true, "browse still locked too");
     } finally {
       post = realPost;
       get = realGet;
-      dockerHostKeys.delete("ssh://u@h");
       state.activeDockerHost = "local";
       state.sources = state.sources.filter((s) => s.id !== "__editpick_test");
       syncDockerDaemonButtons();
