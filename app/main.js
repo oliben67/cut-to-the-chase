@@ -610,6 +610,18 @@ async function createWindow() {
   // coverage starts after load — boot-only top-level lines read as uncovered.
   const testFile = process.env.CTTC_TEST;
   if (testFile) {
+    // 300s, not 120s (BUG-0092): the suite's own sample-export/upload/
+    // download-heavy tests now do real, non-trivial work against sources
+    // that stay genuinely open all the way through the run -- 120s was
+    // only ever enough because a since-fixed bug (remove-dialog.ts's
+    // dlg-remove-daemon-delete closing every open source, not just the
+    // host being removed) silently emptied state.sources partway through
+    // every run, making everything after that artificially instant. Even
+    // at 300s a full run isn't guaranteed to finish in every environment
+    // (observed exceeding even 600s in one heavily-loaded sandbox) -- see
+    // BUG-0092's own doc; treat a timeout here as inconclusive, not
+    // necessarily a real hang, and re-check interactively before assuming
+    // a regression.
     setTimeout(() => {
       console.error("[test] global timeout — spec never resolved");
       // app.exit() (unlike app.quit()) skips 'before-quit', so stopServer()
@@ -618,7 +630,7 @@ async function createWindow() {
       // across this session's test runs before this fix).
       serverProc?.kill();
       app.exit(3);
-    }, 120000);
+    }, 300000);
     setTimeout(async () => {
       let code = 2;
       try {
