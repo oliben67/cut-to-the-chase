@@ -1,3 +1,6 @@
 [submodule "releases"]
 	path = releases
 	url = git@github.com:oliben67/cttc-release.git
+[submodule "app/server-logsump"]
+	path = app/server-logsump
+	url = git@github.com:oliben67/log-sump.git
