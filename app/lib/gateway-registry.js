@@ -149,7 +149,12 @@ function recordGateway(entry, { configPath } = {}) {
  * gateway. Upserted by id when the caller has one, otherwise by hostKey,
  * newest-first, deduped like recordGateway itself. A no-op (returns the
  * list unchanged) if gatewayIdOrKey doesn't match any known gateway --
- * there's nothing to attach it to.
+ * there's nothing to attach it to. Called only after a connect actually
+ * succeeds (see its call site), so it always revives a previously-retired
+ * entry for the same id/hostKey rather than leaving it hidden from
+ * dockerHostHistory() -- reconnecting to a Docker host removed earlier
+ * must make it reappear in "Load Docker Host" history, the same way typing
+ * a removed gateway's host:port again would.
  * @param {string} gatewayIdOrKey
  * @param {{id?: string, hostKey: string, host: string|null, sshKey?: string|null}} dockerHostEntry
  */
@@ -163,7 +168,7 @@ function recordDockerHostForGateway(gatewayIdOrKey, dockerHostEntry, { configPat
   );
   const dockerHosts = (gw.dockerHosts || []).filter((h) => h !== existing);
   const base = { id: randomUUID(), retired: false, retiredAt: null };
-  dockerHosts.unshift({ ...base, ...existing, ...dockerHostEntry, lastUsed: Date.now() });
+  dockerHosts.unshift({ ...base, ...existing, ...dockerHostEntry, retired: false, retiredAt: null, lastUsed: Date.now() });
   gw.dockerHosts = dockerHosts;
   writeGateways(resolvedPath, list);
   return list;

@@ -3,7 +3,7 @@ import { $ } from "../../shared/dollar";
 import { ctxMenu, closeCtxMenu } from "../../shared/ctx-menu";
 import { formatTransformName } from "../../shared/format";
 import { registerToolbarPill, syncPillPeerVisibility, CLIPBOARD_ICON_SVG } from "../../shared/toolbar-pills";
-import { dockerHostHistory } from "./state";
+import { dockerHostHistory, populateDockerHostHistory } from "./state";
 import { openNewDockerHostDialog, openEditDockerHostDialog } from "./set-dialog";
 
 function dockerHostMenuOpen(): boolean {
@@ -43,17 +43,21 @@ export function mountDockerHostPill(): void {
       await $("btn-clear-sources").onclick();
       if (hasDockerDaemon()) return; // confirm declined -- leave the current host connected
     }
-    openNewDockerHostDialog(); // nothing connected now -- opens New Docker Host (its "Load Docker Host"
-                               // select is still populated even though the row itself stays hidden, see
-                               // openNewDockerHostDialog -- driving it programmatically here is unaffected)
+    // nothing connected now -- opens New Docker Host (its "Load Docker Host" select is still
+    // populated even though the row itself stays hidden, see openNewDockerHostDialog -- driving
+    // it programmatically here is unaffected). openNewDockerHostDialog fills that select itself,
+    // but doesn't wait on it (an IPC round-trip) before returning, so it's re-populated here,
+    // awaited, before its value is set below.
+    openNewDockerHostDialog();
+    await populateDockerHostHistory();
     $("docker-host-history").value = hostKey;
     await $("docker-host-history").onchange();
   };
 
-  const render = () => {
+  const render = async () => {
     const active = syncPill();
     dropdown.innerHTML = "";
-    const history = dockerHostHistory();
+    const history = await dockerHostHistory();
     if (!history.length) {
       const empty = document.createElement("div");
       empty.className = "gateway-empty";
@@ -80,7 +84,7 @@ export function mountDockerHostPill(): void {
     });
   };
 
-  // "Current Status" (right-click, see below): SSH connection/key + which
+  // "Current Status" (right-click, see below): SSH connection + which
   // transforms are on for the connected host (see server/transforms/*.py
   // -- exactly these three exist today), styled like the Gateway pill's
   // own info popup (same shared CSS class) -- moved behind a click per
@@ -99,17 +103,16 @@ export function mountDockerHostPill(): void {
     row.append(l, v);
     return row;
   }
-  function showDockerHostStatus() {
+  async function showDockerHostStatus() {
     if (!infoPopup) return;
     const active = hasDockerDaemon() ? currentDockerHost() || "local" : null;
     infoPopup.innerHTML = "";
     if (active == null) {
       infoPopup.appendChild(renderInfoRow("Docker host", "not connected"));
     } else {
-      const entry = (prefs.get("savedDockerDaemons", {}) as Record<string, { ssh_key?: string; transforms?: string[] }>)[active];
+      const entry = (await dockerHostHistory()).find((e) => e.hostKey === active) as { transforms?: string[] } | undefined;
       const label = active === "local" ? "localhost" : active.replace(/^ssh:\/\//, "");
       infoPopup.appendChild(renderInfoRow("SSH Connection", label));
-      infoPopup.appendChild(renderInfoRow("SSH Key", entry?.ssh_key || "---"));
       const sep = document.createElement("div");
       sep.className = "cip-sep";
       infoPopup.appendChild(sep);

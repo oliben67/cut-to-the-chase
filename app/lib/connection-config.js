@@ -50,7 +50,7 @@ function readConfigFile(configPath) {
 /**
  * @param {{env?: object, configPath?: string}} opts
  *   configPath overrides the default ~/.cttc/connection.json (mainly for tests).
- * @returns {{mode: "embedded", runMode?: "native"|"container"} | {mode: "remote", host: string, sshTarget: string, sshKey: string|null, remotePort: number}}
+ * @returns {{mode: "embedded", runMode?: "native"|"container"} | {mode: "remote", host: string, sshTarget: string, sshKey: string|null, remotePort: number, gatewayId?: string}}
  */
 function loadConnectionConfig({ env = process.env, configPath } = {}) {
   const resolvedPath = configPath || defaultConfigPath(env);
@@ -73,6 +73,14 @@ function loadConnectionConfig({ env = process.env, configPath } = {}) {
     throw new Error("remote mode requires ssh_target (CTTC_SSH_TARGET env var, or ssh_target in connection.json)");
   }
   const sshKey = env.CTTC_SSH_KEY || fileCfg.ssh_key || null;
+  // Set for a GUI-managed gateway (its key lives encrypted in the vault,
+  // keyed on this id -- see lib/key-vault.js/lib/ssh-key-file.js) instead of
+  // sshKey above, which stays a literal path for the scripted/env-var deploy
+  // case. The two are mutually exclusive in practice (see main.js's
+  // recordGateway call sites) but both are read here unconditionally --
+  // it's loadConnectionConfig's job to report what's in the file, not to
+  // enforce that invariant.
+  const gatewayId = fileCfg.gateway_id || null;
 
   const remotePortRaw = env.CTTC_REMOTE_PORT || fileCfg.remote_port;
   const remotePort = Number(remotePortRaw);
@@ -95,14 +103,18 @@ function loadConnectionConfig({ env = process.env, configPath } = {}) {
     sshKey,
     remotePort,
     ...(sshPort ? { sshPort } : {}),
+    ...(gatewayId ? { gatewayId } : {}),
   };
 }
 
 /**
  * Writes a "remote" connection.json (mirrors deploy.ps1's step 4) so the
  * gateway setup (see main.js's runSetupWizard) and the PowerShell deploy path
- * produce byte-identical config files.
- * @param {{sshTarget: string, sshKey: string, remotePort: number, sshPort?: number}} cfg
+ * produce byte-identical config files. `cfg.gatewayId` and `cfg.sshKey` are
+ * mutually exclusive (see loadConnectionConfig): a GUI-managed gateway's key
+ * lives encrypted in the vault, keyed by gateway_id; a scripted/env-var
+ * deploy keeps a literal ssh_key path.
+ * @param {{sshTarget: string, sshKey?: string|null, gatewayId?: string, remotePort: number, sshPort?: number}} cfg
  * @param {{configPath?: string}} [opts]
  */
 function saveConnectionConfig(cfg, { configPath } = {}) {
@@ -112,7 +124,11 @@ function saveConnectionConfig(cfg, { configPath } = {}) {
     {
       mode: "remote",
       ssh_target: cfg.sshTarget,
-      ssh_key: cfg.sshKey,
+      // Explicit `undefined` (JSON.stringify drops it) rather than simply
+      // omitted, so a stale ssh_key can never leak through if this is ever
+      // called with a merged/previous object instead of a freshly built one.
+      ssh_key: cfg.gatewayId ? undefined : cfg.sshKey,
+      ...(cfg.gatewayId ? { gateway_id: cfg.gatewayId } : {}),
       remote_port: cfg.remotePort,
       ...(cfg.sshPort ? { ssh_port: cfg.sshPort } : {}),
     },

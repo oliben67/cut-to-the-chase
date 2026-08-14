@@ -971,7 +971,6 @@ async function startTracking(s) {
           host: host === "local" ? null : host,
           stats: false, host_stats: false, transforms: [],
           logs: [{ name: s.name, type: ttype }],
-          ssh_key: dockerHostKeys.get(host) ?? null,
           interval: dockerPollIntervalSecs,
         });
       } catch (err) {
@@ -1236,8 +1235,14 @@ function syncDockerDaemonButtons() {
   $("btn-edit-docker-host").disabled = !hasDockerDaemon();
   // Remove Docker Host (permanently forgetting a saved one) is independent
   // of whether anything is currently connected -- it operates on the saved
-  // catalog (savedDockerDaemons), not on state.sources.
-  $("btn-remove-docker-daemon").disabled = Object.keys(prefs.get("savedDockerDaemons", {})).length === 0;
+  // catalog (gateways.json's dockerHosts[], see dockerHostHistory()), not
+  // on state.sources. dockerHostHistory() is async (an IPC round-trip) --
+  // fire-and-forget rather than blocking this otherwise-synchronous
+  // function (called on every state.sources refresh); the button briefly
+  // keeps its previous disabled state until this resolves.
+  dockerHostHistory().then((history) => {
+    $("btn-remove-docker-daemon").disabled = history.length === 0;
+  });
   refreshDockerHostPill();
 }
 
@@ -1306,7 +1311,6 @@ async function exportSample(t0, t1) {
       const host = currentDockerHost();
       await post("/docker/collect", {
         host, stats: false, host_stats: true, logs: [], transforms: [],
-        ssh_key: dockerHostKeys.get(host || "local") ?? null,
         interval: dockerPollIntervalSecs,
       });
     } catch (err) {
@@ -3969,7 +3973,7 @@ $("dlg-settings-close").onclick = () => dlgPreferences.close();
 // Settings > Danger > Hard Reset: closes every open source (stopping
 // collection server-side, same as Remove Docker Host) and wipes every
 // persisted UI preference (prefs' entire localStorage namespace -- track
-// states, panelOrder, dockerHostKeys, sidebar dock/size, theme, the "now"
+// states, panelOrder, sidebar dock/size, theme, the "now"
 // line style, everything), then reloads to boot exactly like a brand-new
 // install. A real confirm() (not a styled dialog) on purpose -- its
 // blocking, plain-text, native-chrome nature reads as more serious than
@@ -4371,6 +4375,7 @@ if (!POPOUT_KIND) {
     "new-gateway": () => openNewGatewayDialog(),
     "edit-gateways": () => openEditGatewaysDialog(),
     "uninstall-gateway": () => openUninstallGatewayDialog(),
+    "secure-storage": () => window.cttc.openVaultWindow(),
     "event-create": () => $("btn-event-create").click(),
     "event-edit": () => $("btn-event-edit").click(),
     "open-theme": () => openThemeDialog(),

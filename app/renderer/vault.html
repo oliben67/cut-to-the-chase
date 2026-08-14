@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; style-src 'self'; script-src 'self'" />
+  <title>CTTC Secure Storage</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main id="vault">
+    <h2 id="vault-title">Secure Storage</h2>
+    <p id="vault-explainer" class="dlg-intro muted"></p>
+
+    <form id="form">
+      <label id="vault-passphrase-row" class="ctl block">Passphrase
+        <input id="vault-passphrase" type="password" required autocomplete="current-password" />
+      </label>
+      <label id="vault-confirm-row" class="ctl block" hidden>Confirm passphrase
+        <input id="vault-confirm" type="password" autocomplete="new-password" />
+      </label>
+
+      <div id="error" class="error" hidden></div>
+
+      <div class="dlg-actions">
+        <button type="button" id="btn-cancel">Cancel</button>
+        <button type="submit" id="btn-submit" class="primary">Unlock</button>
+      </div>
+    </form>
+  </main>
+  <script src="vault.js"></script>
+</body>
+</html>

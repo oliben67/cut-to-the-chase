@@ -207,6 +207,19 @@ test("retireGateway is a no-op when nothing matches", () => {
   assert.equal(list[0].retired, false);
 });
 
+test("re-recording a retired Docker host revives it (reconnecting to a removed host must reappear in history)", () => {
+  const p = tmpPath();
+  recordGateway({ mode: "remote", host: "h", port: 8765, label: "deploy@h" }, { configPath: p });
+  const recorded = recordDockerHostForGateway("h:8765", { hostKey: "ssh://user@other" }, { configPath: p });
+  const hostId = recorded[0].dockerHosts[0].id;
+  retireDockerHost("h:8765", hostId, { configPath: p });
+  const revived = recordDockerHostForGateway("h:8765", { hostKey: "ssh://user@other" }, { configPath: p });
+  assert.equal(revived[0].dockerHosts.length, 1, "still upserts onto the same entry, not a duplicate");
+  assert.equal(revived[0].dockerHosts[0].id, hostId, "same id preserved");
+  assert.equal(revived[0].dockerHosts[0].retired, false);
+  assert.equal(revived[0].dockerHosts[0].retiredAt, null);
+});
+
 test("retireDockerHost marks a docker host retired with a timestamp but never removes it, and leaves the gateway itself alone", () => {
   const p = tmpPath();
   const before = Date.now();

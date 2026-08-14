@@ -1226,9 +1226,7 @@
 
   await T("Remove Docker Host also forgets the daemon server-side, not just the local catalog (br-REDIS-017)", async () => {
     const hostKey = "ssh://e2e@removeme";
-    const saved = prefs.get("savedDockerDaemons", {});
-    saved[hostKey] = { host: hostKey, stats: true, logs: [], transforms: [], interval: 5, lastUsed: Date.now() };
-    prefs.set("savedDockerDaemons", saved);
+    await window.cttc.recordDockerHost({ hostKey, host: hostKey, sshKey: null, transforms: [] });
 
     const realConfirm = window.confirm;
     const realPost = post;
@@ -1245,7 +1243,7 @@
       return {};
     };
     try {
-      populateRemoveDaemonSelect();
+      await populateRemoveDaemonSelect();
       $("remove-daemon-select").value = hostKey;
       $("remove-daemon-select").onchange();
       await $("dlg-remove-daemon-delete").onclick();
@@ -1253,7 +1251,7 @@
         calls.some((c) => c.path === "/docker/forget" && c.body.host === hostKey),
         `expected a POST /docker/forget for ${hostKey}: ${JSON.stringify(calls)}`
       );
-      ok(!(hostKey in prefs.get("savedDockerDaemons", {})), "removed from the local catalog too");
+      ok(!(await dockerHostHistory()).some((e) => e.hostKey === hostKey), "removed from the local catalog too");
     } finally {
       window.confirm = realConfirm;
       post = realPost;
@@ -1298,10 +1296,8 @@
 
   await T("Removing the active Docker host warns that it abandons the running recording; an inactive one doesn't (ui-REC-018)", async () => {
     const activeKey = "ssh://u@abandon-active";
-    const saved = prefs.get("savedDockerDaemons", {});
-    saved[activeKey] = { host: activeKey, stats: true, logs: [], transforms: [], interval: 5, lastUsed: Date.now() };
-    saved["ssh://u@other-daemon"] = { host: "ssh://u@other-daemon", stats: true, logs: [], transforms: [], interval: 5, lastUsed: Date.now() };
-    prefs.set("savedDockerDaemons", saved);
+    await window.cttc.recordDockerHost({ hostKey: activeKey, host: activeKey, sshKey: null, transforms: [] });
+    await window.cttc.recordDockerHost({ hostKey: "ssh://u@other-daemon", host: "ssh://u@other-daemon", sshKey: null, transforms: [] });
     const fakeSrc = { id: "__abandon_active", path: `docker://${activeKey}/stats`, kind: "stats", live: true };
     state.sources.push(fakeSrc);
     dockerHostKeys.set(activeKey, "/path/to/key");
@@ -1326,7 +1322,7 @@
       // Inactive entry: no recording-abandon warning at all.
       await startRecording();
       calls = [];
-      populateRemoveDaemonSelect();
+      await populateRemoveDaemonSelect();
       $("remove-daemon-select").value = "ssh://u@other-daemon";
       $("remove-daemon-select").onchange();
       await $("dlg-remove-daemon-delete").onclick();
@@ -1335,7 +1331,7 @@
 
       // Active entry: warns, then (on accept) discards before the normal confirm.
       calls = [];
-      populateRemoveDaemonSelect();
+      await populateRemoveDaemonSelect();
       $("remove-daemon-select").value = activeKey;
       $("remove-daemon-select").onchange();
       await $("dlg-remove-daemon-delete").onclick();
@@ -1352,19 +1348,17 @@
       state.sources = state.sources.filter((s) => s.id !== "__abandon_active");
       state.activeDockerHost = savedActiveHost;
       dockerHostKeys.delete(activeKey);
-      const cleanup = prefs.get("savedDockerDaemons", {});
-      delete cleanup[activeKey];
-      delete cleanup["ssh://u@other-daemon"];
-      prefs.set("savedDockerDaemons", cleanup);
+      // Both were already retired above via the dialog's own delete handler --
+      // this is belt-and-braces in case an assertion threw before either ran.
+      await window.cttc.retireDockerHost(activeKey);
+      await window.cttc.retireDockerHost("ssh://u@other-daemon");
       await refreshAll();
       if (dlgRemoveDaemon.open) dlgRemoveDaemon.close();
     }
   });
 
   await T("Remove Docker Host never calls /docker/forget for 'This machine' (never remembered server-side)", async () => {
-    const saved = prefs.get("savedDockerDaemons", {});
-    saved.local = { host: null, stats: true, logs: [], transforms: [], interval: 5, lastUsed: Date.now() };
-    prefs.set("savedDockerDaemons", saved);
+    await window.cttc.recordDockerHost({ hostKey: "local", host: null, sshKey: null, transforms: [] });
 
     const realConfirm = window.confirm;
     const realPost = post;
@@ -1380,7 +1374,7 @@
       return {};
     };
     try {
-      populateRemoveDaemonSelect();
+      await populateRemoveDaemonSelect();
       $("remove-daemon-select").value = "local";
       $("remove-daemon-select").onchange();
       await $("dlg-remove-daemon-delete").onclick();
@@ -1635,8 +1629,12 @@
     }
   });
 
-  await T("New Docker Host (create mode) is never left showing edit-mode labels/locks", () => {
+  await T("New Docker Host (create mode) is never left showing edit-mode labels/locks", async () => {
     $("btn-set").click();
+    // openNewDockerHostDialog doesn't await populating/hiding the Load
+    // Docker Host row (an IPC round-trip) before returning -- give it a
+    // moment before checking it below.
+    await sleep(20);
     try {
       eq($("docker-host").disabled, false, "host unlocked");
       eq($("docker-ssh-key").disabled, false, "ssh key unlocked");
@@ -1704,8 +1702,7 @@
     // had a previously-used entry to show and the user didn't pick one --
     // New Docker Host now never shows that picker at all (Edit Docker Host's
     // job instead), but must still always unlock the fields regardless.
-    const savedBefore = prefs.get("savedDockerDaemons", {});
-    prefs.set("savedDockerDaemons", { ...savedBefore, "ssh://u@h": { lastUsed: Date.now(), ssh_key: "/path/to/key" } });
+    await window.cttc.recordDockerHost({ hostKey: "ssh://u@h", host: "ssh://u@h", sshKey: "/path/to/key" });
     const fakeSrc = { id: "__reconnect_test", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
     state.sources.push(fakeSrc);
     syncDockerDaemonButtons();
@@ -1729,6 +1726,10 @@
       // Reopen via the real New Docker Host button -- no daemon left, so
       // this must take the create-mode branch, not edit mode.
       $("btn-set").click();
+      // openNewDockerHostDialog doesn't await populating/hiding the Load
+      // Docker Host row (an IPC round-trip) before returning -- give it a
+      // moment before checking it below.
+      await sleep(20);
       try {
         eq(dockerDaemonEditMode, false, "create mode, not edit mode -- nothing left to edit");
         eq($("docker-host-history-row").hidden, true, "New Docker Host never shows Load Docker Host, history or not");
@@ -1742,7 +1743,7 @@
       post = realPost;
       get = realGet;
       window.confirm = realConfirm;
-      prefs.set("savedDockerDaemons", savedBefore);
+      await window.cttc.retireDockerHost("ssh://u@h");
       dockerHostKeys.delete("ssh://u@h");
       state.activeDockerHost = "local";
       state.sources = state.sources.filter((s) => s.id !== "__reconnect_test");
@@ -4500,36 +4501,42 @@
     }
   });
 
-  await T("Current Status on the Docker Host pill shows SSH connection/key and which transforms are on", () => {
-    const saved = prefs.get("savedDockerDaemons", {});
-    prefs.set("savedDockerDaemons", { ...saved, "ssh://u@h": { ssh_key: "/path/to/key", transforms: ["json_message"], lastUsed: Date.now() } });
+  await T("Current Status on the Docker Host pill shows SSH connection/key and which transforms are on", async () => {
+    await window.cttc.recordDockerHost({ hostKey: "ssh://u@h", host: "ssh://u@h", sshKey: "/path/to/key", transforms: ["json_message"] });
     const fakeSrc = { id: "__hover_test", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
     state.sources.push(fakeSrc);
+    const savedActiveHost = state.activeDockerHost;
+    state.activeDockerHost = "ssh://u@h"; // currentDockerHost() (br-DHOST-030) reflects this, not state.sources
     syncDockerDaemonButtons();
     try {
       openDockerHostCurrentStatus();
+      // showDockerHostStatus is async (looks the active host up via
+      // dockerHostHistory(), an IPC round-trip) -- give it a moment before
+      // reading the popup it fills in.
+      await sleep(20);
       const text = $("docker-host-info-popup").textContent;
       ok(text.includes("SSH Connection") && text.includes("u@h"), text);
       ok(text.includes("SSH Key") && text.includes("/path/to/key"), text);
       ok(text.includes("drop healthchecks") && text.includes("False"), text);
-      ok(text.includes("json message") && text.includes("True"), text);
+      ok(text.includes("JSON message") && text.includes("True"), text);
       ok(text.includes("parse level") && text.includes("False"), text);
     } finally {
       document.body.click();
       state.sources = state.sources.filter((s) => s.id !== "__hover_test");
+      state.activeDockerHost = savedActiveHost;
       syncDockerDaemonButtons();
-      prefs.set("savedDockerDaemons", saved);
+      await window.cttc.retireDockerHost("ssh://u@h");
     }
   });
 
-  await T("Current Status on the Docker Host pill shows '---' for an unset SSH key", () => {
-    const saved = prefs.get("savedDockerDaemons", {});
-    prefs.set("savedDockerDaemons", { ...saved, local: { transforms: [], lastUsed: Date.now() } });
+  await T("Current Status on the Docker Host pill shows '---' for an unset SSH key", async () => {
+    await window.cttc.recordDockerHost({ hostKey: "local", host: null, sshKey: null, transforms: [] });
     const fakeSrc = { id: "__hover_local_test", path: "docker://local/stats", kind: "stats", live: true };
     state.sources.push(fakeSrc);
     syncDockerDaemonButtons();
     try {
       openDockerHostCurrentStatus();
+      await sleep(20); // see the previous test -- showDockerHostStatus is async now
       const text = $("docker-host-info-popup").textContent;
       ok(text.includes("SSH Connection") && text.includes("localhost"), text);
       ok(text.includes("SSH Key") && text.includes("---"), text);
@@ -4537,7 +4544,7 @@
       document.body.click();
       state.sources = state.sources.filter((s) => s.id !== "__hover_local_test");
       syncDockerDaemonButtons();
-      prefs.set("savedDockerDaemons", saved);
+      await window.cttc.retireDockerHost("local");
     }
   });
 
@@ -4547,9 +4554,14 @@
     // tests may have legitimately left real saved hosts in the catalog
     // (Set/Update Docker Host persists on a successful connect), so an
     // un-isolated "sanity: nothing saved" assumption here would be flaky.
-    const saved = prefs.get("savedDockerDaemons", {});
-    prefs.set("savedDockerDaemons", {});
+    // gateways.json is the sole store now (no bulk-clear IPC) -- retire
+    // whatever's there, restoring each entry by re-recording it in finally
+    // (recordDockerHost revives a retired entry rather than leaving it
+    // hidden, see lib/gateway-registry.js's recordDockerHostForGateway).
+    const saved = await dockerHostHistory();
+    for (const entry of saved) await window.cttc.retireDockerHost(entry.hostKey);
     syncDockerDaemonButtons();
+    await sleep(20); // syncDockerDaemonButtons' own Remove-button update is an IPC round-trip now
     try {
       ok($("btn-edit-docker-host").disabled, "sanity: sidebar's own Edit Docker Host is disabled with nothing connected");
       ok($("btn-remove-docker-daemon").disabled, "sanity: sidebar's own Remove Docker Host is disabled with no saved hosts");
@@ -4577,7 +4589,7 @@
         if (dlg.open) dlg.close();
       }
     } finally {
-      prefs.set("savedDockerDaemons", saved);
+      for (const entry of saved) await window.cttc.recordDockerHost(entry);
       syncDockerDaemonButtons();
     }
   });
@@ -4608,10 +4620,10 @@
     }
   });
 
-  await T("right-clicking the Docker Host pill's Remove Docker Host is enabled once a host is saved", () => {
-    const saved = prefs.get("savedDockerDaemons", {});
-    prefs.set("savedDockerDaemons", { "ssh://u@h": { lastUsed: Date.now(), transforms: [] } });
+  await T("right-clicking the Docker Host pill's Remove Docker Host is enabled once a host is saved", async () => {
+    await window.cttc.recordDockerHost({ hostKey: "ssh://u@h", host: "ssh://u@h", transforms: [] });
     syncDockerDaemonButtons();
+    await sleep(20); // syncDockerDaemonButtons' own Remove-button update is an IPC round-trip now
     try {
       ok(!$("btn-remove-docker-daemon").disabled, "sanity: sidebar's own Remove Docker Host is enabled with a saved host");
       mouse($("docker-host-status"), "contextmenu", 5);
@@ -4620,26 +4632,32 @@
       ok(!removeBtn.disabled, "Remove Docker Host enabled in the menu now that a host is saved");
     } finally {
       document.body.click();
-      prefs.set("savedDockerDaemons", saved);
+      await window.cttc.retireDockerHost("ssh://u@h");
       syncDockerDaemonButtons();
     }
   });
 
-  await T("Docker Host dropdown separates each entry with a divider", () => {
-    const saved = prefs.get("savedDockerDaemons", {});
-    prefs.set("savedDockerDaemons", {
-      "ssh://a@h": { lastUsed: 2, transforms: [] },
-      "ssh://b@h": { lastUsed: 1, transforms: [] },
-    });
+  await T("Docker Host dropdown separates each entry with a divider", async () => {
+    // gateways.json is the sole store now (no bulk-clear IPC) -- retire
+    // whatever's already there so only the two entries below are listed,
+    // restoring each by re-recording it in finally (recordDockerHost
+    // revives a retired entry, see lib/gateway-registry.js).
+    const saved = await dockerHostHistory();
+    for (const entry of saved) await window.cttc.retireDockerHost(entry.hostKey);
+    await window.cttc.recordDockerHost({ hostKey: "ssh://a@h", host: "ssh://a@h", transforms: [] });
+    await window.cttc.recordDockerHost({ hostKey: "ssh://b@h", host: "ssh://b@h", transforms: [] });
     try {
       $("docker-host-status-btn").click();
+      await sleep(20); // the dropdown's render() reads dockerHostHistory(), an IPC round-trip
       const items = $("docker-host-dropdown").querySelectorAll(".gateway-item");
       const seps = $("docker-host-dropdown").querySelectorAll(".gateway-item-sep");
       eq(items.length, 2, "both saved hosts listed");
       eq(seps.length, 1, "one divider between the two entries");
     } finally {
       document.body.click();
-      prefs.set("savedDockerDaemons", saved);
+      await window.cttc.retireDockerHost("ssh://a@h");
+      await window.cttc.retireDockerHost("ssh://b@h");
+      for (const entry of saved) await window.cttc.recordDockerHost(entry);
     }
   });
 
@@ -4716,12 +4734,9 @@
     // unlock the connection-string fields, since editing is about which
     // containers/services to follow for an already-identified host, not
     // retyping its connection string.
-    const saved = prefs.get("savedDockerDaemons", {});
-    prefs.set("savedDockerDaemons", {
-      ...saved,
-      "ssh://u@h": { ssh_key: "/path/to/key", transforms: [], lastUsed: Date.now() },
-      "ssh://other@h2": { ssh_key: "/other/key", transforms: [], lastUsed: Date.now() - 1000 },
-    });
+    const saved = await dockerHostHistory();
+    await window.cttc.recordDockerHost({ hostKey: "ssh://u@h", host: "ssh://u@h", sshKey: "/path/to/key", transforms: [] });
+    await window.cttc.recordDockerHost({ hostKey: "ssh://other@h2", host: "ssh://other@h2", sshKey: "/other/key", transforms: [] });
     const fakeSrc = { id: "__editpick_test", path: "docker://ssh://u@h/stats", kind: "stats", live: true };
     state.sources.push(fakeSrc);
     syncDockerDaemonButtons();
@@ -4749,7 +4764,9 @@
       state.activeDockerHost = "local";
       state.sources = state.sources.filter((s) => s.id !== "__editpick_test");
       syncDockerDaemonButtons();
-      prefs.set("savedDockerDaemons", saved);
+      await window.cttc.retireDockerHost("ssh://u@h");
+      await window.cttc.retireDockerHost("ssh://other@h2");
+      for (const entry of saved) await window.cttc.recordDockerHost(entry);
       dlg.close();
       $("btn-set").click();
       dlg.close();
