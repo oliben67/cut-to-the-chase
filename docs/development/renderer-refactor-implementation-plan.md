@@ -1,9 +1,13 @@
 # Renderer refactor kickoff: Phase 1–2 (FMT, SBAR, GATE, DHOST, PREF, EVT) with Jotai + Preact
 
-**Status:** approved, in progress. Implements Phase 1–2 of
+**Status:** approved, in progress -- Steps A–D shipped (2026-08-14), E–F
+not started. Implements Phase 1–2 of
 [`../architecture/renderer-refactor-plan.md`](../architecture/renderer-refactor-plan.md).
 Tracks execution as six atomic, independently-verified steps -- see that
 document for the full 33-domain map and the later out-of-scope phases.
+**Steps C and D shipped a revised, narrower scope than originally
+specified below** -- see the note after Step D for what actually changed
+and why.
 
 ## Context
 
@@ -131,6 +135,58 @@ rewrite and a JS architecture change at the same time.
   (`index.html:363`).
 - The other two `confirmAbandonRecordingIfAny` call sites move here.
 - **Verify:** full unit + e2e suite green.
+
+**What Steps C and D actually shipped (2026-08-14), and why it's narrower
+than the atoms-based bullets above:** by the time C/D were underway,
+Step B (`SBAR`)'s own `HistoryList.tsx` had already established a
+different, validated pattern than this doc's "atoms for everything"
+wording -- Preact's async/batched re-render doesn't line up with the e2e
+suite's synchronous, no-`await` assertions, so the one piece of state the
+spec mutates/asserts on directly (`statusBarHistory`) deliberately stayed
+a plain array, not a Jotai atom. C and D followed that same validated
+pattern instead of introducing new atoms:
+
+- `gwMode`/`gwGateways` (gateway/dialogs.ts) and `dockerDaemonEditMode`/
+  `activeDockerHost` (docker-host) stay plain module-level state (the
+  latter two are written by `app.js` itself and are out of scope until
+  its own Phase 3+ migration; the spec also reassigns some of these as
+  bare globals with an immediately-following synchronous assertion, which
+  an atom's batched update would break). **No `gatewaysAtom`,
+  `activeGatewayAtom`, `savedDaemonsAtom`, or `activeHostKeyAtom` exist.**
+  A cache atom for the gateway/docker-host lists would also silently
+  change today's always-refetch staleness behavior.
+- The `confirmAbandonRecordingIfAny` call sites (both Gateway-side and
+  both Docker-host-side) were **not** moved -- they stay inline in
+  `app.js` exactly as before this pass.
+- What *did* ship: real Preact components for the genuinely
+  presentational/list markup only -- `gateway/gateway.options.ts` +
+  `shared/components/SelectOptions.tsx` (adopted by both gateway
+  `<select>`s and both docker-host `<select>`s), `docker-host/
+  host-label.ts`, `docker-host/history-select.ts` (state.ts is now
+  DOM-free, matching `status-bar.state.ts`'s shape), `docker-host/
+  TransformList.tsx`, and `docker-host/DockerTargetList.tsx` (the
+  group-header/checkbox/missing-entry markup; all the checked-state
+  diffing, `missingContainers`/`missingServices`, `updateDlgOkEnabled()`,
+  and the `closeMissing`/`post("/close")` logic stayed in
+  `set-dialog.ts`, untouched). Both dialogs' `<select>`/onchange/`.value`/
+  `.disabled` wiring stays imperative, per the same rules.
+- **Consequence for Step B's own bridge note above:** since C/D didn't
+  introduce gateway/docker-host atoms, `SBAR`'s gateway/docker-host status
+  display **stays bridged** (imperative `syncDockerDaemonButtons` etc.),
+  same as the recording portion -- not "true atom subscription" as
+  originally anticipated. Revisit if/when a later pass actually does the
+  atoms-based migration this doc originally specified.
+- Full rationale and the governing pattern:
+  `/Users/oliviersteck/.claude/plans/peaceful-soaring-fiddle.md` (the
+  plan actually executed for this pass).
+- **Verified:** full unit suite (198/198) green throughout; e2e suite
+  confirmed at the same pre-existing 188-passed/47-failed baseline after
+  each of Steps 0/C1/C2/D1/D2/D3/D5/D6 (no new failures introduced --
+  the 47 are pre-existing, unrelated, and tracked as `BUG-0092`/`0093`/
+  `0094`). One real regression was caught and fixed during D6 (a Preact
+  keyed-node-reuse issue where an external `.disabled` write from a prior
+  fetch survived a re-render for a same-named container/service across
+  two Refreshes) before it shipped.
 
 ### Step E — `PREF` → `modules/preferences/`
 

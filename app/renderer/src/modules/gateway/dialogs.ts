@@ -1,6 +1,8 @@
 import "../../shared/legacy-globals";
 import { $ } from "../../shared/dollar";
 import type { Gateway } from "./gateway.types";
+import { gatewayOptionValue, gatewayOptionLabel } from "./gateway.options";
+import { renderSelectOptions } from "../../shared/components/SelectOptions";
 
 // Computed locally, not read off app.js's POPOUT_KIND -- this module's top-
 // level DOM wiring runs at this bundle's own load time, before app.js has
@@ -24,11 +26,8 @@ export const dlgGatewaySetup = $("dlg-gateway-setup");
 let gwMode: "new" | "edit" = "new";
 let gwGateways: Gateway[] = [];
 
-function gwKeyOf(g: Gateway): string {
-  return `${g.host}:${g.port}`;
-}
 function gwSelectedGateway(): Gateway | undefined {
-  return gwGateways.find((g) => gwKeyOf(g) === $("gw-select").value);
+  return gwGateways.find((g) => gatewayOptionValue(g) === $("gw-select").value);
 }
 
 // Reads the currently-checked radio directly rather than each radio's own
@@ -148,19 +147,11 @@ export function editableGateways(gateways: Gateway[]): Gateway[] {
 async function gwLoadGatewaysForEdit(): Promise<void> {
   gwGateways = editableGateways(await window.cttc!.getGateways());
   const prevKey = $("gw-select").value;
-  $("gw-select").innerHTML = "";
-  const placeholder = document.createElement("option");
-  placeholder.value = "";
-  placeholder.textContent = "— Select a gateway —";
-  $("gw-select").appendChild(placeholder);
-  for (const g of gwGateways) {
-    const opt = document.createElement("option");
-    opt.value = gwKeyOf(g);
-    const loc = g.port == null ? g.host : `${g.host}:${g.port}`;
-    opt.textContent = `${g.label || g.host} (${loc})${g.active ? " — active" : ""}`;
-    $("gw-select").appendChild(opt);
-  }
-  $("gw-select").value = gwGateways.some((g) => gwKeyOf(g) === prevKey) ? prevKey : "";
+  renderSelectOptions($("gw-select"), {
+    placeholder: "— Select a gateway —",
+    options: gwGateways.map((g) => ({ value: gatewayOptionValue(g), label: gatewayOptionLabel(g) })),
+  });
+  $("gw-select").value = gwGateways.some((g) => gatewayOptionValue(g) === prevKey) ? prevKey : "";
   gwFillFormForEdit(gwSelectedGateway());
 }
 $("gw-select").onchange = () => gwFillFormForEdit(gwSelectedGateway());
@@ -175,22 +166,18 @@ export const dlgGatewayUninstall = $("dlg-gateway-uninstall");
 let gwUninstallGateways: Gateway[] = [];
 
 function gwUninstallSelectedGateway(): Gateway | undefined {
-  return gwUninstallGateways.find((g) => gwKeyOf(g) === $("gw-uninstall-select").value);
+  return gwUninstallGateways.find((g) => gatewayOptionValue(g) === $("gw-uninstall-select").value);
 }
 
 async function gwLoadGatewaysForUninstall(): Promise<void> {
   gwUninstallGateways = editableGateways(await window.cttc!.getGateways());
   const select = $("gw-uninstall-select");
   const prevKey = select.value;
-  select.innerHTML = '<option value="">— pick a gateway to uninstall —</option>';
-  for (const g of gwUninstallGateways) {
-    const opt = document.createElement("option");
-    opt.value = gwKeyOf(g);
-    const loc = g.port == null ? g.host : `${g.host}:${g.port}`;
-    opt.textContent = `${g.label || g.host} (${loc})${g.active ? " — active" : ""}`;
-    select.appendChild(opt);
-  }
-  select.value = gwUninstallGateways.some((g) => gwKeyOf(g) === prevKey) ? prevKey : "";
+  renderSelectOptions(select, {
+    placeholder: "— pick a gateway to uninstall —",
+    options: gwUninstallGateways.map((g) => ({ value: gatewayOptionValue(g), label: gatewayOptionLabel(g) })),
+  });
+  select.value = gwUninstallGateways.some((g) => gatewayOptionValue(g) === prevKey) ? prevKey : "";
   $("gw-uninstall-delete").disabled = !select.value;
   $("gw-uninstall-error").hidden = true;
   $("gw-uninstall-status").textContent = "";
@@ -286,7 +273,7 @@ $("gw-form").onsubmit = async (e: SubmitEvent) => {
 
   const result =
     gwMode === "edit"
-      ? await window.cttc!.saveGatewayEdit({ ...payload, key: gwKeyOf(gw!), mode: gw!.mode })
+      ? await window.cttc!.saveGatewayEdit({ ...payload, key: gatewayOptionValue(gw!), mode: gw!.mode })
       : await window.cttc!.addGateway(payload);
 
   if (!result.ok) {

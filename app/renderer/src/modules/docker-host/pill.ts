@@ -3,8 +3,10 @@ import { $ } from "../../shared/dollar";
 import { ctxMenu, closeCtxMenu } from "../../shared/ctx-menu";
 import { formatTransformName } from "../../shared/format";
 import { registerToolbarPill, syncPillPeerVisibility, CLIPBOARD_ICON_SVG } from "../../shared/toolbar-pills";
-import { dockerHostHistory, populateDockerHostHistory } from "./state";
+import { dockerHostHistory } from "./state";
+import { populateDockerHostHistory } from "./history-select";
 import { openNewDockerHostDialog, openEditDockerHostDialog } from "./set-dialog";
+import { dockerHostLabel } from "./host-label";
 
 function dockerHostMenuOpen(): boolean {
   const dropdown = $("docker-host-dropdown");
@@ -77,7 +79,7 @@ export function mountDockerHostPill(): void {
       item.dataset.active = String(entry.hostKey === active);
       const label = document.createElement("span");
       label.className = "gateway-item-label";
-      label.textContent = entry.hostKey === "local" ? "localhost" : entry.hostKey.replace(/^ssh:\/\//, "");
+      label.textContent = dockerHostLabel(entry.hostKey);
       item.appendChild(label);
       if (entry.hostKey !== active) item.onclick = () => openHost(entry.hostKey);
       dropdown.appendChild(item);
@@ -111,7 +113,7 @@ export function mountDockerHostPill(): void {
       infoPopup.appendChild(renderInfoRow("Docker host", "not connected"));
     } else {
       const entry = (await dockerHostHistory()).find((e) => e.hostKey === active) as { transforms?: string[] } | undefined;
-      const label = active === "local" ? "localhost" : active.replace(/^ssh:\/\//, "");
+      const label = dockerHostLabel(active);
       infoPopup.appendChild(renderInfoRow("SSH Connection", label));
       const sep = document.createElement("div");
       sep.className = "cip-sep";

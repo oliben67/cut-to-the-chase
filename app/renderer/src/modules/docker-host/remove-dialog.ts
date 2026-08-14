@@ -1,6 +1,8 @@
 import "../../shared/legacy-globals";
 import { $ } from "../../shared/dollar";
 import { dockerHostHistory, setDockerDaemonEditMode } from "./state";
+import { dockerHostLabel } from "./host-label";
+import { renderSelectOptions } from "../../shared/components/SelectOptions";
 
 /* ── Remove Docker Host: permanently forget a saved daemon ─────────────
    Distinct from Disconnect (set-dialog.ts's btn-clear-sources), which only
@@ -15,13 +17,10 @@ export const dlgRemoveDaemon = $("dlg-remove-daemon");
 export async function populateRemoveDaemonSelect(): Promise<void> {
   const history = await dockerHostHistory();
   const select = $("remove-daemon-select");
-  select.innerHTML = '<option value="">— pick a Docker host to remove —</option>';
-  for (const entry of history) {
-    const opt = document.createElement("option");
-    opt.value = entry.hostKey;
-    opt.textContent = entry.hostKey === "local" ? "localhost" : entry.hostKey.replace(/^ssh:\/\//, "");
-    select.appendChild(opt);
-  }
+  renderSelectOptions(select, {
+    placeholder: "— pick a Docker host to remove —",
+    options: history.map((entry) => ({ value: entry.hostKey, label: dockerHostLabel(entry.hostKey) })),
+  });
   select.value = "";
   $("dlg-remove-daemon-delete").disabled = true;
   $("remove-daemon-status").textContent = "";
@@ -45,12 +44,21 @@ $("dlg-remove-daemon-delete").onclick = async () => {
   if (activeHostKey === hostKey && !(await confirmAbandonRecordingIfAny("Removing this Docker host"))) return;
   if (!confirm(`Permanently forget the saved daemon "${hostKey === "local" ? "localhost" : hostKey}"? This can't be undone.`)) return;
   try {
-    // If it's currently connected, close it first -- leaving it running
-    // while its saved record vanishes would be a dangling, un-editable,
-    // un-reconnectable daemon.
+    // If it's currently connected, close *its own* sources first -- leaving
+    // them running while its saved record vanishes would be a dangling,
+    // un-editable, un-reconnectable daemon. Scoped to this hostKey's own
+    // `docker://${hostKey}/...` sources only (same prefix match as
+    // set-dialog.ts's currentlyTrackedTargets) -- BUG-0092: this used to
+    // close every open source regardless of host, silently taking down
+    // unrelated file-based sources or a *different* docker host's sources
+    // too, just because *some* docker host happened to be active.
     if (activeHostKey === hostKey && state.sources.length) {
-      await Promise.all(state.sources.map((s) => post("/close", { id: s.id })));
-      await refreshAll();
+      const prefix = `docker://${hostKey}/`;
+      const toClose = state.sources.filter((s) => (s.path || "").startsWith(prefix));
+      if (toClose.length) {
+        await Promise.all(toClose.map((s) => post("/close", { id: s.id })));
+        await refreshAll();
+      }
     }
     // br-REDIS-017: forgets the server-side Redis registry entry too, not
     // just this client's own local catalog above -- without this, a remote

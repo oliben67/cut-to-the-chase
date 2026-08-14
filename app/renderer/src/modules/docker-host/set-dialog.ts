@@ -1,7 +1,8 @@
 import "../../shared/legacy-globals";
 import { $ } from "../../shared/dollar";
 import { exposeMutable } from "../../shared/expose-mutable";
-import { formatTransformName } from "../../shared/format";
+import { renderTransformList } from "./TransformList";
+import { renderDockerTargetList, clearDockerTargetList, type DockerTargetItem } from "./DockerTargetList";
 import {
   dockerFormFetched,
   setDockerFormFetched,
@@ -15,8 +16,8 @@ import {
   loadSelectedTargets,
   saveSelectedTargets,
   dockerHostHistory,
-  populateDockerHostHistory,
 } from "./state";
+import { populateDockerHostHistory } from "./history-select";
 
 /* ── set-sources dialog (Docker) ────────────────────────────────────────── */
 
@@ -93,8 +94,8 @@ export function openNewDockerHostDialog(): void {
   $("dlg-set-title").textContent = "New Docker Host";
   $("btn-ps-refresh-label").textContent = "Fetch Sources";
   $("dlg-ok").textContent = "Connect Docker Host";
-  $("docker-targets").innerHTML = "";
-  $("transforms-list").innerHTML = "none found in server/transforms/";
+  clearDockerTargetList($("docker-targets"));
+  renderTransformList($("transforms-list"), []);
   $("docker-error").textContent = "";
   setDockerFormEnabled(false);
   renderActivityLog(null);
@@ -143,7 +144,7 @@ export async function enterDockerHostEditMode(hostKey: string): Promise<void> {
   $("dlg-set-title").textContent = "Edit Docker Host";
   $("btn-ps-refresh-label").textContent = "Refresh Sources";
   $("dlg-ok").textContent = "Update Docker Host";
-  $("transforms-list").innerHTML = "none found in server/transforms/";
+  renderTransformList($("transforms-list"), []);
   $("docker-error").textContent = "";
   // The durable "what was actually selected" record for this daemon --
   // loaded before anything renders, since it (not state.track) is what
@@ -252,109 +253,6 @@ $("activity-toggle").onchange = () => {
   $("docker-activity").hidden = !$("activity-toggle").checked;
 };
 
-// Sets a checkbox's checked state and keeps its ✔/nothing mark in sync --
-// the mark is a deliberately explicit, always-visible cue for "this is in
-// [user]@[gateway]-containers.json" (see selectedTargets) independent of
-// however checkboxes happen to render per OS/theme, shown/hidden on every
-// check/uncheck, whether from a user click or the group-select-all header
-// setting .checked programmatically (which fires no "change" event).
-function setCheckedWithMark(cb: HTMLInputElement, mark: HTMLElement, checked: boolean): void {
-  cb.checked = checked;
-  mark.textContent = checked ? "✔" : "";
-}
-
-interface DockerTargetItem {
-  name: string;
-  id?: string;
-  image?: string;
-  replicas?: string;
-}
-
-// Builds one labelled group of checkboxes (Swarm services / Containers)
-// inside #docker-targets -- shared by listContainers()' live `docker ps`
-// result and enterDockerHostEditMode's immediate pre-fill from already-open
-// sources (see renderDockerTargets below), so both end up with the exact
-// same look/behavior. `wasChecked` (name -> bool) carries over whatever
-// the user had ticked/unticked in the checklist *before* this render -- a
-// Refresh must update the list to match the daemon's actual current state
-// (new containers appear, gone ones disappear) without silently
-// re-ticking something the user had just deliberately unchecked.
-// `selectedNames` is this type's half of selectedTargets -- the checked
-// default for anything not already touched this session. `missing` is
-// whatever selectedNames says *was* selected but didn't come back in this
-// fetch/pre-fill at all -- rendered disabled with a 🚫 mark rather than
-// just vanishing, so "this was selected and is now gone" stays visible.
-// A followed-but-never-selected container that's gone is never passed in
-// `missing` at all (see renderDockerTargets) -- there's nothing to flag.
-//
-// Deliberately no other visual distinction for a plain, present,
-// checked/unchecked entry (no dimming, no "already added" label, same
-// color/enabled either way) -- the ✔/🚫 marks are the only cue.
-function renderDockerTargetGroup(
-  box: HTMLElement,
-  title: string,
-  items: DockerTargetItem[],
-  type: string,
-  wasChecked: Map<string, boolean>,
-  selectedNames: Set<string>,
-  missing: DockerTargetItem[] = [],
-): void {
-  if (!items.length && !missing.length) return;
-  const g = document.createElement("div");
-  g.className = "group";
-  g.textContent = title;
-  g.title = "Click to select/deselect all of this group";
-  const groupBoxes: Array<{ cb: HTMLInputElement; mark: HTMLElement }> = []; // for the group-select-all header below
-  g.onclick = () => {
-    const selectAll = groupBoxes.some(({ cb }) => !cb.checked);
-    for (const { cb, mark } of groupBoxes) setCheckedWithMark(cb, mark, selectAll);
-    updateDlgOkEnabled();
-  };
-  box.appendChild(g);
-  for (const it of items) {
-    const label = document.createElement("label");
-    const cb = document.createElement("input");
-    cb.type = "checkbox";
-    cb.value = it.name;
-    cb.dataset.type = type;
-    const mark = document.createElement("span");
-    mark.className = "mark";
-    // Nothing is preselected just for having been *found* -- only a name
-    // in selectedNames (persisted, see selectedTargets) starts ticked; a
-    // fresh discovery starts unticked, and one already in the checklist
-    // keeps whatever the user last left it at.
-    const startChecked = wasChecked.has(it.name) ? wasChecked.get(it.name)! : selectedNames.has(it.name);
-    setCheckedWithMark(cb, mark, startChecked);
-    cb.onchange = () => { setCheckedWithMark(cb, mark, cb.checked); updateDlgOkEnabled(); };
-    groupBoxes.push({ cb, mark });
-    label.append(cb, mark, ` ${it.name} `);
-    const extra = document.createElement("span");
-    extra.className = "tdoc";
-    extra.textContent = it.image || it.replicas || "";
-    label.appendChild(extra);
-    box.appendChild(label);
-  }
-  for (const it of missing) {
-    const label = document.createElement("label");
-    label.classList.add("unavailable");
-    const cb = document.createElement("input");
-    cb.type = "checkbox";
-    cb.checked = true; // it's only ever in `missing` because it WAS selected
-    cb.disabled = true; // excluded from dlg-ok's submission query on purpose -- see "input:checked:not(:disabled)"
-    cb.value = it.name;
-    cb.dataset.type = type;
-    const mark = document.createElement("span");
-    mark.className = "mark";
-    mark.textContent = "🚫";
-    label.append(cb, mark, ` ${it.name} `);
-    const extra = document.createElement("span");
-    extra.className = "tdoc";
-    extra.textContent = "no longer available";
-    label.appendChild(extra);
-    box.appendChild(label);
-  }
-}
-
 // Repopulates #docker-targets from a {name, image?, replicas?}[] pair --
 // either a live `docker ps` result (listContainers) or, immediately on
 // opening Edit Docker Host (before any Refresh), whatever's already being
@@ -362,7 +260,7 @@ function renderDockerTargetGroup(
 // are a diff against selectedTargets (the persisted record, see its own
 // comment), not a blind wipe: a Refresh that finds a *selected* container
 // gone (stopped/removed) marks it disabled rather than dropping it outright
-// (see renderDockerTargetGroup's `missing`) -- one that was never selected
+// (see DockerTargetList's `missing`) -- one that was never selected
 // and is now gone is simply omitted, nothing to flag; a genuinely new one
 // appears unticked (nothing is preselected just for having been *found*);
 // and anything still there keeps exactly whatever the user last
@@ -386,7 +284,6 @@ function renderDockerTargets(
   for (const cb of box.querySelectorAll("input[type=checkbox]:not(:disabled)")) {
     wasChecked.set((cb as HTMLInputElement).value, (cb as HTMLInputElement).checked);
   }
-  box.innerHTML = "";
   // Only ever used here to find an *id* to close for a gone-but-selected
   // entry (see below) -- whether something is "missing" is now purely a
   // selectedTargets question, not "is a log source open for it".
@@ -400,11 +297,17 @@ function renderDockerTargets(
   const missingServices = [...selectedTargets.services]
     .filter((name) => !serviceNames.has(name))
     .map((name) => ({ name, id: trackedIdByName.get(name) }));
-  renderDockerTargetGroup(box, "Swarm services (docker service logs)", services, "service", wasChecked, selectedTargets.services, missingServices);
-  renderDockerTargetGroup(box, "Containers (docker logs)", containers, "container", wasChecked, selectedTargets.containers, missingContainers);
-  if (!services.length && !containers.length && !missingServices.length && !missingContainers.length) {
-    box.textContent = "nothing running";
-  }
+  // Nothing is preselected just for having been *found* -- only a name in
+  // selectedTargets (persisted) starts ticked; a fresh discovery starts
+  // unticked, and one already in the checklist keeps whatever the user
+  // last left it at (wasChecked, carried over from the live DOM above).
+  renderDockerTargetList(box, {
+    services: services.map((it) => ({ ...it, checked: wasChecked.has(it.name) ? wasChecked.get(it.name)! : selectedTargets.services.has(it.name) })),
+    containers: containers.map((it) => ({ ...it, checked: wasChecked.has(it.name) ? wasChecked.get(it.name)! : selectedTargets.containers.has(it.name) })),
+    missingServices,
+    missingContainers,
+    onChange: updateDlgOkEnabled,
+  });
   updateDlgOkEnabled();
   if (closeMissing) {
     // Only ones with an actual open source to close (a selected name with
@@ -516,30 +419,24 @@ export let listContainers = async (): Promise<void> => {
     const wasChecked = new Map<string, boolean>();
     for (const cb of tbox.querySelectorAll("input[type=checkbox]")) wasChecked.set((cb as HTMLInputElement).value, (cb as HTMLInputElement).checked);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    tbox.innerHTML = t.transforms.length ? "" : "none found in server/transforms/";
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    for (const tr of t.transforms as any[]) {
-      const label = document.createElement("label");
-      const cb = document.createElement("input");
-      cb.type = "checkbox";
-      cb.value = tr.name;
-      // json_message and parse_level are on by default -- turning raw JSON
-      // log lines and bare level tagging into something readable is the
-      // common case, not an opt-in; anything else (e.g. drop_healthchecks)
-      // stays opt-in as before.
-      cb.checked = wasChecked.has(tr.name) ? wasChecked.get(tr.name)! : DEFAULT_ON_TRANSFORMS.has(tr.name);
-      label.append(cb, ` ${formatTransformName(tr.name)} `);
-      const doc = document.createElement("span");
-      doc.className = "tdoc";
-      doc.textContent = tr.doc || "";
-      label.appendChild(doc);
-      tbox.appendChild(label);
-    }
+    renderTransformList(
+      tbox,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (t.transforms as any[]).map((tr) => ({
+        name: tr.name,
+        doc: tr.doc,
+        // json_message and parse_level are on by default -- turning raw
+        // JSON log lines and bare level tagging into something readable
+        // is the common case, not an opt-in; anything else (e.g.
+        // drop_healthchecks) stays opt-in as before.
+        checked: wasChecked.has(tr.name) ? wasChecked.get(tr.name)! : DEFAULT_ON_TRANSFORMS.has(tr.name),
+      })),
+    );
     setDockerFormEnabled(true);
   } catch (err: unknown) {
     clearInterval(tick);
     status.textContent = "";
-    $("docker-targets").innerHTML = "";
+    clearDockerTargetList($("docker-targets"));
     renderActivityLog((err as { log?: unknown[] })?.log ?? null);
     // A bare network-level failure (fetch() itself rejected -- server
     // unreachable, tunnel down, connection reset with zero bytes sent) has

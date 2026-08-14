@@ -1,5 +1,4 @@
 import "../../shared/legacy-globals";
-import { $ } from "../../shared/dollar";
 import { exposeMutable } from "../../shared/expose-mutable";
 
 // Whether Fetch has successfully listed the host currently typed into
@@ -99,21 +98,4 @@ type DockerHostHistoryEntry = { hostKey: string; lastUsed?: number; [k: string]:
 export async function dockerHostHistory(): Promise<DockerHostHistoryEntry[]> {
   const hosts = ((await window.cttc?.getDockerHosts?.()) || []) as DockerHostHistoryEntry[];
   return [...hosts].sort((a, b) => (b.lastUsed || 0) - (a.lastUsed || 0));
-}
-
-// Fills the Connect Docker Host dialog's "Load Docker Host" dropdown --
-// hidden entirely (rather than just empty) when there's no history yet, so
-// a first-time user isn't shown a picker with nothing useful in it.
-export async function populateDockerHostHistory(): Promise<void> {
-  const history = await dockerHostHistory();
-  $("docker-host-history-row").hidden = history.length === 0;
-  const select = $("docker-host-history");
-  select.innerHTML = '<option value="">— pick a previously used Docker host —</option>';
-  for (const entry of history) {
-    const opt = document.createElement("option");
-    opt.value = entry.hostKey;
-    opt.textContent = entry.hostKey === "local" ? "localhost" : entry.hostKey.replace(/^ssh:\/\//, "");
-    select.appendChild(opt);
-  }
-  select.value = "";
 }
