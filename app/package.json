@@ -47,7 +47,6 @@
       "assets/**/*",
       "lib/**/*",
       "package.json",
-      "!server/**",
       "!demo/**",
       "!test/**"
     ],
@@ -75,8 +74,8 @@
       "icon": "assets/icon.png",
       "extraResources": [
         {
-          "from": "../releases/_shared/cttc-gateway.tar.gz",
-          "to": "cttc-gateway.tar.gz"
+          "from": "../releases/_shared/log-sump.tar.gz",
+          "to": "log-sump.tar.gz"
         },
         {
           "from": "../releases/_shared/docker-compose.yml",

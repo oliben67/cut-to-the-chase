@@ -2,7 +2,6 @@
 version: '3'
 
 vars:
-  SERVER: server
   # Strip any active venv from another project so uv always uses the local .venv.
   UV: env -u VIRTUAL_ENV uv
   # VSCode's extension host exports ELECTRON_RUN_AS_NODE, which turns the
@@ -24,24 +23,17 @@ tasks:
 
   # ── Setup ─────────────────────────────────────────────────────────────────
   install:
-    desc: Install all dependencies (Electron via npm, server venv via uv)
-    cmds:
-      - npm install
-      - "{{.UV}} sync --project {{.SERVER}}"
+    desc: Install Electron/renderer dependencies (npm)
+    cmd: npm install
 
   # ── Development ───────────────────────────────────────────────────────────
   start:
-    desc: Launch the app (spawns the Python server automatically)
+    desc: Launch the app (starts the local gateway container automatically)
     cmd: "{{.ELECTRON}} ."
 
   start:files:
     desc: "Launch the app with files opened      [usage: task start:files -- a.jsonl b.log]"
     cmd: "{{.ELECTRON}} . {{.CLI_ARGS}}"
-
-  serve:
-    desc: "Run the Python server alone on a fixed port for API work   [usage: task serve -- 8765]"
-    dir: '{{.SERVER}}'
-    cmd: "{{.UV}} run server.py --port {{.CLI_ARGS | default \"8765\"}}"
 
   screenshot:
     desc: Headless UI verification — capture the demo to shot.png and quit
@@ -52,14 +44,17 @@ tasks:
         silent: true
 
   # ── Demo data ─────────────────────────────────────────────────────────────
+  # generate_demo.py has no third-party dependencies of its own --
+  # `--project server-logsump` just borrows an existing, already-`uv sync`'d
+  # venv to run it under, same as test/run-e2e.sh does.
   demo:
     desc: Generate 30 minutes of correlated demo history into demo/data/
-    cmd: "{{.UV}} run --project {{.SERVER}} python demo/generate_demo.py"
+    cmd: "{{.UV}} run --project server-logsump python demo/generate_demo.py"
 
   demo:live:
     desc: Generate demo history and keep appending live ticks (Ctrl+C to stop)
     interactive: true
-    cmd: "{{.UV}} run --project {{.SERVER}} python demo/generate_demo.py --live"
+    cmd: "{{.UV}} run --project server-logsump python demo/generate_demo.py --live"
 
   demo:start:
     desc: Generate demo data, then launch the app with it
@@ -69,16 +64,10 @@ tasks:
 
   # ── Tests ─────────────────────────────────────────────────────────────────
   test:
-    desc: Run everything — server unit tests (with coverage), main-process unit tests, then renderer E2E
+    desc: Run everything — main-process unit tests, then renderer E2E
     cmds:
-      - task: test:server
       - task: test:unit
       - task: test:e2e
-
-  test:server:
-    desc: Server test suite with line coverage (uv run pytest)
-    dir: '{{.SERVER}}'
-    cmd: "{{.UV}} run --group dev pytest tests/ -q --cov=server --cov-report=term-missing"
 
   test:unit:
     desc: Main-process unit tests (lib/*.js) — Node's built-in test runner, no Electron needed
@@ -88,37 +77,14 @@ tasks:
     desc: Renderer E2E — runs test/renderer-spec.js inside the real app against demo data
     cmd: ./test/run-e2e.sh
 
-  # ── Linting (server/ — the only Python in this app) ──────────────────────
-  lint:
-    desc: Check server/ with ruff
-    dir: '{{.SERVER}}'
-    cmd: "{{.UV}} run ruff check ."
-
-  lint:fix:
-    desc: Check server/ with ruff, auto-fix where possible
-    dir: '{{.SERVER}}'
-    cmd: "{{.UV}} run ruff check --fix ."
-
-  # ── Formatting ────────────────────────────────────────────────────────────
-  format:
-    desc: Format server/ in-place with ruff
-    dir: '{{.SERVER}}'
-    cmd: "{{.UV}} run ruff format ."
-
-  format:check:
-    desc: Check server/ formatting without modifying files (used in CI)
-    dir: '{{.SERVER}}'
-    cmd: "{{.UV}} run ruff format --check ."
-
   # ── Type checking ─────────────────────────────────────────────────────────
   typecheck:
-    desc: Run ty (Astral's type checker) on server/'s source (not tests/ -- mostly benign non-null asserts there)
-    dir: '{{.SERVER}}'
-    cmd: "{{.UV}} run ty check server.py files.py"
+    desc: Type-check the renderer's TypeScript modules
+    cmd: npm run typecheck
 
   # ── Quality gates ─────────────────────────────────────────────────────────
   check:
-    desc: Run all quality gates — JS syntax checks, server import, lint, format check, typecheck
+    desc: Run all quality gates — JS syntax checks, typecheck
     cmds:
       - node --check main.js
       - node --check preload.js
@@ -128,16 +94,7 @@ tasks:
       - node --check lib/server-provision.js
       - node --check lib/docker-check.js
       - node --check lib/ssh-key-file.js
-      - "{{.UV}} run --project {{.SERVER}} python -c 'import sys; sys.path.insert(0, \"{{.SERVER}}\"); import server; print(\"server imports ok,\", server.JSON_IMPL)'"
-      - task: lint
-      - task: format:check
       - task: typecheck
-
-  fix:
-    desc: Auto-fix all server/ lint issues and reformat
-    cmds:
-      - task: lint:fix
-      - task: format
 
   ci:
     desc: Full CI pipeline — install → check
@@ -190,19 +147,8 @@ tasks:
         vars: { CLI_ARGS: '{{.CLI_ARGS}}' }
 
   build:gateway:image:
-    desc: "Build the cttc-gateway server image and push it to the registry ref in releases/_repo/image.json   [usage: task build:gateway:image -- --force]"
+    desc: "Build the log-sump server image and push it to the registry ref in releases/_repo/image.json   [usage: task build:gateway:image -- --force]"
     cmd: ../releases/_shared/build-image.sh {{.CLI_ARGS}}
-
-  # ── Dependencies ──────────────────────────────────────────────────────────
-  deps:update:
-    desc: Update server packages to their latest allowed versions
-    dir: '{{.SERVER}}'
-    cmd: uv lock --upgrade
-
-  deps:tree:
-    desc: Show the server dependency tree
-    dir: '{{.SERVER}}'
-    cmd: uv tree
 
   # ── Clean ─────────────────────────────────────────────────────────────────
   clean:
@@ -210,15 +156,14 @@ tasks:
     silent: true
     cmd: |
       rm -rf demo/data/ shot.png
-      find . -path './node_modules' -prune -o -path './{{.SERVER}}/.venv' -prune \
-        -o -type d -name '__pycache__' -print | xargs rm -rf 2>/dev/null || true
+      find . -path './node_modules' -prune -o -type d -name '__pycache__' -print | xargs rm -rf 2>/dev/null || true
       printf '\033[32m✓ Clean\033[0m\n'
 
   clean:all:
-    desc: Remove everything including node_modules and the server venv (run task install to restore)
+    desc: Remove everything including node_modules (run task install to restore)
     cmds:
       - task: clean
-      - cmd: rm -rf node_modules/ {{.SERVER}}/.venv/
+      - cmd: rm -rf node_modules/
         silent: true
       - cmd: printf '\033[32m✓ Fully clean\033[0m\n'
         silent: true

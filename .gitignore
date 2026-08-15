@@ -15,10 +15,3 @@ releases/windows/cttc-windows-deploy/
 .catalyst-proj/*
 .vscode/*
 .claude/worktrees/
-# server.py's own runtime data (recording sessions awaiting collection,
-# this gateway's persisted .gateway-id) -- instance-specific, never
-# meant to be committed (see br-DEDUP-012's gateway id).
-app/server/sessions/
-# Redis's own RDB/AOF persistence files (see redis_log.py's DEFAULT_DATA_DIR)
-# -- instance-specific binary data, never meant to be committed.
-app/server/redis-data/

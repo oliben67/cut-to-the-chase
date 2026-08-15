@@ -81,7 +81,7 @@ async function fireUiEvent(ev: UiEvent, detail: string): Promise<void> {
       const opts = { safe: ev.action.safe, maxKeepMs: ev.action.max_keep_seconds ? ev.action.max_keep_seconds * 1000 : null };
       ev.artifactPath = window.cttc?.saveEventArtifact ? await window.cttc.saveEventArtifact(name, bytes, opts) : null;
     } else {
-      const { session_id } = await post("/session/start", {
+      const { session_id } = await post("/legacy/session/start", {
         duration_minutes: ev.action.duration_minutes, safe: ev.action.safe, max_keep_seconds: ev.action.max_keep_seconds,
       });
       ev.artifactPath = session_id; // resolved to a real local path once the recording completes, see uiEventTick's poll
@@ -101,9 +101,9 @@ async function resolvePendingUiRecordings(): Promise<void> {
   for (const ev of list) {
     if (!ev._pendingGatewaySessionId) continue;
     try {
-      const st = await get(`/session/${ev._pendingGatewaySessionId}/status`);
+      const st = await get(`/legacy/session/${ev._pendingGatewaySessionId}/status`);
       if (!st.ready) continue;
-      const res = await fetch(`${API}/session/${ev._pendingGatewaySessionId}/download`, { headers: authHeaders() });
+      const res = await fetch(`${API}/legacy/session/${ev._pendingGatewaySessionId}/download`, { headers: authHeaders() });
       const bytes = new Uint8Array(await res.arrayBuffer());
       const name = `${ev.name}-${ev.id}.cttc-record`;
       const opts = { safe: ev.action.safe, maxKeepMs: ev.action.max_keep_seconds ? ev.action.max_keep_seconds * 1000 : null };
@@ -122,9 +122,9 @@ async function resolvePendingUiRecordings(): Promise<void> {
 const gatewayEventLastStatus = new Map<string, string>();
 async function pollGatewayEventTriggers(): Promise<void> {
   try {
-    const { event_ids } = await get("/events/list");
+    const { event_ids } = await get("/legacy/events/list");
     for (const id of event_ids) {
-      const st = await get(`/events/${id}`);
+      const st = await get(`/legacy/events/${id}`);
       const last = gatewayEventLastStatus.get(id);
       if (st.status === "triggered" && last !== "triggered") {
         notifyEvent(`Event "${st.name}" fired (${st.trigger_detail || ""})`);

@@ -29,35 +29,10 @@ tasks:
     cmds:
       - task: app:ci
 
-  lint:
-    desc: Lint every sub-project
-    cmds:
-      - task: app:lint
-
-  lint:fix:
-    desc: Lint every sub-project, auto-fixing where possible
-    cmds:
-      - task: app:lint:fix
-
-  format:
-    desc: Format every sub-project in-place
-    cmds:
-      - task: app:format
-
-  format:check:
-    desc: Check formatting across every sub-project without modifying files
-    cmds:
-      - task: app:format:check
-
   typecheck:
     desc: Type-check every sub-project
     cmds:
       - task: app:typecheck
-
-  fix:
-    desc: Auto-fix lint issues and reformat every sub-project
-    cmds:
-      - task: app:fix
 
   # ── Release ───────────────────────────────────────────────────────────────
   build:release:win:
@@ -89,7 +64,7 @@ tasks:
         vars: { CLI_ARGS: '{{.CLI_ARGS}}' }
 
   build:gateway:image:
-    desc: "Build the cttc-gateway server image and push it to Docker Hub   [usage: task build:gateway:image -- --force]"
+    desc: "Build the log-sump server image and push it to Docker Hub   [usage: task build:gateway:image -- --force]"
     cmds:
       - task: app:build:gateway:image
         vars: { CLI_ARGS: '{{.CLI_ARGS}}' }
@@ -108,6 +83,6 @@ tasks:
       - task: app:clean
 
   clean:all:
-    desc: Remove everything including venvs and node_modules across all sub-projects
+    desc: Remove everything including node_modules across all sub-projects
     cmds:
       - task: app:clean:all

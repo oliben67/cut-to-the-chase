@@ -15,7 +15,7 @@ export interface TransformItem {
 // afterward, exactly as before, so a user's/test's own tick between
 // rebuilds survives untouched.
 export function TransformList({ transforms }: { transforms: TransformItem[] }) {
-  if (transforms.length === 0) return <>none found in server/transforms/</>;
+  if (transforms.length === 0) return <>none found</>;
   return (
     <>
       {transforms.map((tr) => (

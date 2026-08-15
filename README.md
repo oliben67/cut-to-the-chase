@@ -25,8 +25,7 @@ In short, CTTC can:
   pop-out windows that stay in sync;
 - **capture and share** — point-in-time snapshots (TXT/JSON), and
   drag-selected time ranges exported as `.cttc-metric` metrics files — optionally
-  **encrypted** for a chosen recipient, with a built-in key manager;
-- **reshape logs at ingest** via drop-in Python transform modules.
+  **encrypted** for a chosen recipient, with a built-in key manager.
 
 **📖 All usage documentation lives in the [User Manual](MANUAL.md)** —
 every feature, the interactions reference, the server API for scripting,
@@ -37,21 +36,24 @@ and troubleshooting.
 ```sh
 cd app
 npm install          # once (Electron)
-npm start            # uv provisions server/.venv on first run
+npm start            # starts the local gateway container (Docker required)
 # or open files straight away:
 npm start -- path/to/stats.jsonl path/to/service.log
 ```
 
 Or with [Task](https://taskfile.dev): `task install`, then `task start`.
 
-Requirements: Node + Electron (npm), [`uv`](https://docs.astral.sh/uv/), and
-the `docker` CLI if you use the Docker collector.
+Requirements: Node + Electron (npm), and Docker (the gateway that collects
+and stores logs/telemetry runs as a container — see
+[app/server-logsump](app/server-logsump) — there is no non-Docker fallback).
+[`uv`](https://docs.astral.sh/uv/) is only needed for the demo-data
+generator below.
 
 ### Demo
 
 ```sh
 cd app
-uv run --project server demo/generate_demo.py            # 30 min of correlated history
+uv run --project server-logsump demo/generate_demo.py    # 30 min of correlated history
 npm start -- demo/data/stats.jsonl demo/data/c3_api.log demo/data/c3_worker.log
 ```
 
@@ -63,28 +65,33 @@ generator to keep it appending.
 
 - [MANUAL.md](MANUAL.md) — the user manual.
 - [app/](app/) — the application.
-  - [app/main.js](app/main.js) — Electron main process: spawns the Python
-    server via `uv run`, opens the renderer with the server's port.
-  - [app/server/server.py](app/server/server.py) — Python server (deps via
-    **uv**, JSON via **orjson**): ingestion/normalization, tailing, docker +
-    host collectors, series bucketing, `.cttc-metric` export/load + encryption,
-    SSE. Binds `127.0.0.1` only.
+  - [app/main.js](app/main.js) — Electron main process: starts/connects to
+    the gateway container (local or remote) and opens the renderer against
+    its address.
+  - [app/server-logsump](app/server-logsump) — the gateway server (a
+    [log-sump](https://github.com/oliben67/log-sump) submodule): SSH-based
+    Docker log/metric collection into Redis Streams, behind an authenticated
+    HTTP API. Runs as a Docker container, never spawned bare.
+  - [app/log-sump-plugin](app/log-sump-plugin) — CTTC-specific compat routes
+    (chart/log-panel queries, recording sessions, condition-based events)
+    loaded into the gateway container at runtime via log-sump's own plugin
+    mechanism; a separate repo, bind-mounted in rather than baked into the
+    image.
   - [app/renderer/](app/renderer/) — dependency-free canvas charting +
     virtual-scrolled log panels.
-  - [app/server/transforms/](app/server/transforms/) — drop-in transform
-    modules.
   - [app/demo/](app/demo/) — correlated demo-data generator.
   - [app/test/](app/test/) — the in-app renderer E2E spec and runner.
 
 ## Tests
 
-- **Server** — `task test:server`: 150+ tests, 100% line coverage of
-  `server.py` (parsers, ingestion, collectors with mocked subprocesses,
-  samples + encryption, every HTTP endpoint incl. SSE, `main()`).
+- **Main process** — `task test:unit`: `app/lib/*.js` unit tests (Node's
+  built-in test runner).
 - **Renderer** — `task test:e2e`: launches the real app on fresh demo data
   and runs `app/test/renderer-spec.js` inside the window; prints pass/fail
   plus V8 byte-coverage of `app.js`.
-- `task test` runs both.
+- `task test` runs both. The gateway itself (`app/server-logsump`,
+  `app/log-sump-plugin`) has its own test suite in its own repo/submodule,
+  run independently of `task test` here.
 
 ## Development / verification hooks
 

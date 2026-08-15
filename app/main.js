@@ -16,11 +16,9 @@ const { randomUUID } = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const readline = require("readline");
 const {
   loadConnectionConfig,
   saveConnectionConfig,
-  saveRunMode,
   clearConnectionConfig,
   hostFromTarget,
 } = require("./lib/connection-config");
@@ -54,9 +52,7 @@ const {
 const { readSelectedContainers, writeSelectedContainers, deleteSelectedContainers } = require("./lib/container-selection");
 const { openSshTunnel, closeSshTunnel } = require("./lib/ssh-tunnel");
 const { recordTunnel, removeTunnel, killOrphanedTunnels } = require("./lib/tunnel-registry");
-const { gracefulStop } = require("./lib/graceful-stop");
 const { getOrCreateApiToken, forgetApiToken } = require("./lib/api-token");
-const { isRoutineServerLine } = require("./lib/server-log-level");
 const {
   readSettings: readLogCollectorSettings,
   writeSettings: writeLogCollectorSettings,
@@ -65,7 +61,6 @@ const {
 const { saveArtifact, listArtifacts, sweepArtifacts } = require("./lib/event-artifacts");
 const { buildZip } = require("./lib/zip-writer");
 
-const SERVER_DIR = path.join(__dirname, "server");
 const APP_ICON = path.join(__dirname, "assets", "icon.png");
 // one-liner as published on GitHub (kept in sync with package.json's "description")
 const APP_TAGLINE = "Correlate container telemetry with service logs on a shared clickable timeline";
@@ -99,7 +94,6 @@ async function openManual(anchor) {
   }
   await shell.openExternal(`file://${local}${anchor}`);
 }
-let serverProc = null;
 // serverHost/serverPort are the actual address the client (renderer + this
 // process's own fetch calls) talks to -- 127.0.0.1 for embedded/local *and*
 // for a tunneled remote gateway (see connectRemoteGateway), the real
@@ -116,11 +110,10 @@ let activeGatewayHost = "127.0.0.1";
 let activeGatewayPort = null;
 let serverConnectionType = "local";
 // The shared-secret required (as X-CTTC-Token) by the *currently active*
-// gateway's own HTTP API, once one is generated for it -- null only for the
-// bare/native 127.0.0.1-only embedded path (see startServer), which never
-// binds 0.0.0.0 and so was never network-reachable in the first place
-// (br-NET-004). Exposed to the renderer via get-api-token/preload.js; every
-// gateway connect path below (connectToServer, connectRemoteGateway,
+// gateway's own HTTP API, once one is generated for it -- null only before
+// the very first connectToServer()/connectRemoteGateway() call has run.
+// Exposed to the renderer via get-api-token/preload.js; every gateway
+// connect path below (connectToServer, connectRemoteGateway,
 // gateway-manage-save, the boot-time local-container fallback) must set
 // this to whatever token it actually used to provision/reach that gateway.
 let currentApiToken = null;
@@ -236,9 +229,8 @@ function broadcastLog(level, text) {
 
 // "Collect CTTC Own Logs" (Preferences > Settings): an optional third sink
 // alongside the console/DevTools ones above, writing to a file instead --
-// covers the server subprocess's own logging too (see mainError below),
-// since serverProc's stderr is already piped through mainError, not just
-// this process's own messages.
+// covers everything mainLog/mainError already sees, not just this
+// process's own messages.
 // Where "Collect CTTC Own Logs" writes by default, the first time this app
 // has ever run on this machine (see app.whenReady() below) -- next to the
 // app itself, same folder the executable/AppImage lives in, rather than
@@ -299,108 +291,16 @@ function mainError(...args) {
   writeToLogCollector(`ERROR ${text}`);
 }
 
-function startServer(extraArgs) {
-  return new Promise((resolve, reject) => {
-    // uv provisions the venv (orjson) on first run; --project pins it to server/
-    serverProc = spawn(
-      "uv",
-      ["run", "--project", SERVER_DIR, path.join(SERVER_DIR, "server.py"), "--port", "0", ...extraArgs],
-      { stdio: ["ignore", "pipe", "pipe"] }
-    );
-    let settled = false;
-    // redis-server is a hard dependency now (Redis is the sole source of
-    // truth for logs/telemetry, see redis_log.py) -- kept here purely to
-    // recognize *why* the process exited early and give an actionable
-    // message, same spirit as lib/docker-check.js's missing/unhealthy
-    // Docker probes, not to duplicate any check server.py itself does.
-    let stderrTail = "";
-    serverProc.on("error", (err) =>
-      reject(new Error(`could not start server via uv: ${err.message}`))
-    );
-    // server.py's own logging.basicConfig deliberately sends every level
-    // (including routine per-request INFO lines) to stderr, not just actual
-    // errors -- treating 100% of this stream as an error-level main-log
-    // entry (as a single unconditional mainError call used to) meant every
-    // normal request the embedded server handled showed up as a red
-    // "exception" in DevTools, burying any real warning/error in a flood of
-    // noise (br-LOG-001). Route each line by the level word its own
-    // formatter already put there ("HH:MM:SS LEVELNAME cttc: ..."); only
-    // WARNING/ERROR/CRITICAL -- or anything that doesn't match at all, e.g.
-    // a raw Python traceback -- still goes through mainError.
-    serverProc.stderr.on("data", (d) => {
-      const text = `${d}`;
-      stderrTail = (stderrTail + text).slice(-4000);
-      for (const line of text.split("\n")) {
-        if (!line.trim()) continue;
-        const logFn = isRoutineServerLine(line) ? mainLog : mainError;
-        logFn(`[server] ${line}`.trimEnd());
-      }
-    });
-
-    const rl = readline.createInterface({ input: serverProc.stdout });
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      reject(new Error("server did not report a port in 30s"));
-    }, 30000);
-    rl.once("line", (line) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      try {
-        const info = JSON.parse(line);
-        // This is the bare dev/no-Docker embedded fallback -- always local,
-        // but serverHost can be stale from a previous remote connection
-        // (switch-gateway/uninstall reconnecting to "This machine" doesn't
-        // relaunch the process anymore, so the module-level "127.0.0.1"
-        // default only applies once, at first launch).
-        serverHost = "127.0.0.1";
-        serverPort = info.port;
-        activeGatewayHost = "127.0.0.1";
-        activeGatewayPort = info.port;
-        serverConnectionType = "local";
-        activeSshTarget = null;
-        activeSshPort = undefined;
-        mainLog(`[server] listening on ${info.port} (json: ${info.json})`);
-        resolve(info.port);
-      } catch {
-        reject(new Error(`unexpected server output: ${line}`));
-      }
-    });
-    serverProc.on("exit", (code) => {
-      mainLog(`[server] exited (${code})`);
-      serverProc = null;
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      // The embedded/dev server.py path now requires redis-server on PATH,
-      // the same way uv/docker already are (see redis_log.py) -- a missing
-      // binary or a redis-server that failed to come up makes server.py
-      // raise and exit before ever printing its {"port": N} line, which
-      // otherwise surfaces only as an opaque "did not report a port"
-      // timeout. Recognize that case from the process's own stderr and give
-      // an actionable message instead.
-      const mentionsRedis = /redis[-_]?server/i.test(stderrTail);
-      const detail = mentionsRedis
-        ? "redis-server is required to run CTTC's embedded server but wasn't found (or failed to " +
-          "start). Install Redis and make sure `redis-server` is on your PATH, then restart CTTC " +
-          "(e.g. `brew install redis` on macOS, `apt install redis-server` on Debian/Ubuntu)."
-        : `the embedded server exited unexpectedly (code ${code}) before it finished starting.` +
-          (stderrTail.trim() ? `\n\n${stderrTail.trim()}` : "");
-      reject(new Error(detail));
-    });
-  });
-}
-
 async function showAboutDialog() {
   const stack = [
     `Electron ${process.versions.electron}`,
     `Chromium ${process.versions.chrome}`,
     `Node.js ${process.versions.node}`,
-    "Python >=3.11 (via uv)",
-    "orjson >=3.10",
-    "psutil >=5.9",
-    "Redis >=5.0.0",
+    // The gateway itself (log-sump + log-sump-plugin) runs in its own Docker
+    // container, not bundled into this process -- its own dependency
+    // versions (Python, Redis, ...) are that image's concern, not pinned
+    // here.
+    "Docker (log-sump gateway)",
   ];
   const { response } = await dialog.showMessageBox({
     type: "info",
@@ -624,11 +524,6 @@ async function createWindow() {
     // a regression.
     setTimeout(() => {
       console.error("[test] global timeout — spec never resolved");
-      // app.exit() (unlike app.quit()) skips 'before-quit', so stopServer()
-      // never runs on its own here -- without this, every e2e run leaks its
-      // spawned `uv run server.py` process (confirmed: dozens accumulated
-      // across this session's test runs before this fix).
-      serverProc?.kill();
       app.exit(3);
     }, 300000);
     setTimeout(async () => {
@@ -661,7 +556,6 @@ async function createWindow() {
       } catch (err) {
         console.error(`[test] ${err.stack || err}`);
       }
-      serverProc?.kill();
       app.exit(code);
     }, 1500);
     return;
@@ -919,32 +813,32 @@ function resourcesDirForApp() {
 async function connectToServer(fileArgs) {
   const cfg = loadConnectionConfig();
   if (cfg.mode === "embedded") {
-    // cfg.runMode is the user's one-time choice (see the first-run dialog in
-    // app.whenReady()) between the local Docker container and a bare native
-    // process. Only an explicit "native" pick skips the container path
-    // outright; anything else (an explicit "container" pick, or no choice
-    // ever recorded -- e.g. pre-existing installs, or unpackaged/no-Docker
-    // runs where the dialog never fires) falls back to today's auto-detect.
-    const wantsContainer = cfg.runMode !== "native";
-    if (app.isPackaged && wantsContainer && (await hasLocalDocker())) {
-      narrate("starting the local gateway container...");
-      const apiToken = getOrCreateApiToken("embedded");
-      const { port } = await ensureLocalContainer({ resourcesDir: resourcesDirForApp(), apiToken, onLog: mainLog });
-      serverHost = "127.0.0.1";
-      serverPort = port;
-      activeGatewayHost = "127.0.0.1";
-      activeGatewayPort = port;
-      serverConnectionType = "local";
-      activeSshTarget = null;
-      activeSshPort = undefined;
-      currentApiToken = apiToken;
-      mainLog(`[docker] server container running locally — port ${serverPort}`);
-      recordGateway({ mode: "embedded", host: serverHost, port: serverPort, label: "This machine", connectionType: "local" });
-      return;
+    // app/server (the bare `uv run server.py` native fallback) is gone --
+    // the embedded gateway is always the local log-sump Docker container
+    // now, unconditionally, on both packaged and dev-checkout runs. There is
+    // no non-Docker path left to fall back to (see
+    // .claude/plans/sprightly-stirring-blum.md's Phase 10); a missing Docker
+    // install surfaces here as a clear, actionable error instead of a
+    // confusing failure a few layers down inside ensureLocalContainer.
+    if (!(await hasLocalDocker())) {
+      throw new Error(
+        "Docker is required to run CTTC's gateway locally -- install Docker Desktop " +
+          "(or Docker Engine) and make sure it's running, then restart CTTC."
+      );
     }
-    narrate("starting the server...");
-    currentApiToken = null; // bare/native, 127.0.0.1-only -- never needed one (br-NET-004)
-    await startServer(fileArgs);
+    narrate("starting the local gateway container...");
+    const apiToken = getOrCreateApiToken("embedded");
+    const { port } = await ensureLocalContainer({ resourcesDir: resourcesDirForApp(), apiToken, onLog: mainLog });
+    serverHost = "127.0.0.1";
+    serverPort = port;
+    activeGatewayHost = "127.0.0.1";
+    activeGatewayPort = port;
+    serverConnectionType = "local";
+    activeSshTarget = null;
+    activeSshPort = undefined;
+    currentApiToken = apiToken;
+    mainLog(`[docker] server container running locally — port ${serverPort}`);
+    recordGateway({ mode: "embedded", host: serverHost, port: serverPort, label: "This machine", connectionType: "local" });
     return;
   }
   if (fileArgs.length) {
@@ -1904,7 +1798,7 @@ ipcMain.handle("ship-logs", async () => {
       signal: AbortSignal.timeout(20000),
       ...(currentApiToken ? { headers: { "X-CTTC-Token": currentApiToken } } : {}),
     });
-    const gatewayName = res.headers.get("X-CTTC-Gateway-Name") || "gateway";
+    const gatewayName = res.headers.get("X-Gateway-Name") || "gateway";
     const bytes = Buffer.from(await res.arrayBuffer());
     entries.push({ name: `${gatewayName}.log`, data: bytes });
   } catch (err) {
@@ -2097,13 +1991,11 @@ ipcMain.handle("gateway-manage-uninstall", async (_e, entry) => {
     forgetApiToken(entry.mode === "embedded" ? "embedded" : hostFromTarget(entry.sshTarget));
     const wasActive = isActiveGateway(entry);
     if (wasActive) {
-      // stopServer() (not just clearCurrentTunnel()) so a bare `uv run
-      // server.py` dev fallback (see startServer -- the embedded/Docker
-      // path just reuses its already-running, restart:unless-stopped
-      // container instead) doesn't leak its old process, still holding
-      // whatever .cttc-metric/.cttc-record samples were loaded into it, as
-      // an orphan alongside the fresh one connectToServer is about to spawn.
-      stopServer();
+      // Closes an active ssh tunnel, if the just-uninstalled gateway was
+      // reached through one -- a local/embedded gateway's own container is
+      // shared/persistent infrastructure (restart: unless-stopped) and is
+      // never torn down here, only disconnected from.
+      disconnectActiveTunnel();
       clearConnectionConfig();
       // reverts to embedded mode, same as switch-gateway's isUnprovisionedLocal
       // path -- there's nothing left running locally to just point at, so
@@ -2227,53 +2119,26 @@ app.whenReady().then(async () => {
         // actually present to fall back to.
         await runSetupWizard(await hasLocalDocker());
       } catch {
-        // declined (Skip, or just closed the window) -- give local docker a
+        // declined (Skip, or just closed the window) -- give local Docker a
         // genuine try (docker compose up) rather than trusting the earlier
         // quick canBeServerLocally() probe, which can miss a daemon that's
-        // still starting up; only fall back to the bare, docker-less
-        // embedded server if that attempt itself fails.
-        try {
-          narrate("starting the local gateway container...");
-          const apiToken = getOrCreateApiToken("embedded");
-          const { port } = await ensureLocalContainer({ resourcesDir: resourcesDirForApp(), apiToken, onLog: mainLog });
-          serverHost = "127.0.0.1";
-          serverPort = port;
-          activeGatewayHost = "127.0.0.1";
-          activeGatewayPort = port;
-          serverConnectionType = "local";
-          activeSshTarget = null;
-          activeSshPort = undefined;
-          currentApiToken = apiToken;
-          mainLog(`[docker] server container running locally — port ${serverPort}`);
-        } catch {
-          narrate("starting the server...");
-          currentApiToken = null; // bare/native, 127.0.0.1-only -- never needed one (br-NET-004)
-          await startServer(fileArgs);
-        }
+        // still starting up. A failure here propagates to the outer catch
+        // below and surfaces as a clear error dialog -- there is no
+        // bare/native fallback left (see connectToServer's own comment).
+        narrate("starting the local gateway container...");
+        const apiToken = getOrCreateApiToken("embedded");
+        const { port } = await ensureLocalContainer({ resourcesDir: resourcesDirForApp(), apiToken, onLog: mainLog });
+        serverHost = "127.0.0.1";
+        serverPort = port;
+        activeGatewayHost = "127.0.0.1";
+        activeGatewayPort = port;
+        serverConnectionType = "local";
+        activeSshTarget = null;
+        activeSshPort = undefined;
+        currentApiToken = apiToken;
+        mainLog(`[docker] server container running locally — port ${serverPort}`);
       }
     } else {
-      // Both a local Docker container and a bare native process are viable
-      // here (that's what canBeServerLocally() just confirmed) -- ask the
-      // user once, the first time this machine ever reaches this point, and
-      // remember the answer (connectToServer() reads cfg.runMode from here
-      // on, so this never re-prompts).
-      if (app.isPackaged && cfg.mode === "embedded" && cfg.runMode === undefined && (await hasLocalDocker())) {
-        const { response } = await dialog.showMessageBox({
-          type: "question",
-          icon: APP_ICON,
-          title: "Run CTTC Timeline locally",
-          message: "How should the local gateway run?",
-          detail:
-            "Docker is available on this machine, so there are two ways to run the gateway that collects and stores your logs/telemetry:\n\n" +
-            "• As a container (recommended) -- self-contained, bundles everything it needs (including its Redis data store), matches how CTTC runs in production.\n\n" +
-            "• Natively -- runs directly as a process on this machine instead, no Docker involved after this point. Requires `redis-server` to already be installed and on this machine's PATH.\n\n" +
-            "This is remembered for next time; you won't be asked again.",
-          buttons: ["Run as a container", "Run natively"],
-          defaultId: 0,
-          cancelId: 0,
-        });
-        saveRunMode(response === 1 ? "native" : "container");
-      }
       await connectToServer(fileArgs);
     }
   } catch (err) {
@@ -2292,46 +2157,38 @@ app.whenReady().then(async () => {
   });
 });
 
-function stopServer() {
-  // An ssh -N -L tunnel *is* this process's own child (unlike the remote
-  // server/local container it forwards to -- see the comment below), so it
-  // never outlives the app quitting *on an orderly exit*. A crash/force-quit
-  // still leaves it running with nothing left to close it -- see
-  // lib/tunnel-registry.js's killOrphanedTunnels(), called once at the next
-  // launch to clean up exactly that case.
+// An ssh -N -L tunnel *is* this process's own child (unlike the remote
+// server/local container it forwards to), so it never outlives the app
+// quitting *on an orderly exit*. A crash/force-quit still leaves it running
+// with nothing left to close it -- see lib/tunnel-registry.js's
+// killOrphanedTunnels(), called once at the next launch to clean up exactly
+// that case. A remote gateway (or a local Docker container -- see
+// ensureLocalContainer's `restart: unless-stopped`) is shared/persistent
+// infrastructure, not this process's own child: there is nothing else for
+// this process to tear down on quit, and it must never POST /shutdown to
+// either. (Named disconnectActiveTunnel, not stopServer, since this stopped
+// being about stopping a server once app/server's bare `uv run server.py`
+// fallback was decommissioned -- see .claude/plans/sprightly-stirring-blum.md's
+// Phase 10.)
+function disconnectActiveTunnel() {
   clearCurrentTunnel();
-  // A remote server (or a local Docker container -- see ensureLocalContainer's
-  // `restart: unless-stopped`) is shared/persistent infrastructure, not this
-  // process's own child: there's nothing local to tear down, and this
-  // process must never POST /shutdown to it. Only a bare `uv run server.py`
-  // (serverProc) is actually owned by this process.
-  //
-  // Returns a promise that resolves once serverProc has actually exited
-  // (gracefully, or via gracefulStop's own fallback kill) -- see
-  // lib/graceful-stop.js and the before-quit handler below (br-EMBED-002).
-  return gracefulStop(serverProc, {
-    stopUrl: `http://${serverHost}:${serverPort}/shutdown`,
-    onLog: mainLog,
-  });
 }
 
 app.on("window-all-closed", () => {
   // Just triggers the real teardown below -- app.quit() always fires
-  // before-quit first, which is the one place stopServer()/stopLogCollector()
-  // now run (br-EMBED-002: having two independent call sites racing to stop
-  // the same process is exactly what made the fallback-kill timing bug hard
-  // to reason about in the first place).
+  // before-quit first, which is the one place disconnectActiveTunnel()/
+  // stopLogCollector() run.
   app.quit();
 });
 // Every quit path (Quit menu/button, Cmd+Q, Dock > Quit, a window's own
 // close triggering window-all-closed above, or the app.quit() at the end of
 // this same handler on its second pass) funnels through this event -- the
 // one place to tell every still-open window's status bar a shutdown is
-// underway, then actually stop the server, before the process really exits.
+// underway, then actually disconnect, before the process really exits.
 // Guarded against re-entrancy since the deferred app.quit() below re-fires
-// before-quit -- stopServer/stopLogCollector are idempotent and safely run
-// twice, but shuttingDownNotified being true means this branch is skipped
-// on that second pass, letting the quit actually proceed.
+// before-quit -- disconnectActiveTunnel/stopLogCollector are idempotent and
+// safely run twice, but shuttingDownNotified being true means this branch is
+// skipped on that second pass, letting the quit actually proceed.
 let shuttingDownNotified = false;
 app.on("before-quit", (e) => {
   if (shuttingDownNotified) return;
@@ -2342,13 +2199,10 @@ app.on("before-quit", (e) => {
   }
   stopLogCollector();
   sessionPassphraseKey = null; // the vault's fallback-scheme key is session-only, never persisted
-  // br-EMBED-002: the re-quit below must wait for stopServer()'s own
-  // graceful-shutdown/fallback-kill sequence to actually finish, not fire on
-  // a fixed timer that races past it -- otherwise a wedged (or silently
-  // failed-to-POST) embedded server was never actually killed, because the
-  // app had already force-quit by the time gracefulStop's 1500ms fallback
-  // timer would have run. The 200ms floor alongside it is kept only so the
-  // "shutting down" broadcast above still gets at least one paint even when
-  // stopServer() resolves almost instantly (no serverProc to stop at all).
-  Promise.all([stopServer(), new Promise((resolve) => setTimeout(resolve, 200))]).then(() => app.quit());
+  disconnectActiveTunnel();
+  // A fixed 200ms floor so the "shutting down" broadcast above gets at least
+  // one paint before the window actually closes -- disconnectActiveTunnel()
+  // itself is synchronous (no graceful-shutdown handshake left to await now
+  // that there's no local process this app owns the lifecycle of).
+  setTimeout(() => app.quit(), 200);
 });

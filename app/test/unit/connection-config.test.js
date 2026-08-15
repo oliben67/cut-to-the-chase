@@ -8,7 +8,6 @@ const path = require("path");
 const {
   loadConnectionConfig,
   saveConnectionConfig,
-  saveRunMode,
   defaultConfigPath,
   hostFromTarget,
 } = require("../../lib/connection-config");
@@ -127,38 +126,21 @@ test("hostFromTarget leaves a bare host (no user@) alone", () => {
   assert.equal(hostFromTarget("docker-host"), "docker-host");
 });
 
-test("embedded config with no run_mode -> runMode omitted", () => {
+test("embedded config with no run_mode -> plain embedded", () => {
   const p = tmpConfigPath();
   writeConfig(p, { mode: "embedded" });
   const got = loadConnectionConfig({ env: {}, configPath: p });
   assert.deepEqual(got, { mode: "embedded" });
-  assert.equal("runMode" in got, false);
 });
 
-test("embedded config with run_mode: container -> runMode reported", () => {
-  const p = tmpConfigPath();
-  writeConfig(p, { mode: "embedded", run_mode: "container" });
-  assert.deepEqual(loadConnectionConfig({ env: {}, configPath: p }), { mode: "embedded", runMode: "container" });
-});
-
-test("embedded config with run_mode: native -> runMode reported", () => {
+// app/server (the bare native fallback run_mode used to choose between) was
+// decommissioned -- see .claude/plans/sprightly-stirring-blum.md's Phase 10.
+// A stale run_mode key from a pre-existing ~/.cttc/connection.json must not
+// resurface as anything callers act on; it's just ignored now.
+test("a pre-existing run_mode key in the file is ignored", () => {
   const p = tmpConfigPath();
   writeConfig(p, { mode: "embedded", run_mode: "native" });
-  assert.deepEqual(loadConnectionConfig({ env: {}, configPath: p }), { mode: "embedded", runMode: "native" });
-});
-
-test("saveRunMode writes a fresh file that loadConnectionConfig reads back", () => {
-  const p = tmpConfigPath();
-  const written = saveRunMode("native", { configPath: p });
-  assert.equal(written, p);
-  assert.deepEqual(loadConnectionConfig({ env: {}, configPath: p }), { mode: "embedded", runMode: "native" });
-});
-
-test("saveRunMode overwrites a previous choice", () => {
-  const p = tmpConfigPath();
-  saveRunMode("container", { configPath: p });
-  saveRunMode("native", { configPath: p });
-  assert.deepEqual(loadConnectionConfig({ env: {}, configPath: p }), { mode: "embedded", runMode: "native" });
+  assert.deepEqual(loadConnectionConfig({ env: {}, configPath: p }), { mode: "embedded" });
 });
 
 test("gateway_id in the file round-trips into loadConnectionConfig's gatewayId", () => {

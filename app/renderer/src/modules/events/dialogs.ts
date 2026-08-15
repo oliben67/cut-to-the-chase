@@ -275,7 +275,7 @@ $("dlg-event-create").onclick = async () => {
     if (editingEvent) {
       const { id, hosted } = editingEvent;
       if (hosted === "gateway") {
-        await post(`/events/${id}/update`, { name, source_ids: sourceIds, conditions, match, action });
+        await post(`/legacy/events/${id}/update`, { name, source_ids: sourceIds, conditions, match, action });
       } else {
         const list = loadUiEvents();
         const ev = list.find((x) => x.id === id);
@@ -284,7 +284,7 @@ $("dlg-event-create").onclick = async () => {
       }
       notifyEvent(`Event "${name}" updated`);
     } else if ($("event-hosted").value === "gateway") {
-      await post("/events/create", { name, source_ids: sourceIds, conditions, match, action });
+      await post("/legacy/events/create", { name, source_ids: sourceIds, conditions, match, action });
       notifyEvent(`Event "${name}" created`);
     } else {
       const list = loadUiEvents();
@@ -325,13 +325,13 @@ function renderEventRow(ev: GatewayEvent | UiEvent, hosted: string): HTMLElement
   const id = hosted === "gateway" ? ev.event_id : ev.id;
   row.appendChild(mkBtn("Update", () => openEventEditForm(ev, hosted)));
   row.appendChild(mkBtn(ev.enabled ? "Disable" : "Enable", async () => {
-    if (hosted === "gateway") await post(`/events/${id}/${ev.enabled ? "disable" : "enable"}`, {});
+    if (hosted === "gateway") await post(`/legacy/events/${id}/${ev.enabled ? "disable" : "enable"}`, {});
     else { const list = loadUiEvents(); const e = list.find((x) => x.id === id)!; e.enabled = !e.enabled; saveUiEvents(list); }
     refreshEventsList();
   }));
   if (ev.status === "triggered") {
     row.appendChild(mkBtn("Reset", async () => {
-      if (hosted === "gateway") await post(`/events/${id}/reset`, {});
+      if (hosted === "gateway") await post(`/legacy/events/${id}/reset`, {});
       else { const list = loadUiEvents(); const e = list.find((x) => x.id === id)!; e.armed = true; e.status = "armed"; saveUiEvents(list); }
       refreshEventsList();
     }));
@@ -340,7 +340,7 @@ function renderEventRow(ev: GatewayEvent | UiEvent, hosted: string): HTMLElement
       row.appendChild(mkBtn("Save…", async () => {
         try {
           if (hosted === "gateway") {
-            const res = await fetch(`${API}/session/${artifactId}/download`, { headers: authHeaders() });
+            const res = await fetch(`${API}/legacy/session/${artifactId}/download`, { headers: authHeaders() });
             if (!res.ok) throw new Error(`download failed: ${res.status}`);
             const bytes = new Uint8Array(await res.arrayBuffer());
             const ext = res.headers.get("Content-Disposition")?.includes(".cttc-record") ? ".cttc-record" : ".cttc-metric";
@@ -356,7 +356,7 @@ function renderEventRow(ev: GatewayEvent | UiEvent, hosted: string): HTMLElement
     }
   }
   row.appendChild(mkBtn(hosted === "gateway" ? "Cancel" : "Delete", async () => {
-    if (hosted === "gateway") await post(`/events/${id}/cancel`, {});
+    if (hosted === "gateway") await post(`/legacy/events/${id}/cancel`, {});
     else saveUiEvents(loadUiEvents().filter((x) => x.id !== id));
     refreshEventsList();
   }));
@@ -367,9 +367,9 @@ export async function refreshEventsList(): Promise<void> {
   const box = $("events-list");
   box.innerHTML = "";
   try {
-    const { event_ids } = await get("/events/list");
+    const { event_ids } = await get("/legacy/events/list");
     for (const id of event_ids) {
-      const ev = await get(`/events/${id}`);
+      const ev = await get(`/legacy/events/${id}`);
       box.appendChild(renderEventRow(ev, "gateway"));
     }
   } catch {

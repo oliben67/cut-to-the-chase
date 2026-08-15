@@ -1383,7 +1383,7 @@ async function takeSnapshot(t) {
 // (via /index_at + /logs). Reused for the center time and, when a panorama
 // is requested, for the "before"/"after" times too.
 async function computeSlice(t, { includeLogs, ctxLines }) {
-  const r = await get(`/point?t=${t}`);
+  const r = await get(`/legacy/point?t=${t}`);
   let services = Object.entries(r.services || {}).map(([name, v]) => ({ name, ...v }));
   const selected = new Set(allSvcSeries().filter((s) => trackStateOf(s) === "sel").map((s) => s.name));
   services = services.filter((s) => (s.host || selected.has(s.name)) && !isOtherDockerHostHidden(s.sid));
@@ -1394,7 +1394,7 @@ async function computeSlice(t, { includeLogs, ctxLines }) {
     const logSources = state.sources.filter((s) => s.kind === "log" && !isSampleHidden(s.id) && !isLiveDataHidden(s.id) && !isOtherDockerHostHidden(s.id));
     logs = await Promise.all(logSources.map(async (s) => {
       try {
-        const idx = await get(`/index_at?source=${s.id}&t=${t}`);
+        const idx = await get(`/legacy/index_at?source=${s.id}&t=${t}`);
         const start = Math.max(0, idx.index - ctxLines);
         const page = await get(`/logs?source=${s.id}&start=${start}&count=${ctxLines * 2 + 1}`);
         return { source: s.name, path: s.path, rows: page.rows };
@@ -1658,7 +1658,7 @@ const STATS_FIELD_EXPLANATIONS = [
 async function fetchLogRowsInRange(sourceId, t0, t1) {
   let start;
   try {
-    start = (await get(`/index_at?source=${sourceId}&t=${t0}`)).index;
+    start = (await get(`/legacy/index_at?source=${sourceId}&t=${t0}`)).index;
   } catch {
     return [];
   }
@@ -2173,11 +2173,11 @@ async function fetchSeries() {
   const px = Math.round(plotWidth());
   const { t0, t1 } = state.view;
   try {
-    state.series = await get(`/series?from=${t0}&to=${t1}&px=${px}`);
+    state.series = await get(`/legacy/series?from=${t0}&to=${t1}&px=${px}`);
     const logs = state.sources.filter((s) => s.kind === "log");
     await Promise.all(
       logs.map(async (s) => {
-        const r = await get(`/ticks?source=${s.id}&from=${t0}&to=${t1}&px=${px}`);
+        const r = await get(`/legacy/ticks?source=${s.id}&from=${t0}&to=${t1}&px=${px}`);
         state.ticks.set(s.id, r.counts);
       })
     );
@@ -2652,7 +2652,7 @@ class Panel {
 
   async jumpTo(t) {
     try {
-      const r = await get(`/index_at?source=${this.src.id}&t=${t}`);
+      const r = await get(`/legacy/index_at?source=${this.src.id}&t=${t}`);
       this.cursorIdx = r.index;
       const vi = this.visualIndexOf(r.index);
       this.body.scrollTop = Math.max(0, vi * ROWH - this.body.clientHeight / 2 + ROWH / 2);
@@ -2676,7 +2676,7 @@ class Panel {
     const start = this.cursorIdx != null ? this.cursorIdx + (forward ? 1 : -1) : 0;
     try {
       const r = await get(
-        `/logs/find?source=${this.src.id}&q=${encodeURIComponent(q)}&start=${Math.max(0, start)}&dir=${forward ? "fwd" : "back"}`
+        `/legacy/logs/find?source=${this.src.id}&q=${encodeURIComponent(q)}&start=${Math.max(0, start)}&dir=${forward ? "fwd" : "back"}`
       );
       if (r.index == null) { this.searchStatus.textContent = "no matches"; return; }
       this.searchStatus.textContent = "";

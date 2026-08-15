@@ -1,10 +1,22 @@
 "use strict";
 
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const { spawn } = require("child_process");
 const { hostFromTarget } = require("./connection-config");
 const { waitForHttpOk } = require("./net-wait");
+
+// log-sump-plugin (github.com/oliben67/cttc-log-sump-plugin): cttc's own
+// client-specific compat routes, never baked into the log-sump image
+// itself (see releases/_shared/build-image.sh's own comment) -- cloned
+// fresh by ensurePluginCheckout below and bind-mounted into the container
+// at `docker compose up` time instead, so log-sump's own image stays
+// generic. Not user-configurable (unlike the server image itself, via
+// Settings > "Update server image") -- no equivalent UI exists for this
+// yet; a fixed ref is today's whole story.
+const PLUGIN_REPO_URL = "git@github.com:oliben67/cttc-log-sump-plugin.git";
+const PLUGIN_REPO_REF = "main";
 
 // The server image tarball + both docker-compose variants ship as
 // electron-builder extraResources (see app/package.json's
@@ -27,7 +39,7 @@ function defaultRepoDir() {
 }
 
 function bundledTarballPath({ resourcesDir } = {}) {
-  return resourcesDir ? path.join(resourcesDir, "cttc-gateway.tar.gz") : path.join(defaultSharedDir(), "cttc-gateway.tar.gz");
+  return resourcesDir ? path.join(resourcesDir, "log-sump.tar.gz") : path.join(defaultSharedDir(), "log-sump.tar.gz");
 }
 function bundledOfflineComposePath({ resourcesDir } = {}) {
   return resourcesDir
@@ -101,7 +113,7 @@ function scpArgs({ sshKey, sshPort }) {
  * Resolves what image to run and which compose file goes with it. `source`
  * (from Settings > "Update server image", see main.js's "update-image"
  * handler) explicitly overrides the default of "whatever's bundled":
- *   { type: "tarball", path: "C:\\path\\to\\cttc-gateway.tar.gz" }
+ *   { type: "tarball", path: "C:\\path\\to\\log-sump.tar.gz" }
  *   { type: "registry", ref: "osteck/cttc-gateway:0.0.2" }
  * With no override: prefers the tarball baked into this install,
  * falling back to image.json's registry ref (a placeholder until a real
@@ -142,6 +154,35 @@ function resolveSource(source, { resourcesDir } = {}) {
   return { kind: "registry", ref, composeFile: registryComposePath({ resourcesDir }), imageRef: ref };
 }
 
+function localPluginCheckoutDir() {
+  return path.join(os.homedir(), ".cttc", "log-sump-plugin");
+}
+
+/**
+ * Clones (first time) or fast-forwards (already present) log-sump-plugin
+ * into `dir`, on *this* machine -- idempotent, safe to call on every
+ * provision cycle (an ordinary reconnect calls this again, same as it
+ * re-runs `docker compose up -d` against an already-running container).
+ * A plain `git` checkout, not anything docker-related: log-sump's own
+ * image has no idea this directory's contents exist at all -- they're
+ * bind-mounted in by whichever compose file's `CTTC_PLUGINS_DIR`
+ * references it (see releases/_shared and releases/_repo's own
+ * docker-compose.yml). Requires `git` on PATH -- a new operational
+ * requirement this adds, alongside the `docker`/`ssh` this module already
+ * assumed.
+ * @returns {Promise<string>} `dir`, once it's a clean, up-to-date checkout.
+ */
+async function ensurePluginCheckout({ spawnFn = spawn, dir = localPluginCheckoutDir(), onLog } = {}) {
+  if (fs.existsSync(path.join(dir, ".git"))) {
+    await run(spawnFn, "git", ["-C", dir, "fetch", "origin", PLUGIN_REPO_REF], {}, onLog);
+    await run(spawnFn, "git", ["-C", dir, "reset", "--hard", `origin/${PLUGIN_REPO_REF}`], {}, onLog);
+  } else {
+    fs.mkdirSync(path.dirname(dir), { recursive: true });
+    await run(spawnFn, "git", ["clone", "--branch", PLUGIN_REPO_REF, PLUGIN_REPO_URL, dir], {}, onLog);
+  }
+  return dir;
+}
+
 /**
  * Gets the server container running on *this* machine: docker-load or
  * docker-pull per resolveSource(), then `docker compose up -d` with the
@@ -153,13 +194,25 @@ function resolveSource(source, { resourcesDir } = {}) {
  * the same persisted token across calls (see lib/api-token.js) so this
  * never changes between an ordinary reconnect's `docker compose up -d`
  * calls -- an env var that *did* change would make compose recreate the
- * container instead of leaving the already-running one alone.
+ * container instead of leaving the already-running one alone. Also
+ * (re-)clones log-sump-plugin via ensurePluginCheckout and passes its
+ * checkout dir through as CTTC_PLUGINS_DIR, which both docker-compose.yml
+ * variants bind-mount in -- see that function's own docstring.
  * @returns {{port: number, imageRef: string}}
  */
-async function ensureLocalContainer({ spawnFn = spawn, resourcesDir, port = 8765, source, apiToken, onLog } = {}) {
+async function ensureLocalContainer({
+  spawnFn = spawn,
+  resourcesDir,
+  port = 8765,
+  source,
+  apiToken,
+  onLog,
+  pluginDir,
+} = {}) {
   const resolved = resolveSource(source, { resourcesDir });
   const env = { ...process.env };
   if (apiToken) env.CTTC_API_TOKEN = apiToken;
+  env.CTTC_PLUGINS_DIR = await ensurePluginCheckout({ spawnFn, dir: pluginDir, onLog });
   if (resolved.kind === "tarball") {
     await run(spawnFn, "docker", ["load", "-i", resolved.tarballPath], {}, onLog);
   } else {
@@ -233,18 +286,33 @@ async function ensureRemoteContainer(
   // leaving the already-running, already-authenticated one alone.
   const apiTokenEnv = apiToken ? `CTTC_API_TOKEN=${apiToken} ` : "";
 
+  // (Re-)clones log-sump-plugin *on the remote host itself* -- mirrors
+  // ensurePluginCheckout's own local logic (clone if absent, fetch+reset
+  // if already there), just run over ssh instead of spawnFn directly. The
+  // one new operational requirement this adds for a remote gateway host:
+  // `git` on PATH, alongside the `docker`/`docker compose` this already
+  // needed. `$PWD` (not a literal path) for the same reason idRsaEnv uses
+  // it below: this whole thing runs as one shell invocation after `cd
+  // ${remoteDir}`, so `$PWD` is already that absolute directory by the
+  // time docker compose reads CTTC_PLUGINS_DIR from it.
+  await run(spawnFn, sshBin, [
+    ...ssh,
+    `cd ${remoteDir} && if [ -d log-sump-plugin/.git ]; then cd log-sump-plugin && git fetch origin ${PLUGIN_REPO_REF} && git reset --hard origin/${PLUGIN_REPO_REF}; else git clone --branch ${PLUGIN_REPO_REF} ${PLUGIN_REPO_URL} log-sump-plugin; fi`,
+  ], {}, onLog);
+  const pluginsDirEnv = 'CTTC_PLUGINS_DIR="$PWD/log-sump-plugin" ';
+
   if (resolved.kind === "tarball") {
     await run(spawnFn, scpBin, [...scp, resolved.tarballPath, `${target}:${remoteDir}/`], {}, onLog);
     await run(spawnFn, scpBin, [...scp, resolved.composeFile, `${target}:${remoteDir}/docker-compose.yml`], {}, onLog);
     await run(spawnFn, sshBin, [
       ...ssh,
-      `cd ${remoteDir} && docker load -i ${path.basename(resolved.tarballPath)} && ${apiTokenEnv}${idRsaEnv}docker compose -f docker-compose.yml up -d`,
+      `cd ${remoteDir} && docker load -i ${path.basename(resolved.tarballPath)} && ${apiTokenEnv}${idRsaEnv}${pluginsDirEnv}docker compose -f docker-compose.yml up -d`,
     ], {}, onLog);
   } else {
     await run(spawnFn, scpBin, [...scp, resolved.composeFile, `${target}:${remoteDir}/docker-compose.yml`], {}, onLog);
     await run(spawnFn, sshBin, [
       ...ssh,
-      `cd ${remoteDir} && docker pull ${resolved.ref} && CTTC_IMAGE=${resolved.ref} ${apiTokenEnv}${idRsaEnv}docker compose -f docker-compose.yml up -d`,
+      `cd ${remoteDir} && docker pull ${resolved.ref} && CTTC_IMAGE=${resolved.ref} ${apiTokenEnv}${idRsaEnv}${pluginsDirEnv}docker compose -f docker-compose.yml up -d`,
     ], {}, onLog);
   }
 

@@ -185,53 +185,37 @@ space; the position is remembered.
 
 ## Connecting to a Gateway
 
-A **Gateway** is where the CTTC server actually runs. Three modes:
+A **Gateway** is where the CTTC server actually runs. Two modes:
 
-- **Embedded** (default) — spawned locally as a subprocess; nothing to set
-  up.
-- **Local Docker container** — the packaged `cttc-gateway` image, run on
-  this machine's own Docker.
+- **Embedded** (default) — the local **log-sump** gateway container, run on
+  this machine's own Docker. Docker is required; there is no non-Docker
+  fallback.
 - **Remote, over SSH** — provisioned onto another machine you control:
   CTTC connects with an SSH key, starts the gateway container there (or
   reuses one already running), and reaches it either directly or through an
   SSH tunnel if the remote port isn't otherwise reachable.
 
 The gateway stores everything it collects in Redis — its sole data store, no
-in-memory fallback. When Docker is available on this machine, **the first
-time the app ever runs** you're asked to choose how the embedded gateway
-should run: **as a container** (recommended — self-contained, bundles its
-own Redis, matches how CTTC runs in production) or **natively** (runs
-directly as a process on this machine; requires `redis-server` to already be
-installed and on this machine's `PATH`, the same way the container-free
-embedded server has always required `uv`). That choice is remembered — you
-won't be asked again unless you delete `~/.cttc/connection.json`. If Docker
-isn't available at all, the embedded server always runs natively and this
-choice never comes up.
+in-memory fallback. Redis itself is reachable directly (not just through the
+gateway's own API) on `127.0.0.1:6379` by default (`redis-cli`, RedisInsight,
+etc.) — useful for inspecting what's actually stored. Loopback-only, no
+password, same trust model as everything else this app runs locally.
 
-Redis itself is reachable directly (not just through the gateway's own API)
-on `127.0.0.1:56379` by default (`redis-cli -p 56379`, RedisInsight, etc.),
-in both modes — useful for inspecting what's actually stored. Loopback-only,
-no password, same trust model as everything else this app runs locally.
-Configurable via server.py's `--redis-port` flag if 56379 ever collides with
-something else on your machine.
-
-That data now **survives a restart** — a graceful shutdown snapshots it to
-disk, and even an ungraceful crash loses at most a second or two of the most
-recent writes. Retention defaults to 3 days (`--redis-ttl-seconds`); how
-often new data is actually saved defaults to every second
-(`--redis-flush-interval-seconds`, live-adjustable without a restart) and
-where it's saved defaults to a folder next to the server
-(`--redis-data-dir`) — in a container, that folder needs to be on a
-host-mounted volume (already set up in the bundled `docker-compose.yml`) or
-it's lost whenever the container itself is recreated, same as any other
-container storage.
+That data **survives a restart** — a graceful shutdown snapshots it to disk,
+and even an ungraceful crash loses at most a second or two of the most
+recent writes (Redis's own RDB persistence). Retention defaults to 7 days
+(log-sump's own default; CTTC's deployment doesn't currently override it).
+Where it's saved defaults to a folder next to the server
+(`log-sump-redis-data`, override with `CTTC_REDIS_DATA_DIR`) — that folder
+is a host-mounted volume (already set up in the bundled
+`docker-compose.yml`) so it survives the container itself being recreated,
+same as any other container storage.
 
 **New Gateway…** (sidebar → Gateway) walks through adding a remote one:
 host, SSH key (a file already on this machine, or paste one directly), and
 which gateway image to use (a registry reference, or a local tarball for
 offline installs). **Skip — use this machine** bypasses all of this and
-uses local Docker (or the embedded server if Docker isn't available), per
-the choice above.
+uses local Docker.
 **Edit Gateway** re-opens that same form for an existing entry — **"This
 machine"** (the embedded/local gateway) is never listed here, since it has
 no connection settings to change and can't be uninstalled; it's always
@@ -793,10 +777,17 @@ pop-outs are extra views, so nothing moves.
 
 ## Transforms
 
+> **Currently unavailable.** The Transforms checklist in **New Docker
+> Host…**/**Edit Docker Host** is always empty right now — this feature has
+> no working path since the gateway moved off `app/server` onto the
+> log-sump-based backend (see `BUG-0098`). The description below is what it
+> looked like before that migration and what it's meant to look like again
+> once `BUG-0098` is fixed; it does not describe current behavior.
+
 Transforms are user-written Python modules applied to every log record at
-ingest. Drop a `.py` file into `app/server/transforms/` and it appears as a
-checkbox in the **New Docker Host…**/**Edit Docker Host** dialog. Modules are reloaded every time
-sources are opened — edit and re-add, no restart needed.
+ingest, ticked as a checkbox in the **New Docker Host…**/**Edit Docker
+Host** dialog. Modules are reloaded every time sources are opened — edit
+and re-add, no restart needed.
 
 ```python
 def transform(record):   # {"ts": epoch_ms, "text": str, "fields": dict, "source": str}
