@@ -296,3 +296,83 @@ async def test_stats_export(client: AsyncClient, redis: FakeAsyncRedis) -> None:
     assert body["granularity"] == "summary"
     web = next(s for s in body["services"] if s["name"] == "web")
     assert web["cpu"] == {"min": 42.0, "avg": 42.0, "max": 42.0}
+
+
+async def test_session_start_stop_status_download(
+    client: AsyncClient, redis: FakeAsyncRedis
+) -> None:
+    await client.post(
+        "/docker/collect",
+        json={"host": None, "stats": False, "host_stats": False, "logs": [{"name": "web"}]},
+        headers=_auth_headers(),
+    )
+
+    start_resp = await client.post(
+        "/legacy/session/start", json={}, headers=_auth_headers()
+    )
+    assert start_resp.status_code == 200
+    session_id = start_resp.json()["session_id"]
+
+    await _seed_log_via_redis(redis, "web", 1000, "hello from session")
+
+    status_resp = await client.get(
+        f"/legacy/session/{session_id}/status", headers=_auth_headers()
+    )
+    assert status_resp.json() == {
+        "session_id": session_id,
+        "status": "running",
+        "ready": False,
+        "safe": False,
+    }
+
+    stop_resp = await client.post(
+        f"/legacy/session/{session_id}/stop", headers=_auth_headers()
+    )
+    assert stop_resp.status_code == 200
+
+    status_resp = await client.get(
+        f"/legacy/session/{session_id}/status", headers=_auth_headers()
+    )
+    assert status_resp.json()["status"] == "completed"
+    assert status_resp.json()["ready"] is True
+
+    download_resp = await client.get(
+        f"/legacy/session/{session_id}/download", headers=_auth_headers()
+    )
+    assert download_resp.status_code == 200
+    assert f'{session_id}.cttc-record' in download_resp.headers["content-disposition"]
+
+
+async def test_session_status_of_unknown_session_is_404(client: AsyncClient) -> None:
+    resp = await client.get("/legacy/session/leg-rec999/status", headers=_auth_headers())
+    assert resp.status_code == 404
+
+
+async def test_session_safe_and_ttl(client: AsyncClient) -> None:
+    start_resp = await client.post("/legacy/session/start", json={}, headers=_auth_headers())
+    session_id = start_resp.json()["session_id"]
+
+    safe_resp = await client.post(
+        f"/legacy/session/{session_id}/safe",
+        json={"max_keep_seconds": 999.0},
+        headers=_auth_headers(),
+    )
+    assert safe_resp.status_code == 200
+
+    ttl_resp = await client.post(
+        "/legacy/session/ttl", json={"seconds": 3600.0}, headers=_auth_headers()
+    )
+    assert ttl_resp.status_code == 200
+    assert ttl_resp.json() == {"ok": True}
+
+
+async def test_bare_session_start_is_still_the_built_in_route(client: AsyncClient) -> None:
+    """Confirms /legacy/session/* didn't just add a working path -- the
+    built-in daemon-scoped /session/start (X-API-Key, not the gateway
+    token) must still be the one answering at the bare path, per
+    br-PLUG-001.
+    """
+    resp = await client.post(
+        "/session/start", json={"docker_host": "local"}, headers=_auth_headers()
+    )
+    assert resp.status_code == 401  # missing X-API-Key -- proves the built-in handler answered

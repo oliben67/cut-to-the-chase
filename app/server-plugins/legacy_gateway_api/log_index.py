@@ -161,6 +161,22 @@ async def ticks(
     return counts
 
 
+async def rows_between(
+    redis: Redis, docker_host: str, name: str, t0_ms: int, t1_ms: int
+) -> list[tuple[float, str]]:
+    """`(ts_ms, text)` for every entry in `[t0_ms, t1_ms]` -- backs a
+    recording session's own archive export, which needs a plain windowed
+    slice, not a rank. Reuses the same cached, incrementally-caught-up
+    entry list as `total`/`log_slice`/etc., so this is cheap once
+    anything else has already touched this container's index; a first-
+    ever access still pays the same one full-scan cost `total` would.
+    """
+    entries = await _catch_up(redis, docker_host, name)
+    lo = bisect.bisect_left(entries, t0_ms, key=lambda e: e[1])
+    hi = bisect.bisect_right(entries, t1_ms, key=lambda e: e[1])
+    return [(float(ts_ms), text) for _id, ts_ms, text in entries[lo:hi]]
+
+
 async def find_text(
     redis: Redis, docker_host: str, name: str, query: str, start: int, forward: bool
 ) -> int | None:

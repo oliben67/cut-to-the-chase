@@ -5,23 +5,25 @@ Source lifecycle: `GET /sources`, `GET /range`, `POST /docker/collect`,
 queries (once a source from that first group is already open): `GET
 /logs`, `GET /stats_export`, and, under `/legacy/*` (see below), `GET
 /point`, `GET /series`, `GET /index_at`, `GET /ticks`, `GET /logs/find`.
-Every request/response shape here matches the legacy gateway's own wire
-protocol exactly (field names, `docker://<host>/<type>/<name>` source
-ids, millisecond-epoch-number timestamps, not log-sump's own ISO
-datetimes elsewhere) so its existing client can keep talking to this
-backend essentially unchanged.
+Recording sessions, also under `/legacy/*`: `POST /session/start`,
+`/{id}/stop`, `/{id}/safe`, `GET /{id}/status`, `/{id}/download`, `POST
+/session/ttl`. Every request/response shape here matches the legacy
+gateway's own wire protocol exactly (field names, `docker://<host>/
+<type>/<name>` source ids, millisecond-epoch-number timestamps, not
+log-sump's own ISO datetimes elsewhere) so its existing client can keep
+talking to this backend essentially unchanged.
 
-The `/legacy/*` prefix on five of these (not all -- `/sources` etc. and
+The `/legacy/*` prefix on most of these (not all -- `/sources` etc. and
 `/logs`/`/stats_export` have no built-in counterpart to collide with) is
-not a stylistic choice: log-sump's own built-in `series` router already
-owns bare `/point`, `/series`, `/index_at`, `/ticks`, `/logs/find` for its
-own, differently-addressed (`docker_host`+`container_id`, `X-API-Key`)
-native API -- confirmed the hard way that mounting this plugin's own
+not a stylistic choice: log-sump's own built-in `series` and `sessions`
+routers already own bare `/point`, `/series`, `/index_at`, `/ticks`,
+`/logs/find`, and the whole `/session/*` family, for their own,
+differently-addressed (`docker_host`(+`container_id`), `X-API-Key`)
+native APIs -- confirmed the hard way that mounting this plugin's own
 versions at those same bare paths made the built-in ones unreachable
 (app.py's plugin-mounting loop now rejects that outright, see its own
 comment) rather than actually working around them. This client's own
-renderer call sites for these five (only these five) point at `/legacy/*`
-accordingly.
+renderer call sites for these point at `/legacy/*` accordingly.
 
 Gated by the gateway token, matching what the legacy client actually sends
 (`X-CTTC-Token`) -- the same gate log-sump's own `routers/gateway.py` uses;
@@ -34,13 +36,14 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
 
+from log_sump.common.sample_archive import RECORD_EXT
 from log_sump.server.deps import get_redis, require_gateway_token
 
-from . import compat
+from . import compat, sessions_compat
 
 router = APIRouter(dependencies=[Depends(require_gateway_token)])
 
@@ -263,3 +266,91 @@ async def get_logs_find(
     except ValueError as exc:
         raise HTTPException(400, detail=str(exc)) from exc
     return FindResponse(index=index)
+
+
+# ── recording sessions ──────────────────────────────────────────────────────
+
+
+class SessionStartRequest(BaseModel):
+    duration_minutes: float | None = None
+    safe: bool = False
+    max_keep_seconds: float | None = None
+
+
+class SessionStartResponse(BaseModel):
+    session_id: str
+
+
+@router.post("/legacy/session/start")
+async def post_session_start(
+    body: SessionStartRequest, redis: Annotated[Redis, Depends(get_redis)]
+) -> SessionStartResponse:
+    session_id = await sessions_compat.start(
+        redis,
+        duration_minutes=body.duration_minutes,
+        safe=body.safe,
+        max_keep_seconds=body.max_keep_seconds,
+    )
+    return SessionStartResponse(session_id=session_id)
+
+
+@router.post("/legacy/session/{session_id}/stop")
+async def post_session_stop(
+    session_id: str, redis: Annotated[Redis, Depends(get_redis)]
+) -> OkResponse:
+    try:
+        await sessions_compat.stop(redis, session_id)
+    except sessions_compat.UnknownSession as exc:
+        raise HTTPException(404, detail=f"unknown session: {session_id}") from exc
+    return OkResponse()
+
+
+class SessionSafeRequest(BaseModel):
+    max_keep_seconds: float
+
+
+@router.post("/legacy/session/{session_id}/safe")
+async def post_session_safe(session_id: str, body: SessionSafeRequest) -> OkResponse:
+    try:
+        sessions_compat.mark_safe(session_id, body.max_keep_seconds)
+    except sessions_compat.UnknownSession as exc:
+        raise HTTPException(404, detail=f"unknown session: {session_id}") from exc
+    return OkResponse()
+
+
+@router.get("/legacy/session/{session_id}/status")
+async def get_session_status(
+    session_id: str, redis: Annotated[Redis, Depends(get_redis)]
+) -> dict[str, Any]:
+    try:
+        return await sessions_compat.status_of(redis, session_id)
+    except sessions_compat.UnknownSession as exc:
+        raise HTTPException(404, detail=f"unknown session: {session_id}") from exc
+
+
+@router.get("/legacy/session/{session_id}/download")
+async def get_session_download(session_id: str) -> Response:
+    try:
+        data = sessions_compat.download(session_id)
+    except sessions_compat.UnknownSession as exc:
+        raise HTTPException(
+            404, detail=f"unknown or not-yet-completed session: {session_id}"
+        ) from exc
+    return Response(
+        content=data,
+        media_type="application/octet-stream",
+        headers={
+            "Content-Disposition": f'attachment; filename="{session_id}{RECORD_EXT}"',
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
+
+
+class SessionTtlRequest(BaseModel):
+    seconds: float
+
+
+@router.post("/legacy/session/ttl")
+async def post_session_ttl(body: SessionTtlRequest) -> OkResponse:
+    sessions_compat.set_default_ttl(body.seconds)
+    return OkResponse()
