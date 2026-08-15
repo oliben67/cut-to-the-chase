@@ -7,23 +7,27 @@ queries (once a source from that first group is already open): `GET
 /point`, `GET /series`, `GET /index_at`, `GET /ticks`, `GET /logs/find`.
 Recording sessions, also under `/legacy/*`: `POST /session/start`,
 `/{id}/stop`, `/{id}/safe`, `GET /{id}/status`, `/{id}/download`, `POST
-/session/ttl`. Every request/response shape here matches the legacy
-gateway's own wire protocol exactly (field names, `docker://<host>/
-<type>/<name>` source ids, millisecond-epoch-number timestamps, not
-log-sump's own ISO datetimes elsewhere) so its existing client can keep
-talking to this backend essentially unchanged.
+/session/ttl`. Gateway-hosted events, also under `/legacy/*`: `POST
+/events/create`, `GET /events/list`, `GET /events/{id}`, `POST
+/events/{id}/update`, `/enable`, `/disable`, `/reset`, `/cancel`. Every
+request/response shape here matches the legacy gateway's own wire
+protocol exactly (field names, `docker://<host>/<type>/<name>` source
+ids, millisecond-epoch-number timestamps, not log-sump's own ISO
+datetimes elsewhere) so its existing client can keep talking to this
+backend essentially unchanged.
 
 The `/legacy/*` prefix on most of these (not all -- `/sources` etc. and
 `/logs`/`/stats_export` have no built-in counterpart to collide with) is
-not a stylistic choice: log-sump's own built-in `series` and `sessions`
-routers already own bare `/point`, `/series`, `/index_at`, `/ticks`,
-`/logs/find`, and the whole `/session/*` family, for their own,
-differently-addressed (`docker_host`(+`container_id`), `X-API-Key`)
-native APIs -- confirmed the hard way that mounting this plugin's own
-versions at those same bare paths made the built-in ones unreachable
-(app.py's plugin-mounting loop now rejects that outright, see its own
-comment) rather than actually working around them. This client's own
-renderer call sites for these point at `/legacy/*` accordingly.
+not a stylistic choice: log-sump's own built-in `series`, `sessions`,
+and `events` routers already own bare `/point`, `/series`, `/index_at`,
+`/ticks`, `/logs/find`, the whole `/session/*` family, and the whole
+`/events/*` family, for their own, differently-addressed
+(`docker_host`(+`container_id`), `X-API-Key`) native APIs -- confirmed
+the hard way that mounting this plugin's own versions at those same bare
+paths made the built-in ones unreachable (app.py's plugin-mounting loop
+now rejects that outright, see its own comment) rather than actually
+working around them. This client's own renderer call sites for these
+point at `/legacy/*` accordingly.
 
 Gated by the gateway token, matching what the legacy client actually sends
 (`X-CTTC-Token`) -- the same gate log-sump's own `routers/gateway.py` uses;
@@ -34,16 +38,15 @@ which this client has no knowledge of at all.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
 
-from log_sump.common.sample_archive import RECORD_EXT
 from log_sump.server.deps import get_redis, require_gateway_token
 
-from . import compat, sessions_compat
+from . import compat, events_compat, sessions_compat
 
 router = APIRouter(dependencies=[Depends(require_gateway_token)])
 
@@ -331,7 +334,7 @@ async def get_session_status(
 @router.get("/legacy/session/{session_id}/download")
 async def get_session_download(session_id: str) -> Response:
     try:
-        data = sessions_compat.download(session_id)
+        data, ext = sessions_compat.download(session_id)
     except sessions_compat.UnknownSession as exc:
         raise HTTPException(
             404, detail=f"unknown or not-yet-completed session: {session_id}"
@@ -340,7 +343,7 @@ async def get_session_download(session_id: str) -> Response:
         content=data,
         media_type="application/octet-stream",
         headers={
-            "Content-Disposition": f'attachment; filename="{session_id}{RECORD_EXT}"',
+            "Content-Disposition": f'attachment; filename="{session_id}{ext}"',
             "Access-Control-Allow-Origin": "*",
         },
     )
@@ -353,4 +356,129 @@ class SessionTtlRequest(BaseModel):
 @router.post("/legacy/session/ttl")
 async def post_session_ttl(body: SessionTtlRequest) -> OkResponse:
     sessions_compat.set_default_ttl(body.seconds)
+    return OkResponse()
+
+
+# ── gateway-hosted events ────────────────────────────────────────────────────
+
+
+class EventCreateRequest(BaseModel):
+    name: str = ""
+    source_ids: list[str] = []
+    conditions: list[dict[str, Any]] = []
+    action: dict[str, Any] = {}
+    match: Literal["any", "all"] = "any"
+
+
+class EventIdResponse(BaseModel):
+    event_id: str
+
+
+@router.post("/legacy/events/create")
+async def post_events_create(
+    body: EventCreateRequest, redis: Annotated[Redis, Depends(get_redis)]
+) -> EventIdResponse:
+    try:
+        conditions = [events_compat.parse_condition(c) for c in body.conditions]
+        action = events_compat.parse_action(body.action)
+        event_id = await events_compat.create(
+            redis,
+            name=body.name,
+            source_ids=set(body.source_ids),
+            conditions=conditions,
+            action=action,
+            match=body.match,
+        )
+    except events_compat.InvalidEvent as exc:
+        raise HTTPException(400, detail=str(exc)) from exc
+    return EventIdResponse(event_id=event_id)
+
+
+class EventListResponse(BaseModel):
+    event_ids: list[str]
+
+
+@router.get("/legacy/events/list")
+async def get_events_list() -> EventListResponse:
+    return EventListResponse(event_ids=events_compat.list_ids())
+
+
+@router.get("/legacy/events/{event_id}")
+async def get_event_status(
+    event_id: str, redis: Annotated[Redis, Depends(get_redis)]
+) -> dict[str, Any]:
+    try:
+        return await events_compat.status_of(redis, event_id)
+    except events_compat.UnknownEvent as exc:
+        raise HTTPException(404, detail=f"unknown event: {event_id}") from exc
+
+
+@router.post("/legacy/events/{event_id}/enable")
+async def post_event_enable(event_id: str) -> OkResponse:
+    try:
+        events_compat.enable(event_id)
+    except events_compat.UnknownEvent as exc:
+        raise HTTPException(404, detail=f"unknown event: {event_id}") from exc
+    return OkResponse()
+
+
+@router.post("/legacy/events/{event_id}/disable")
+async def post_event_disable(event_id: str) -> OkResponse:
+    try:
+        events_compat.disable(event_id)
+    except events_compat.UnknownEvent as exc:
+        raise HTTPException(404, detail=f"unknown event: {event_id}") from exc
+    return OkResponse()
+
+
+@router.post("/legacy/events/{event_id}/reset")
+async def post_event_reset(event_id: str) -> OkResponse:
+    try:
+        events_compat.reset(event_id)
+    except events_compat.UnknownEvent as exc:
+        raise HTTPException(404, detail=f"unknown event: {event_id}") from exc
+    return OkResponse()
+
+
+class EventUpdateRequest(BaseModel):
+    name: str | None = None
+    source_ids: list[str] | None = None
+    conditions: list[dict[str, Any]] | None = None
+    action: dict[str, Any] | None = None
+    match: Literal["any", "all"] | None = None
+
+
+@router.post("/legacy/events/{event_id}/update")
+async def post_event_update(
+    event_id: str, body: EventUpdateRequest, redis: Annotated[Redis, Depends(get_redis)]
+) -> OkResponse:
+    try:
+        conditions = (
+            [events_compat.parse_condition(c) for c in body.conditions]
+            if body.conditions is not None
+            else None
+        )
+        action = events_compat.parse_action(body.action) if body.action is not None else None
+        await events_compat.update(
+            redis,
+            event_id,
+            name=body.name,
+            source_ids=set(body.source_ids) if body.source_ids is not None else None,
+            conditions=conditions,
+            action=action,
+            match=body.match,
+        )
+    except events_compat.UnknownEvent as exc:
+        raise HTTPException(404, detail=f"unknown event: {event_id}") from exc
+    except events_compat.InvalidEvent as exc:
+        raise HTTPException(400, detail=str(exc)) from exc
+    return OkResponse()
+
+
+@router.post("/legacy/events/{event_id}/cancel")
+async def post_event_cancel(event_id: str) -> OkResponse:
+    try:
+        events_compat.cancel(event_id)
+    except events_compat.UnknownEvent as exc:
+        raise HTTPException(404, detail=f"unknown event: {event_id}") from exc
     return OkResponse()

@@ -50,7 +50,7 @@ from typing import Literal
 
 from redis.asyncio import Redis
 
-from log_sump.common.sample_archive import write_archive
+from log_sump.common.sample_archive import METRIC_EXT, RECORD_EXT, write_archive
 from log_sump.common.schema import SYSTEM_SCOPE_ID
 from log_sump.server.queries import export_window
 
@@ -65,7 +65,23 @@ class UnknownSession(KeyError):
 
 @dataclass(frozen=True)
 class _Scope:
-    watched: frozenset[str]
+    """A daemon's contribution to one session/snapshot's own scope.
+
+    `log_names` and `stats_names` are tracked separately, not as one
+    merged "watched" set: the old gateway addresses a container's log
+    source and its stats (bundled into the daemon's one aggregate
+    "stats" source) as independently-selectable objects -- selecting
+    only `docker://<host>/stats` (not also `docker://<host>/container/
+    <name>`) must include that container's stats without also pulling
+    in its logs, and vice versa. An ordinary session (`_scopes_from_
+    open_sources`, "everything currently open") ends up with the same
+    names in both anyway, since `/sources` always reports both together
+    for a watched name -- this distinction only matters for an event's
+    own explicitly-scoped snapshot (`_scopes_from_source_ids`).
+    """
+
+    log_names: frozenset[str]
+    stats_names: frozenset[str]
     include_host: bool
 
 
@@ -81,6 +97,7 @@ class CompatSession:
     end_ts_ms: float | None = None
     data: bytes | None = None
     stored_ts_ms: float | None = None
+    ext: str = RECORD_EXT
 
 
 _SESSIONS: dict[str, CompatSession] = {}
@@ -96,31 +113,52 @@ def _from_ms(ms: float) -> datetime:
     return datetime.fromtimestamp(ms / 1000.0, tz=UTC)
 
 
+def _scopes_from_sources(sources: list[dict]) -> dict[str, _Scope]:
+    log_names: dict[str, set[str]] = {}
+    stats_names: dict[str, set[str]] = {}
+    include_host: dict[str, bool] = {}
+    for s in sources:
+        hostkey = compat.hostkey(s["host"])
+        if s["kind"] == "log":
+            log_names.setdefault(hostkey, set()).add(s["name"])
+        elif s["kind"] == "stats" and s.get("is_host"):
+            include_host[hostkey] = True
+        elif s["kind"] == "stats":
+            # A "stats" source's own `services` already lists every
+            # watched container/service name on this daemon (see
+            # compat.list_sources) -- contributes those names to the
+            # *stats* side of the scope on its own, independent of
+            # whether a log source for that same name is separately
+            # selected (see _Scope's own docstring).
+            stats_names.setdefault(hostkey, set()).update(s.get("services", ()))
+    hostkeys = set(log_names) | set(stats_names) | set(include_host)
+    return {
+        hostkey: _Scope(
+            log_names=frozenset(log_names.get(hostkey, ())),
+            stats_names=frozenset(stats_names.get(hostkey, ())),
+            include_host=include_host.get(hostkey, False),
+        )
+        for hostkey in hostkeys
+    }
+
+
 async def _scopes_from_open_sources(redis: Redis) -> dict[str, _Scope]:
     """Every currently-open source, grouped by daemon -- the same
     "what's open right now" view `/sources` itself reports, snapshotted
     at session-start time exactly like the old gateway's own
     `set(self._state.sources.keys())`.
     """
+    return _scopes_from_sources(await compat.list_sources(redis))
+
+
+async def _scopes_from_source_ids(redis: Redis, source_ids: set[str]) -> dict[str, _Scope]:
+    """Same grouping as `_scopes_from_open_sources`, but restricted to an
+    explicit set of legacy source ids -- for an event's own snapshot
+    action, which is scoped to *that event's* monitored sources, not
+    necessarily everything currently open.
+    """
     sources = await compat.list_sources(redis)
-    watched: dict[str, set[str]] = {}
-    include_host: dict[str, bool] = {}
-    for s in sources:
-        hostkey = compat.hostkey(s["host"])
-        if s["kind"] == "log":
-            watched.setdefault(hostkey, set()).add(s["name"])
-        elif s["kind"] == "stats" and s.get("is_host"):
-            include_host[hostkey] = True
-        elif s["kind"] == "stats":
-            watched.setdefault(hostkey, set())
-    hostkeys = set(watched) | set(include_host)
-    return {
-        hostkey: _Scope(
-            watched=frozenset(watched.get(hostkey, ())),
-            include_host=include_host.get(hostkey, False),
-        )
-        for hostkey in hostkeys
-    }
+    return _scopes_from_sources([s for s in sources if s["id"] in source_ids])
 
 
 async def start(
@@ -143,6 +181,43 @@ async def start(
     return sid
 
 
+async def store_precomputed(
+    redis: Redis,
+    *,
+    source_ids: set[str],
+    t0_ms: float,
+    t1_ms: float,
+    safe: bool,
+    max_keep_seconds: float | None,
+) -> str:
+    """Registers an already-elapsed `[t0_ms, t1_ms]` window, scoped to
+    `source_ids`, as an immediately-completed session -- for
+    `events_compat.py`'s own snapshot action, which (unlike an on-demand
+    `start()`/`stop()` session) already knows both ends of its window at
+    fire time. Gets the same id space, download()/status_of() access,
+    and TTL sweep as an ordinary session, same as the old gateway's own
+    `store_precomputed` -- the `.cttc-metric` extension (not `.cttc-
+    record`) is this function's own signal to `download()` that this is
+    a snapshot, not an on-demand recording.
+    """
+    global _next_id
+    await _sweep(redis)
+    sid = f"leg-rec{_next_id}"
+    _next_id += 1
+    sess = CompatSession(
+        id=sid,
+        scopes=await _scopes_from_source_ids(redis, source_ids),
+        start_ts_ms=t0_ms,
+        duration_minutes=None,
+        safe=safe,
+        max_keep_seconds=max_keep_seconds,
+        ext=METRIC_EXT,
+    )
+    _SESSIONS[sid] = sess
+    await _finish(redis, sess, t1_ms)
+    return sid
+
+
 def _require(session_id: str) -> CompatSession:
     sess = _SESSIONS.get(session_id)
     if sess is None:
@@ -156,19 +231,21 @@ async def _finish(redis: Redis, sess: CompatSession, end_ts_ms: float) -> None:
     all_swarm: set[str] = set()
     t0, t1 = _from_ms(sess.start_ts_ms), _from_ms(end_ts_ms)
     for hostkey, scope in sess.scopes.items():
-        for name in sorted(scope.watched):
+        for name in sorted(scope.log_names):
             rows = await log_index.rows_between(
                 redis, hostkey, name, int(sess.start_ts_ms), int(end_ts_ms)
             )
             if rows:
                 all_log_sources.append((name, rows))
+        if not scope.stats_names and not scope.include_host:
+            continue
         export = await export_window(redis, hostkey, t0, t1)
         for group, series in export["stats_series"].items():
             is_host_group = group == SYSTEM_SCOPE_ID
             if is_host_group:
                 if scope.include_host:
                     all_stats_series[group] = series
-            elif group in scope.watched:
+            elif group in scope.stats_names:
                 all_stats_series[group] = series
         all_swarm.update(export["swarm_services"])
     sess.data = write_archive(
@@ -234,11 +311,11 @@ async def status_of(redis: Redis, session_id: str) -> dict:
     }
 
 
-def download(session_id: str) -> bytes:
+def download(session_id: str) -> tuple[bytes, str]:
     sess = _require(session_id)
     if sess.status != "completed" or sess.data is None:
         raise UnknownSession(session_id)
-    return sess.data
+    return sess.data, sess.ext
 
 
 def set_default_ttl(seconds: float) -> None:

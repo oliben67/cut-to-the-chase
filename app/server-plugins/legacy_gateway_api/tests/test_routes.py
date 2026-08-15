@@ -376,3 +376,76 @@ async def test_bare_session_start_is_still_the_built_in_route(client: AsyncClien
         "/session/start", json={"docker_host": "local"}, headers=_auth_headers()
     )
     assert resp.status_code == 401  # missing X-API-Key -- proves the built-in handler answered
+
+
+async def test_event_create_list_status_update_reset_cancel(
+    client: AsyncClient, redis: FakeAsyncRedis
+) -> None:
+    create_resp = await client.post(
+        "/legacy/events/create",
+        json={
+            "name": "cpu spike",
+            "source_ids": [],
+            "conditions": [{"type": "metric", "metric": "cpu", "op": ">", "threshold": 80.0}],
+            "action": {"kind": "snapshot", "minutes": 5},
+            "match": "any",
+        },
+        headers=_auth_headers(),
+    )
+    assert create_resp.status_code == 200
+    event_id = create_resp.json()["event_id"]
+
+    list_resp = await client.get("/legacy/events/list", headers=_auth_headers())
+    assert list_resp.json() == {"event_ids": [event_id]}
+
+    status_resp = await client.get(f"/legacy/events/{event_id}", headers=_auth_headers())
+    body = status_resp.json()
+    assert body["name"] == "cpu spike"
+    assert body["status"] == "armed"
+
+    update_resp = await client.post(
+        f"/legacy/events/{event_id}/update",
+        json={"name": "renamed"},
+        headers=_auth_headers(),
+    )
+    assert update_resp.status_code == 200
+    status_resp = await client.get(f"/legacy/events/{event_id}", headers=_auth_headers())
+    assert status_resp.json()["name"] == "renamed"
+
+    disable_resp = await client.post(
+        f"/legacy/events/{event_id}/disable", headers=_auth_headers()
+    )
+    assert disable_resp.status_code == 200
+    assert (await client.get(f"/legacy/events/{event_id}", headers=_auth_headers())).json()[
+        "enabled"
+    ] is False
+
+    enable_resp = await client.post(f"/legacy/events/{event_id}/enable", headers=_auth_headers())
+    assert enable_resp.status_code == 200
+
+    reset_resp = await client.post(f"/legacy/events/{event_id}/reset", headers=_auth_headers())
+    assert reset_resp.status_code == 200
+
+    cancel_resp = await client.post(
+        f"/legacy/events/{event_id}/cancel", headers=_auth_headers()
+    )
+    assert cancel_resp.status_code == 200
+    missing_resp = await client.get(f"/legacy/events/{event_id}", headers=_auth_headers())
+    assert missing_resp.status_code == 404
+
+
+async def test_event_create_rejects_no_conditions(client: AsyncClient) -> None:
+    resp = await client.post(
+        "/legacy/events/create",
+        json={"name": "e", "conditions": [], "action": {"kind": "snapshot", "minutes": 5}},
+        headers=_auth_headers(),
+    )
+    assert resp.status_code == 400
+
+
+async def test_bare_events_create_is_still_the_built_in_route(client: AsyncClient) -> None:
+    """Same br-PLUG-001 confirmation as the session test above, for the
+    /events/* family.
+    """
+    resp = await client.get("/events/list", headers=_auth_headers())
+    assert resp.status_code == 401  # missing X-API-Key -- proves the built-in handler answered

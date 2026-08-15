@@ -120,7 +120,8 @@ async def test_stop_produces_a_downloadable_archive_scoped_to_open_sources() -> 
     assert status["status"] == "completed"
     assert status["ready"] is True
 
-    data = sessions_compat.download(sid)
+    data, ext = sessions_compat.download(sid)
+    assert ext == ".cttc-record"
     sources = read_archive(data)
     assert len(sources) == 1
     assert sources[0].kind == "log"
@@ -140,7 +141,7 @@ async def test_stop_excludes_a_container_that_was_never_opened() -> None:
     await asyncio.sleep(0.05)
 
     await sessions_compat.stop(redis, sid)
-    data = sessions_compat.download(sid)
+    data, _ext = sessions_compat.download(sid)
 
     sources = read_archive(data)
     assert [s.name for s in sources] == ["web"]
@@ -156,7 +157,7 @@ async def test_stop_includes_host_scope_only_when_it_was_open() -> None:
     await asyncio.sleep(0.05)
 
     await sessions_compat.stop(redis, sid)
-    data = sessions_compat.download(sid)
+    data, _ext = sessions_compat.download(sid)
 
     sources = read_archive(data)
     assert len(sources) == 1
@@ -164,14 +165,81 @@ async def test_stop_includes_host_scope_only_when_it_was_open() -> None:
     assert SYSTEM_SCOPE_ID in sources[0].stats_series
 
 
+async def test_store_precomputed_scoped_to_stats_source_still_includes_watched_names() -> None:
+    """A "stats" source's own `services` list already names every
+    currently-watched container on its daemon -- an explicit source_ids
+    scope naming *only* that stats source id (not also the matching log
+    source id) must still see those names for *stats*, without depending
+    on the log source id being listed too. Regression test for a real
+    bug caught by events_compat.py's own snapshot-action test:
+    `_scopes_from_sources` populated `watched` only from log-kind source
+    dicts, leaving a stats-only-scoped snapshot with an empty stats
+    series.
+
+    Also seeds a *log* line for the same container (not just a metric):
+    an earlier version of this test only seeded metrics, so it couldn't
+    catch a related bug in the same fix -- conflating "include this
+    container's stats" with "include its logs too" would have silently
+    passed here, since `write_archive` only adds a log source when there
+    are rows to add, and a metric-only seed never produces any. Caught
+    for real only once verified against a real container with both log
+    and metric traffic actually flowing.
+    """
+    redis = FakeAsyncRedis()
+    await compat.collect(redis, host=None, stats=True, host_stats=False, logs=[{"name": "web"}])
+    start_ts = sessions_compat._now_ms()
+    await _seed_metric(redis, "local", "web", int(start_ts) + 10)
+    await _seed_log(redis, "local", "web", int(start_ts) + 20, "hello")
+
+    sid = await sessions_compat.store_precomputed(
+        redis,
+        source_ids={compat.stats_source_id(None)},  # only the stats id, not the log id
+        t0_ms=start_ts,
+        t1_ms=start_ts + 1000,
+        safe=False,
+        max_keep_seconds=None,
+    )
+
+    data, ext = sessions_compat.download(sid)
+    assert ext == ".cttc-metric"
+    sources = read_archive(data)
+    assert [s.kind for s in sources] == ["stats"]  # not "log" -- that id was never in scope
+    assert "web" in sources[0].stats_series
+
+
+async def test_store_precomputed_scoped_to_log_source_excludes_stats() -> None:
+    """The mirror image of the test above: selecting only the *log*
+    source id must not pull in that container's stats either.
+    """
+    redis = FakeAsyncRedis()
+    await compat.collect(redis, host=None, stats=True, host_stats=False, logs=[{"name": "web"}])
+    start_ts = sessions_compat._now_ms()
+    await _seed_metric(redis, "local", "web", int(start_ts) + 10)
+    await _seed_log(redis, "local", "web", int(start_ts) + 20, "hello")
+
+    sid = await sessions_compat.store_precomputed(
+        redis,
+        source_ids={compat.log_source_id(None, "container", "web")},  # only the log id
+        t0_ms=start_ts,
+        t1_ms=start_ts + 1000,
+        safe=False,
+        max_keep_seconds=None,
+    )
+
+    data, _ext = sessions_compat.download(sid)
+    sources = read_archive(data)
+    assert [s.kind for s in sources] == ["log"]  # not "stats" -- that id was never in scope
+    assert sources[0].log_rows[0].text == "hello"
+
+
 async def test_stop_is_idempotent() -> None:
     redis = FakeAsyncRedis()
     sid = await _start(redis)
 
     await sessions_compat.stop(redis, sid)
-    first = sessions_compat.download(sid)
+    first, _ext = sessions_compat.download(sid)
     await sessions_compat.stop(redis, sid)  # no-op, already completed
-    second = sessions_compat.download(sid)
+    second, _ext = sessions_compat.download(sid)
 
     assert first == second
 
