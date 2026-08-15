@@ -2,22 +2,55 @@
 
 # CTTC remote connectivity: call trace and why the tunnel isn't working
 
-> **Status**: the `ssh_key` dead-plumbing bug described in Scenario 2 has since been fixed — `HostStatsSource` now passes `-i <key> -o IdentitiesOnly=yes` directly, `docker_ps`/`docker_client`/`DockerLogSource` get the same pinning via a managed per-host `ssh_config` stanza (`ensure_ssh_identity()` in `server.py`), and the renderer's "Set Sources" dialog now has a real key picker instead of hardcoding `ssh_key: null`. The analysis below is kept as-is as the record of what was wrong and why; see the bottom of the "Why this is always failing" section for what changed.
+> **⚠️ ARCHIVED — describes the pre-migration `app/server` architecture.**
+> `app/server` (including every `server.py`/`docker_ps`/`HostStatsSource`/
+> `ensure_ssh_identity` reference below) was decommissioned in favor of the
+> log-sump-based gateway (see `.claude/plans/sprightly-stirring-blum.md`'s
+> Phase 10) — none of the code paths this doc traces exist anymore. Kept for
+> historical record of the investigation and fix described below, **not**
+> as a description of current behavior.
+>
+> **The current equivalent**: `app/log-sump-plugin/src/log_sump_plugin/`
+> (`routes.py`'s `/docker/ps`/`/docker/collect`, `compat.py`'s
+> `register_or_get_daemon`/`preview_containers`/`collect`), which
+> translates a Set Sources docker-host string into a daemon registration
+> that log-sump's own `SSHTransport` (`app/server-logsump/src/log_sump/common/transport.py`)
+> runs as `ssh user@host "docker ..."`. The gateway container's ambient
+> `SSH_AUTH_SOCK` forwarding (same mount shape as described below) is still
+> the mechanism today. **The exact `ssh_key` dead-plumbing bug this
+> document is about has been reintroduced in that new code** — the request
+> models still declare `ssh_key`, but nothing between the route handler and
+> `register_or_get_daemon` actually threads it through (`register_or_get_daemon`
+> has no parameter for it at all) — see `BUG-0099`/`br-PLUG-003`. The
+> renderer's docker-host module (`app/renderer/src/modules/docker-host/`)
+> also no longer has any SSH-key-picker UI at all, unlike what this
+> document's "what's been fixed" section describes.
+>
+> Original status note, describing the state as of the last time `app/server`
+> actually had this bug fixed: the `ssh_key` dead-plumbing bug described in
+> Scenario 2 was fixed — `HostStatsSource` passed `-i <key> -o
+> IdentitiesOnly=yes` directly, `docker_ps`/`docker_client`/`DockerLogSource`
+> got the same pinning via a managed per-host `ssh_config` stanza
+> (`ensure_ssh_identity()` in `server.py`), and the renderer's "Set Sources"
+> dialog had a real key picker instead of hardcoding `ssh_key: null`. The
+> analysis below is kept as-is as the record of what was wrong and why; see
+> the bottom of the "Why this is always failing" section for what changed
+> (in `app/server`, since removed).
 
 Two things are being conflated under "remote tunnel," and that distinction is the root of the failure. CTTC has **two independent SSH surfaces**:
 
-1. **Gateway connection** — how the Electron client on `localhost` reaches the `cttc-gateway` container on `remote-host`. This is what `app/lib/ssh-tunnel.js` + `app/lib/server-provision.js` implement. It's per-source, username-correct, and — per your setup — already working (`cttc-container running and healthy`).
+1. **Gateway connection** — how the Electron client on `localhost` reaches the log-sump gateway container on `remote-host`. This is what `app/lib/ssh-tunnel.js` + `app/lib/server-provision.js` implement. It's per-source, username-correct, and — per your setup — already working (`cttc-container running and healthy`).
 2. **"Set Sources" Docker-host telemetry** — a *second, independent* SSH hop that the CTTC **server itself** (running inside the gateway container, wherever that container lives) makes outward to a third machine, to run `docker ps`/`docker stats`/`/proc` reads there. This is the feature you're describing: *"an API call should trigger docker calls in the python server, querying the remote source system, bypassing the missing local Docker instance."* This is where `remote-source` / `remoto` lives, and this is the one that's broken.
 
 ---
 
 ## The full picture: `local` vs `remote` vs `remote-tunnel`
 
-Every gateway CTTC ever connects to is recorded with exactly one of three `connectionType` values (`app/lib/gateway-registry.js`). This is decided once, at connect time, by `connectToServer()`/`connectRemoteGateway()` in `main.js`, and everything downstream — the renderer, `server.py`, the "Set Sources" feature from Scenario 2 below — is identical no matter which one is active. The renderer only ever sees `http://<serverHost>:<serverPort>`; it cannot tell them apart.
+Every gateway CTTC ever connects to is recorded with exactly one of three `connectionType` values (`app/lib/gateway-registry.js`). This is decided once, at connect time, by `connectToServer()`/`connectRemoteGateway()` in `main.js`. This part of the doc is **not archived** — the three-way classification is still current; only the deep-dive Scenario 2 walkthrough below traces the now-removed `app/server`. The renderer only ever sees `http://<serverHost>:<serverPort>`; it cannot tell them apart.
 
 | `connectionType` | When it happens | Client traffic | SSH involved? |
 |---|---|---|---|
-| **`local`** | `cfg.mode === "embedded"` — the default, no `~/.cttc/connection.json`. Two sub-cases, both stamped `local`: (a) packaged app **with** Docker found (`hasLocalDocker()`) → `ensureLocalContainer()` runs the gateway as a container on `127.0.0.1` (`main.js:667-678`); (b) unpackaged dev checkout, or packaged-but-no-Docker-and-not-yet-caught-by-the-wizard-gate → bare `uv run server.py` (`startServer()`, `main.js:200-236`). | `http://127.0.0.1:<port>` directly | No — nothing to SSH to |
+| **`local`** | `cfg.mode === "embedded"` — the default, no `~/.cttc/connection.json`. `ensureLocalContainer()` runs the log-sump gateway container on `127.0.0.1`. Docker is required unconditionally now — there is no non-Docker fallback (`app/server`'s bare `uv run server.py` path was decommissioned, see `.claude/plans/sprightly-stirring-blum.md`'s Phase 10); a missing/failed Docker surfaces as a clear error instead. | `http://127.0.0.1:<port>` directly | No — nothing to SSH to |
 | **`remote`** | `cfg.mode === "remote"` (from `connection.json`/env) **and** the gateway answered a direct HTTP `/health` probe (`main.js` `connectRemoteGateway`, the `!forceTunnel` branch). The gateway container is reachable on the network as-is. | `http://<remote-host>:<port>` directly, from the Electron client itself | Only once, up front, to *provision* (`ensureRemoteContainer` → `docker compose up` over ssh) — never for the ongoing request/response traffic |
 | **`remote-tunnel`** | Same starting point as `remote`, but the direct `/health` probe failed/timed out (firewalled, no route, etc.) — or the gateway is already known (`forceTunnel: alreadyKnown` at `switch-gateway`, skipping the probe). | `http://127.0.0.1:<port>` from the Electron client — but that port is the **local end of an `ssh -L` forward**, not a real local server | Continuously — an `ssh -N -L` process is held open for as long as the gateway is active (`ssh-tunnel.js`) |
 
@@ -29,7 +62,7 @@ sequenceDiagram
     participant DC as docker-check.js
     participant SP as server-provision.js (ssh, one-time provision)
     participant TUN as ssh-tunnel.js
-    participant GW as gateway (container or bare process)
+    participant GW as log-sump gateway container
 
     U->>M: launch CTTC.app
     M->>CFG: loadConnectionConfig()
@@ -38,7 +71,7 @@ sequenceDiagram
         alt Docker present locally
             M->>GW: ensureLocalContainer() -- docker compose up on 127.0.0.1
         else no local Docker
-            M->>GW: startServer() -- bare `uv run server.py`
+            M->>M: clear error dialog, app quits -- no fallback
         end
         Note over M: connectionType = "local"<br/>serverHost=127.0.0.1, serverPort=<port>
     else cfg.mode === "remote" (connection.json: sshTarget, sshKey, remote_port)

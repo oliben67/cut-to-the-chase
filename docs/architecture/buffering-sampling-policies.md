@@ -1,5 +1,18 @@
 # Feature Prompt: Buffered Collection Server + Rate-Bounded Polling Client
 
+> **⚠️ ARCHIVED — describes `app/server`'s (`server.py`/`redis_log.py`)
+> buffered-flush Redis design.** This was the original feature prompt that
+> design was built from (sRate/sTTL/cRate, one hash + one sorted-set index
+> per entity, a startup-only TTL read with an age-based reconciliation
+> pass). `app/server` was decommissioned in favor of the log-sump-based
+> gateway (see `.claude/plans/sprightly-stirring-blum.md`'s Phase 10),
+> which uses a materially different storage model — Redis **Streams**
+> (`XADD`/`XRANGE`/`XTRIM`-based retention), continuously appended via a
+> Logstash pipeline rather than a periodic buffered-flush loop on the
+> server side. None of the specific mechanics below (sRate, the reconcile-
+> TTL Lua function, the hash+zset schema) apply to the current backend.
+> Kept for historical record.
+
 ## Context
 
 Implement a two-part system for a system-performance monitoring application:

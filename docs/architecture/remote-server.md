@@ -1,5 +1,72 @@
 # Running the CTTC server remotely (no local Docker required)
 
+> **⚠️ ARCHIVED below "Current state" — describes the pre-migration
+> `app/server` (`server.py`) design.** `app/server` was decommissioned
+> entirely in favor of the log-sump-based gateway (see
+> `.claude/plans/sprightly-stirring-blum.md`'s Phase 10) — the Dockerfile,
+> Redis schema (`cttc:log:<id>` hash+zset, `server/logs.lua`), encryption-key
+> proposal, and every `server.py`/`redis_log.py`/`files.py` reference below
+> describe code that no longer exists. Kept as the historical design record
+> (the reasoning, the empirical findings, the real bugs hit along the way
+> are still genuinely useful context for *why* things ended up shaped the
+> way they did) — not as a description of current behavior. See
+> [Current state](#current-state-log-sump-based-gateway) immediately below
+> for where the equivalent mechanism actually lives today.
+
+## Current state (log-sump-based gateway)
+
+The product-level design principles this document argued for mostly held up
+through the migration; only the implementation moved:
+
+- **Remote deployment, direct HTTP, no tunnel by default** — still exactly
+  the shipped model this doc describes below ("Phase 1 — done, shipped as
+  direct HTTP, not a tunnel"). `app/lib/server-provision.js`'s
+  `ensureRemoteContainer` provisions the **log-sump** gateway container over
+  ssh (`docker load`/`pull` + `docker compose up`, plus — new since this
+  doc — an `ensurePluginCheckout` step that clones `log-sump-plugin` onto
+  the target host too); the client then talks straight to
+  `http://<host>:<port>`, ssh used only for that one-time provisioning step.
+  An ssh tunnel fallback (`app/lib/ssh-tunnel.js`) still exists for when the
+  direct route isn't reachable — unchanged in spirit from what's described
+  below.
+- **One collector per monitored host, shared by every viewer** — still the
+  model, now implemented as log-sump's daemon registry
+  (`log_sump_plugin.compat.register_or_get_daemon`: returns the existing
+  daemon for a host if one's already registered, registers a fresh one
+  otherwise) rather than `server.py`'s `State._open_or_reuse()` /
+  `docker://{host}/...` path matching. The underlying reasoning in
+  [Single collector, multiple viewers](#single-collector-multiple-viewers)
+  below is still the right mental model even though every code reference in
+  it is gone.
+- **Durable log/telemetry storage** — Redis remains the sole source of
+  truth, but the schema is completely different: log-sump uses Redis
+  **Streams** (`logsump:stream:{docker_host}:{kind}`, `XADD`/`XRANGE`/
+  `XTRIM`-based retention) instead of `server.py`'s custom
+  hash-plus-sorted-set-plus-Lua-function design described below. Retention
+  defaults to log-sump's own 7 days (`LOG_SUMP_RETENTION__RETENTION_DAYS`,
+  not currently overridden anywhere in CTTC's deployment), not the 3-day
+  default this doc describes.
+- **File transfer / sample export** — implemented in `log-sump-plugin`'s
+  `sessions_compat.py`, not `server.py`'s `files.py`; same
+  `.cttc-metric`/`.cttc-record` on-disk format, now built via
+  `log_sump.common.sample_archive.write_archive` (the renamed, client-name-
+  scrubbed descendant of the old `cttc_format.py`, moved into
+  `log-sump-common`), different server-side code entirely.
+- **Encryption keys** — [Encryption keys need to move client-side](#encryption-keys-need-to-move-client-side)
+  below was a *proposal*, not yet shipped, when `app/server` was
+  decommissioned — its premise (private keys must not live server-side once
+  a server can have more than one viewer) still applies to the current
+  gateway and has not been revisited since the migration; treat it as an
+  open design question again, not settled either way.
+- **Config surface** (`~/.cttc/connection.json`, `CTTC_MODE`/
+  `CTTC_SSH_TARGET`/etc.) — unchanged, still exactly as
+  [Configuration surface](#configuration-surface-keeps-the-default-flow-untouched)
+  describes.
+
+---
+
+## Original document (archived)
+
 **Status:** superseded in part -- see below. Phases 2-3 (collector
 de-duplication; file transfer) are implemented as described. Phase 1 as
 originally designed (**option A: SSH tunnel**, below) was swapped out before
@@ -21,7 +88,9 @@ some environment needs it back (e.g. inbound HTTP blocked but SSH egress
 allowed) -- `lib/ssh-tunnel.js`/its tests existed and worked before removal;
 see git history on this file if reviving that path.
 
-See [Using it today](#using-it-today) for how to actually run it.
+See [Using it today](#using-it-today) for how the old `app/server` version
+of this worked (historical -- see [Current state](#current-state-log-sump-based-gateway)
+above for how to actually run it today).
 
 ## Product context this design has to preserve
 

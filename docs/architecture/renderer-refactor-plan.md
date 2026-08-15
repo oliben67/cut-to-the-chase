@@ -6,6 +6,20 @@ current renderer against catalyst's own 33 inferred domains
 [Ray 3.0's published architecture](https://myray.app/blog/ray-architecture)
 (also an Electron app choosing "single codebase, multiple OSes").
 
+> **Note (2026-08-15):** `app/server` (`server.py`) referenced throughout
+> below was decommissioned after this doc was written, replaced by the
+> log-sump-based gateway (`app/server-logsump` + `app/log-sump-plugin`) --
+> see `.claude/plans/sprightly-stirring-blum.md`'s Phase 10. The
+> three-layer structural analysis (renderer / main / server) and the
+> web-app feasibility conclusions below are unaffected; only the specific
+> file/line-count references and the "spawns server.py as a child process"
+> embedded-mode mechanism are stale (embedded mode now always runs the
+> gateway as a Docker container, never a bare child process). The `server.py
+> -- 11 business domains` breakdown (`REDIS`/`DEDUP`/`AUTO`/`RECS`/`EVTO`/
+> `SCHED`/`RBUF`/`QUEUE`/`BUCKET`/`SEG`/`ORPHAN`) was that catalyst rule
+> catalog's own domain split for the now-removed code -- it has not been
+> re-derived for the new backend's actual domain boundaries.
+
 ## Where the renderer stands today
 
 The renderer is vanilla JS against the DOM -- a `$(id)` helper, direct
@@ -19,7 +33,7 @@ build step, no framework, no package beyond Electron itself.
 |---|---|---|
 | [`app/renderer/app.js`](../../app/renderer/app.js) | 6,548 | one global `state` object, ~35 preload IPC calls scattered inline |
 | [`app/main.js`](../../app/main.js) | 1,941 | Node/Electron main process |
-| [`app/server/server.py`](../../app/server/server.py) | 3,304 | Redis-backed telemetry store, its own process |
+| [`app/server-logsump`](../../app/server-logsump) + [`app/log-sump-plugin`](../../app/log-sump-plugin) | n/a (separate repos/submodules) | Redis-backed telemetry store, its own process (was `app/server/server.py`, 3,304 lines, before the log-sump migration) |
 | Runtime dependencies | 0 | Electron + electron-builder only, both dev-only |
 
 The file is not actually disorganized -- it's *unseparated*. It carries 47
@@ -35,7 +49,7 @@ Three processes, three concerns:
 |---|---|---|---|
 | Renderer | `renderer/app.js` | All 13 UI domains: charts, log panels, dialogs, sidebar, recording controls, event editor | -- |
 | Main (Electron/Node) | `main.js` | Gateway provisioning (SSH/Docker), window & menu management, native dialogs, local persistence | contextBridge / IPC (`preload.js`) |
-| Server (Python) | `server/server.py` | Redis-backed telemetry store, collection, event orchestration, recording sessions | HTTP + SSE (`fetch`, no Electron API) |
+| Server (Python) | `server-logsump` + `log-sump-plugin` | Redis-backed telemetry store, collection, event orchestration, recording sessions | HTTP + SSE (`fetch`, no Electron API) |
 
 That third row matters more than it looks. The renderer's actual data
 plane -- `/range`, `/series`, `/sources`, `/docker/*`, `/events/*`,
@@ -88,7 +102,7 @@ graph LR
     M2["EMBED . ORCH . BUILD . NET"]
     M3["PERSIST"]
   end
-  subgraph S["server.py -- 11 business domains"]
+  subgraph S["server.py (historical) -- 11 business domains"]
     direction TB
     S1["REDIS . DEDUP . AUTO . RECS"]
     S2["EVTO . SCHED . RBUF . QUEUE"]
@@ -234,12 +248,12 @@ graph TB
   subgraph Today["today -- Electron"]
     direction LR
     RT["renderer"] -- "IPC" --> MT["main.js"]
-    MT -- "spawns" --> ST["server.py (embedded)"]
+    MT -- "runs as a local<br/>Docker container" --> ST["gateway (embedded)"]
     RT -- "fetch/SSE" --> ST
   end
   subgraph Web["as a web app"]
     direction LR
-    RW["renderer (browser tab)"] -- "fetch/SSE, always remote" --> SW["server.py (always remote -- 'This machine' stops being local)"]
+    RW["renderer (browser tab)"] -- "fetch/SSE, always remote" --> SW["gateway (always remote -- 'This machine' stops being local)"]
   end
   Today -.->|"GATE/DHOST provisioning moves out of the client entirely"| Web
 ```
@@ -261,7 +275,7 @@ always-local path, keep the always-remote one that already exists.*
 | Theme mode | `setThemeMode` IPC → OS-level | `prefers-color-scheme` + a page-level override | straightforward |
 | cttc's own log shipping | `shipLogs` → local disk write | Not meaningful in a browser tab (there's no "app log" to ship) -- drop, or route to the server's own logs | re-scope |
 | **Gateway provisioning** (New Gateway → SSH in, install Docker image) | `main.js`: SSH + Docker, from the user's own machine | Cannot run in a browser sandbox at all -- SSH and container orchestration are inherently privileged, host-level operations | structural |
-| **Embedded / "This machine" gateway** | `main.js` spawns `server.py` as a child process | No equivalent -- a browser tab cannot spawn a local server process either | structural |
+| **Embedded / "This machine" gateway** | `main.js` runs the gateway as a local Docker container | No equivalent -- a browser tab cannot run a local container either | structural |
 
 Eight of ten rows are mechanical substitutions with a well-known browser
 API on the other side. The two structural ones -- provisioning and the
