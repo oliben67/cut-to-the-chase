@@ -65,6 +65,17 @@ def _auth_headers() -> dict[str, str]:
     return {"X-CTTC-Token": TOKEN}
 
 
+async def test_health_requires_gateway_token(client: AsyncClient) -> None:
+    resp = await client.get("/health")
+    assert resp.status_code == 401
+
+
+async def test_health_ok(client: AsyncClient) -> None:
+    resp = await client.get("/health", headers=_auth_headers())
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+
+
 async def test_sources_requires_gateway_token(client: AsyncClient) -> None:
     resp = await client.get("/sources")
     assert resp.status_code == 401

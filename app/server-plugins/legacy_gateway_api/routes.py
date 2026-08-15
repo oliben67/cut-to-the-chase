@@ -1,7 +1,9 @@
 """HTTP routes for the legacy gateway API plugin -- see this package's
 `__init__.py` for what this is and why it exists as a log-sump plugin.
-Source lifecycle: `GET /sources`, `GET /range`, `POST /docker/collect`,
-`POST /docker/forget`, `POST /docker/ps`, `POST /close`. Chart/log-panel
+`GET /health`: the old gateway's own bare liveness probe (no built-in
+counterpart, see its own docstring below). Source lifecycle: `GET
+/sources`, `GET /range`, `POST /docker/collect`, `POST /docker/forget`,
+`POST /docker/ps`, `POST /close`. Chart/log-panel
 queries (once a source from that first group is already open): `GET
 /logs`, `GET /stats_export`, and, under `/legacy/*` (see below), `GET
 /point`, `GET /series`, `GET /index_at`, `GET /ticks`, `GET /logs/find`.
@@ -53,6 +55,27 @@ router = APIRouter(dependencies=[Depends(require_gateway_token)])
 
 def _from_ms(ms: float) -> datetime:
     return datetime.fromtimestamp(ms / 1000.0, tz=UTC)
+
+
+class HealthResponse(BaseModel):
+    ok: bool = True
+
+
+@router.get("/health")
+async def get_health() -> HealthResponse:
+    """The old gateway's own cheap liveness probe (`{"ok": true}`, gated
+    same as everything else there -- confirmed against its own
+    `_require_api_token` middleware, `/ping` is the *only* unauthenticated
+    exemption). No bare `/health` exists in log-sump core at all (only
+    `/health/live`/`/health/ready`, both unauthenticated infra probes --
+    a different shape and a different trust model), so this doesn't
+    collide with anything and needs no `/legacy/` prefix. Renderer/main.js
+    call sites still hit this bare path unchanged (`checkGatewayReachable`,
+    the gateway status pill, `connectRemoteGatewayWithKeyPath`) -- all
+    three only ever check `response.ok`, never this body, so reproducing
+    the exact JSON shape is a courtesy, not a requirement.
+    """
+    return HealthResponse()
 
 
 class SourcesResponse(BaseModel):
