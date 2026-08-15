@@ -11,10 +11,12 @@ own public modules.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
+from pydantic import ValidationError
 from redis.asyncio import Redis
 
 from log_sump.common.config import DaemonConfig
@@ -24,8 +26,16 @@ from log_sump.common.daemon_registry import (
     unregister_daemon,
 )
 from log_sump.common.redis_keys import stream_key
-from log_sump.common.schema import SYSTEM_SCOPE_ID, Kind, MetricRecord
-from log_sump.server.queries import fetch_kind_page
+from log_sump.common.schema import SYSTEM_SCOPE_ID, Kind, MetricRecord, RecordAdapter
+from log_sump.server.queries import bucketed, fetch_kind_page, point_at
+
+from . import log_index
+
+#: Redis Stream IDs are `<ms>-<seq>`; this is the max seq for a given ms,
+#: so `<ms>-MAX_SEQ` is an inclusive upper bound covering every entry
+#: stamped within that millisecond -- same trick log-sump's own queries.py
+#: uses, reproduced locally rather than imported (that one's private).
+_MAX_SEQ = (2**64) - 1
 
 # ── source-id scheme ─────────────────────────────────────────────────────
 #
@@ -230,6 +240,7 @@ async def close_source(redis: Redis, sid: str) -> None:
     remaining = [n for n in daemon.watched_containers if n != parsed.name]
     if remaining != daemon.watched_containers:
         await register_daemon(redis, daemon.model_copy(update={"watched_containers": remaining}))
+    log_index.forget(parsed.hostkey, parsed.name)
 
 
 # ── sources / range ────────────────────────────────────────────────────────
@@ -321,7 +332,7 @@ async def list_sources(redis: Redis) -> list[dict[str, Any]]:
                         "min_ts": log_min_ts,
                         "max_ts": log_max_ts,
                         "error": None,
-                        "total": 0,
+                        "total": await log_index.total(redis, daemon.id, name),
                         "host": host,
                         "transforms": [],
                     }
@@ -340,3 +351,262 @@ async def time_range(redis: Redis) -> tuple[int | None, int | None]:
             if max_ts is not None:
                 hi = max_ts if hi is None else max(hi, max_ts)
     return lo, hi
+
+
+# ── chart/log-panel queries ─────────────────────────────────────────────────
+#
+# /point, /series, /stats_export, /logs, /index_at, /ticks, /logs/find --
+# deliberately not delegated to log_sump.server.routers.series (Phase 1):
+# that router is daemon-scoped and per-`X-API-Key`, addressed by
+# `docker_host`+`container_id`; this legacy client has no notion of either
+# (no per-daemon key, and its source ids name a *container name*, stable
+# across that container's restarts, not the container id `docker ps`
+# reassigns on every one -- see log_index.py's own docstring). /point and
+# /series still reach into `queries.point_at`/`bucketed` directly (both
+# already group by container *name* internally), just reshaped and merged
+# across every registered daemon's currently-open sources at once, the way
+# the old gateway's own global sources dict did.
+
+
+def _is_open_group(group: str, watched: set[str]) -> bool:
+    return group == SYSTEM_SCOPE_ID or group in watched
+
+
+async def point_all(redis: Redis, t: datetime) -> dict[str, dict[str, Any]]:
+    """Per display group, the nearest metric sample to `t`, merged across
+    every registered daemon's currently-open stats sources -- backs
+    `/point` (compares an arbitrary instant, e.g. a loaded sample, against
+    another, e.g. live "now").
+
+    No net rate here, unlike `series_all`/`stats_export_all` below:
+    `queries.point_at` hands back one raw sample, and a rate needs a
+    *second*, prior sample to diff against -- unlike a windowed query,
+    which already computes rates while scanning a whole range anyway. A
+    known, deliberately accepted gap (the old gateway's own snapshot
+    dialog is this field's only consumer).
+    """
+    daemons = await list_registered_daemons(redis)
+    out: dict[str, dict[str, Any]] = {}
+    for daemon in daemons:
+        host = None if daemon.id == "local" else daemon.id
+        watched = set(daemon.watched_containers or [])
+        nearest = await point_at(redis, daemon.id, Kind.METRIC, t)
+        for group, (_entry_id, record, _is_service) in nearest.items():
+            if not isinstance(record, MetricRecord) or not _is_open_group(group, watched):
+                continue
+            is_host_group = group == SYSTEM_SCOPE_ID
+            out[group] = {
+                "ts": record.ts.timestamp() * 1000.0,
+                "cpu": record.cpu_pct,
+                "mem": record.mem_pct,
+                "mem_bytes": record.mem_used_bytes,
+                "net": None,
+                "host": is_host_group,
+                "sid": host_source_id(host) if is_host_group else stats_source_id(host),
+            }
+    return out
+
+
+async def series_all(redis: Redis, t0: datetime, t1: datetime, px: int) -> list[dict[str, Any]]:
+    """Per display group, per pixel bucket: max cpu/mem, max net rate --
+    backs `/series` (chart rendering). Merged across every registered
+    daemon's currently-open stats sources, same gating as `point_all`.
+    """
+    daemons = await list_registered_daemons(redis)
+    out: list[dict[str, Any]] = []
+    for daemon in daemons:
+        host = None if daemon.id == "local" else daemon.id
+        watched = set(daemon.watched_containers or [])
+        for c in await bucketed(redis, daemon.id, t0, t1, px):
+            if not _is_open_group(c["name"], watched):
+                continue
+            is_host_group = c["name"] == SYSTEM_SCOPE_ID
+            out.append(
+                {
+                    "name": c["name"],
+                    "cpu": c["cpu"],
+                    "mem": c["mem"],
+                    "net": c["net"],
+                    "host": is_host_group,
+                    "sid": host_source_id(host) if is_host_group else stats_source_id(host),
+                    "ttype": c["ttype"],
+                }
+            )
+    return out
+
+
+def _metric_group(container_name: str) -> tuple[str, bool]:
+    group = container_name.split(".", 1)[0]
+    return (group, True) if group != container_name else (container_name, False)
+
+
+def _decode_metric_entry(fields: dict | None) -> MetricRecord | None:
+    if not fields:
+        return None
+    data = fields.get(b"data")
+    if data is None:
+        return None
+    try:
+        record = RecordAdapter.validate_json(data)
+    except ValidationError:
+        return None
+    return record if isinstance(record, MetricRecord) else None
+
+
+class _MetricRow(NamedTuple):
+    ts_ms: int
+    cpu: float | None
+    mem: float | None
+    mem_bytes: float | None
+    net: float | None
+
+
+async def stats_export_all(
+    redis: Redis, t0_ms: int, t1_ms: int, granularity: str
+) -> list[dict[str, Any]]:
+    """Per display group: every raw sample in `[t0_ms, t1_ms]` ("full") or
+    a min/avg/max summary over them ("summary") -- backs `/stats_export`
+    ("Export metrics"). Unlike `series_all`'s per-pixel max (chart
+    rendering), this reads exact stored samples, so it scans the window
+    directly rather than going through `queries.bucketed`.
+    """
+    daemons = await list_registered_daemons(redis)
+    out: list[dict[str, Any]] = []
+    for daemon in daemons:
+        host = None if daemon.id == "local" else daemon.id
+        watched = set(daemon.watched_containers or [])
+        stream = stream_key(daemon.id, Kind.METRIC)
+        raw = await redis.xrange(stream, min=f"{t0_ms}-0", max=f"{t1_ms}-{_MAX_SEQ}")
+
+        by_container: dict[str, list[tuple[int, MetricRecord]]] = {}
+        for entry_id, fields in raw or []:
+            if entry_id is None:
+                continue
+            record = _decode_metric_entry(fields)
+            if record is None:
+                continue
+            ts_ms = _entry_id_ms(entry_id)
+            by_container.setdefault(record.container_id, []).append((ts_ms, record))
+
+        # Two-pass, same shape as queries.bucketed: rate first, per
+        # container id (a different container's counters are unrelated),
+        # then merge same-group containers together.
+        by_group: dict[str, list[_MetricRow]] = {}
+        for samples in by_container.values():
+            samples.sort(key=lambda pair: pair[0])
+            group, _is_service = _metric_group(samples[0][1].container_name)
+            rows = by_group.setdefault(group, [])
+            prev_total: tuple[int, int] | None = None
+            for ts_ms, record in samples:
+                total = None
+                if record.net_rx_bytes is not None and record.net_tx_bytes is not None:
+                    total = record.net_rx_bytes + record.net_tx_bytes
+                rate = None
+                if total is not None and prev_total is not None and ts_ms > prev_total[0]:
+                    delta = total - prev_total[1]
+                    if delta >= 0:  # negative == counter reset (restart); skip it
+                        rate = delta / ((ts_ms - prev_total[0]) / 1000.0)
+                if total is not None:
+                    prev_total = (ts_ms, total)
+                mem_bytes = record.mem_used_bytes
+                mem_bytes = float(mem_bytes) if mem_bytes is not None else None
+                rows.append(_MetricRow(ts_ms, record.cpu_pct, record.mem_pct, mem_bytes, rate))
+
+        for group in sorted(by_group):
+            if not _is_open_group(group, watched):
+                continue
+            rows = sorted(by_group[group], key=lambda row: row[0])
+            is_host_group = group == SYSTEM_SCOPE_ID
+            sid = host_source_id(host) if is_host_group else stats_source_id(host)
+            if granularity == "full":
+                out.append(
+                    {
+                        "name": group,
+                        "host": is_host_group,
+                        "sid": sid,
+                        "samples": [
+                            {
+                                "ts": r.ts_ms,
+                                "cpu": r.cpu,
+                                "mem": r.mem,
+                                "mem_bytes": r.mem_bytes,
+                                "net": r.net,
+                            }
+                            for r in rows
+                        ],
+                    }
+                )
+                continue
+
+            def agg(
+                rows: list[_MetricRow], key: Callable[[_MetricRow], float | None]
+            ) -> dict[str, float] | None:
+                vals: list[float] = []
+                for row in rows:
+                    v = key(row)
+                    if v is not None:
+                        vals.append(v)
+                if not vals:
+                    return None
+                return {"min": min(vals), "avg": sum(vals) / len(vals), "max": max(vals)}
+
+            out.append(
+                {
+                    "name": group,
+                    "host": is_host_group,
+                    "sid": sid,
+                    "count": len(rows),
+                    "cpu": agg(rows, lambda r: r.cpu),
+                    "mem": agg(rows, lambda r: r.mem),
+                    "mem_bytes": agg(rows, lambda r: r.mem_bytes),
+                    "net": agg(rows, lambda r: r.net),
+                }
+            )
+    return out
+
+
+# ── log-panel queries (rank-addressed, see log_index.py) ────────────────────
+
+
+def _log_target(sid: str) -> tuple[str, str]:
+    """A log source id -> `(docker_host, container_name)` -- shared by
+    every function below so a malformed or non-log source id (e.g. a
+    stats/host source's own id) fails the same way in one place.
+    """
+    parsed = parse_source_id(sid)
+    if parsed.subtype not in ("container", "service") or parsed.name is None:
+        raise ValueError(f"not a log source id: {sid!r}")
+    return parsed.hostkey, parsed.name
+
+
+async def logs_total(redis: Redis, sid: str) -> int:
+    docker_host, name = _log_target(sid)
+    return await log_index.total(redis, docker_host, name)
+
+
+async def logs_page(
+    redis: Redis, sid: str, start: int, count: int
+) -> tuple[int, list[dict[str, Any]]]:
+    docker_host, name = _log_target(sid)
+    # Sequential, not gathered: log_slice's own catch-up scan already
+    # leaves the index fully up to date, so this second call is a cache
+    # hit with no further Redis round trips -- gathering them would just
+    # race two catch-up scans against the same key for no benefit.
+    rows = await log_index.log_slice(redis, docker_host, name, start, count)
+    total = await log_index.total(redis, docker_host, name)
+    return total, rows
+
+
+async def logs_index_at(redis: Redis, sid: str, t_ms: int) -> int:
+    docker_host, name = _log_target(sid)
+    return await log_index.index_at(redis, docker_host, name, t_ms)
+
+
+async def logs_ticks(redis: Redis, sid: str, t0_ms: int, t1_ms: int, px: int) -> list[int]:
+    docker_host, name = _log_target(sid)
+    return await log_index.ticks(redis, docker_host, name, t0_ms, t1_ms, px)
+
+
+async def logs_find(redis: Redis, sid: str, query: str, start: int, forward: bool) -> int | None:
+    docker_host, name = _log_target(sid)
+    return await log_index.find_text(redis, docker_host, name, query, start, forward)

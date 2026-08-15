@@ -12,7 +12,8 @@ for picking specific containers to watch, its millisecond-epoch-number
 timestamps. None of that is a capability log-sump itself should carry
 permanently; it belongs entirely to this one client's own migration path
 off its old backend. See `routes.py`'s own module docstring for the exact
-route list and what's deliberately out of scope for this first slice.
+route list, including why five of them are mounted under `/legacy/*`
+rather than at the bare path the old gateway itself used.
 
 Deployed by mounting this directory (or a directory containing it,
 alongside any sibling plugins) and pointing `LOG_SUMP_PLUGINS__DIRECTORY`

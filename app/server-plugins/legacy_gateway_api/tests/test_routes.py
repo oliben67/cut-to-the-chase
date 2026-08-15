@@ -4,7 +4,9 @@ so these tests also double as end-to-end confirmation that the plugin
 loads and mounts correctly.
 """
 
+import sys
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -12,10 +14,34 @@ from fakeredis import FakeAsyncRedis
 from httpx import ASGITransport, AsyncClient
 
 from log_sump.common.config import GatewayConfig, PluginsConfig, Settings
+from log_sump.common.redis_keys import stream_key
+from log_sump.common.schema import Kind, LogRecord, MetricRecord, RecordAdapter
 from log_sump.server.app import create_app
 
 TOKEN = "gateway-secret"
 PLUGINS_DIR = Path(__file__).resolve().parent.parent.parent
+
+
+@pytest.fixture(autouse=True)
+def _reload_plugin_fresh_every_test():
+    """create_app()'s plugin loader (`log_sump.server.plugins`) registers
+    the plugin package under a fixed `sys.modules` name and only
+    overwrites *that* top-level entry on each load -- its submodules
+    (`.routes`, `.compat`, `.log_index`) stay cached in `sys.modules` from
+    whichever test loaded them first, since Python's own relative-import
+    resolution reuses an already-registered submodule rather than
+    re-executing it. Harmless in real deployments (`create_app()` runs
+    once per process there), but `log_index.py`'s in-process rank cache is
+    the first piece of this plugin's own state that isn't Redis-backed,
+    so it's the first thing to actually leak between this file's own
+    `create_app()` calls -- purge every submodule so each test's `client`
+    fixture gets a genuinely fresh plugin load, matching what a real
+    process restart would give it.
+    """
+    prefix = "log_sump_plugin_legacy_gateway_api"
+    for mod_name in [n for n in sys.modules if n == prefix or n.startswith(prefix + ".")]:
+        del sys.modules[mod_name]
+    yield
 
 
 @pytest.fixture
@@ -116,3 +142,157 @@ async def test_docker_ps_preview(client: AsyncClient, redis: FakeAsyncRedis) -> 
     body = resp.json()
     assert "containers" in body
     assert "services" in body
+
+
+async def _seed_log_via_redis(
+    redis: FakeAsyncRedis, container_name: str, ts_ms: int, text: str
+) -> None:
+    record = LogRecord(
+        docker_host="local",
+        container_name=container_name,
+        container_id=f"{container_name}-id",
+        ts=datetime.fromtimestamp(ts_ms / 1000.0, tz=UTC),
+        seq=1,
+        stream="stdout",
+        level="info",
+        message=text,
+        raw=text,
+    )
+    await redis.xadd(
+        stream_key("local", Kind.LOG),
+        {"data": RecordAdapter.dump_json(record)},
+        id=f"{ts_ms}-0",
+    )
+
+
+async def test_logs_returns_total_and_rows(client: AsyncClient, redis: FakeAsyncRedis) -> None:
+    await client.post(
+        "/docker/collect",
+        json={"host": None, "stats": False, "host_stats": False, "logs": [{"name": "web"}]},
+        headers=_auth_headers(),
+    )
+    await _seed_log_via_redis(redis, "web", 1000, "hello")
+    await _seed_log_via_redis(redis, "web", 1001, "world")
+
+    resp = await client.get(
+        "/logs",
+        params={"source": "docker://local/container/web", "start": 0, "count": 10},
+        headers=_auth_headers(),
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] == 2
+    assert [r["text"] for r in body["rows"]] == ["hello", "world"]
+
+
+async def test_logs_unknown_source_is_a_bad_request(client: AsyncClient) -> None:
+    resp = await client.get(
+        "/logs", params={"source": "docker://local/stats"}, headers=_auth_headers()
+    )
+    assert resp.status_code == 400
+
+
+async def test_legacy_index_at_and_ticks_and_find(
+    client: AsyncClient, redis: FakeAsyncRedis
+) -> None:
+    await client.post(
+        "/docker/collect",
+        json={"host": None, "stats": False, "host_stats": False, "logs": [{"name": "web"}]},
+        headers=_auth_headers(),
+    )
+    await _seed_log_via_redis(redis, "web", 1000, "alpha")
+    await _seed_log_via_redis(redis, "web", 2000, "beta")
+    sid = "docker://local/container/web"
+
+    index_resp = await client.get(
+        "/legacy/index_at", params={"source": sid, "t": 1000}, headers=_auth_headers()
+    )
+    assert index_resp.json() == {"index": 0}
+
+    ticks_resp = await client.get(
+        "/legacy/ticks",
+        params={"source": sid, "from": 1000, "to": 2001, "px": 2},
+        headers=_auth_headers(),
+    )
+    assert ticks_resp.json() == {"counts": [1, 1]}
+
+    find_resp = await client.get(
+        "/legacy/logs/find",
+        params={"source": sid, "q": "beta", "start": 0, "dir": "fwd"},
+        headers=_auth_headers(),
+    )
+    assert find_resp.json() == {"index": 1}
+
+
+async def test_legacy_point_and_series(client: AsyncClient, redis: FakeAsyncRedis) -> None:
+    await client.post(
+        "/docker/collect",
+        json={"host": None, "stats": True, "host_stats": True, "logs": [{"name": "web"}]},
+        headers=_auth_headers(),
+    )
+    record = MetricRecord(
+        docker_host="local",
+        container_name="web",
+        container_id="web-id",
+        ts=datetime.fromtimestamp(1.0, tz=UTC),
+        seq=1,
+        metric_scope="container",
+        cpu_pct=42.0,
+        mem_pct=10.0,
+        source="docker stats",
+    )
+    await redis.xadd(
+        stream_key("local", Kind.METRIC),
+        {"data": RecordAdapter.dump_json(record)},
+        id="1000-0",
+    )
+
+    point_resp = await client.get(
+        "/legacy/point", params={"t": 1000}, headers=_auth_headers()
+    )
+    assert point_resp.json()["services"]["web"]["cpu"] == 42.0
+
+    series_resp = await client.get(
+        "/legacy/series", params={"from": 0, "to": 5000, "px": 4}, headers=_auth_headers()
+    )
+    body = series_resp.json()
+    assert body["from"] == 0
+    names = {s["name"] for s in body["services"]}
+    assert "web" in names
+
+
+async def test_stats_export(client: AsyncClient, redis: FakeAsyncRedis) -> None:
+    await client.post(
+        "/docker/collect",
+        json={"host": None, "stats": True, "host_stats": False, "logs": [{"name": "web"}]},
+        headers=_auth_headers(),
+    )
+    record = MetricRecord(
+        docker_host="local",
+        container_name="web",
+        container_id="web-id",
+        ts=datetime.fromtimestamp(1.0, tz=UTC),
+        seq=1,
+        metric_scope="container",
+        cpu_pct=42.0,
+        mem_pct=10.0,
+        source="docker stats",
+    )
+    await redis.xadd(
+        stream_key("local", Kind.METRIC),
+        {"data": RecordAdapter.dump_json(record)},
+        id="1000-0",
+    )
+
+    resp = await client.get(
+        "/stats_export",
+        params={"from": 0, "to": 5000, "granularity": "summary"},
+        headers=_auth_headers(),
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["granularity"] == "summary"
+    web = next(s for s in body["services"] if s["name"] == "web")
+    assert web["cpu"] == {"min": 42.0, "avg": 42.0, "max": 42.0}
