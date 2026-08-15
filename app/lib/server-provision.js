@@ -4,7 +4,7 @@ const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
 const { hostFromTarget } = require("./connection-config");
-const { waitForPortOpen, waitForHttpOk } = require("./net-wait");
+const { waitForHttpOk } = require("./net-wait");
 
 // The server image tarball + both docker-compose variants ship as
 // electron-builder extraResources (see app/package.json's
@@ -145,7 +145,7 @@ function resolveSource(source, { resourcesDir } = {}) {
 /**
  * Gets the server container running on *this* machine: docker-load or
  * docker-pull per resolveSource(), then `docker compose up -d` with the
- * matching compose file, then wait for the fixed container port to open.
+ * matching compose file, then wait for GET /health/ready to return 200.
  * `apiToken`, when given, is passed through as CTTC_API_TOKEN -- this
  * container binds 0.0.0.0 with `network_mode: host` (see docker-compose.yml)
  * exactly like a remote gateway's, so it's reachable by anything else on
@@ -167,8 +167,15 @@ async function ensureLocalContainer({ spawnFn = spawn, resourcesDir, port = 8765
     await run(spawnFn, "docker", ["pull", resolved.ref], {}, onLog);
   }
   await run(spawnFn, "docker", ["compose", "-f", resolved.composeFile, "up", "-d"], { env }, onLog);
-  onLog?.(`$ waiting for the container to come up on 127.0.0.1:${port} ...`);
-  await waitForPortOpen("127.0.0.1", port, { timeoutMs: 30000 });
+  onLog?.(`$ waiting for the container to become ready (checking http://127.0.0.1:${port}/health/ready) ...`);
+  // /health/ready (not just a raw port-open check) confirms the FastAPI
+  // app inside is actually up *and* has a working Redis connection, not
+  // just that something is listening on the port yet -- matches
+  // ensureRemoteContainer's own health check below.
+  await waitForHttpOk(`http://127.0.0.1:${port}/health/ready`, {
+    timeoutMs: 30000,
+    ...(apiToken ? { headers: { "X-CTTC-Token": apiToken } } : {}),
+  });
   return { port, imageRef: resolved.imageRef };
 }
 
@@ -241,9 +248,9 @@ async function ensureRemoteContainer(
     ], {}, onLog);
   }
 
-  onLog?.(`$ waiting for the container to come up (checking http://${host}:${cfg.remotePort}/health) ...`);
+  onLog?.(`$ waiting for the container to come up (checking http://${host}:${cfg.remotePort}/health/ready) ...`);
   try {
-    await waitForHttpOk(`http://${host}:${cfg.remotePort}/health`, {
+    await waitForHttpOk(`http://${host}:${cfg.remotePort}/health/ready`, {
       timeoutMs: 30000,
       ...(apiToken ? { headers: { "X-CTTC-Token": apiToken } } : {}),
     });

@@ -5,7 +5,6 @@ const assert = require("node:assert/strict");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const net = require("net");
 const http = require("http");
 const {
   uninstallLocalContainer,
@@ -14,13 +13,6 @@ const {
   ensureLocalContainer,
   ensureRemoteContainer,
 } = require("../../lib/server-provision");
-
-function freeLocalPortListener() {
-  return new Promise((resolve) => {
-    const srv = net.createServer();
-    srv.listen(0, "127.0.0.1", () => resolve(srv));
-  });
-}
 
 function freeLocalHttpServer(handler) {
   return new Promise((resolve) => {
@@ -58,11 +50,16 @@ function fakeSpawnWithOpts(calls) {
 
 test("ensureLocalContainer passes CTTC_API_TOKEN through the docker compose up env when given (br-NET-004)", async () => {
   // br-PROV-004 already flags ensureLocalContainer as hard to test end-to-end
-  // (a real waitForPortOpen against the fixed container port) -- binding a
-  // real local listener on an ephemeral port and passing it as `port` here
-  // sidesteps that without needing to touch the function itself.
-  const listener = await freeLocalPortListener();
-  const port = listener.address().port;
+  // (a real /health/ready check against the fixed container port) --
+  // binding a real local HTTP server on an ephemeral port and passing it as
+  // `port` here sidesteps that without needing to touch the function itself.
+  let seenHeaders = null;
+  const srv = await freeLocalHttpServer((req, res) => {
+    seenHeaders = req.headers;
+    res.writeHead(200);
+    res.end();
+  });
+  const port = srv.address().port;
   const calls = [];
   try {
     const result = await ensureLocalContainer({
@@ -76,14 +73,22 @@ test("ensureLocalContainer passes CTTC_API_TOKEN through the docker compose up e
     const upCall = calls.find((c) => c.args.includes("up"));
     assert.ok(upCall, JSON.stringify(calls));
     assert.equal(upCall.opts.env.CTTC_API_TOKEN, "s3cr3t");
+    // the readiness check itself also carried the token -- a token-gated
+    // /health/ready would otherwise 401 forever and never report ready.
+    assert.equal(seenHeaders["x-cttc-token"], "s3cr3t");
   } finally {
-    listener.close();
+    srv.close();
   }
 });
 
 test("ensureLocalContainer omits CTTC_API_TOKEN from the env when no apiToken is given", async () => {
-  const listener = await freeLocalPortListener();
-  const port = listener.address().port;
+  let seenHeaders = null;
+  const srv = await freeLocalHttpServer((req, res) => {
+    seenHeaders = req.headers;
+    res.writeHead(200);
+    res.end();
+  });
+  const port = srv.address().port;
   const calls = [];
   try {
     await ensureLocalContainer({
@@ -94,8 +99,9 @@ test("ensureLocalContainer omits CTTC_API_TOKEN from the env when no apiToken is
     });
     const upCall = calls.find((c) => c.args.includes("up"));
     assert.ok(!("CTTC_API_TOKEN" in upCall.opts.env));
+    assert.equal(seenHeaders["x-cttc-token"], undefined);
   } finally {
-    listener.close();
+    srv.close();
   }
 });
 
