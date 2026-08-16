@@ -74,7 +74,7 @@ test("ensureLocalContainer passes CTTC_API_TOKEN through the docker compose up e
     const result = await ensureLocalContainer({
       spawnFn: fakeSpawnWithOpts(calls),
       resourcesDir: "/fake/resources",
-      source: { type: "registry", ref: "osteck/cttc-gateway:1.2.3" },
+      source: { type: "registry", ref: "osteck/log-sump:1.2.3" },
       port,
       apiToken: "s3cr3t",
       pluginDir,
@@ -107,7 +107,7 @@ test("ensureLocalContainer omits CTTC_API_TOKEN from the env when no apiToken is
     await ensureLocalContainer({
       spawnFn: fakeSpawnWithOpts(calls),
       resourcesDir: "/fake/resources",
-      source: { type: "registry", ref: "osteck/cttc-gateway:1.2.3" },
+      source: { type: "registry", ref: "osteck/log-sump:1.2.3" },
       port,
       pluginDir,
     });
@@ -134,7 +134,7 @@ test("ensureLocalContainer clones log-sump-plugin fresh when pluginDir has no ex
     await ensureLocalContainer({
       spawnFn: fakeSpawnWithOpts(calls),
       resourcesDir: "/fake/resources",
-      source: { type: "registry", ref: "osteck/cttc-gateway:1.2.3" },
+      source: { type: "registry", ref: "osteck/log-sump:1.2.3" },
       port,
       pluginDir,
     });
@@ -167,7 +167,7 @@ test("ensureLocalContainer fetches+resets log-sump-plugin when pluginDir already
     await ensureLocalContainer({
       spawnFn: fakeSpawnWithOpts(calls),
       resourcesDir: "/fake/resources",
-      source: { type: "registry", ref: "osteck/cttc-gateway:1.2.3" },
+      source: { type: "registry", ref: "osteck/log-sump:1.2.3" },
       port,
       pluginDir,
     });
@@ -199,7 +199,7 @@ test("ensureRemoteContainer's ssh command includes CTTC_API_TOKEN when apiToken 
       {
         spawnFn: fakeSpawn(calls),
         resourcesDir: "/fake/resources",
-        source: { type: "registry", ref: "osteck/cttc-gateway:1.2.3" },
+        source: { type: "registry", ref: "osteck/log-sump:1.2.3" },
         apiToken: "s3cr3t",
       }
     );
@@ -253,7 +253,7 @@ test("ensureRemoteContainer's ssh command omits CTTC_API_TOKEN when no apiToken 
       {
         spawnFn: fakeSpawn(calls),
         resourcesDir: "/fake/resources",
-        source: { type: "registry", ref: "osteck/cttc-gateway:1.2.3" },
+        source: { type: "registry", ref: "osteck/log-sump:1.2.3" },
       }
     );
     const upCall = calls.find((c) => c.args.at(-1)?.includes("docker compose"));
@@ -277,13 +277,13 @@ test("ensureRemoteContainer's ssh commands clone log-sump-plugin on the remote h
       {
         spawnFn: fakeSpawn(calls),
         resourcesDir: "/fake/resources",
-        source: { type: "registry", ref: "osteck/cttc-gateway:1.2.3" },
+        source: { type: "registry", ref: "osteck/log-sump:1.2.3" },
       }
     );
     const sshCalls = calls.filter((c) => c.cmd === "ssh");
     const cloneCall = sshCalls.find((c) => c.args.at(-1)?.includes("log-sump-plugin"));
     assert.ok(cloneCall, JSON.stringify(calls));
-    assert.match(cloneCall.args.at(-1), /cd cttc-gateway && if \[ -d log-sump-plugin\/\.git \]/);
+    assert.match(cloneCall.args.at(-1), /cd log-sump && if \[ -d log-sump-plugin\/\.git \]/);
     assert.match(cloneCall.args.at(-1), /git clone --branch main git@github\.com:oliben67\/cttc-log-sump-plugin\.git log-sump-plugin/);
     const upCall = calls.find((c) => c.args.at(-1)?.includes("docker compose"));
     assert.ok(upCall, JSON.stringify(calls));
@@ -311,7 +311,7 @@ test("uninstallLocalContainer resolves the compose file matching a provided regi
   await uninstallLocalContainer({
     spawnFn: fakeSpawn(calls),
     resourcesDir: "/fake/resources",
-    source: { type: "registry", ref: "osteck/cttc-gateway:1.2.3" },
+    source: { type: "registry", ref: "osteck/log-sump:1.2.3" },
   });
   assert.equal(calls[0].args[2], path.join("/fake/resources", "docker-compose.registry.yml"));
 });
@@ -342,7 +342,7 @@ test("uninstallRemoteContainer runs one ssh command that stops the container and
   assert.equal(calls[0].cmd, "ssh");
   const remoteCmd = calls[0].args.at(-1);
   assert.match(remoteCmd, /docker compose down --rmi all/, "removes the image too, not just the container");
-  assert.match(remoteCmd, /rm -rf cttc-gateway/);
+  assert.match(remoteCmd, /rm -rf log-sump/);
   assert.ok(calls[0].args.includes("-i"), "ssh key flag present");
   assert.ok(calls[0].args.includes("deploy@host"), "target present");
 });
@@ -380,7 +380,7 @@ test("checkStillInstalled runs a remote `docker compose ps -a` over ssh for a no
 test("checkStillInstalled resolves the compose file matching entry.imageSource, not the default (br-PROV-007)", async () => {
   const calls = [];
   await checkStillInstalled(
-    { mode: "embedded", imageSource: { type: "registry", ref: "osteck/cttc-gateway:1.2.3" } },
+    { mode: "embedded", imageSource: { type: "registry", ref: "osteck/log-sump:1.2.3" } },
     { spawnFn: fakeSpawn(calls), resourcesDir: "/fake/resources" }
   );
   assert.equal(calls[0].args[2], path.join("/fake/resources", "docker-compose.registry.yml"));

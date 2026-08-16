@@ -114,7 +114,7 @@ function scpArgs({ sshKey, sshPort }) {
  * (from Settings > "Update server image", see main.js's "update-image"
  * handler) explicitly overrides the default of "whatever's bundled":
  *   { type: "tarball", path: "C:\\path\\to\\log-sump.tar.gz" }
- *   { type: "registry", ref: "osteck/cttc-gateway:0.0.2" }
+ *   { type: "registry", ref: "osteck/log-sump:0.0.2" }
  * With no override: prefers the tarball baked into this install,
  * falling back to image.json's registry ref (a placeholder until a real
  * registry is wired up).
@@ -253,7 +253,7 @@ async function ensureRemoteContainer(
   cfg,
   { spawnFn = spawn, sshBin = "ssh", scpBin = "scp", resourcesDir, source, apiToken, onLog } = {}
 ) {
-  const remoteDir = "cttc-gateway";
+  const remoteDir = "log-sump";
   const ssh = sshExecArgs(cfg);
   const scp = scpArgs(cfg);
   const target = cfg.sshTarget;
@@ -356,7 +356,7 @@ async function uninstallLocalContainer({ spawnFn = spawn, resourcesDir, source, 
  * @param {{sshTarget: string, sshKey: string|null, sshPort?: number}} cfg
  */
 async function uninstallRemoteContainer(cfg, { spawnFn = spawn, sshBin = "ssh", onLog } = {}) {
-  const remoteDir = "cttc-gateway";
+  const remoteDir = "log-sump";
   const ssh = sshExecArgs(cfg);
   await run(
     spawnFn,
@@ -385,7 +385,7 @@ async function checkStillInstalled(entry, { spawnFn = spawn, resourcesDir, sshBi
       await run(spawnFn, "docker", ["compose", "-f", resolved.composeFile, "ps", "-a"], {}, onLog);
     } else {
       const ssh = sshExecArgs({ sshTarget: entry.sshTarget, sshKey: entry.sshKey, sshPort: entry.sshPort });
-      await run(spawnFn, sshBin, [...ssh, "cd cttc-gateway && docker compose ps -a"], {}, onLog);
+      await run(spawnFn, sshBin, [...ssh, "cd log-sump && docker compose ps -a"], {}, onLog);
     }
   } catch (err) {
     onLog?.(`  could not check: ${err.message}`);
