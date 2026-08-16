@@ -65,7 +65,14 @@ async function post(path, body, { timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS } = {})
     r = await fetch(API + path, {
       method: "POST",
       body: JSON.stringify(body || {}),
-      headers: authHeaders(),
+      // Without this, fetch() defaults an outgoing string body to
+      // text/plain -- the old server.py parsed the raw bytes as JSON
+      // regardless of Content-Type, so this went unnoticed for years, but
+      // FastAPI's Pydantic body parsing (the log-sump-based gateway) only
+      // treats the body as JSON when this header says so; otherwise every
+      // POST body fails validation with a 422 ("Input should be a valid
+      // dictionary"), no matter how well-formed the JSON actually is.
+      headers: authHeaders({ "Content-Type": "application/json" }),
       signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (err) {
