@@ -1,6 +1,7 @@
 "use strict";
 
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const { spawn } = require("child_process");
 const { hostFromTarget } = require("./connection-config");
@@ -52,11 +53,40 @@ function hasBundledTarball({ resourcesDir } = {}) {
 // src/ (its importable package root -- see docker-compose.yml's own
 // CTTC_PLUGINS_DIR comment) as "plugins" alongside the executable.
 // Dev/unpackaged: read straight out of the submodule checkout, same
-// dev-fallback pattern as defaultSharedDir/defaultRepoDir above.
+// dev-fallback pattern as defaultSharedDir/defaultRepoDir above. This is
+// where the plugin ships *from* -- see deployLocalPluginsDir/
+// ensureRemoteContainer below for where it actually runs *from* on a
+// given instance.
 function bundledPluginsDir({ resourcesDir } = {}) {
   return resourcesDir
     ? path.join(resourcesDir, "plugins")
     : path.join(__dirname, "..", "log-sump-plugin", "src");
+}
+
+// ~/.cttc/ is cttc's own local app-data directory (see lib/gateway-registry.js's
+// ~/.cttc/gateways.json) -- the embedded "This machine" instance's plugin
+// copy lives at ~/.cttc/plugins, namespaced there rather than referencing
+// bundledPluginsDir() in place, matching how a remote instance gets its
+// own copy under <remoteDir>/.cttc/plugins (see ensureRemoteContainer).
+function localPluginsDeployDir() {
+  return path.join(os.homedir(), ".cttc", "plugins");
+}
+
+/**
+ * Copies bundledPluginsDir()'s current contents to `destDir` (default
+ * localPluginsDeployDir()), replacing whatever was there before (an older
+ * install's plugin version, if any) -- cheap enough to redo on every
+ * ensureLocalContainer call, and keeps the destination always matching
+ * this install rather than whatever was first copied there. `destDir` is
+ * only ever overridden by tests, to avoid touching the real
+ * ~/.cttc/plugins on the machine running them.
+ * @returns {string} `destDir`, once it holds a fresh copy.
+ */
+function deployLocalPlugins({ resourcesDir, destDir = localPluginsDeployDir() } = {}) {
+  fs.rmSync(destDir, { recursive: true, force: true });
+  fs.mkdirSync(path.dirname(destDir), { recursive: true });
+  fs.cpSync(bundledPluginsDir({ resourcesDir }), destDir, { recursive: true });
+  return destDir;
 }
 
 /**
@@ -175,8 +205,9 @@ function resolveSource(source, { resourcesDir } = {}) {
  * never changes between an ordinary reconnect's `docker compose up -d`
  * calls -- an env var that *did* change would make compose recreate the
  * container instead of leaving the already-running one alone. Also
- * passes bundledPluginsDir() through as CTTC_PLUGINS_DIR, which both
- * docker-compose.yml variants bind-mount in.
+ * (re-)deploys the bundled plugin to ~/.cttc/plugins (see
+ * deployLocalPlugins) and passes that through as CTTC_PLUGINS_DIR, which
+ * both docker-compose.yml variants bind-mount in.
  * @returns {{port: number, imageRef: string}}
  */
 async function ensureLocalContainer({
@@ -186,11 +217,15 @@ async function ensureLocalContainer({
   source,
   apiToken,
   onLog,
+  pluginsDestDir,
 } = {}) {
   const resolved = resolveSource(source, { resourcesDir });
   const env = { ...process.env };
   if (apiToken) env.CTTC_API_TOKEN = apiToken;
-  env.CTTC_PLUGINS_DIR = bundledPluginsDir({ resourcesDir });
+  env.CTTC_PLUGINS_DIR = deployLocalPlugins({
+    resourcesDir,
+    ...(pluginsDestDir ? { destDir: pluginsDestDir } : {}),
+  });
   if (resolved.kind === "tarball") {
     await run(spawnFn, "docker", ["load", "-i", resolved.tarballPath], {}, onLog);
   } else {
@@ -265,25 +300,29 @@ async function ensureRemoteContainer(
   const apiTokenEnv = apiToken ? `CTTC_API_TOKEN=${apiToken} ` : "";
 
   // Copies the bundled plugins directory (see bundledPluginsDir's own
-  // docstring) up to the remote host itself -- cleaned first so a plugin
-  // file removed since the last deploy doesn't linger (plain `scp -r`
-  // onto an existing directory only overwrites/adds, never deletes).
-  // Requires nothing beyond `docker`/`docker compose` on the remote host:
-  // no `git`, no SSH access of its own to GitHub, unlike the
+  // docstring) up to the remote host itself, under .cttc/ -- namespaces
+  // cttc's own addition separately from log-sump's native files sitting
+  // directly in ${remoteDir} (docker-compose.yml, the tarball, id_rsa),
+  // mirroring ~/.cttc/ as cttc's own app-data convention on the local
+  // side (see localPluginsDeployDir). Cleaned first so a plugin file
+  // removed since the last deploy doesn't linger (plain `scp -r` onto an
+  // existing directory only overwrites/adds, never deletes). Requires
+  // nothing beyond `docker`/`docker compose` on the remote host: no
+  // `git`, no SSH access of its own to GitHub, unlike the
   // git-clone-at-provision-time approach this replaced. `$PWD` (not a
   // literal path) for the same reason idRsaEnv uses it below: this whole
   // thing runs as one shell invocation after `cd ${remoteDir}`, so `$PWD`
   // is already that absolute directory by the time docker compose reads
   // CTTC_PLUGINS_DIR from it.
-  await run(spawnFn, sshBin, [...ssh, `rm -rf ${remoteDir}/plugins`], {}, onLog);
+  await run(spawnFn, sshBin, [...ssh, `rm -rf ${remoteDir}/.cttc/plugins && mkdir -p ${remoteDir}/.cttc`], {}, onLog);
   await run(
     spawnFn,
     scpBin,
-    [...scp, "-r", bundledPluginsDir({ resourcesDir }), `${target}:${remoteDir}/plugins`],
+    [...scp, "-r", bundledPluginsDir({ resourcesDir }), `${target}:${remoteDir}/.cttc/plugins`],
     {},
     onLog
   );
-  const pluginsDirEnv = 'CTTC_PLUGINS_DIR="$PWD/plugins" ';
+  const pluginsDirEnv = 'CTTC_PLUGINS_DIR="$PWD/.cttc/plugins" ';
 
   if (resolved.kind === "tarball") {
     await run(spawnFn, scpBin, [...scp, resolved.tarballPath, `${target}:${remoteDir}/`], {}, onLog);
@@ -380,6 +419,8 @@ module.exports = {
   bundledTarballPath,
   bundledOfflineComposePath,
   bundledPluginsDir,
+  localPluginsDeployDir,
+  deployLocalPlugins,
   hasBundledTarball,
   readImageRef,
   registryComposePath,

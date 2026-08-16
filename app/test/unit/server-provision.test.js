@@ -12,8 +12,22 @@ const {
   checkStillInstalled,
   ensureLocalContainer,
   ensureRemoteContainer,
-  bundledPluginsDir,
 } = require("../../lib/server-provision");
+
+// deployLocalPlugins() does a real fs.cpSync from bundledPluginsDir() --
+// these give every ensureLocalContainer test a real (throwaway) source to
+// copy from and a real (throwaway) destination to copy to, so nothing
+// touches the developer's actual ~/.cttc/plugins.
+function tmpBundledResourcesDir() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cttc-resources-"));
+  fs.mkdirSync(path.join(dir, "plugins", "log_sump_plugin"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "plugins", "log_sump_plugin", "__init__.py"), "");
+  return dir;
+}
+
+function tmpPluginsDestDir() {
+  return path.join(fs.mkdtempSync(path.join(os.tmpdir(), "cttc-plugins-dest-")), "plugins");
+}
 
 function freeLocalHttpServer(handler) {
   return new Promise((resolve) => {
@@ -62,10 +76,13 @@ test("ensureLocalContainer passes CTTC_API_TOKEN through the docker compose up e
   });
   const port = srv.address().port;
   const calls = [];
+  const resourcesDir = tmpBundledResourcesDir();
+  const pluginsDestDir = tmpPluginsDestDir();
   try {
     const result = await ensureLocalContainer({
       spawnFn: fakeSpawnWithOpts(calls),
-      resourcesDir: "/fake/resources",
+      resourcesDir,
+      pluginsDestDir,
       source: { type: "registry", ref: "osteck/log-sump:1.2.3" },
       port,
       apiToken: "s3cr3t",
@@ -74,12 +91,14 @@ test("ensureLocalContainer passes CTTC_API_TOKEN through the docker compose up e
     const upCall = calls.find((c) => c.args.includes("up"));
     assert.ok(upCall, JSON.stringify(calls));
     assert.equal(upCall.opts.env.CTTC_API_TOKEN, "s3cr3t");
-    assert.equal(upCall.opts.env.CTTC_PLUGINS_DIR, bundledPluginsDir({ resourcesDir: "/fake/resources" }));
+    assert.equal(upCall.opts.env.CTTC_PLUGINS_DIR, pluginsDestDir);
     // the readiness check itself also carried the token -- a token-gated
     // /health/ready would otherwise 401 forever and never report ready.
     assert.equal(seenHeaders["x-cttc-token"], "s3cr3t");
   } finally {
     srv.close();
+    fs.rmSync(resourcesDir, { recursive: true, force: true });
+    fs.rmSync(pluginsDestDir, { recursive: true, force: true });
   }
 });
 
@@ -92,10 +111,13 @@ test("ensureLocalContainer omits CTTC_API_TOKEN from the env when no apiToken is
   });
   const port = srv.address().port;
   const calls = [];
+  const resourcesDir = tmpBundledResourcesDir();
+  const pluginsDestDir = tmpPluginsDestDir();
   try {
     await ensureLocalContainer({
       spawnFn: fakeSpawnWithOpts(calls),
-      resourcesDir: "/fake/resources",
+      resourcesDir,
+      pluginsDestDir,
       source: { type: "registry", ref: "osteck/log-sump:1.2.3" },
       port,
     });
@@ -104,28 +126,39 @@ test("ensureLocalContainer omits CTTC_API_TOKEN from the env when no apiToken is
     assert.equal(seenHeaders["x-cttc-token"], undefined);
   } finally {
     srv.close();
+    fs.rmSync(resourcesDir, { recursive: true, force: true });
+    fs.rmSync(pluginsDestDir, { recursive: true, force: true });
   }
 });
 
-test("ensureLocalContainer points CTTC_PLUGINS_DIR at the bundled plugins directory, no git involved", async () => {
+test("ensureLocalContainer deploys the bundled plugins to pluginsDestDir, no git involved", async () => {
   const srv = await freeLocalHttpServer((_req, res) => {
     res.writeHead(200);
     res.end();
   });
   const port = srv.address().port;
   const calls = [];
+  const resourcesDir = tmpBundledResourcesDir();
+  const pluginsDestDir = tmpPluginsDestDir();
   try {
     await ensureLocalContainer({
       spawnFn: fakeSpawnWithOpts(calls),
-      resourcesDir: "/fake/resources",
+      resourcesDir,
+      pluginsDestDir,
       source: { type: "registry", ref: "osteck/log-sump:1.2.3" },
       port,
     });
     assert.ok(!calls.some((c) => c.cmd === "git"), JSON.stringify(calls));
     const upCall = calls.find((c) => c.args.includes("up"));
-    assert.equal(upCall.opts.env.CTTC_PLUGINS_DIR, path.join("/fake/resources", "plugins"));
+    assert.equal(upCall.opts.env.CTTC_PLUGINS_DIR, pluginsDestDir);
+    assert.ok(
+      fs.existsSync(path.join(pluginsDestDir, "log_sump_plugin", "__init__.py")),
+      "the bundled plugin's contents must actually be copied to pluginsDestDir"
+    );
   } finally {
     srv.close();
+    fs.rmSync(resourcesDir, { recursive: true, force: true });
+    fs.rmSync(pluginsDestDir, { recursive: true, force: true });
   }
 });
 
@@ -226,18 +259,20 @@ test("ensureRemoteContainer copies the bundled plugins directory to the remote h
       }
     );
     assert.ok(!calls.some((c) => c.cmd === "git"), JSON.stringify(calls));
-    const rmCall = calls.find((c) => c.cmd === "ssh" && c.args.at(-1) === "rm -rf log-sump/plugins");
+    const rmCall = calls.find(
+      (c) => c.cmd === "ssh" && c.args.at(-1) === "rm -rf log-sump/.cttc/plugins && mkdir -p log-sump/.cttc"
+    );
     assert.ok(rmCall, JSON.stringify(calls));
     const scpCall = calls.find((c) => c.cmd === "scp" && c.args.includes("-r"));
     assert.ok(scpCall, JSON.stringify(calls));
     assert.deepEqual(scpCall.args, [
       "-r",
       path.join("/fake/resources", "plugins"),
-      "deploy@host:log-sump/plugins",
+      "deploy@host:log-sump/.cttc/plugins",
     ]);
     const upCall = calls.find((c) => c.args.at(-1)?.includes("docker compose"));
     assert.ok(upCall, JSON.stringify(calls));
-    assert.match(upCall.args.at(-1), /CTTC_PLUGINS_DIR="\$PWD\/plugins" /);
+    assert.match(upCall.args.at(-1), /CTTC_PLUGINS_DIR="\$PWD\/\.cttc\/plugins" /);
   } finally {
     srv.close();
   }
