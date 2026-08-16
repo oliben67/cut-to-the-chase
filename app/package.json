@@ -65,6 +65,10 @@
       {
         "from": "build/CTTC-Manual.html",
         "to": "CTTC-Manual.html"
+      },
+      {
+        "from": "log-sump-plugin/src",
+        "to": "plugins"
       }
     ],
     "win": {
