@@ -50,43 +50,49 @@ function hasBundledTarball({ resourcesDir } = {}) {
 }
 
 // Packaged: app/package.json's extraResources stages log-sump-plugin's
-// src/ (its importable package root -- see docker-compose.yml's own
-// CTTC_PLUGINS_DIR comment) as "plugins" alongside the executable.
+// src/ (its importable package root's own *parent* -- see docker-compose.yml's
+// own CTTC_PLUGINS_DIR comment) as "plugins" alongside the executable, so
+// this resolves straight to the log_sump_plugin package directory itself.
 // Dev/unpackaged: read straight out of the submodule checkout, same
 // dev-fallback pattern as defaultSharedDir/defaultRepoDir above. This is
-// where the plugin ships *from* -- see deployLocalPluginsDir/
+// where the plugin ships *from* -- see deployLocalPlugins/
 // ensureRemoteContainer below for where it actually runs *from* on a
 // given instance.
-function bundledPluginsDir({ resourcesDir } = {}) {
+function bundledPluginSourceDir({ resourcesDir } = {}) {
   return resourcesDir
-    ? path.join(resourcesDir, "plugins")
-    : path.join(__dirname, "..", "log-sump-plugin", "src");
+    ? path.join(resourcesDir, "plugins", "log_sump_plugin")
+    : path.join(__dirname, "..", "log-sump-plugin", "src", "log_sump_plugin");
 }
 
-// ~/.cttc/ is cttc's own local app-data directory (see lib/gateway-registry.js's
-// ~/.cttc/gateways.json) -- the embedded "This machine" instance's plugin
-// copy lives at ~/.cttc/plugins, namespaced there rather than referencing
-// bundledPluginsDir() in place, matching how a remote instance gets its
-// own copy under <remoteDir>/.cttc/plugins (see ensureRemoteContainer).
-function localPluginsDeployDir() {
-  return path.join(os.homedir(), ".cttc", "plugins");
+// Each log-sump instance -- the embedded "This machine" one included --
+// gets its own ~/.log-sump directory, mirroring the remoteDir a *remote*
+// instance is provisioned into (see ensureRemoteContainer) rather than
+// cttc's unrelated ~/.cttc/ app-data directory (gateways.json, keys,
+// connection.json, ...). CTTC_PLUGINS_DIR always points at this
+// directory's own "plugins" subdirectory -- log-sump's native "directory
+// *of* plugin subdirectories" concept (see LOG_SUMP_PLUGINS__DIRECTORY's
+// own comment in docker-compose.yml) -- with cttc's own plugin living at
+// plugins/cttc, one named entry alongside room for any other plugin a
+// deployment might add later.
+function localInstanceDir() {
+  return path.join(os.homedir(), ".log-sump");
 }
 
 /**
- * Copies bundledPluginsDir()'s current contents to `destDir` (default
- * localPluginsDeployDir()), replacing whatever was there before (an older
- * install's plugin version, if any) -- cheap enough to redo on every
- * ensureLocalContainer call, and keeps the destination always matching
- * this install rather than whatever was first copied there. `destDir` is
- * only ever overridden by tests, to avoid touching the real
- * ~/.cttc/plugins on the machine running them.
- * @returns {string} `destDir`, once it holds a fresh copy.
+ * Copies bundledPluginSourceDir()'s current contents to
+ * `<localInstanceDir()>/plugins/cttc` (or `destDir`, only ever overridden
+ * by tests to avoid touching the real ~/.log-sump on the machine running
+ * them), replacing whatever was there before -- cheap enough to redo on
+ * every ensureLocalContainer call, and keeps the destination always
+ * matching this install rather than whatever was first copied there.
+ * @returns {string} the plugins *parent* directory (destDir's own parent),
+ *   which is what CTTC_PLUGINS_DIR must be set to.
  */
-function deployLocalPlugins({ resourcesDir, destDir = localPluginsDeployDir() } = {}) {
+function deployLocalPlugins({ resourcesDir, destDir = path.join(localInstanceDir(), "plugins", "cttc") } = {}) {
   fs.rmSync(destDir, { recursive: true, force: true });
   fs.mkdirSync(path.dirname(destDir), { recursive: true });
-  fs.cpSync(bundledPluginsDir({ resourcesDir }), destDir, { recursive: true });
-  return destDir;
+  fs.cpSync(bundledPluginSourceDir({ resourcesDir }), destDir, { recursive: true });
+  return path.dirname(destDir);
 }
 
 /**
@@ -266,7 +272,7 @@ async function ensureRemoteContainer(
   cfg,
   { spawnFn = spawn, sshBin = "ssh", scpBin = "scp", resourcesDir, source, apiToken, onLog } = {}
 ) {
-  const remoteDir = "log-sump";
+  const remoteDir = ".log-sump";
   const ssh = sshExecArgs(cfg);
   const scp = scpArgs(cfg);
   const target = cfg.sshTarget;
@@ -299,30 +305,29 @@ async function ensureRemoteContainer(
   // leaving the already-running, already-authenticated one alone.
   const apiTokenEnv = apiToken ? `CTTC_API_TOKEN=${apiToken} ` : "";
 
-  // Copies the bundled plugins directory (see bundledPluginsDir's own
-  // docstring) up to the remote host itself, under .cttc/ -- namespaces
-  // cttc's own addition separately from log-sump's native files sitting
-  // directly in ${remoteDir} (docker-compose.yml, the tarball, id_rsa),
-  // mirroring ~/.cttc/ as cttc's own app-data convention on the local
-  // side (see localPluginsDeployDir). Cleaned first so a plugin file
-  // removed since the last deploy doesn't linger (plain `scp -r` onto an
-  // existing directory only overwrites/adds, never deletes). Requires
-  // nothing beyond `docker`/`docker compose` on the remote host: no
-  // `git`, no SSH access of its own to GitHub, unlike the
+  // Copies the bundled plugin (see bundledPluginSourceDir's own docstring)
+  // up to the remote host itself, at ${remoteDir}/plugins/cttc --
+  // log-sump's own native "directory of plugin subdirectories" concept
+  // (LOG_SUMP_PLUGINS__DIRECTORY), with cttc's own plugin as one named
+  // entry in it rather than a bespoke cttc-only layout. Cleaned first so a
+  // plugin file removed since the last deploy doesn't linger (plain
+  // `scp -r` onto an existing directory only overwrites/adds, never
+  // deletes). Requires nothing beyond `docker`/`docker compose` on the
+  // remote host: no `git`, no SSH access of its own to GitHub, unlike the
   // git-clone-at-provision-time approach this replaced. `$PWD` (not a
   // literal path) for the same reason idRsaEnv uses it below: this whole
   // thing runs as one shell invocation after `cd ${remoteDir}`, so `$PWD`
   // is already that absolute directory by the time docker compose reads
   // CTTC_PLUGINS_DIR from it.
-  await run(spawnFn, sshBin, [...ssh, `rm -rf ${remoteDir}/.cttc/plugins && mkdir -p ${remoteDir}/.cttc`], {}, onLog);
+  await run(spawnFn, sshBin, [...ssh, `rm -rf ${remoteDir}/plugins/cttc && mkdir -p ${remoteDir}/plugins`], {}, onLog);
   await run(
     spawnFn,
     scpBin,
-    [...scp, "-r", bundledPluginsDir({ resourcesDir }), `${target}:${remoteDir}/.cttc/plugins`],
+    [...scp, "-r", bundledPluginSourceDir({ resourcesDir }), `${target}:${remoteDir}/plugins/cttc`],
     {},
     onLog
   );
-  const pluginsDirEnv = 'CTTC_PLUGINS_DIR="$PWD/.cttc/plugins" ';
+  const pluginsDirEnv = 'CTTC_PLUGINS_DIR="$PWD/plugins" ';
 
   if (resolved.kind === "tarball") {
     await run(spawnFn, scpBin, [...scp, resolved.tarballPath, `${target}:${remoteDir}/`], {}, onLog);
@@ -379,7 +384,7 @@ async function uninstallLocalContainer({ spawnFn = spawn, resourcesDir, source, 
  * @param {{sshTarget: string, sshKey: string|null, sshPort?: number}} cfg
  */
 async function uninstallRemoteContainer(cfg, { spawnFn = spawn, sshBin = "ssh", onLog } = {}) {
-  const remoteDir = "log-sump";
+  const remoteDir = ".log-sump";
   const ssh = sshExecArgs(cfg);
   await run(
     spawnFn,
@@ -408,7 +413,7 @@ async function checkStillInstalled(entry, { spawnFn = spawn, resourcesDir, sshBi
       await run(spawnFn, "docker", ["compose", "-f", resolved.composeFile, "ps", "-a"], {}, onLog);
     } else {
       const ssh = sshExecArgs({ sshTarget: entry.sshTarget, sshKey: entry.sshKey, sshPort: entry.sshPort });
-      await run(spawnFn, sshBin, [...ssh, "cd log-sump && docker compose ps -a"], {}, onLog);
+      await run(spawnFn, sshBin, [...ssh, "cd .log-sump && docker compose ps -a"], {}, onLog);
     }
   } catch (err) {
     onLog?.(`  could not check: ${err.message}`);
@@ -418,8 +423,8 @@ async function checkStillInstalled(entry, { spawnFn = spawn, resourcesDir, sshBi
 module.exports = {
   bundledTarballPath,
   bundledOfflineComposePath,
-  bundledPluginsDir,
-  localPluginsDeployDir,
+  bundledPluginSourceDir,
+  localInstanceDir,
   deployLocalPlugins,
   hasBundledTarball,
   readImageRef,

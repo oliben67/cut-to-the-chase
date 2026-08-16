@@ -14,10 +14,10 @@ const {
   ensureRemoteContainer,
 } = require("../../lib/server-provision");
 
-// deployLocalPlugins() does a real fs.cpSync from bundledPluginsDir() --
+// deployLocalPlugins() does a real fs.cpSync from bundledPluginSourceDir() --
 // these give every ensureLocalContainer test a real (throwaway) source to
 // copy from and a real (throwaway) destination to copy to, so nothing
-// touches the developer's actual ~/.cttc/plugins.
+// touches the developer's actual ~/.log-sump.
 function tmpBundledResourcesDir() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cttc-resources-"));
   fs.mkdirSync(path.join(dir, "plugins", "log_sump_plugin"), { recursive: true });
@@ -25,8 +25,11 @@ function tmpBundledResourcesDir() {
   return dir;
 }
 
+// The "cttc" leaf deployLocalPlugins copies into -- CTTC_PLUGINS_DIR ends
+// up as this path's own parent (the plugins directory itself, matching
+// log-sump's "directory of plugin subdirectories" convention).
 function tmpPluginsDestDir() {
-  return path.join(fs.mkdtempSync(path.join(os.tmpdir(), "cttc-plugins-dest-")), "plugins");
+  return path.join(fs.mkdtempSync(path.join(os.tmpdir(), "cttc-plugins-dest-")), "plugins", "cttc");
 }
 
 function freeLocalHttpServer(handler) {
@@ -91,14 +94,14 @@ test("ensureLocalContainer passes CTTC_API_TOKEN through the docker compose up e
     const upCall = calls.find((c) => c.args.includes("up"));
     assert.ok(upCall, JSON.stringify(calls));
     assert.equal(upCall.opts.env.CTTC_API_TOKEN, "s3cr3t");
-    assert.equal(upCall.opts.env.CTTC_PLUGINS_DIR, pluginsDestDir);
+    assert.equal(upCall.opts.env.CTTC_PLUGINS_DIR, path.dirname(pluginsDestDir));
     // the readiness check itself also carried the token -- a token-gated
     // /health/ready would otherwise 401 forever and never report ready.
     assert.equal(seenHeaders["x-cttc-token"], "s3cr3t");
   } finally {
     srv.close();
     fs.rmSync(resourcesDir, { recursive: true, force: true });
-    fs.rmSync(pluginsDestDir, { recursive: true, force: true });
+    fs.rmSync(path.dirname(pluginsDestDir), { recursive: true, force: true });
   }
 });
 
@@ -127,11 +130,11 @@ test("ensureLocalContainer omits CTTC_API_TOKEN from the env when no apiToken is
   } finally {
     srv.close();
     fs.rmSync(resourcesDir, { recursive: true, force: true });
-    fs.rmSync(pluginsDestDir, { recursive: true, force: true });
+    fs.rmSync(path.dirname(pluginsDestDir), { recursive: true, force: true });
   }
 });
 
-test("ensureLocalContainer deploys the bundled plugins to pluginsDestDir, no git involved", async () => {
+test("ensureLocalContainer deploys the bundled plugin to pluginsDestDir directly, no git involved", async () => {
   const srv = await freeLocalHttpServer((_req, res) => {
     res.writeHead(200);
     res.end();
@@ -150,15 +153,15 @@ test("ensureLocalContainer deploys the bundled plugins to pluginsDestDir, no git
     });
     assert.ok(!calls.some((c) => c.cmd === "git"), JSON.stringify(calls));
     const upCall = calls.find((c) => c.args.includes("up"));
-    assert.equal(upCall.opts.env.CTTC_PLUGINS_DIR, pluginsDestDir);
+    assert.equal(upCall.opts.env.CTTC_PLUGINS_DIR, path.dirname(pluginsDestDir));
     assert.ok(
-      fs.existsSync(path.join(pluginsDestDir, "log_sump_plugin", "__init__.py")),
-      "the bundled plugin's contents must actually be copied to pluginsDestDir"
+      fs.existsSync(path.join(pluginsDestDir, "__init__.py")),
+      "the bundled plugin's own contents must land directly under pluginsDestDir (the 'cttc' leaf), not nested further"
     );
   } finally {
     srv.close();
     fs.rmSync(resourcesDir, { recursive: true, force: true });
-    fs.rmSync(pluginsDestDir, { recursive: true, force: true });
+    fs.rmSync(path.dirname(pluginsDestDir), { recursive: true, force: true });
   }
 });
 
@@ -260,19 +263,19 @@ test("ensureRemoteContainer copies the bundled plugins directory to the remote h
     );
     assert.ok(!calls.some((c) => c.cmd === "git"), JSON.stringify(calls));
     const rmCall = calls.find(
-      (c) => c.cmd === "ssh" && c.args.at(-1) === "rm -rf log-sump/.cttc/plugins && mkdir -p log-sump/.cttc"
+      (c) => c.cmd === "ssh" && c.args.at(-1) === "rm -rf .log-sump/plugins/cttc && mkdir -p .log-sump/plugins"
     );
     assert.ok(rmCall, JSON.stringify(calls));
     const scpCall = calls.find((c) => c.cmd === "scp" && c.args.includes("-r"));
     assert.ok(scpCall, JSON.stringify(calls));
     assert.deepEqual(scpCall.args, [
       "-r",
-      path.join("/fake/resources", "plugins"),
-      "deploy@host:log-sump/.cttc/plugins",
+      path.join("/fake/resources", "plugins", "log_sump_plugin"),
+      "deploy@host:.log-sump/plugins/cttc",
     ]);
     const upCall = calls.find((c) => c.args.at(-1)?.includes("docker compose"));
     assert.ok(upCall, JSON.stringify(calls));
-    assert.match(upCall.args.at(-1), /CTTC_PLUGINS_DIR="\$PWD\/\.cttc\/plugins" /);
+    assert.match(upCall.args.at(-1), /CTTC_PLUGINS_DIR="\$PWD\/plugins" /);
   } finally {
     srv.close();
   }
@@ -327,7 +330,7 @@ test("uninstallRemoteContainer runs one ssh command that stops the container and
   assert.equal(calls[0].cmd, "ssh");
   const remoteCmd = calls[0].args.at(-1);
   assert.match(remoteCmd, /docker compose down --rmi all/, "removes the image too, not just the container");
-  assert.match(remoteCmd, /rm -rf log-sump/);
+  assert.match(remoteCmd, /rm -rf \.log-sump/);
   assert.ok(calls[0].args.includes("-i"), "ssh key flag present");
   assert.ok(calls[0].args.includes("deploy@host"), "target present");
 });
