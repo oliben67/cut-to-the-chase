@@ -106,7 +106,7 @@ sequenceDiagram
     participant TUN as ssh-tunnel.js
     participant SSH as ssh (child_process)
     participant RH as remote-host
-    participant GW as cttc-gateway container
+    participant GW as log-sump container
 
     U->>M: launch CTTC.app
     M->>DC: hasLocalDocker() / hasLocalSsh()

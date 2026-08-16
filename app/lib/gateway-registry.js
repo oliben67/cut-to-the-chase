@@ -5,7 +5,7 @@ const os = require("os");
 const path = require("path");
 const { randomUUID } = require("crypto");
 
-// Remembers every gateway (cttc-gateway container) this client has actually
+// Remembers every gateway (log-sump container) this client has actually
 // connected to -- one entry per host:port, updated (never duplicated) each
 // time a connect succeeds, so the "recent gateways" dropdown next to the
 // main window's status pill has something to show without the user ever
