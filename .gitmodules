@@ -5,6 +5,6 @@
 	path = app/server-logsump
 	url = git@github.com:oliben67/log-sump.git
 	branch = cttc-integration
-[submodule "app/log-sump-plugin"]
-	path = app/log-sump-plugin
-	url = git@github.com:oliben67/cttc-log-sump-plugin.git
+[submodule "app/log-sump-extended"]
+	path = app/log-sump-extended
+	url = git@github.com:oliben67/log-sump-extended.git
