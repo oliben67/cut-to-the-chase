@@ -72,11 +72,12 @@ generator to keep it appending.
     [log-sump](https://github.com/oliben67/log-sump) submodule): SSH-based
     Docker log/metric collection into Redis Streams, behind an authenticated
     HTTP API. Runs as a Docker container, never spawned bare.
-  - [app/log-sump-plugin](app/log-sump-plugin) — CTTC-specific compat routes
-    (chart/log-panel queries, recording sessions, condition-based events)
-    loaded into the gateway container at runtime via log-sump's own plugin
-    mechanism; a separate repo, bind-mounted in rather than baked into the
-    image.
+  - [app/log-sump-extended](app/log-sump-extended) — CTTC-specific compat
+    routes (chart/log-panel queries, recording sessions, condition-based
+    events); a separate repo/submodule that installs
+    [log-sump](https://github.com/oliben67/log-sump) as a real dependency
+    and bakes these routes into its own Docker image at build time —
+    that image, not `app/server-logsump`'s own, is what actually ships.
   - [app/renderer/](app/renderer/) — dependency-free canvas charting +
     virtual-scrolled log panels.
   - [app/demo/](app/demo/) — correlated demo-data generator.
@@ -90,7 +91,7 @@ generator to keep it appending.
   and runs `app/test/renderer-spec.js` inside the window; prints pass/fail
   plus V8 byte-coverage of `app.js`.
 - `task test` runs both. The gateway itself (`app/server-logsump`,
-  `app/log-sump-plugin`) has its own test suite in its own repo/submodule,
+  `app/log-sump-extended`) has its own test suite in its own repo/submodule,
   run independently of `task test` here.
 
 ## Development / verification hooks

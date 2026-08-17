@@ -13,7 +13,7 @@ CTTC, and it's easy to conflate them:
 The one invariant that holds no matter what: **the browser/renderer only
 ever talks to `http://127.0.0.1:<port>`** — wherever the log-sump gateway
 itself lives (app-host or tunnel-host). The Docker host field is just a
-string in the JSON body of that request; it's the gateway (log-sump-plugin's
+string in the JSON body of that request; it's the gateway (log-sump-extended's
 `compat.py`, translating it into a daemon registration that log-sump's own
 `SSHTransport` then runs `ssh user@host "docker ..."` against) that turns it
 into an actual ssh connection to docker-host. The client never opens a

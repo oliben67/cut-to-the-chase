@@ -10,14 +10,19 @@
 > historical record of the investigation and fix described below, **not**
 > as a description of current behavior.
 >
-> **The current equivalent**: `app/log-sump-plugin/src/log_sump_plugin/`
+> **The current equivalent**: `app/log-sump-extended/src/log_sump_extended/`
 > (`routes.py`'s `/docker/ps`/`/docker/collect`, `compat.py`'s
-> `register_or_get_daemon`/`preview_containers`/`collect`), which
+> `register_or_get_daemon`/`preview_containers`/`collect` -- ported
+> unchanged from the now-retired `app/log-sump-plugin`, see log-sump's own
+> `docs/architecture.md` "Extension model" for why that became a separate,
+> explicitly-composed image instead of a runtime-loaded plugin), which
 > translates a Set Sources docker-host string into a daemon registration
 > that log-sump's own `SSHTransport` (`app/server-logsump/src/log_sump/common/transport.py`)
-> runs as `ssh user@host "docker ..."`. The gateway container's ambient
-> `SSH_AUTH_SOCK` forwarding (same mount shape as described below) is still
-> the mechanism today. **The exact `ssh_key` dead-plumbing bug this
+> runs against -- over `paramiko` (a pure-Python SSH client) as of
+> 2026-08-16, not a shelled-out `ssh` binary; see `br-CONN-010`. The
+> gateway container's ambient `SSH_AUTH_SOCK` forwarding (same mount shape
+> as described below) is still how it authenticates. **The exact `ssh_key`
+> dead-plumbing bug this
 > document is about has been reintroduced in that new code** — the request
 > models still declare `ssh_key`, but nothing between the route handler and
 > `register_or_get_daemon` actually threads it through (`register_or_get_daemon`

@@ -6,10 +6,12 @@ current renderer against catalyst's own 33 inferred domains
 [Ray 3.0's published architecture](https://myray.app/blog/ray-architecture)
 (also an Electron app choosing "single codebase, multiple OSes").
 
-> **Note (2026-08-15):** `app/server` (`server.py`) referenced throughout
-> below was decommissioned after this doc was written, replaced by the
-> log-sump-based gateway (`app/server-logsump` + `app/log-sump-plugin`) --
-> see `.claude/plans/sprightly-stirring-blum.md`'s Phase 10. The
+> **Note (2026-08-15, updated 2026-08-17):** `app/server` (`server.py`)
+> referenced throughout below was decommissioned after this doc was
+> written, replaced by the log-sump-based gateway (`app/server-logsump` +
+> `app/log-sump-extended`, the latter superseding an intermediate
+> `app/log-sump-plugin` runtime-plugin approach) -- see
+> `.claude/plans/sprightly-stirring-blum.md`'s Phase 10. The
 > three-layer structural analysis (renderer / main / server) and the
 > web-app feasibility conclusions below are unaffected; only the specific
 > file/line-count references and the "spawns server.py as a child process"
@@ -33,7 +35,7 @@ build step, no framework, no package beyond Electron itself.
 |---|---|---|
 | [`app/renderer/app.js`](../../app/renderer/app.js) | 6,548 | one global `state` object, ~35 preload IPC calls scattered inline |
 | [`app/main.js`](../../app/main.js) | 1,941 | Node/Electron main process |
-| [`app/server-logsump`](../../app/server-logsump) + [`app/log-sump-plugin`](../../app/log-sump-plugin) | n/a (separate repos/submodules) | Redis-backed telemetry store, its own process (was `app/server/server.py`, 3,304 lines, before the log-sump migration) |
+| [`app/server-logsump`](../../app/server-logsump) + [`app/log-sump-extended`](../../app/log-sump-extended) | n/a (separate repos/submodules) | Redis-backed telemetry store, its own process (was `app/server/server.py`, 3,304 lines, before the log-sump migration) |
 | Runtime dependencies | 0 | Electron + electron-builder only, both dev-only |
 
 The file is not actually disorganized -- it's *unseparated*. It carries 47
@@ -49,7 +51,7 @@ Three processes, three concerns:
 |---|---|---|---|
 | Renderer | `renderer/app.js` | All 13 UI domains: charts, log panels, dialogs, sidebar, recording controls, event editor | -- |
 | Main (Electron/Node) | `main.js` | Gateway provisioning (SSH/Docker), window & menu management, native dialogs, local persistence | contextBridge / IPC (`preload.js`) |
-| Server (Python) | `server-logsump` + `log-sump-plugin` | Redis-backed telemetry store, collection, event orchestration, recording sessions | HTTP + SSE (`fetch`, no Electron API) |
+| Server (Python) | `server-logsump` + `log-sump-extended` | Redis-backed telemetry store, collection, event orchestration, recording sessions | HTTP + SSE (`fetch`, no Electron API) |
 
 That third row matters more than it looks. The renderer's actual data
 plane -- `/range`, `/series`, `/sources`, `/docker/*`, `/events/*`,

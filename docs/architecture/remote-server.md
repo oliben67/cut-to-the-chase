@@ -21,17 +21,19 @@ through the migration; only the implementation moved:
 - **Remote deployment, direct HTTP, no tunnel by default** — still exactly
   the shipped model this doc describes below ("Phase 1 — done, shipped as
   direct HTTP, not a tunnel"). `app/lib/server-provision.js`'s
-  `ensureRemoteContainer` provisions the **log-sump** gateway container over
-  ssh (`docker load`/`pull` + `docker compose up`, plus — new since this
-  doc — an `ensurePluginCheckout` step that clones `log-sump-plugin` onto
-  the target host too); the client then talks straight to
-  `http://<host>:<port>`, ssh used only for that one-time provisioning step.
-  An ssh tunnel fallback (`app/lib/ssh-tunnel.js`) still exists for when the
-  direct route isn't reachable — unchanged in spirit from what's described
-  below.
+  `ensureRemoteContainer` provisions the **log-sump-extended** gateway
+  container over ssh (`docker load`/`pull` + `docker compose up` only --
+  as of 2026-08-17 cttc's own compat routes are baked into that image at
+  build time, so there's no separate plugin-deployment step at all; see
+  log-sump-extended's own README for the git-clone-then-bind-mount and
+  later plugin-bind-mount approaches this replaced); the client then
+  talks straight to `http://<host>:<port>`, ssh used only for that
+  one-time provisioning step. An ssh tunnel fallback
+  (`app/lib/ssh-tunnel.js`) still exists for when the direct route isn't
+  reachable — unchanged in spirit from what's described below.
 - **One collector per monitored host, shared by every viewer** — still the
   model, now implemented as log-sump's daemon registry
-  (`log_sump_plugin.compat.register_or_get_daemon`: returns the existing
+  (`log_sump_extended.compat.register_or_get_daemon`: returns the existing
   daemon for a host if one's already registered, registers a fresh one
   otherwise) rather than `server.py`'s `State._open_or_reuse()` /
   `docker://{host}/...` path matching. The underlying reasoning in
@@ -46,7 +48,7 @@ through the migration; only the implementation moved:
   defaults to log-sump's own 7 days (`LOG_SUMP_RETENTION__RETENTION_DAYS`,
   not currently overridden anywhere in CTTC's deployment), not the 3-day
   default this doc describes.
-- **File transfer / sample export** — implemented in `log-sump-plugin`'s
+- **File transfer / sample export** — implemented in `log-sump-extended`'s
   `sessions_compat.py`, not `server.py`'s `files.py`; same
   `.cttc-metric`/`.cttc-record` on-disk format, now built via
   `log_sump.common.sample_archive.write_archive` (the renamed, client-name-
