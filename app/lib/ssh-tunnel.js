@@ -20,6 +20,16 @@ function sshTunnelArgs({ sshTarget, sshKey, sshPort, containerPort }) {
     // fails fast (instead of leaving a shell process that never forwards
     // anything) if the remote sshd refuses this specific -L for any reason
     "-o", "ExitOnForwardFailure=yes",
+    // Without these, an idle -L forward relies on the OS's own TCP
+    // keepalive (macOS default: ~2 hours) to notice a dead path -- far too
+    // slow to matter, and does nothing at all for a NAT/firewall/VPN that
+    // silently drops an idle connection's state rather than resetting it
+    // outright. Sending an encrypted probe every 15s both keeps any such
+    // idle-connection state alive and, if the path really is dead, gets
+    // openSshTunnel's onUnexpectedExit to fire within ~45s instead of
+    // however long it'd otherwise take for something to notice.
+    "-o", "ServerAliveInterval=15",
+    "-o", "ServerAliveCountMax=3",
     "-L", `${containerPort}:localhost:${containerPort}`,
   ];
   if (sshKey) args.push("-i", sshKey, "-o", "IdentitiesOnly=yes");
