@@ -23,9 +23,9 @@
     "dist:mac": "electron-builder --mac dmg",
     "predist:linux": "npm run build:manual",
     "dist:linux": "electron-builder --linux AppImage",
-    "release:win": "../releases/windows/build-bundle.sh",
-    "release:mac": "../releases/macos/build-bundle.sh",
-    "release:linux": "../releases/linux/build-bundle.sh"
+    "release:win": "../releases/_shared/build-bundle.sh",
+    "release:mac": "../releases/_shared/build-bundle.sh",
+    "release:linux": "../releases/_shared/build-bundle.sh"
   },
   "devDependencies": {
     "@floating-ui/dom": "^1.8.0",

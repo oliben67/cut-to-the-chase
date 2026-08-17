@@ -109,32 +109,43 @@ tasks:
   # build:release:all with "local changes would be overwritten". The `diff
   # --cached --quiet ||` guard skips the commit (instead of failing the
   # task) on a no-op rebuild, e.g. re-running after nothing changed.
+  # Each build:release:<platform> task also bumps that branch's own
+  # release-num.txt (first step) and, after pushing, tags the release
+  # commit and publishes it as a GitHub Release on cttc-release with a
+  # CTTC.zip asset (last step) -- see
+  # releases/windows/README.md's "Build number + GitHub Releases".
   build:release:win:
-    desc: "Build the Windows installer + deploy bundle, and push it   [usage: task build:release:win]"
+    desc: "Build the Windows installer + deploy bundle, tag + publish a GitHub Release, and push it   [usage: task build:release:win]"
     cmds:
       - git -C ../releases checkout windows
+      - ../releases/_shared/bump-release-num.sh
       - npm run release:win -- {{.CLI_ARGS}}
       - git -C ../releases add -A
       - "git -C ../releases diff --cached --quiet || git -C ../releases commit -m 'chore(windows): rebuild deploy bundle'"
       - git -C ../releases push origin windows
+      - '../releases/_shared/publish-release.sh -win "CTTC Setup.exe" ../releases/windows'
 
   build:release:mac:
-    desc: "Build the macOS installer + deploy bundle, and push it   [usage: task build:release:mac]"
+    desc: "Build the macOS installer + deploy bundle, tag + publish a GitHub Release, and push it   [usage: task build:release:mac]"
     cmds:
       - git -C ../releases checkout mac
+      - ../releases/_shared/bump-release-num.sh
       - npm run release:mac -- {{.CLI_ARGS}}
       - git -C ../releases add -A
       - "git -C ../releases diff --cached --quiet || git -C ../releases commit -m 'chore(mac): rebuild deploy bundle'"
       - git -C ../releases push origin mac
+      - '../releases/_shared/publish-release.sh -mac "CTTC.dmg" ../releases/macos'
 
   build:release:linux:
-    desc: "Build the Linux AppImage + deploy bundle, and push it   [usage: task build:release:linux]"
+    desc: "Build the Linux AppImage + deploy bundle, tag + publish a GitHub Release, and push it   [usage: task build:release:linux]"
     cmds:
       - git -C ../releases checkout linux
+      - ../releases/_shared/bump-release-num.sh
       - npm run release:linux -- {{.CLI_ARGS}}
       - git -C ../releases add -A
       - "git -C ../releases diff --cached --quiet || git -C ../releases commit -m 'chore(linux): rebuild deploy bundle'"
       - git -C ../releases push origin linux
+      - '../releases/_shared/publish-release.sh -linux "CTTC.AppImage" ../releases/linux'
 
   build:release:all:
     desc: "Build all three platforms' installers + deploy bundles   [usage: task build:release:all]"
