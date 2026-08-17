@@ -1,21 +1,21 @@
 "use strict";
 
 const fs = require("fs");
-const os = require("os");
 const path = require("path");
 const { spawn } = require("child_process");
 const { hostFromTarget } = require("./connection-config");
 const { waitForHttpOk } = require("./net-wait");
 
-// log-sump-plugin (app/log-sump-plugin, a submodule of this repo): cttc's
-// own client-specific compat routes, never baked into the log-sump image
-// itself (see releases/_shared/build-image.sh's own comment) -- instead
-// bundled alongside the executable (see app/package.json's extraResources,
-// "plugins") and bind-mounted into the container at `docker compose up`
-// time, so log-sump's own image stays generic. Deploying it this way
-// (rather than the git-clone-at-provision-time approach used until
-// 2026-08-16) means a remote gateway host needs nothing beyond `docker`/
-// `docker compose` -- no `git`, no SSH access of its own to GitHub.
+// The server image is log-sump-extended (app/log-sump-extended, a
+// separate repo: github.com/oliben67/log-sump-extended) -- log-sump plus
+// cttc's own client-specific compat routes, baked in at build time via
+// log-sump's own create_app(extra_routers=[...]) seam. Nothing is
+// bind-mounted or cloned at provision time: this is the one and only
+// image, built by releases/_shared/build-image.sh. Supersedes the older
+// log-sump-plugin approach (a directory git-cloned or bind-mounted into a
+// plain, unmodified log-sump image and dynamically loaded at startup,
+// used until 2026-08-16) -- see log-sump-extended's own README for why
+// that was replaced.
 
 // The server image tarball + both docker-compose variants ship as
 // electron-builder extraResources (see app/package.json's
@@ -38,7 +38,9 @@ function defaultRepoDir() {
 }
 
 function bundledTarballPath({ resourcesDir } = {}) {
-  return resourcesDir ? path.join(resourcesDir, "log-sump.tar.gz") : path.join(defaultSharedDir(), "log-sump.tar.gz");
+  return resourcesDir
+    ? path.join(resourcesDir, "log-sump-extended.tar.gz")
+    : path.join(defaultSharedDir(), "log-sump-extended.tar.gz");
 }
 function bundledOfflineComposePath({ resourcesDir } = {}) {
   return resourcesDir
@@ -47,52 +49,6 @@ function bundledOfflineComposePath({ resourcesDir } = {}) {
 }
 function hasBundledTarball({ resourcesDir } = {}) {
   return fs.existsSync(bundledTarballPath({ resourcesDir }));
-}
-
-// Packaged: app/package.json's extraResources stages log-sump-plugin's
-// src/ (its importable package root's own *parent* -- see docker-compose.yml's
-// own CTTC_PLUGINS_DIR comment) as "plugins" alongside the executable, so
-// this resolves straight to the log_sump_plugin package directory itself.
-// Dev/unpackaged: read straight out of the submodule checkout, same
-// dev-fallback pattern as defaultSharedDir/defaultRepoDir above. This is
-// where the plugin ships *from* -- see deployLocalPlugins/
-// ensureRemoteContainer below for where it actually runs *from* on a
-// given instance.
-function bundledPluginSourceDir({ resourcesDir } = {}) {
-  return resourcesDir
-    ? path.join(resourcesDir, "plugins", "log_sump_plugin")
-    : path.join(__dirname, "..", "log-sump-plugin", "src", "log_sump_plugin");
-}
-
-// Each log-sump instance -- the embedded "This machine" one included --
-// gets its own ~/.log-sump directory, mirroring the remoteDir a *remote*
-// instance is provisioned into (see ensureRemoteContainer) rather than
-// cttc's unrelated ~/.cttc/ app-data directory (gateways.json, keys,
-// connection.json, ...). CTTC_PLUGINS_DIR always points at this
-// directory's own "plugins" subdirectory -- log-sump's native "directory
-// *of* plugin subdirectories" concept (see LOG_SUMP_PLUGINS__DIRECTORY's
-// own comment in docker-compose.yml) -- with cttc's own plugin living at
-// plugins/cttc, one named entry alongside room for any other plugin a
-// deployment might add later.
-function localInstanceDir() {
-  return path.join(os.homedir(), ".log-sump");
-}
-
-/**
- * Copies bundledPluginSourceDir()'s current contents to
- * `<localInstanceDir()>/plugins/cttc` (or `destDir`, only ever overridden
- * by tests to avoid touching the real ~/.log-sump on the machine running
- * them), replacing whatever was there before -- cheap enough to redo on
- * every ensureLocalContainer call, and keeps the destination always
- * matching this install rather than whatever was first copied there.
- * @returns {string} the plugins *parent* directory (destDir's own parent),
- *   which is what CTTC_PLUGINS_DIR must be set to.
- */
-function deployLocalPlugins({ resourcesDir, destDir = path.join(localInstanceDir(), "plugins", "cttc") } = {}) {
-  fs.rmSync(destDir, { recursive: true, force: true });
-  fs.mkdirSync(path.dirname(destDir), { recursive: true });
-  fs.cpSync(bundledPluginSourceDir({ resourcesDir }), destDir, { recursive: true });
-  return path.dirname(destDir);
 }
 
 /**
@@ -158,8 +114,8 @@ function scpArgs({ sshKey, sshPort }) {
  * Resolves what image to run and which compose file goes with it. `source`
  * (from Settings > "Update server image", see main.js's "update-image"
  * handler) explicitly overrides the default of "whatever's bundled":
- *   { type: "tarball", path: "C:\\path\\to\\log-sump.tar.gz" }
- *   { type: "registry", ref: "osteck/log-sump:0.0.2" }
+ *   { type: "tarball", path: "C:\\path\\to\\log-sump-extended.tar.gz" }
+ *   { type: "registry", ref: "osteck/log-sump-extended:0.0.2" }
  * With no override: prefers the tarball baked into this install,
  * falling back to image.json's registry ref (a placeholder until a real
  * registry is wired up).
@@ -204,16 +160,13 @@ function resolveSource(source, { resourcesDir } = {}) {
  * docker-pull per resolveSource(), then `docker compose up -d` with the
  * matching compose file, then wait for GET /health/ready to return 200.
  * `apiToken`, when given, is passed through as CTTC_API_TOKEN -- this
- * container binds 0.0.0.0 with `network_mode: host` (see docker-compose.yml)
- * exactly like a remote gateway's, so it's reachable by anything else on
- * the LAN too, not just this machine (br-NET-004); main.js always supplies
- * the same persisted token across calls (see lib/api-token.js) so this
- * never changes between an ordinary reconnect's `docker compose up -d`
- * calls -- an env var that *did* change would make compose recreate the
- * container instead of leaving the already-running one alone. Also
- * (re-)deploys the bundled plugin to ~/.cttc/plugins (see
- * deployLocalPlugins) and passes that through as CTTC_PLUGINS_DIR, which
- * both docker-compose.yml variants bind-mount in.
+ * container's port 8765 is exposed to the LAN (br-NET-004, see
+ * docker-compose.yml), reachable by anything else that can reach this
+ * host, not just this machine; main.js always supplies the same
+ * persisted token across calls (see lib/api-token.js) so this never
+ * changes between an ordinary reconnect's `docker compose up -d` calls
+ * -- an env var that *did* change would make compose recreate the
+ * container instead of leaving the already-running one alone.
  * @returns {{port: number, imageRef: string}}
  */
 async function ensureLocalContainer({
@@ -223,15 +176,10 @@ async function ensureLocalContainer({
   source,
   apiToken,
   onLog,
-  pluginsDestDir,
 } = {}) {
   const resolved = resolveSource(source, { resourcesDir });
   const env = { ...process.env };
   if (apiToken) env.CTTC_API_TOKEN = apiToken;
-  env.CTTC_PLUGINS_DIR = deployLocalPlugins({
-    resourcesDir,
-    ...(pluginsDestDir ? { destDir: pluginsDestDir } : {}),
-  });
   if (resolved.kind === "tarball") {
     await run(spawnFn, "docker", ["load", "-i", resolved.tarballPath], {}, onLog);
   } else {
@@ -295,52 +243,28 @@ async function ensureRemoteContainer(
     await run(spawnFn, sshBin, [...ssh, `chmod 600 ${remoteDir}/id_rsa`], {}, onLog);
     idRsaEnv = 'CTTC_ID_RSA="$PWD/id_rsa" ';
   }
-  // br-NET-004: this container binds 0.0.0.0 with network_mode: host (see
+  // br-NET-004: this container's port 8765 is exposed to the LAN (see
   // docker-compose.yml), reachable by anything else that can reach this
-  // host, not just this client -- CTTC_API_TOKEN gates server.py's own
-  // auth middleware behind it. main.js always supplies the same persisted
-  // token across calls (lib/api-token.js), so this never changes between
-  // an ordinary reconnect's `docker compose up -d` calls -- an env var
-  // that did change would make compose recreate the container instead of
+  // host, not just this client -- CTTC_API_TOKEN gates the gateway's own
+  // auth behind it. main.js always supplies the same persisted token
+  // across calls (lib/api-token.js), so this never changes between an
+  // ordinary reconnect's `docker compose up -d` calls -- an env var that
+  // did change would make compose recreate the container instead of
   // leaving the already-running, already-authenticated one alone.
   const apiTokenEnv = apiToken ? `CTTC_API_TOKEN=${apiToken} ` : "";
-
-  // Copies the bundled plugin (see bundledPluginSourceDir's own docstring)
-  // up to the remote host itself, at ${remoteDir}/plugins/cttc --
-  // log-sump's own native "directory of plugin subdirectories" concept
-  // (LOG_SUMP_PLUGINS__DIRECTORY), with cttc's own plugin as one named
-  // entry in it rather than a bespoke cttc-only layout. Cleaned first so a
-  // plugin file removed since the last deploy doesn't linger (plain
-  // `scp -r` onto an existing directory only overwrites/adds, never
-  // deletes). Requires nothing beyond `docker`/`docker compose` on the
-  // remote host: no `git`, no SSH access of its own to GitHub, unlike the
-  // git-clone-at-provision-time approach this replaced. `$PWD` (not a
-  // literal path) for the same reason idRsaEnv uses it below: this whole
-  // thing runs as one shell invocation after `cd ${remoteDir}`, so `$PWD`
-  // is already that absolute directory by the time docker compose reads
-  // CTTC_PLUGINS_DIR from it.
-  await run(spawnFn, sshBin, [...ssh, `rm -rf ${remoteDir}/plugins/cttc && mkdir -p ${remoteDir}/plugins`], {}, onLog);
-  await run(
-    spawnFn,
-    scpBin,
-    [...scp, "-r", bundledPluginSourceDir({ resourcesDir }), `${target}:${remoteDir}/plugins/cttc`],
-    {},
-    onLog
-  );
-  const pluginsDirEnv = 'CTTC_PLUGINS_DIR="$PWD/plugins" ';
 
   if (resolved.kind === "tarball") {
     await run(spawnFn, scpBin, [...scp, resolved.tarballPath, `${target}:${remoteDir}/`], {}, onLog);
     await run(spawnFn, scpBin, [...scp, resolved.composeFile, `${target}:${remoteDir}/docker-compose.yml`], {}, onLog);
     await run(spawnFn, sshBin, [
       ...ssh,
-      `cd ${remoteDir} && docker load -i ${path.basename(resolved.tarballPath)} && ${apiTokenEnv}${idRsaEnv}${pluginsDirEnv}docker compose -f docker-compose.yml up -d`,
+      `cd ${remoteDir} && docker load -i ${path.basename(resolved.tarballPath)} && ${apiTokenEnv}${idRsaEnv}docker compose -f docker-compose.yml up -d`,
     ], {}, onLog);
   } else {
     await run(spawnFn, scpBin, [...scp, resolved.composeFile, `${target}:${remoteDir}/docker-compose.yml`], {}, onLog);
     await run(spawnFn, sshBin, [
       ...ssh,
-      `cd ${remoteDir} && docker pull ${resolved.ref} && CTTC_IMAGE=${resolved.ref} ${apiTokenEnv}${idRsaEnv}${pluginsDirEnv}docker compose -f docker-compose.yml up -d`,
+      `cd ${remoteDir} && docker pull ${resolved.ref} && CTTC_IMAGE=${resolved.ref} ${apiTokenEnv}${idRsaEnv}docker compose -f docker-compose.yml up -d`,
     ], {}, onLog);
   }
 
@@ -423,9 +347,6 @@ async function checkStillInstalled(entry, { spawnFn = spawn, resourcesDir, sshBi
 module.exports = {
   bundledTarballPath,
   bundledOfflineComposePath,
-  bundledPluginSourceDir,
-  localInstanceDir,
-  deployLocalPlugins,
   hasBundledTarball,
   readImageRef,
   registryComposePath,

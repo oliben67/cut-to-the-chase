@@ -296,7 +296,7 @@ async function showAboutDialog() {
     `Electron ${process.versions.electron}`,
     `Chromium ${process.versions.chrome}`,
     `Node.js ${process.versions.node}`,
-    // The gateway itself (log-sump + log-sump-plugin) runs in its own Docker
+    // The gateway itself (log-sump-extended) runs in its own Docker
     // container, not bundled into this process -- its own dependency
     // versions (Python, Redis, ...) are that image's concern, not pinned
     // here.

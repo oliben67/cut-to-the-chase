@@ -65,10 +65,6 @@
       {
         "from": "build/CTTC-Manual.html",
         "to": "CTTC-Manual.html"
-      },
-      {
-        "from": "log-sump-plugin/src",
-        "to": "plugins"
       }
     ],
     "win": {
@@ -78,8 +74,8 @@
       "icon": "assets/icon.png",
       "extraResources": [
         {
-          "from": "../releases/_shared/log-sump.tar.gz",
-          "to": "log-sump.tar.gz"
+          "from": "../releases/_shared/log-sump-extended.tar.gz",
+          "to": "log-sump-extended.tar.gz"
         },
         {
           "from": "../releases/_shared/docker-compose.yml",
