@@ -4,7 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const net = require("net");
 const { EventEmitter } = require("events");
-const { openSshTunnel, closeSshTunnel } = require("../../lib/ssh-tunnel");
+const { openSshTunnel, closeSshTunnel, sshTunnelArgs } = require("../../lib/ssh-tunnel");
 
 async function freePort() {
   return new Promise((resolve, reject) => {
@@ -169,4 +169,14 @@ test("closeSshTunnel is a no-op (no log) for a null/already-dead handle", () => 
   const lines = [];
   assert.doesNotThrow(() => closeSshTunnel(null, { onLog: (l) => lines.push(l) }));
   assert.equal(lines.length, 0);
+});
+
+// br-TUNL-009: without these, an idle -L forward only notices a dead path
+// via the OS's own multi-hour TCP keepalive default, and never notices at
+// all a NAT/firewall/VPN that silently drops idle connection state instead
+// of resetting it outright.
+test("sshTunnelArgs sends SSH-level keepalive probes (br-TUNL-009)", () => {
+  const args = sshTunnelArgs({ sshTarget: "u@h", sshKey: null, containerPort: 8765 });
+  assert.ok(args.includes("ServerAliveInterval=15"), args.join(" "));
+  assert.ok(args.includes("ServerAliveCountMax=3"), args.join(" "));
 });
