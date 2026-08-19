@@ -81,6 +81,26 @@ function localManualPath() {
     : path.join(__dirname, "build", "CTTC-Manual.html");
   return fs.existsSync(p) ? p : null;
 }
+
+// Written fresh by build/write-release-info.js on every packaging run (see
+// package.json's extraResources and predist:* hooks) -- carries the actual
+// release tag this build was cut under (e.g. "0.2.0-win4", matching
+// releases/_shared/publish-release.sh's own tag scheme exactly), not just
+// the bare semver app.getVersion() returns, which every platform/build
+// shares regardless of which numbered release it actually is. Same
+// packaged-vs-dev path resolution as localManualPath() above; a dev run
+// (or a packaged build somehow missing it) falls back to app.getVersion()
+// alone in showAboutDialog() below, same graceful-absence pattern.
+function localReleaseInfo() {
+  const p = app.isPackaged
+    ? path.join(process.resourcesPath, "release-info.json")
+    : path.join(__dirname, "build", "release-info.json");
+  try {
+    return JSON.parse(fs.readFileSync(p, "utf8"));
+  } catch {
+    return null;
+  }
+}
 async function openManual(anchor) {
   const local = localManualPath();
   if (!local) {
@@ -302,6 +322,17 @@ async function showAboutDialog() {
     // here.
     "Docker (log-sump gateway)",
   ];
+  // release-info.json's tag (e.g. "0.2.0-win4") is the actual shipped
+  // identifier -- app.getVersion() alone is just the bare semver every
+  // platform/build shares, which alone can't tell two different Windows
+  // builds of the same version apart. Falls back to app.getVersion() only
+  // if the file is missing entirely (an old dev checkout predating this,
+  // or a packaged build that somehow shipped without it).
+  const releaseInfo = localReleaseInfo();
+  const versionLine = releaseInfo ? `Version ${releaseInfo.tag}` : `Version ${app.getVersion()}`;
+  const provenanceLine = releaseInfo?.commit
+    ? `Built ${new Date(releaseInfo.builtAt).toLocaleDateString()} \u2022 ${releaseInfo.commit.slice(0, 7)}\n`
+    : "";
   const { response } = await dialog.showMessageBox({
     type: "info",
     icon: APP_ICON,
@@ -309,7 +340,8 @@ async function showAboutDialog() {
     message: "Cut to the Chase (CTTC)",
     detail:
       `${APP_TAGLINE}\n\n` +
-      `Version ${app.getVersion()}\n` +
+      `${versionLine}\n` +
+      provenanceLine +
       `\u00A9 ${new Date().getFullYear()} Olivier Steck\n\n` +
       `Built with:\n${stack.map((s) => `  \u2022 ${s}`).join("\n")}\n\n` +
       `Icons by Flaticon (flaticon.com)`,

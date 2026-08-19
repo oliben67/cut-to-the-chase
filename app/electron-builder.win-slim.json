@@ -18,7 +18,8 @@
   },
   "extraResources": [
     { "from": "../releases/_repo/image.json", "to": "image.json" },
-    { "from": "../releases/_repo/docker-compose.yml", "to": "docker-compose.registry.yml" }
+    { "from": "../releases/_repo/docker-compose.yml", "to": "docker-compose.registry.yml" },
+    { "from": "build/release-info.json", "to": "release-info.json" }
   ],
   "win": {
     "target": ["nsis"],
