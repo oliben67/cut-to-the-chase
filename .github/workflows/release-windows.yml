@@ -1,0 +1,163 @@
+name: Release Windows (signed)
+
+# Reproduces `task build:release:win` (see app/Taskfile.yml), split across
+# two runners: an ubuntu-latest job builds the log-sump-extended server
+# image tarball (plain Docker, works anywhere), and a windows-latest job
+# packages + code-signs the installer -- Azure Trusted Signing only runs
+# via a real PowerShell session (Install-Module TrustedSigning +
+# Invoke-TrustedSigning), which a Windows build host can't fake, unlike
+# NSIS packaging itself, which can cross-build from any host.
+#
+# Required repo secrets (Settings > Secrets and variables > Actions):
+#   AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET
+#     -- a Microsoft Entra service principal with the "Trusted Signing
+#        Certificate Profile Signer" role on the Trusted Signing Account
+#        below. Read via Azure's own EnvironmentCredential -- see
+#        https://learn.microsoft.com/en-us/dotnet/api/azure.identity.environmentcredential
+#   AZURE_TRUSTED_SIGNING_ENDPOINT, AZURE_TRUSTED_SIGNING_CERT_PROFILE,
+#   AZURE_TRUSTED_SIGNING_ACCOUNT, AZURE_TRUSTED_SIGNING_PUBLISHER
+#     -- the Trusted Signing Account's own endpoint/certificate-profile/
+#        account/publisher names (not secret in the access-granting sense,
+#        but kept out of the committed electron-builder config regardless
+#        -- see releases/_shared/build-bundle.sh's -c.<path>=<value>
+#        passthrough this workflow relies on).
+#   CTTC_RELEASE_PUSH_TOKEN
+#     -- a PAT (classic, `repo` scope, or fine-grained with Contents:
+#        Read & write on oliben67/cttc-release) used only to push the
+#        built installer + tag, and to `gh release create`. The default
+#        GITHUB_TOKEN can't write to a different repo, which is what
+#        oliben67/cttc-release (the releases/ submodule's own remote) is.
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: Installer variant
+        type: choice
+        options: [bundle, slim]
+        default: bundle
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-windows
+  cancel-in-progress: false
+
+jobs:
+  build-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build the log-sump-extended server image tarball
+        working-directory: app
+        run: ../releases/_shared/build-image.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: log-sump-extended-image
+          path: releases/_shared/log-sump-extended.tar.gz
+          retention-days: 1
+
+  build-sign-publish-windows:
+    needs: build-image
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: log-sump-extended-image
+          path: releases/_shared
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: npm ci
+        shell: bash
+        working-directory: app
+        run: npm ci
+
+      - name: Register Git LFS filters
+        # Required before the commit step below: CTTC Setup.exe is LFS-
+        # tracked in cttc-release (see its own .gitattributes). Without
+        # `git lfs install` registering the local smudge/clean/pre-push
+        # filters, `git add`/`git commit` would commit the new installer
+        # as a plain blob instead of an LFS pointer, silently breaking LFS
+        # for this file and likely tripping GitHub's 100MB blob limit.
+        shell: bash
+        run: git lfs install
+
+      - name: Configure the release repo's git identity
+        shell: bash
+        working-directory: app
+        run: |
+          git -C ../releases config user.name "cttc-release-bot"
+          git -C ../releases config user.email "actions@users.noreply.github.com"
+
+      - name: Check out the windows release branch
+        shell: bash
+        working-directory: app
+        run: git -C ../releases checkout windows
+
+      - name: Bump the release build number
+        shell: bash
+        working-directory: app
+        run: ../releases/_shared/bump-release-num.sh
+
+      - name: Build + sign the Windows installer
+        shell: bash
+        working-directory: app
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          SIGN_ENDPOINT: ${{ secrets.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+          SIGN_CERT_PROFILE: ${{ secrets.AZURE_TRUSTED_SIGNING_CERT_PROFILE }}
+          SIGN_ACCOUNT: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT }}
+          SIGN_PUBLISHER: ${{ secrets.AZURE_TRUSTED_SIGNING_PUBLISHER }}
+        # --reuse-cache: this job never rebuilds the image itself, only
+        # ever the tarball build-image already produced on ubuntu-latest
+        # (see that job's own comment on why Windows can't be trusted to
+        # load/tag/push a linux/amd64 image reliably).
+        run: |
+          npm run release:win -- \
+            --${{ github.event.inputs.variant }} \
+            --reuse-cache \
+            -c.win.azureSignOptions.endpoint="$SIGN_ENDPOINT" \
+            -c.win.azureSignOptions.certificateProfileName="$SIGN_CERT_PROFILE" \
+            -c.win.azureSignOptions.codeSigningAccountName="$SIGN_ACCOUNT" \
+            -c.win.azureSignOptions.publisherName="$SIGN_PUBLISHER"
+
+      - name: Commit the signed installer
+        shell: bash
+        working-directory: app
+        run: |
+          git -C ../releases add -A
+          git -C ../releases diff --cached --quiet || git -C ../releases commit -m 'chore(windows): rebuild deploy bundle'
+
+      - name: Push to oliben67/cttc-release
+        shell: bash
+        working-directory: app
+        env:
+          PUSH_TOKEN: ${{ secrets.CTTC_RELEASE_PUSH_TOKEN }}
+        run: |
+          git -C ../releases remote set-url origin "https://x-access-token:${PUSH_TOKEN}@github.com/oliben67/cttc-release.git"
+          git -C ../releases push origin windows
+
+      - name: Tag + publish the GitHub Release
+        shell: bash
+        working-directory: app
+        env:
+          GH_TOKEN: ${{ secrets.CTTC_RELEASE_PUSH_TOKEN }}
+        run: '../releases/_shared/publish-release.sh -win "CTTC Setup.exe" ../releases/windows'
